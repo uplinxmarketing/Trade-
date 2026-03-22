@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState } from 'react';
 import TopBar from '@/components/dashboard/TopBar';
 import PortfolioSummary from '@/components/dashboard/PortfolioSummary';
 import PriceChart from '@/components/dashboard/PriceChart';
@@ -6,11 +6,11 @@ import PositionsList from '@/components/dashboard/PositionsList';
 import BotDashboard from '@/components/dashboard/BotDashboard';
 import CoinSelector from '@/components/dashboard/CoinSelector';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
+import AiAnalysisPanel from '@/components/dashboard/AiAnalysisPanel';
 import RecentTrades from '@/components/dashboard/RecentTrades';
 import TradePanel from '@/components/dashboard/TradePanel';
 import type { KlineData, Position } from '@/lib/binance-types';
 
-// Demo data — replaced by real Binance data when API keys are connected
 const mockKlines: KlineData[] = Array.from({ length: 24 }, (_, i) => {
   const base = 67200 + Math.sin(i * 0.5) * 800 + Math.random() * 400;
   return { time: `${i}:00`, open: base, high: base + 200, low: base - 150, close: base + (Math.random() - 0.4) * 300, volume: 1200 + Math.random() * 800 };
@@ -62,14 +62,22 @@ const Index = () => {
             <TradePanel selectedCoins={selectedCoins} />
           </div>
 
-          {/* Bot Section */}
+          {/* Bot + AI Section */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-            <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} />
-            <BotDashboard
-              selectedCoins={selectedCoins}
-              mode={botMode}
-              onModeChange={setBotMode}
-            />
+            <div className="space-y-4">
+              <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} />
+              <BotDashboard
+                selectedCoins={selectedCoins}
+                mode={botMode}
+                onModeChange={setBotMode}
+              />
+            </div>
+            <div className="lg:col-span-2">
+              <AiAnalysisPanel selectedCoins={selectedCoins} />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <RecentTrades trades={mockTrades} />
           </div>
         </div>
