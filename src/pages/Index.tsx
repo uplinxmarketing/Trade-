@@ -57,7 +57,7 @@ const Index = () => {
             activeBots={strategies.filter(s => s.status === 'active').length}
           />
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
             <PriceChart
               data={mockKlines}
               symbol="BTC / USDT"
@@ -65,6 +65,7 @@ const Index = () => {
               priceChange="2.14"
             />
             <PositionsList positions={mockPositions} />
+            <TradePanel />
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
