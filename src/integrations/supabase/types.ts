@@ -14,7 +14,138 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      bot_config: {
+        Row: {
+          created_at: string
+          current_balance: number
+          id: string
+          initial_balance: number
+          is_running: boolean
+          mode: string
+          selected_coins: string[]
+          updated_at: string
+          user_session: string
+        }
+        Insert: {
+          created_at?: string
+          current_balance?: number
+          id?: string
+          initial_balance?: number
+          is_running?: boolean
+          mode?: string
+          selected_coins?: string[]
+          updated_at?: string
+          user_session?: string
+        }
+        Update: {
+          created_at?: string
+          current_balance?: number
+          id?: string
+          initial_balance?: number
+          is_running?: boolean
+          mode?: string
+          selected_coins?: string[]
+          updated_at?: string
+          user_session?: string
+        }
+        Relationships: []
+      }
+      bot_trade_history: {
+        Row: {
+          created_at: string
+          id: string
+          pnl: number | null
+          price: number
+          quantity: number
+          reason: string | null
+          side: string
+          symbol: string
+          user_session: string
+        }
+        Insert: {
+          created_at?: string
+          id?: string
+          pnl?: number | null
+          price: number
+          quantity: number
+          reason?: string | null
+          side: string
+          symbol: string
+          user_session?: string
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          pnl?: number | null
+          price?: number
+          quantity?: number
+          reason?: string | null
+          side?: string
+          symbol?: string
+          user_session?: string
+        }
+        Relationships: []
+      }
+      paper_portfolio: {
+        Row: {
+          avg_entry_price: number
+          id: string
+          quantity: number
+          symbol: string
+          updated_at: string
+          user_session: string
+        }
+        Insert: {
+          avg_entry_price?: number
+          id?: string
+          quantity?: number
+          symbol: string
+          updated_at?: string
+          user_session?: string
+        }
+        Update: {
+          avg_entry_price?: number
+          id?: string
+          quantity?: number
+          symbol?: string
+          updated_at?: string
+          user_session?: string
+        }
+        Relationships: []
+      }
+      paper_trades: {
+        Row: {
+          created_at: string
+          id: string
+          price: number
+          quantity: number
+          side: string
+          symbol: string
+          total: number | null
+          user_session: string
+        }
+        Insert: {
+          created_at?: string
+          id?: string
+          price: number
+          quantity: number
+          side: string
+          symbol: string
+          total?: number | null
+          user_session?: string
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          price?: number
+          quantity?: number
+          side?: string
+          symbol?: string
+          total?: number | null
+          user_session?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
