@@ -7,6 +7,7 @@ import BotDashboard from '@/components/dashboard/BotDashboard';
 import CoinSelector from '@/components/dashboard/CoinSelector';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import AiAnalysisPanel from '@/components/dashboard/AiAnalysisPanel';
+import BinanceConnect from '@/components/dashboard/BinanceConnect';
 import RecentTrades from '@/components/dashboard/RecentTrades';
 import TradePanel from '@/components/dashboard/TradePanel';
 import type { KlineData, Position } from '@/lib/binance-types';
@@ -35,13 +36,23 @@ const Index = () => {
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT'
   ]);
   const [botMode, setBotMode] = useState<'test' | 'live'>('test');
+  const [binanceConnected, setBinanceConnected] = useState(false);
+  const [showBinanceConnect, setShowBinanceConnect] = useState(false);
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
-      <TopBar isConnected={true} />
+      <TopBar
+        isConnected={binanceConnected}
+        onConnectClick={() => setShowBinanceConnect(true)}
+      />
+
+      <BinanceConnect
+        isOpen={showBinanceConnect}
+        onClose={() => setShowBinanceConnect(false)}
+        onConnectionChange={setBinanceConnected}
+      />
 
       <div className="flex-1 flex">
-        {/* Main Dashboard */}
         <div className="flex-1 p-4 space-y-4 overflow-y-auto scrollbar-thin">
           <PortfolioSummary
             totalBalance={24_847.32}
@@ -62,7 +73,6 @@ const Index = () => {
             <TradePanel selectedCoins={selectedCoins} />
           </div>
 
-          {/* Bot + AI Section */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
             <div className="space-y-4">
               <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} />
@@ -70,6 +80,7 @@ const Index = () => {
                 selectedCoins={selectedCoins}
                 mode={botMode}
                 onModeChange={setBotMode}
+                binanceConnected={binanceConnected}
               />
             </div>
             <div className="lg:col-span-2">
@@ -82,7 +93,6 @@ const Index = () => {
           </div>
         </div>
 
-        {/* AI Chat Sidebar */}
         <div className="w-80 xl:w-96 border-l border-border hidden md:flex flex-col">
           <AiChatPanel />
         </div>
