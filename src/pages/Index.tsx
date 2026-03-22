@@ -3,11 +3,12 @@ import TopBar from '@/components/dashboard/TopBar';
 import PortfolioSummary from '@/components/dashboard/PortfolioSummary';
 import PriceChart from '@/components/dashboard/PriceChart';
 import PositionsList from '@/components/dashboard/PositionsList';
-import BotStrategies from '@/components/dashboard/BotStrategies';
+import BotDashboard from '@/components/dashboard/BotDashboard';
+import CoinSelector from '@/components/dashboard/CoinSelector';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import RecentTrades from '@/components/dashboard/RecentTrades';
 import TradePanel from '@/components/dashboard/TradePanel';
-import type { KlineData, Position, BotStrategy } from '@/lib/binance-types';
+import type { KlineData, Position } from '@/lib/binance-types';
 
 // Demo data — replaced by real Binance data when API keys are connected
 const mockKlines: KlineData[] = Array.from({ length: 24 }, (_, i) => {
@@ -30,17 +31,10 @@ const mockTrades = [
 ];
 
 const Index = () => {
-  const [strategies, setStrategies] = useState<BotStrategy[]>([
-    { id: '1', name: 'Grid Trading', status: 'active', pair: 'BTC/USDT', pnl: 342.18, trades: 47, winRate: 72 },
-    { id: '2', name: 'DCA Bot', status: 'active', pair: 'ETH/USDT', pnl: 128.55, trades: 23, winRate: 65 },
-    { id: '3', name: 'Momentum Scalper', status: 'paused', pair: 'SOL/USDT', pnl: -18.40, trades: 112, winRate: 54 },
+  const [selectedCoins, setSelectedCoins] = useState<string[]>([
+    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT'
   ]);
-
-  const toggleBot = useCallback((id: string) => {
-    setStrategies(prev => prev.map(s =>
-      s.id === id ? { ...s, status: s.status === 'active' ? 'paused' : 'active' } : s
-    ));
-  }, []);
+  const [botMode, setBotMode] = useState<'test' | 'live'>('test');
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
@@ -54,7 +48,7 @@ const Index = () => {
             dailyPnl={344.18}
             dailyPnlPercent={1.41}
             openPositions={mockPositions.length}
-            activeBots={strategies.filter(s => s.status === 'active').length}
+            activeBots={selectedCoins.length}
           />
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -65,11 +59,17 @@ const Index = () => {
               priceChange="2.14"
             />
             <PositionsList positions={mockPositions} />
-            <TradePanel />
+            <TradePanel selectedCoins={selectedCoins} />
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <BotStrategies strategies={strategies} onToggle={toggleBot} />
+          {/* Bot Section */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} />
+            <BotDashboard
+              selectedCoins={selectedCoins}
+              mode={botMode}
+              onModeChange={setBotMode}
+            />
             <RecentTrades trades={mockTrades} />
           </div>
         </div>
