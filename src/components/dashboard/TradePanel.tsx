@@ -8,17 +8,23 @@ import { toast } from 'sonner';
 type OrderSide = 'BUY' | 'SELL';
 type OrderType = 'MARKET' | 'LIMIT' | 'STOP_LIMIT';
 
-const PAIRS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT'];
 const ORDER_TYPES: { value: OrderType; label: string }[] = [
   { value: 'MARKET', label: 'Market' },
   { value: 'LIMIT', label: 'Limit' },
   { value: 'STOP_LIMIT', label: 'Stop-Limit' },
 ];
 
-const TradePanel = () => {
+const QTY_PRESETS = [25, 50, 75, 100];
+
+interface TradePanelProps {
+  selectedCoins?: string[];
+  availableBalance?: number;
+}
+
+const TradePanel = ({ selectedCoins = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT'], availableBalance = 10000 }: TradePanelProps) => {
   const [side, setSide] = useState<OrderSide>('BUY');
   const [orderType, setOrderType] = useState<OrderType>('MARKET');
-  const [symbol, setSymbol] = useState('BTCUSDT');
+  const [symbol, setSymbol] = useState(selectedCoins[0] || 'BTCUSDT');
   const [quantity, setQuantity] = useState('');
   const [price, setPrice] = useState('');
   const [stopPrice, setStopPrice] = useState('');
@@ -26,6 +32,14 @@ const TradePanel = () => {
 
   const needsPrice = orderType === 'LIMIT' || orderType === 'STOP_LIMIT';
   const needsStopPrice = orderType === 'STOP_LIMIT';
+
+  const applyQtyPreset = (percent: number) => {
+    // For a rough estimate, use available balance / estimated price
+    const estimatedPrice = parseFloat(price) || 67000; // fallback
+    const maxQty = availableBalance / estimatedPrice;
+    const qty = (maxQty * percent) / 100;
+    setQuantity(qty.toFixed(6));
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -115,7 +129,7 @@ const TradePanel = () => {
             onChange={e => setSymbol(e.target.value)}
             className="w-full bg-muted/40 border border-border rounded px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent"
           >
-            {PAIRS.map(p => (
+            {selectedCoins.map(p => (
               <option key={p} value={p}>{p.replace('USDT', ' / USDT')}</option>
             ))}
           </select>
@@ -152,9 +166,22 @@ const TradePanel = () => {
             onChange={e => setQuantity(e.target.value)}
             className="bg-muted/40 border-border text-sm font-mono"
           />
+          {/* Quantity preset buttons */}
+          <div className="grid grid-cols-4 gap-1 mt-1.5">
+            {QTY_PRESETS.map(pct => (
+              <button
+                key={pct}
+                type="button"
+                onClick={() => applyQtyPreset(pct)}
+                className="py-1 rounded bg-muted/50 border border-border text-[10px] font-medium text-muted-foreground hover:text-foreground hover:bg-muted/80 transition-colors active:scale-[0.96]"
+              >
+                {pct}%
+              </button>
+            ))}
+          </div>
         </div>
 
-        {/* Stop Price (stop-limit only) */}
+        {/* Stop Price */}
         {needsStopPrice && (
           <div>
             <label className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1 block">Stop Price</label>
