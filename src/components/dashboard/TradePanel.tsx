@@ -6,9 +6,14 @@ import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
 
 type OrderSide = 'BUY' | 'SELL';
-type OrderType = 'MARKET' | 'LIMIT';
+type OrderType = 'MARKET' | 'LIMIT' | 'STOP_LIMIT';
 
 const PAIRS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT'];
+const ORDER_TYPES: { value: OrderType; label: string }[] = [
+  { value: 'MARKET', label: 'Market' },
+  { value: 'LIMIT', label: 'Limit' },
+  { value: 'STOP_LIMIT', label: 'Stop-Limit' },
+];
 
 const TradePanel = () => {
   const [side, setSide] = useState<OrderSide>('BUY');
@@ -16,7 +21,11 @@ const TradePanel = () => {
   const [symbol, setSymbol] = useState('BTCUSDT');
   const [quantity, setQuantity] = useState('');
   const [price, setPrice] = useState('');
+  const [stopPrice, setStopPrice] = useState('');
   const [loading, setLoading] = useState(false);
+
+  const needsPrice = orderType === 'LIMIT' || orderType === 'STOP_LIMIT';
+  const needsStopPrice = orderType === 'STOP_LIMIT';
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -25,22 +34,29 @@ const TradePanel = () => {
       toast.error('Enter a valid quantity');
       return;
     }
-    if (orderType === 'LIMIT' && (!price || parseFloat(price) <= 0)) {
+    if (needsPrice && (!price || parseFloat(price) <= 0)) {
       toast.error('Enter a valid limit price');
+      return;
+    }
+    if (needsStopPrice && (!stopPrice || parseFloat(stopPrice) <= 0)) {
+      toast.error('Enter a valid stop price');
       return;
     }
 
     setLoading(true);
     try {
+      const binanceType = orderType === 'STOP_LIMIT' ? 'STOP_LOSS_LIMIT' : orderType;
+
       const { data, error } = await supabase.functions.invoke('binance-proxy', {
         body: {
           action: 'order',
           params: {
             symbol,
             side,
-            type: orderType,
+            type: binanceType,
             quantity,
-            ...(orderType === 'LIMIT' ? { price } : {}),
+            ...(needsPrice ? { price } : {}),
+            ...(needsStopPrice ? { stopPrice } : {}),
           },
         },
       });
@@ -48,11 +64,13 @@ const TradePanel = () => {
       if (error) throw error;
       if (data?.error) throw new Error(data.error);
 
+      const priceLabel = orderType === 'MARKET' ? 'market' : orderType === 'STOP_LIMIT' ? `stop ${stopPrice} / limit ${price}` : price;
       toast.success(`${side} order placed`, {
-        description: `${quantity} ${symbol} @ ${orderType === 'MARKET' ? 'market' : price}`,
+        description: `${quantity} ${symbol} @ ${priceLabel}`,
       });
       setQuantity('');
       setPrice('');
+      setStopPrice('');
     } catch (err: any) {
       toast.error('Order failed', { description: err.message || 'Check your API keys and balance' });
     } finally {
@@ -106,17 +124,17 @@ const TradePanel = () => {
         {/* Order type */}
         <div>
           <label className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1 block">Type</label>
-          <div className="grid grid-cols-2 gap-1 bg-muted/30 rounded-md p-0.5">
-            {(['MARKET', 'LIMIT'] as const).map(t => (
+          <div className="grid grid-cols-3 gap-1 bg-muted/30 rounded-md p-0.5">
+            {ORDER_TYPES.map(t => (
               <button
-                key={t}
+                key={t.value}
                 type="button"
-                onClick={() => setOrderType(t)}
-                className={`py-1.5 rounded text-xs font-medium transition-colors ${
-                  orderType === t ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:text-foreground'
+                onClick={() => setOrderType(t.value)}
+                className={`py-1.5 rounded text-[11px] font-medium transition-colors ${
+                  orderType === t.value ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:text-foreground'
                 }`}
               >
-                {t}
+                {t.label}
               </button>
             ))}
           </div>
@@ -136,8 +154,24 @@ const TradePanel = () => {
           />
         </div>
 
-        {/* Price (limit only) */}
-        {orderType === 'LIMIT' && (
+        {/* Stop Price (stop-limit only) */}
+        {needsStopPrice && (
+          <div>
+            <label className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1 block">Stop Price</label>
+            <Input
+              type="number"
+              step="any"
+              min="0"
+              placeholder="Trigger price"
+              value={stopPrice}
+              onChange={e => setStopPrice(e.target.value)}
+              className="bg-muted/40 border-border text-sm font-mono"
+            />
+          </div>
+        )}
+
+        {/* Limit Price */}
+        {needsPrice && (
           <div>
             <label className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1 block">Limit Price</label>
             <Input
