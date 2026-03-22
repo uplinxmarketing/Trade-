@@ -79,7 +79,8 @@ serve(async (req) => {
           recvWindow: "5000",
         });
         if (params.price) orderParams.set("price", params.price);
-        if (params.type === "LIMIT") orderParams.set("timeInForce", "GTC");
+        if (params.stopPrice) orderParams.set("stopPrice", params.stopPrice);
+        if (params.type === "LIMIT" || params.type === "STOP_LOSS_LIMIT") orderParams.set("timeInForce", "GTC");
         
         const qs = orderParams.toString();
         const encoder = new TextEncoder();
