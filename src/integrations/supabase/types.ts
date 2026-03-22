@@ -14,6 +14,60 @@ export type Database = {
   }
   public: {
     Tables: {
+      ai_analyses: {
+        Row: {
+          actual_change_percent: number | null
+          actual_direction: string | null
+          analysis_type: string
+          confidence: number
+          created_at: string
+          id: string
+          predicted_change_percent: number | null
+          predicted_direction: string | null
+          price_at_analysis: number
+          reasoning: string | null
+          reviewed_at: string | null
+          signal: string
+          symbol: string
+          user_session: string
+          was_correct: boolean | null
+        }
+        Insert: {
+          actual_change_percent?: number | null
+          actual_direction?: string | null
+          analysis_type?: string
+          confidence?: number
+          created_at?: string
+          id?: string
+          predicted_change_percent?: number | null
+          predicted_direction?: string | null
+          price_at_analysis: number
+          reasoning?: string | null
+          reviewed_at?: string | null
+          signal: string
+          symbol: string
+          user_session?: string
+          was_correct?: boolean | null
+        }
+        Update: {
+          actual_change_percent?: number | null
+          actual_direction?: string | null
+          analysis_type?: string
+          confidence?: number
+          created_at?: string
+          id?: string
+          predicted_change_percent?: number | null
+          predicted_direction?: string | null
+          price_at_analysis?: number
+          reasoning?: string | null
+          reviewed_at?: string | null
+          signal?: string
+          symbol?: string
+          user_session?: string
+          was_correct?: boolean | null
+        }
+        Relationships: []
+      }
       bot_config: {
         Row: {
           created_at: string
@@ -82,6 +136,42 @@ export type Database = {
           reason?: string | null
           side?: string
           symbol?: string
+          user_session?: string
+        }
+        Relationships: []
+      }
+      learning_metrics: {
+        Row: {
+          accuracy_percent: number
+          avg_confidence: number
+          best_pattern: string | null
+          correct_predictions: number
+          id: string
+          symbol: string
+          total_predictions: number
+          updated_at: string
+          user_session: string
+        }
+        Insert: {
+          accuracy_percent?: number
+          avg_confidence?: number
+          best_pattern?: string | null
+          correct_predictions?: number
+          id?: string
+          symbol: string
+          total_predictions?: number
+          updated_at?: string
+          user_session?: string
+        }
+        Update: {
+          accuracy_percent?: number
+          avg_confidence?: number
+          best_pattern?: string | null
+          correct_predictions?: number
+          id?: string
+          symbol?: string
+          total_predictions?: number
+          updated_at?: string
           user_session?: string
         }
         Relationships: []
