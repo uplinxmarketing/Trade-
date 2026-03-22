@@ -17,7 +17,7 @@ serve(async (req) => {
     const { action, coins, mode } = await req.json();
 
     if (action === "start") {
-      // Fetch current prices for selected coins from Binance public API
+      // 1. Fetch current prices
       const prices: Record<string, number> = {};
       for (const symbol of coins) {
         try {
@@ -29,7 +29,7 @@ serve(async (req) => {
         }
       }
 
-      // Get bot config
+      // 2. Get bot config
       const { data: config } = await sb
         .from("bot_config")
         .select("*")
@@ -45,7 +45,7 @@ serve(async (req) => {
 
       const currentBalance = Number(config.current_balance);
 
-      // Get current holdings
+      // 3. Get current holdings
       const { data: holdings } = await sb
         .from("paper_portfolio")
         .select("*")
@@ -58,62 +58,94 @@ serve(async (req) => {
         }
       }
 
-      // Simple spot strategy: buy low (when price is near recent low), sell high
-      // For test mode, simulate analysis and make a decision
-      const decisions: Array<{ symbol: string; side: string; price: number; quantity: number; reason: string; pnl?: number }> = [];
+      // 4. Get latest AI analyses for smarter decisions
+      const { data: aiAnalyses } = await sb
+        .from("ai_analyses")
+        .select("symbol, signal, confidence, predicted_direction, predicted_change_percent")
+        .eq("user_session", "default")
+        .in("symbol", coins)
+        .order("created_at", { ascending: false })
+        .limit(coins.length * 2);
+
+      // Deduplicate: latest per symbol
+      const latestAnalysis: Record<string, any> = {};
+      if (aiAnalyses) {
+        for (const a of aiAnalyses) {
+          if (!latestAnalysis[a.symbol]) latestAnalysis[a.symbol] = a;
+        }
+      }
+
+      // 5. Make AI-informed decisions
+      const decisions: Array<{
+        symbol: string; side: string; price: number;
+        quantity: number; reason: string; pnl?: number;
+        aiSignal?: string; aiConfidence?: number;
+      }> = [];
 
       for (const symbol of coins) {
         const price = prices[symbol];
         if (!price) continue;
 
         const holding = holdingsMap[symbol];
+        const analysis = latestAnalysis[symbol];
+        const aiSignal = analysis?.signal || "hold";
+        const aiConfidence = analysis?.confidence || 0;
 
         if (holding && holding.qty > 0) {
-          // We hold this coin — check if we should sell
+          // Check if we should sell
           const gainPercent = ((price - holding.avgPrice) / holding.avgPrice) * 100;
 
-          if (gainPercent > 1.5) {
-            // Sell — take profit
+          // AI-informed sell: lower threshold if AI says sell
+          const sellThreshold = (aiSignal === "sell" || aiSignal === "strong_sell") && aiConfidence > 50
+            ? 0.8 // Sell earlier when AI says sell
+            : 1.5; // Normal take profit
+
+          const stopLoss = (aiSignal === "sell" || aiSignal === "strong_sell") && aiConfidence > 70
+            ? -1.5 // Tighter stop when AI bearish
+            : -3;
+
+          if (gainPercent > sellThreshold) {
             const pnl = (price - holding.avgPrice) * holding.qty;
             decisions.push({
-              symbol,
-              side: "SELL",
-              price,
-              quantity: holding.qty,
-              reason: `Take profit at ${gainPercent.toFixed(2)}% gain`,
+              symbol, side: "SELL", price, quantity: holding.qty,
+              reason: `Take profit at ${gainPercent.toFixed(2)}% ${aiSignal !== 'hold' ? `(AI: ${aiSignal} ${aiConfidence}%)` : ''}`,
               pnl: Math.round(pnl * 100) / 100,
+              aiSignal, aiConfidence,
             });
-          } else if (gainPercent < -3) {
-            // Stop loss
+          } else if (gainPercent < stopLoss) {
             const pnl = (price - holding.avgPrice) * holding.qty;
             decisions.push({
-              symbol,
-              side: "SELL",
-              price,
-              quantity: holding.qty,
-              reason: `Stop loss at ${gainPercent.toFixed(2)}% loss`,
+              symbol, side: "SELL", price, quantity: holding.qty,
+              reason: `Stop loss at ${gainPercent.toFixed(2)}% ${aiSignal !== 'hold' ? `(AI: ${aiSignal} ${aiConfidence}%)` : ''}`,
               pnl: Math.round(pnl * 100) / 100,
+              aiSignal, aiConfidence,
             });
           }
         } else {
-          // We don't hold — consider buying
-          // Allocate up to 20% of balance per coin
-          const maxAllocation = currentBalance * 0.2;
-          if (maxAllocation > 10) {
-            const quantity = maxAllocation / price;
-            decisions.push({
-              symbol,
-              side: "BUY",
-              price,
-              quantity: Math.round(quantity * 1e6) / 1e6,
-              reason: `Spot buy — diversifying into ${symbol.replace("USDT", "")}`,
-            });
+          // Consider buying — only if AI says buy or strong_buy with decent confidence
+          const shouldBuy = !analysis || // No analysis yet = cautious buy
+            (aiSignal === "strong_buy" && aiConfidence > 40) ||
+            (aiSignal === "buy" && aiConfidence > 55);
+
+          if (shouldBuy) {
+            // Allocate based on AI confidence
+            const allocationPercent = aiConfidence > 70 ? 0.25 : aiConfidence > 50 ? 0.15 : 0.1;
+            const maxAllocation = currentBalance * allocationPercent;
+            if (maxAllocation > 10) {
+              const quantity = maxAllocation / price;
+              decisions.push({
+                symbol, side: "BUY", price,
+                quantity: Math.round(quantity * 1e6) / 1e6,
+                reason: `Spot buy ${analysis ? `(AI: ${aiSignal} ${aiConfidence}%)` : '(no AI data yet)'}`,
+                aiSignal, aiConfidence,
+              });
+            }
           }
         }
       }
 
-      // Pick the best opportunity (for now just take the first decision)
-      // In future iterations, the ML model will rank these
+      // 6. Rank decisions by AI confidence and pick the best
+      decisions.sort((a, b) => (b.aiConfidence || 0) - (a.aiConfidence || 0));
       const trade = decisions.length > 0 ? decisions[0] : null;
 
       if (trade) {
@@ -136,7 +168,6 @@ serve(async (req) => {
             updated_at: new Date().toISOString(),
           }).eq("user_session", "default");
 
-          // Upsert holding
           const existing = holdingsMap[trade.symbol];
           const newQty = (existing?.qty || 0) + trade.quantity;
           const newAvg = existing
@@ -158,7 +189,6 @@ serve(async (req) => {
             updated_at: new Date().toISOString(),
           }).eq("user_session", "default");
 
-          // Remove holding
           await sb.from("paper_portfolio").delete()
             .eq("user_session", "default")
             .eq("symbol", trade.symbol);
@@ -167,6 +197,7 @@ serve(async (req) => {
         return new Response(JSON.stringify({
           success: true,
           trade,
+          allDecisions: decisions,
           prices,
           balance: trade.side === "BUY"
             ? currentBalance - trade.price * trade.quantity
@@ -178,7 +209,7 @@ serve(async (req) => {
 
       return new Response(JSON.stringify({
         success: true,
-        message: "No trade opportunities found at current prices",
+        message: "No trade opportunities — AI signals are neutral or bearish with low confidence",
         prices,
         balance: currentBalance,
       }), {
