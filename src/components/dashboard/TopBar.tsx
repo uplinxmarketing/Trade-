@@ -1,10 +1,12 @@
-import { Activity, Bot, Wifi, WifiOff } from 'lucide-react';
+import { Activity, Bot, Key, Wifi, WifiOff } from 'lucide-react';
+import { Button } from '@/components/ui/button';
 
 interface TopBarProps {
   isConnected: boolean;
+  onConnectClick?: () => void;
 }
 
-const TopBar = ({ isConnected }: TopBarProps) => {
+const TopBar = ({ isConnected, onConnectClick }: TopBarProps) => {
   return (
     <header className="h-14 border-b border-border bg-card flex items-center justify-between px-6">
       <div className="flex items-center gap-3">
@@ -12,7 +14,7 @@ const TopBar = ({ isConnected }: TopBarProps) => {
           <Bot className="w-6 h-6 text-primary" />
           <h1 className="text-lg font-semibold tracking-tight">TradeBot AI</h1>
         </div>
-        <span className="text-xs font-mono text-muted-foreground bg-secondary px-2 py-0.5 rounded">v1.0</span>
+        <span className="text-xs font-mono text-muted-foreground bg-secondary px-2 py-0.5 rounded">v2.0</span>
       </div>
 
       <div className="flex items-center gap-4">
@@ -20,7 +22,10 @@ const TopBar = ({ isConnected }: TopBarProps) => {
           <Activity className="w-4 h-4 text-muted-foreground" />
           <span className="text-muted-foreground font-mono">Binance</span>
         </div>
-        <div className="flex items-center gap-2">
+        <button
+          onClick={onConnectClick}
+          className="flex items-center gap-2 hover:opacity-80 transition-opacity"
+        >
           {isConnected ? (
             <>
               <div className="pulse-dot" />
@@ -29,11 +34,11 @@ const TopBar = ({ isConnected }: TopBarProps) => {
             </>
           ) : (
             <>
-              <WifiOff className="w-4 h-4 text-loss" />
-              <span className="text-xs text-loss font-medium">Disconnected</span>
+              <Key className="w-4 h-4 text-warn" />
+              <span className="text-xs text-warn font-medium">Connect API</span>
             </>
           )}
-        </div>
+        </button>
       </div>
     </header>
   );
