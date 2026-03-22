@@ -6,6 +6,7 @@ import PositionsList from '@/components/dashboard/PositionsList';
 import BotStrategies from '@/components/dashboard/BotStrategies';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import RecentTrades from '@/components/dashboard/RecentTrades';
+import TradePanel from '@/components/dashboard/TradePanel';
 import type { KlineData, Position, BotStrategy } from '@/lib/binance-types';
 
 // Demo data — replaced by real Binance data when API keys are connected
