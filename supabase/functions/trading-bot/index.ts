@@ -94,14 +94,18 @@ serve(async (req) => {
         if (holding && holding.qty > 0) {
           // Check if we should sell
           const gainPercent = ((price - holding.avgPrice) / holding.avgPrice) * 100;
+          const holdingValue = price * holding.qty;
 
-          // AI-informed sell: lower threshold if AI says sell
+          // Minimum 0.5% profit target for each trade
+          const minProfitThreshold = 0.5;
+
+          // AI-informed sell: can sell at min profit if AI says sell
           const sellThreshold = (aiSignal === "sell" || aiSignal === "strong_sell") && aiConfidence > 50
-            ? 0.8 // Sell earlier when AI says sell
-            : 1.5; // Normal take profit
+            ? minProfitThreshold
+            : Math.max(minProfitThreshold, 1.5);
 
           const stopLoss = (aiSignal === "sell" || aiSignal === "strong_sell") && aiConfidence > 70
-            ? -1.5 // Tighter stop when AI bearish
+            ? -1.5
             : -3;
 
           if (gainPercent > sellThreshold) {
@@ -123,15 +127,16 @@ serve(async (req) => {
           }
         } else {
           // Consider buying — only if AI says buy or strong_buy with decent confidence
-          const shouldBuy = !analysis || // No analysis yet = cautious buy
+          const shouldBuy = !analysis ||
             (aiSignal === "strong_buy" && aiConfidence > 40) ||
             (aiSignal === "buy" && aiConfidence > 55);
 
           if (shouldBuy) {
-            // Allocate based on AI confidence
+            // Allocate based on AI confidence, enforce minimum 5 USDT order
             const allocationPercent = aiConfidence > 70 ? 0.25 : aiConfidence > 50 ? 0.15 : 0.1;
             const maxAllocation = currentBalance * allocationPercent;
-            if (maxAllocation > 10) {
+            const minOrderUsd = 5;
+            if (maxAllocation >= minOrderUsd) {
               const quantity = maxAllocation / price;
               decisions.push({
                 symbol, side: "BUY", price,
