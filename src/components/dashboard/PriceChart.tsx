@@ -1,14 +1,28 @@
+import { useState } from 'react';
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
-import type { KlineData } from '@/lib/binance-types';
+import { useBinanceKlines } from '@/hooks/useBinanceKlines';
+import { Loader2 } from 'lucide-react';
 
 interface PriceChartProps {
-  data: KlineData[];
   symbol: string;
   currentPrice: string;
   priceChange: string;
 }
 
-const PriceChart = ({ data, symbol, currentPrice, priceChange }: PriceChartProps) => {
+const TIMEFRAMES = [
+  { key: '1m', label: '1m' },
+  { key: '5m', label: '5m' },
+  { key: '15m', label: '15m' },
+  { key: '1h', label: '1H' },
+  { key: '4h', label: '4H' },
+  { key: '1d', label: '1D' },
+  { key: '1w', label: '1W' },
+];
+
+const PriceChart = ({ symbol, currentPrice, priceChange }: PriceChartProps) => {
+  const [interval, setInterval] = useState('1h');
+  const binanceSymbol = symbol.replace(' / ', '').replace('/', '');
+  const { klines, loading } = useBinanceKlines(binanceSymbol, interval);
   const isPositive = parseFloat(priceChange) >= 0;
 
   return (
@@ -25,36 +39,47 @@ const PriceChart = ({ data, symbol, currentPrice, priceChange }: PriceChartProps
             </span>
           </div>
         </div>
-        <div className="flex gap-1">
-          {['1H', '4H', '1D', '1W'].map((tf) => (
+        <div className="flex gap-0.5 flex-wrap justify-end">
+          {TIMEFRAMES.map((tf) => (
             <button
-              key={tf}
-              className="text-xs px-2 py-1 rounded text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors active:scale-95 first:bg-secondary first:text-foreground"
+              key={tf.key}
+              onClick={() => setInterval(tf.key)}
+              className={`text-[10px] px-1.5 py-1 rounded transition-colors active:scale-95 ${
+                interval === tf.key
+                  ? 'bg-secondary text-foreground font-semibold'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-secondary/50'
+              }`}
             >
-              {tf}
+              {tf.label}
             </button>
           ))}
         </div>
       </div>
 
-      <div className="h-52">
+      <div className="h-52 relative">
+        {loading && klines.length === 0 && (
+          <div className="absolute inset-0 flex items-center justify-center">
+            <Loader2 className="w-5 h-5 text-muted-foreground animate-spin" />
+          </div>
+        )}
         <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={data} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
+          <AreaChart data={klines} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
             <defs>
               <linearGradient id="priceGradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor={isPositive ? 'hsl(160, 70%, 45%)' : 'hsl(0, 72%, 55%)'} stopOpacity={0.3} />
-                <stop offset="95%" stopColor={isPositive ? 'hsl(160, 70%, 45%)' : 'hsl(0, 72%, 55%)'} stopOpacity={0} />
+                <stop offset="0%" stopColor={isPositive ? 'hsl(var(--gain))' : 'hsl(var(--loss))'} stopOpacity={0.3} />
+                <stop offset="95%" stopColor={isPositive ? 'hsl(var(--gain))' : 'hsl(var(--loss))'} stopOpacity={0} />
               </linearGradient>
             </defs>
             <XAxis
               dataKey="time"
-              tick={{ fill: 'hsl(215, 12%, 50%)', fontSize: 10, fontFamily: 'JetBrains Mono' }}
+              tick={{ fill: 'hsl(var(--muted-foreground))', fontSize: 10, fontFamily: 'JetBrains Mono' }}
               axisLine={false}
               tickLine={false}
+              interval="preserveStartEnd"
             />
             <YAxis
               domain={['auto', 'auto']}
-              tick={{ fill: 'hsl(215, 12%, 50%)', fontSize: 10, fontFamily: 'JetBrains Mono' }}
+              tick={{ fill: 'hsl(var(--muted-foreground))', fontSize: 10, fontFamily: 'JetBrains Mono' }}
               axisLine={false}
               tickLine={false}
               width={60}
@@ -62,19 +87,19 @@ const PriceChart = ({ data, symbol, currentPrice, priceChange }: PriceChartProps
             />
             <Tooltip
               contentStyle={{
-                background: 'hsl(220, 18%, 12%)',
-                border: '1px solid hsl(220, 14%, 18%)',
+                background: 'hsl(var(--popover))',
+                border: '1px solid hsl(var(--border))',
                 borderRadius: '8px',
                 fontSize: 12,
                 fontFamily: 'JetBrains Mono',
               }}
-              labelStyle={{ color: 'hsl(215, 12%, 50%)' }}
-              itemStyle={{ color: 'hsl(210, 20%, 92%)' }}
+              labelStyle={{ color: 'hsl(var(--muted-foreground))' }}
+              itemStyle={{ color: 'hsl(var(--foreground))' }}
             />
             <Area
               type="monotone"
               dataKey="close"
-              stroke={isPositive ? 'hsl(160, 70%, 45%)' : 'hsl(0, 72%, 55%)'}
+              stroke={isPositive ? 'hsl(var(--gain))' : 'hsl(var(--loss))'}
               strokeWidth={2}
               fill="url(#priceGradient)"
             />
