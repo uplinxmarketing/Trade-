@@ -10,6 +10,7 @@ import CoinSelector from '@/components/dashboard/CoinSelector';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import AiAnalysisPanel from '@/components/dashboard/AiAnalysisPanel';
 import BinanceConnect from '@/components/dashboard/BinanceConnect';
+import ProfitSettings from '@/components/dashboard/ProfitSettings';
 import RecentTrades from '@/components/dashboard/RecentTrades';
 import TradePanel from '@/components/dashboard/TradePanel';
 import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
