@@ -2,6 +2,8 @@ import { useState } from 'react';
 import TopBar from '@/components/dashboard/TopBar';
 import PortfolioSummary from '@/components/dashboard/PortfolioSummary';
 import PriceChart from '@/components/dashboard/PriceChart';
+import PnlChart from '@/components/dashboard/PnlChart';
+import ReportDashboard from '@/components/dashboard/ReportDashboard';
 import PositionsList from '@/components/dashboard/PositionsList';
 import BotDashboard from '@/components/dashboard/BotDashboard';
 import CoinSelector from '@/components/dashboard/CoinSelector';
@@ -10,12 +12,8 @@ import AiAnalysisPanel from '@/components/dashboard/AiAnalysisPanel';
 import BinanceConnect from '@/components/dashboard/BinanceConnect';
 import RecentTrades from '@/components/dashboard/RecentTrades';
 import TradePanel from '@/components/dashboard/TradePanel';
-import type { KlineData, Position } from '@/lib/binance-types';
-
-const mockKlines: KlineData[] = Array.from({ length: 24 }, (_, i) => {
-  const base = 67200 + Math.sin(i * 0.5) * 800 + Math.random() * 400;
-  return { time: `${i}:00`, open: base, high: base + 200, low: base - 150, close: base + (Math.random() - 0.4) * 300, volume: 1200 + Math.random() * 800 };
-});
+import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
+import type { Position } from '@/lib/binance-types';
 
 const mockPositions: Position[] = [
   { symbol: 'BTCUSDT', side: 'LONG', entryPrice: '66850', markPrice: '67420', unrealizedPnl: '285.00', quantity: '0.5', leverage: 10 },
@@ -35,14 +33,20 @@ const Index = () => {
   const [selectedCoins, setSelectedCoins] = useState<string[]>([
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT'
   ]);
+  const [activeCoin, setActiveCoin] = useState('BTCUSDT');
   const [botMode, setBotMode] = useState<'test' | 'live'>('test');
   const [binanceConnected, setBinanceConnected] = useState(false);
   const [showBinanceConnect, setShowBinanceConnect] = useState(false);
+
+  const { prices, connected: wsConnected } = useBinanceWebSocket(selectedCoins);
+
+  const activePrice = prices[activeCoin];
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
       <TopBar
         isConnected={binanceConnected}
+        wsConnected={wsConnected}
         onConnectClick={() => setShowBinanceConnect(true)}
       />
 
@@ -54,6 +58,35 @@ const Index = () => {
 
       <div className="flex-1 flex">
         <div className="flex-1 p-4 space-y-4 overflow-y-auto scrollbar-thin">
+          {/* Live coin ticker strip */}
+          <div className="flex gap-1.5 overflow-x-auto scrollbar-thin pb-1">
+            {selectedCoins.map(coin => {
+              const p = prices[coin];
+              const change = parseFloat(p?.priceChangePercent || '0');
+              return (
+                <button
+                  key={coin}
+                  onClick={() => setActiveCoin(coin)}
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-mono whitespace-nowrap transition-colors active:scale-95 ${
+                    activeCoin === coin
+                      ? 'bg-secondary text-foreground'
+                      : 'text-muted-foreground hover:text-foreground hover:bg-secondary/50'
+                  }`}
+                >
+                  <span className="font-semibold">{coin.replace('USDT', '')}</span>
+                  {p && (
+                    <>
+                      <span className="tabular-nums">${parseFloat(p.price).toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
+                      <span className={`tabular-nums ${change >= 0 ? 'text-gain' : 'text-loss'}`}>
+                        {change >= 0 ? '+' : ''}{change.toFixed(2)}%
+                      </span>
+                    </>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
           <PortfolioSummary
             totalBalance={24_847.32}
             dailyPnl={344.18}
@@ -64,13 +97,18 @@ const Index = () => {
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
             <PriceChart
-              data={mockKlines}
-              symbol="BTC / USDT"
-              currentPrice="67420.50"
-              priceChange="2.14"
+              symbol={activeCoin.replace('USDT', '') + ' / USDT'}
+              currentPrice={activePrice?.price || '0'}
+              priceChange={activePrice?.priceChangePercent || '0'}
             />
             <PositionsList positions={mockPositions} />
             <TradePanel selectedCoins={selectedCoins} />
+          </div>
+
+          {/* P&L Chart + Report */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <PnlChart />
+            <ReportDashboard />
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">

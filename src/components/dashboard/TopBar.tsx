@@ -1,12 +1,12 @@
 import { Activity, Bot, Key, Wifi, WifiOff } from 'lucide-react';
-import { Button } from '@/components/ui/button';
 
 interface TopBarProps {
   isConnected: boolean;
+  wsConnected?: boolean;
   onConnectClick?: () => void;
 }
 
-const TopBar = ({ isConnected, onConnectClick }: TopBarProps) => {
+const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
   return (
     <header className="h-14 border-b border-border bg-card flex items-center justify-between px-6">
       <div className="flex items-center gap-3">
@@ -18,6 +18,21 @@ const TopBar = ({ isConnected, onConnectClick }: TopBarProps) => {
       </div>
 
       <div className="flex items-center gap-4">
+        {wsConnected !== undefined && (
+          <div className="flex items-center gap-1.5 text-xs">
+            {wsConnected ? (
+              <>
+                <div className="w-1.5 h-1.5 rounded-full bg-gain animate-pulse" />
+                <span className="text-gain font-mono">Live</span>
+              </>
+            ) : (
+              <>
+                <div className="w-1.5 h-1.5 rounded-full bg-warn" />
+                <span className="text-warn font-mono">Connecting...</span>
+              </>
+            )}
+          </div>
+        )}
         <div className="flex items-center gap-2 text-sm">
           <Activity className="w-4 h-4 text-muted-foreground" />
           <span className="text-muted-foreground font-mono">Binance</span>
