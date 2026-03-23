@@ -44,6 +44,8 @@ serve(async (req) => {
       }
 
       const currentBalance = Number(config.current_balance);
+      const configMinProfit = Number(config.min_profit_percent ?? 0.5);
+      const configStopLoss = Number(config.stop_loss_percent ?? 3);
 
       // 3. Get current holdings
       const { data: holdings } = await sb
