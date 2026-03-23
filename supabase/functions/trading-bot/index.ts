@@ -44,6 +44,8 @@ serve(async (req) => {
       }
 
       const currentBalance = Number(config.current_balance);
+      const configMinProfit = Number(config.min_profit_percent ?? 0.5);
+      const configStopLoss = Number(config.stop_loss_percent ?? 3);
 
       // 3. Get current holdings
       const { data: holdings } = await sb
@@ -96,17 +98,14 @@ serve(async (req) => {
           const gainPercent = ((price - holding.avgPrice) / holding.avgPrice) * 100;
           const holdingValue = price * holding.qty;
 
-          // Minimum 0.5% profit target for each trade
-          const minProfitThreshold = 0.5;
-
-          // AI-informed sell: can sell at min profit if AI says sell
+          // Use configurable profit target and stop loss from settings
           const sellThreshold = (aiSignal === "sell" || aiSignal === "strong_sell") && aiConfidence > 50
-            ? minProfitThreshold
-            : Math.max(minProfitThreshold, 1.5);
+            ? configMinProfit
+            : Math.max(configMinProfit, 1.5);
 
           const stopLoss = (aiSignal === "sell" || aiSignal === "strong_sell") && aiConfidence > 70
-            ? -1.5
-            : -3;
+            ? -(configStopLoss * 0.5)
+            : -configStopLoss;
 
           if (gainPercent > sellThreshold) {
             const pnl = (price - holding.avgPrice) * holding.qty;

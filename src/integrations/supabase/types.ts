@@ -75,8 +75,10 @@ export type Database = {
           id: string
           initial_balance: number
           is_running: boolean
+          min_profit_percent: number
           mode: string
           selected_coins: string[]
+          stop_loss_percent: number
           updated_at: string
           user_session: string
         }
@@ -86,8 +88,10 @@ export type Database = {
           id?: string
           initial_balance?: number
           is_running?: boolean
+          min_profit_percent?: number
           mode?: string
           selected_coins?: string[]
+          stop_loss_percent?: number
           updated_at?: string
           user_session?: string
         }
@@ -97,8 +101,10 @@ export type Database = {
           id?: string
           initial_balance?: number
           is_running?: boolean
+          min_profit_percent?: number
           mode?: string
           selected_coins?: string[]
+          stop_loss_percent?: number
           updated_at?: string
           user_session?: string
         }

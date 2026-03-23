@@ -10,6 +10,7 @@ import CoinSelector from '@/components/dashboard/CoinSelector';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import AiAnalysisPanel from '@/components/dashboard/AiAnalysisPanel';
 import BinanceConnect from '@/components/dashboard/BinanceConnect';
+import ProfitSettings from '@/components/dashboard/ProfitSettings';
 import RecentTrades from '@/components/dashboard/RecentTrades';
 import TradePanel from '@/components/dashboard/TradePanel';
 import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
@@ -114,6 +115,7 @@ const Index = () => {
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
             <div className="space-y-4">
               <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} />
+              <ProfitSettings />
               <BotDashboard
                 selectedCoins={selectedCoins}
                 mode={botMode}

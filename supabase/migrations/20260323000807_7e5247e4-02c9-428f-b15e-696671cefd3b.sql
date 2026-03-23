@@ -1,0 +1,2 @@
+ALTER TABLE public.bot_config ADD COLUMN IF NOT EXISTS min_profit_percent numeric NOT NULL DEFAULT 0.5;
+ALTER TABLE public.bot_config ADD COLUMN IF NOT EXISTS stop_loss_percent numeric NOT NULL DEFAULT 3;
