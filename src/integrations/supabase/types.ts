@@ -112,6 +112,7 @@ export type Database = {
       }
       bot_trade_history: {
         Row: {
+          bot_id: string | null
           created_at: string
           id: string
           pnl: number | null
@@ -123,6 +124,7 @@ export type Database = {
           user_session: string
         }
         Insert: {
+          bot_id?: string | null
           created_at?: string
           id?: string
           pnl?: number | null
@@ -134,6 +136,7 @@ export type Database = {
           user_session?: string
         }
         Update: {
+          bot_id?: string | null
           created_at?: string
           id?: string
           pnl?: number | null
@@ -144,7 +147,15 @@ export type Database = {
           symbol?: string
           user_session?: string
         }
-        Relationships: []
+        Relationships: [
+          {
+            foreignKeyName: "bot_trade_history_bot_id_fkey"
+            columns: ["bot_id"]
+            isOneToOne: false
+            referencedRelation: "trading_bots"
+            referencedColumns: ["id"]
+          },
+        ]
       }
       learning_metrics: {
         Row: {
@@ -185,6 +196,7 @@ export type Database = {
       paper_portfolio: {
         Row: {
           avg_entry_price: number
+          bot_id: string | null
           id: string
           quantity: number
           symbol: string
@@ -193,6 +205,7 @@ export type Database = {
         }
         Insert: {
           avg_entry_price?: number
+          bot_id?: string | null
           id?: string
           quantity?: number
           symbol: string
@@ -201,13 +214,22 @@ export type Database = {
         }
         Update: {
           avg_entry_price?: number
+          bot_id?: string | null
           id?: string
           quantity?: number
           symbol?: string
           updated_at?: string
           user_session?: string
         }
-        Relationships: []
+        Relationships: [
+          {
+            foreignKeyName: "paper_portfolio_bot_id_fkey"
+            columns: ["bot_id"]
+            isOneToOne: false
+            referencedRelation: "trading_bots"
+            referencedColumns: ["id"]
+          },
+        ]
       }
       paper_trades: {
         Row: {
@@ -239,6 +261,102 @@ export type Database = {
           symbol?: string
           total?: number | null
           user_session?: string
+        }
+        Relationships: []
+      }
+      trading_bots: {
+        Row: {
+          allocated_budget: number
+          allow_multiple_open: boolean
+          assigned_coins: string[]
+          available_balance: number
+          bot_name: string
+          consecutive_losses: number
+          cooldown_seconds: number
+          created_at: string
+          daily_loss: number
+          daily_loss_reset_at: string
+          fixed_balance_mode: boolean
+          id: string
+          last_trade_at: string | null
+          max_budget_cap: number
+          max_daily_loss: number
+          max_drawdown_percent: number
+          max_trades_per_hour: number
+          min_profit_percent: number
+          reinvest_profits: boolean
+          status: string
+          stop_after_consecutive_losses: number
+          stop_loss_percent: number
+          total_pnl: number
+          total_trades: number
+          trade_mode: string
+          updated_at: string
+          used_balance: number
+          user_session: string
+          winning_trades: number
+        }
+        Insert: {
+          allocated_budget?: number
+          allow_multiple_open?: boolean
+          assigned_coins?: string[]
+          available_balance?: number
+          bot_name?: string
+          consecutive_losses?: number
+          cooldown_seconds?: number
+          created_at?: string
+          daily_loss?: number
+          daily_loss_reset_at?: string
+          fixed_balance_mode?: boolean
+          id?: string
+          last_trade_at?: string | null
+          max_budget_cap?: number
+          max_daily_loss?: number
+          max_drawdown_percent?: number
+          max_trades_per_hour?: number
+          min_profit_percent?: number
+          reinvest_profits?: boolean
+          status?: string
+          stop_after_consecutive_losses?: number
+          stop_loss_percent?: number
+          total_pnl?: number
+          total_trades?: number
+          trade_mode?: string
+          updated_at?: string
+          used_balance?: number
+          user_session?: string
+          winning_trades?: number
+        }
+        Update: {
+          allocated_budget?: number
+          allow_multiple_open?: boolean
+          assigned_coins?: string[]
+          available_balance?: number
+          bot_name?: string
+          consecutive_losses?: number
+          cooldown_seconds?: number
+          created_at?: string
+          daily_loss?: number
+          daily_loss_reset_at?: string
+          fixed_balance_mode?: boolean
+          id?: string
+          last_trade_at?: string | null
+          max_budget_cap?: number
+          max_daily_loss?: number
+          max_drawdown_percent?: number
+          max_trades_per_hour?: number
+          min_profit_percent?: number
+          reinvest_profits?: boolean
+          status?: string
+          stop_after_consecutive_losses?: number
+          stop_loss_percent?: number
+          total_pnl?: number
+          total_trades?: number
+          trade_mode?: string
+          updated_at?: string
+          used_balance?: number
+          user_session?: string
+          winning_trades?: number
         }
         Relationships: []
       }
