@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import TopBar from '@/components/dashboard/TopBar';
 import PortfolioSummary from '@/components/dashboard/PortfolioSummary';
 import PriceChart from '@/components/dashboard/PriceChart';
@@ -6,6 +6,7 @@ import PnlChart from '@/components/dashboard/PnlChart';
 import ReportDashboard from '@/components/dashboard/ReportDashboard';
 import PositionsList from '@/components/dashboard/PositionsList';
 import BotDashboard from '@/components/dashboard/BotDashboard';
+import BotManager from '@/components/dashboard/BotManager';
 import CoinSelector from '@/components/dashboard/CoinSelector';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import AiAnalysisPanel from '@/components/dashboard/AiAnalysisPanel';
@@ -13,7 +14,10 @@ import BinanceConnect from '@/components/dashboard/BinanceConnect';
 import ProfitSettings from '@/components/dashboard/ProfitSettings';
 import RecentTrades from '@/components/dashboard/RecentTrades';
 import TradePanel from '@/components/dashboard/TradePanel';
+import NotificationCenter from '@/components/dashboard/NotificationCenter';
 import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
+import { supabase } from '@/integrations/supabase/client';
+import { toast } from 'sonner';
 import type { Position } from '@/lib/binance-types';
 
 const mockPositions: Position[] = [
@@ -38,13 +42,33 @@ const Index = () => {
   const [botMode, setBotMode] = useState<'test' | 'live'>('test');
   const [binanceConnected, setBinanceConnected] = useState(false);
   const [showBinanceConnect, setShowBinanceConnect] = useState(false);
+  const [killSwitchActive, setKillSwitchActive] = useState(false);
 
   const { prices, connected: wsConnected } = useBinanceWebSocket(selectedCoins);
-
   const activePrice = prices[activeCoin];
+
+  const handleKillSwitch = useCallback(async () => {
+    const newState = !killSwitchActive;
+    setKillSwitchActive(newState);
+    if (newState) {
+      // Stop ALL bots
+      await supabase.from('trading_bots').update({
+        status: 'stopped',
+        updated_at: new Date().toISOString(),
+      } as any).eq('user_session', 'default').neq('status', 'stopped');
+      await supabase.from('bot_config').update({
+        is_running: false,
+        updated_at: new Date().toISOString(),
+      }).eq('user_session', 'default');
+      toast.error('🛑 KILL SWITCH ACTIVATED — All bots stopped', { duration: 10000 });
+    } else {
+      toast.info('Kill switch deactivated');
+    }
+  }, [killSwitchActive]);
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
+      <NotificationCenter />
       <TopBar
         isConnected={binanceConnected}
         wsConnected={wsConnected}
@@ -112,6 +136,7 @@ const Index = () => {
             <ReportDashboard />
           </div>
 
+          {/* Bot Manager + Legacy Bot + Settings */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
             <div className="space-y-4">
               <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} />
@@ -123,7 +148,8 @@ const Index = () => {
                 binanceConnected={binanceConnected}
               />
             </div>
-            <div className="lg:col-span-2">
+            <div className="lg:col-span-2 space-y-4">
+              <BotManager onKillSwitch={handleKillSwitch} killSwitchActive={killSwitchActive} />
               <AiAnalysisPanel selectedCoins={selectedCoins} />
             </div>
           </div>
