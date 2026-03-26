@@ -38,6 +38,67 @@ interface BotManagerProps {
   killSwitchActive: boolean;
 }
 
+// Sub-component for coin selection with search
+const BotCoinSelector = ({ selectedCoins, onToggle }: { selectedCoins: string[]; onToggle: (coin: string) => void }) => {
+  const [coinSearch, setCoinSearch] = useState('');
+  const [showAll, setShowAll] = useState(false);
+  
+  const filtered = coinSearch.trim()
+    ? BINANCE_COINS.filter(c => c.toUpperCase().includes(coinSearch.toUpperCase()))
+    : BINANCE_COINS;
+  const displayCoins = showAll ? filtered : filtered.slice(0, 15);
+
+  return (
+    <div className="space-y-1.5">
+      {/* Selected coins */}
+      <div className="flex flex-wrap gap-1">
+        {selectedCoins.map(coin => (
+          <button
+            key={coin}
+            onClick={() => onToggle(coin)}
+            className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-accent/20 text-accent border border-accent/30 hover:bg-loss/20 hover:text-loss hover:border-loss/30 transition-colors"
+          >
+            {coin.replace('USDT', '')} ×
+          </button>
+        ))}
+      </div>
+      {/* Search + add */}
+      <div className="relative">
+        <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-muted-foreground" />
+        <input
+          type="text"
+          placeholder="Search coins to add..."
+          value={coinSearch}
+          onChange={e => { setCoinSearch(e.target.value); setShowAll(true); }}
+          onFocus={() => setShowAll(true)}
+          className="w-full bg-muted/30 border border-border rounded pl-7 pr-3 py-1 text-[10px] font-mono text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-accent/50"
+        />
+      </div>
+      {showAll && (
+        <div className="flex flex-wrap gap-1 max-h-28 overflow-y-auto scrollbar-thin">
+          {displayCoins.filter(c => !selectedCoins.includes(c)).map(coin => (
+            <button
+              key={coin}
+              onClick={() => onToggle(coin)}
+              className="px-1.5 py-0.5 rounded text-[10px] font-mono text-muted-foreground hover:text-foreground bg-muted/20 hover:bg-muted/40 transition-colors"
+            >
+              {coin.replace('USDT', '')}
+            </button>
+          ))}
+          {displayCoins.filter(c => !selectedCoins.includes(c)).length === 0 && (
+            <span className="text-[10px] text-muted-foreground">No results</span>
+          )}
+        </div>
+      )}
+      {!showAll && (
+        <button onClick={() => setShowAll(true)} className="text-[10px] text-accent hover:underline">
+          Browse all {BINANCE_COINS.length} coins
+        </button>
+      )}
+    </div>
+  );
+};
+
 const BotManager = ({ onKillSwitch, killSwitchActive }: BotManagerProps) => {
   const [bots, setBots] = useState<TradingBot[]>([]);
   const [expandedBot, setExpandedBot] = useState<string | null>(null);
