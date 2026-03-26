@@ -56,7 +56,7 @@ serve(async (req) => {
 
     if (!BINANCE_API_KEY || !BINANCE_SECRET) {
       return new Response(JSON.stringify({ error: "Binance API credentials not configured. Add your keys in the settings panel." }), {
-        status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
