@@ -312,22 +312,10 @@ const BotManager = ({ onKillSwitch, killSwitchActive }: BotManagerProps) => {
                     <label className="text-[10px] uppercase tracking-widest text-muted-foreground flex items-center gap-1 mb-1.5">
                       <Coins className="w-3 h-3" /> Assigned Coins
                     </label>
-                    <div className="flex flex-wrap gap-1">
-                      {ALL_COINS.slice(0, 10).map(coin => {
-                        const isSelected = bot.assigned_coins.includes(coin);
-                        return (
-                          <button
-                            key={coin}
-                            onClick={() => toggleCoin(bot.id, coin, bot.assigned_coins)}
-                            className={`px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors ${
-                              isSelected ? 'bg-accent/20 text-accent border border-accent/30' : 'text-muted-foreground hover:text-foreground bg-muted/20'
-                            }`}
-                          >
-                            {coin.replace('USDT', '')}
-                          </button>
-                        );
-                      })}
-                    </div>
+                    <BotCoinSelector
+                      selectedCoins={bot.assigned_coins}
+                      onToggle={(coin) => toggleCoin(bot.id, coin, bot.assigned_coins)}
+                    />
                   </div>
 
                   {/* Trade settings */}
