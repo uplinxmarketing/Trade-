@@ -1,15 +1,10 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Plus, Trash2, Play, Pause, Square, Settings2, DollarSign, Coins, Shield, AlertTriangle, Bot } from 'lucide-react';
+import { Plus, Trash2, Play, Pause, Square, Settings2, DollarSign, Coins, Shield, AlertTriangle, Bot, Search } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
-
-const ALL_COINS = [
-  'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT',
-  'XRPUSDT', 'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT',
-  'LINKUSDT', 'LTCUSDT', 'UNIUSDT', 'ATOMUSDT', 'NEARUSDT',
-];
+import { BINANCE_COINS } from '@/lib/binance-coins';
 
 interface TradingBot {
   id: string;
@@ -42,6 +37,67 @@ interface BotManagerProps {
   onKillSwitch: () => void;
   killSwitchActive: boolean;
 }
+
+// Sub-component for coin selection with search
+const BotCoinSelector = ({ selectedCoins, onToggle }: { selectedCoins: string[]; onToggle: (coin: string) => void }) => {
+  const [coinSearch, setCoinSearch] = useState('');
+  const [showAll, setShowAll] = useState(false);
+  
+  const filtered = coinSearch.trim()
+    ? BINANCE_COINS.filter(c => c.toUpperCase().includes(coinSearch.toUpperCase()))
+    : BINANCE_COINS;
+  const displayCoins = showAll ? filtered : filtered.slice(0, 15);
+
+  return (
+    <div className="space-y-1.5">
+      {/* Selected coins */}
+      <div className="flex flex-wrap gap-1">
+        {selectedCoins.map(coin => (
+          <button
+            key={coin}
+            onClick={() => onToggle(coin)}
+            className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-accent/20 text-accent border border-accent/30 hover:bg-loss/20 hover:text-loss hover:border-loss/30 transition-colors"
+          >
+            {coin.replace('USDT', '')} ×
+          </button>
+        ))}
+      </div>
+      {/* Search + add */}
+      <div className="relative">
+        <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-muted-foreground" />
+        <input
+          type="text"
+          placeholder="Search coins to add..."
+          value={coinSearch}
+          onChange={e => { setCoinSearch(e.target.value); setShowAll(true); }}
+          onFocus={() => setShowAll(true)}
+          className="w-full bg-muted/30 border border-border rounded pl-7 pr-3 py-1 text-[10px] font-mono text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-accent/50"
+        />
+      </div>
+      {showAll && (
+        <div className="flex flex-wrap gap-1 max-h-28 overflow-y-auto scrollbar-thin">
+          {displayCoins.filter(c => !selectedCoins.includes(c)).map(coin => (
+            <button
+              key={coin}
+              onClick={() => onToggle(coin)}
+              className="px-1.5 py-0.5 rounded text-[10px] font-mono text-muted-foreground hover:text-foreground bg-muted/20 hover:bg-muted/40 transition-colors"
+            >
+              {coin.replace('USDT', '')}
+            </button>
+          ))}
+          {displayCoins.filter(c => !selectedCoins.includes(c)).length === 0 && (
+            <span className="text-[10px] text-muted-foreground">No results</span>
+          )}
+        </div>
+      )}
+      {!showAll && (
+        <button onClick={() => setShowAll(true)} className="text-[10px] text-accent hover:underline">
+          Browse all {BINANCE_COINS.length} coins
+        </button>
+      )}
+    </div>
+  );
+};
 
 const BotManager = ({ onKillSwitch, killSwitchActive }: BotManagerProps) => {
   const [bots, setBots] = useState<TradingBot[]>([]);
@@ -317,22 +373,10 @@ const BotManager = ({ onKillSwitch, killSwitchActive }: BotManagerProps) => {
                     <label className="text-[10px] uppercase tracking-widest text-muted-foreground flex items-center gap-1 mb-1.5">
                       <Coins className="w-3 h-3" /> Assigned Coins
                     </label>
-                    <div className="flex flex-wrap gap-1">
-                      {ALL_COINS.slice(0, 10).map(coin => {
-                        const isSelected = bot.assigned_coins.includes(coin);
-                        return (
-                          <button
-                            key={coin}
-                            onClick={() => toggleCoin(bot.id, coin, bot.assigned_coins)}
-                            className={`px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors ${
-                              isSelected ? 'bg-accent/20 text-accent border border-accent/30' : 'text-muted-foreground hover:text-foreground bg-muted/20'
-                            }`}
-                          >
-                            {coin.replace('USDT', '')}
-                          </button>
-                        );
-                      })}
-                    </div>
+                    <BotCoinSelector
+                      selectedCoins={bot.assigned_coins}
+                      onToggle={(coin) => toggleCoin(bot.id, coin, bot.assigned_coins)}
+                    />
                   </div>
 
                   {/* Trade settings */}
