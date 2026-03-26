@@ -1,15 +1,10 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Plus, Trash2, Play, Pause, Square, Settings2, DollarSign, Coins, Shield, AlertTriangle, Bot } from 'lucide-react';
+import { Plus, Trash2, Play, Pause, Square, Settings2, DollarSign, Coins, Shield, AlertTriangle, Bot, Search } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
-
-const ALL_COINS = [
-  'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT',
-  'XRPUSDT', 'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT',
-  'LINKUSDT', 'LTCUSDT', 'UNIUSDT', 'ATOMUSDT', 'NEARUSDT',
-];
+import { BINANCE_COINS } from '@/lib/binance-coins';
 
 interface TradingBot {
   id: string;
