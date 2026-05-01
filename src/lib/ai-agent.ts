@@ -87,7 +87,7 @@ function buildReasoning(ind: Indicators, action: 'BUY' | 'SELL' | 'HOLD', extra 
   return parts.join('. ');
 }
 
-async function fetchIndicators(symbol: string): Promise<{ ind: Indicators; score: number } | null> {
+export async function fetchIndicators(symbol: string): Promise<{ ind: Indicators; score: number } | null> {
   try {
     const [klineRes, depthRes] = await Promise.all([
       fetch(`${B}/klines?symbol=${symbol}&interval=1m&limit=100`),
@@ -145,8 +145,8 @@ async function fetchIndicators(symbol: string): Promise<{ ind: Indicators; score
 function parseInstructions(text: string): { threshold: number; excludeCoins: string[] } {
   const t = text.toLowerCase();
   const threshold =
-    t.includes('aggressive') || t.includes('quick') || t.includes('fast') ? 45 :
-    t.includes('conservative') || t.includes('safe') || t.includes('careful') ? 65 : 55;
+    t.includes('aggressive') || t.includes('quick') || t.includes('fast') ? 35 :
+    t.includes('conservative') || t.includes('safe') || t.includes('careful') ? 60 : 40;
 
   // e.g. "avoid DOGE" or "skip BNB"
   const excludeCoins: string[] = [];
