@@ -453,7 +453,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             {instructions || <span className="italic opacity-60">No instructions — Claude will use its own judgment. Click Edit to add strategy guidelines.</span>}
           </p>
         )}
-        <p className="text-[9px] text-muted-foreground">Claude reads these instructions before every trade cycle. The agent learns from outcomes over time.</p>
+        <p className="text-[9px] text-muted-foreground">The agent reads these instructions before every cycle and adjusts thresholds accordingly. No API key needed.</p>
       </div>
 
       {/* ── Stats ── */}
@@ -481,7 +481,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       </Button>
       {!isRunning && (
         <p className="text-[10px] text-center text-muted-foreground -mt-2">
-          Claude analyses {selectedCoins.length} coins every 30 s · 0.1% fee · learns from every trade
+          Analyses {selectedCoins.length} coins every 30 s · 0.1% fee · no API key required
         </p>
       )}
       {isRunning && agentStatus && (
@@ -640,7 +640,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         </div>
         {!trades.length ? (
           <p className="text-xs text-muted-foreground text-center py-4">
-            {isRunning ? 'Claude is analyzing the market — first cycle running…' : 'Start the agent to see trades here'}
+            {isRunning ? 'Analyzing market indicators — first cycle running…' : 'Start the agent to see trades here'}
           </p>
         ) : (
           <div className="space-y-0.5">

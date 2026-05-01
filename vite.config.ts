@@ -34,10 +34,14 @@ function chatProxyPlugin(): Plugin {
           let body = "";
           for await (const chunk of req) body += chunk;
 
-          const apiKey = process.env.ANTHROPIC_API_KEY;
+          // API key: use env var if set, otherwise accept from the request body
+          // (user pastes it into the UI — stored in localStorage, sent per-request)
+          let parsed: { messages: unknown[]; apiKey?: string };
+          try { parsed = JSON.parse(body); } catch { res.writeHead(400); res.end(); return; }
+          const apiKey = process.env.ANTHROPIC_API_KEY || parsed.apiKey || "";
 
           if (!apiKey) {
-            const msg = "**AI Chat setup required**\n\nTo enable the AI assistant:\n1. Get a free API key from [console.anthropic.com](https://console.anthropic.com)\n2. Add this line to your `.env` file:\n   ```\n   ANTHROPIC_API_KEY=sk-ant-...\n   ```\n3. Restart the app\n\nThe trading bot itself works without this — only the chat needs it.";
+            const msg = "**Add your Anthropic API key to use this chat.**\n\nClick the **Add key** button at the top of this panel and paste your key from [console.anthropic.com](https://console.anthropic.com).\n\nThe trading bot itself works completely without any API key.";
             const chunk = JSON.stringify({ choices: [{ delta: { content: msg } }] });
             res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
             res.write(`data: ${chunk}\n\ndata: [DONE]\n\n`);
@@ -46,7 +50,7 @@ function chatProxyPlugin(): Plugin {
           }
 
           try {
-            const { messages } = JSON.parse(body);
+            const { messages } = parsed;
             const upstream = await fetch("https://api.anthropic.com/v1/messages", {
               method: "POST",
               headers: {

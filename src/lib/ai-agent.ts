@@ -1,22 +1,21 @@
-import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcSMA } from './indicators';
+import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcSMA, calcEntryScore } from './indicators';
 import { TAKER_FEE } from './trading-engine';
 import type { LivePrices } from './trading-engine';
 
 const B = 'https://api.binance.com/api/v3';
-
 const MIN_NOTIONAL_USDT = 11;
 
 export interface AgentDecision {
   symbol: string;
   action: 'BUY' | 'SELL' | 'HOLD';
-  confidence: number;       // 0–100
-  reasoning: string;        // Claude's full explanation
+  confidence: number;
+  reasoning: string;
 }
 
 export interface AgentResponse {
   decisions: AgentDecision[];
-  learned: string;          // what the agent observes / learns this cycle
-  nextWatch: string;        // coins / conditions to watch next
+  learned: string;
+  nextWatch: string;
 }
 
 export interface OpenPosition {
@@ -34,40 +33,71 @@ export interface RecentTrade {
   created_at: string;
 }
 
-const AGENT_SYSTEM = `You are an autonomous crypto paper-trading agent.
-You start with ZERO knowledge and learn from every trade you make.
-Your goal is profitable spot trading — enter strong setups, exit quickly once profitable.
+interface Indicators {
+  price: number;
+  ema9: number; ema21: number; ema50: number;
+  rsi: number;
+  macd: { macdLine: number; signalLine: number; histogram: number };
+  bb: { upper: number; middle: number; lower: number; position: number };
+  volumeRatio: number;
+  volumeIncreasing: boolean;
+  obRatio: number;
+  spread: number;
+  change15m: number;
+}
 
-Rules:
-- Only BUY coins not already held. Only SELL coins you currently hold.
-- Minimum trade size: $11 USDT.
-- Fee is 0.1% each way. Break-even requires +0.20% price move.
-- Never enter extremely overbought coins (RSI > 75) or fully-bearish trends (EMA9 < EMA21 < EMA50).
-- Always respond with ONLY valid JSON — no markdown, no extra text.
+function fmt(n: number, dp = 4): string {
+  return n.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: dp });
+}
 
-Response format (strict JSON, no code fences):
-{
-  "decisions": [
-    { "symbol": "BTCUSDT", "action": "BUY", "confidence": 72, "reasoning": "EMA9 crossed above EMA21, RSI at 48 (neutral), MACD histogram positive, volume 1.4x average. Clean setup." },
-    { "symbol": "ETHUSDT", "action": "HOLD", "confidence": 55, "reasoning": "RSI 62 elevated, MACD histogram flat. Waiting for pullback." }
-  ],
-  "learned": "BTC consolidation breakout above 200 EMA looks strong. Previous ETH buy worked well at RSI 42.",
-  "nextWatch": "SOL approaching key support at EMA50. BNB volume picking up."
-}`;
+// Build human-readable reasoning from indicator values — no API needed
+function buildReasoning(ind: Indicators, action: 'BUY' | 'SELL' | 'HOLD', extra = ''): string {
+  const parts: string[] = [];
 
-async function fetchMarketData(symbol: string): Promise<string | null> {
+  const trendStr =
+    ind.ema9 > ind.ema21 && ind.ema21 > ind.ema50 ? 'strong uptrend' :
+    ind.ema9 > ind.ema21 ? 'short-term uptrend' :
+    ind.ema9 < ind.ema21 && ind.ema21 < ind.ema50 ? 'downtrend' : 'mixed trend';
+  parts.push(`EMA: ${trendStr} (9=${fmt(ind.ema9)} / 21=${fmt(ind.ema21)} / 50=${fmt(ind.ema50)})`);
+
+  const rsiZone =
+    ind.rsi < 30 ? 'oversold — bounce likely' :
+    ind.rsi < 45 ? 'bullish zone — room to run' :
+    ind.rsi < 60 ? 'neutral — balanced' :
+    ind.rsi < 70 ? 'elevated — caution' : 'overbought — avoid entry';
+  parts.push(`RSI ${ind.rsi.toFixed(1)} (${rsiZone})`);
+
+  const macdDir = ind.macd.histogram > 0 ? 'positive momentum' : 'negative momentum';
+  parts.push(`MACD ${macdDir} (hist ${ind.macd.histogram > 0 ? '+' : ''}${ind.macd.histogram.toFixed(6)})`);
+
+  if (ind.volumeRatio > 1.3) parts.push(`Volume ${ind.volumeRatio.toFixed(1)}× avg — buyers active`);
+  else if (ind.volumeRatio < 0.7) parts.push(`Volume ${ind.volumeRatio.toFixed(1)}× avg — low activity`);
+
+  const bbPct = (ind.bb.position * 100).toFixed(0);
+  parts.push(`BB position ${bbPct}% (${ind.bb.position < 0.3 ? 'near lower band' : ind.bb.position > 0.7 ? 'near upper band' : 'mid range'})`);
+
+  if (Math.abs(ind.change15m) > 0.1) {
+    parts.push(`15m move ${ind.change15m > 0 ? '+' : ''}${ind.change15m.toFixed(2)}%`);
+  }
+
+  if (action === 'BUY')  parts.push('→ Entry conditions met — opening position.');
+  if (action === 'SELL') parts.push(`→ Exit: ${extra || 'indicators turning bearish'}.`);
+  if (action === 'HOLD') parts.push(`→ Hold — ${extra || 'waiting for better setup'}.`);
+
+  return parts.join('. ');
+}
+
+async function fetchIndicators(symbol: string): Promise<{ ind: Indicators; score: number } | null> {
   try {
     const [klineRes, depthRes] = await Promise.all([
       fetch(`${B}/klines?symbol=${symbol}&interval=1m&limit=100`),
       fetch(`${B}/depth?symbol=${symbol}&limit=10`),
     ]);
     const klines = await klineRes.json();
-    const depth = await depthRes.json();
-    if (!Array.isArray(klines) || klines.length < 30) return null;
+    const depth  = await depthRes.json();
+    if (!Array.isArray(klines) || klines.length < 50) return null;
 
     const closes  = klines.map((k: any[]) => parseFloat(k[4]));
-    const highs   = klines.map((k: any[]) => parseFloat(k[2]));
-    const lows    = klines.map((k: any[]) => parseFloat(k[3]));
     const volumes = klines.map((k: any[]) => parseFloat(k[5]));
 
     const price  = closes[closes.length - 1];
@@ -78,28 +108,58 @@ async function fetchMarketData(symbol: string): Promise<string | null> {
     const macd   = calcMACD(closes);
     const bb     = calcBollingerBands(closes);
     const volSma = calcSMA(volumes, 20);
-    const volRatio = volSma > 0 ? (volumes[volumes.length - 1] / volSma) : 1;
+    const currentVol = volumes[volumes.length - 1] ?? 0;
+    const volumeRatio = volSma > 0 ? currentVol / volSma : 1;
+    const recentVol = volumes.slice(-15).reduce((a, b) => a + b, 0);
+    const prevVol   = volumes.slice(-30, -15).reduce((a, b) => a + b, 0);
+    const volumeIncreasing = recentVol > prevVol;
 
     const bids = (depth.bids || []).slice(0, 5);
     const asks = (depth.asks || []).slice(0, 5);
     const bidVol = bids.reduce((s: number, b: string[]) => s + parseFloat(b[1]), 0);
     const askVol = asks.reduce((s: number, a: string[]) => s + parseFloat(a[1]), 0);
-    const obRatio = askVol > 0 ? (bidVol / askVol).toFixed(2) : 'N/A';
+    const bestBid = bids.length ? parseFloat(bids[0][0]) : 0;
+    const bestAsk = asks.length ? parseFloat(asks[0][0]) : 0;
+    const spread  = bestAsk > 0 ? ((bestAsk - bestBid) / bestAsk) * 100 : 999;
+    const obRatio = askVol > 0 ? bidVol / askVol : 1;
 
-    const trend = ema9 > ema21 && ema21 > ema50 ? 'BULL' : ema9 < ema21 && ema21 < ema50 ? 'BEAR' : 'MIXED';
-    const bbPos = ((price - bb.lower) / (bb.upper - bb.lower) * 100).toFixed(0);
-
-    // 15-min trend from last 15 candles
     const change15m = closes.length >= 15
-      ? (((price - closes[closes.length - 15]) / closes[closes.length - 15]) * 100).toFixed(3)
-      : '0';
+      ? ((price - closes[closes.length - 15]) / closes[closes.length - 15]) * 100 : 0;
 
-    return `${symbol}: price=$${price.toFixed(4)} trend=${trend} ema9=${ema9.toFixed(4)} ema21=${ema21.toFixed(4)} ema50=${ema50.toFixed(4)} rsi=${rsi.toFixed(1)} macd_hist=${macd.histogram.toFixed(6)} macd_line=${macd.macdLine.toFixed(6)} signal=${macd.signalLine.toFixed(6)} bb_pos=${bbPos}% vol_ratio=${volRatio.toFixed(2)}x ob_ratio=${obRatio} change_15m=${change15m}%`;
+    const ind: Indicators = {
+      price, ema9, ema21, ema50, rsi, macd, bb,
+      volumeRatio, volumeIncreasing, obRatio, spread, change15m,
+    };
+
+    const score = calcEntryScore({
+      ema9, ema21, ema50, price, rsi, macd, volumeRatio, obRatio, bb, volumeIncreasing,
+    });
+
+    return { ind, score };
   } catch {
     return null;
   }
 }
 
+// Parse the user's free-text instructions into simple trading parameters
+function parseInstructions(text: string): { threshold: number; excludeCoins: string[] } {
+  const t = text.toLowerCase();
+  const threshold =
+    t.includes('aggressive') || t.includes('quick') || t.includes('fast') ? 45 :
+    t.includes('conservative') || t.includes('safe') || t.includes('careful') ? 65 : 55;
+
+  // e.g. "avoid DOGE" or "skip BNB"
+  const excludeCoins: string[] = [];
+  const avoidMatch = t.match(/(?:avoid|skip|no)\s+([a-z]+)/g) || [];
+  for (const m of avoidMatch) {
+    const coin = m.replace(/(?:avoid|skip|no)\s+/, '').toUpperCase();
+    excludeCoins.push(coin + 'USDT');
+  }
+  return { threshold, excludeCoins };
+}
+
+// ── Main agent cycle — runs every 30 s, uses local indicators only ────────────
+// No Claude API required. Decisions come from indicator thresholds + rules.
 export async function runAgentCycle(
   coins: string[],
   prices: LivePrices,
@@ -108,72 +168,91 @@ export async function runAgentCycle(
   balance: number,
   userInstructions: string,
 ): Promise<AgentResponse> {
-  // Gather market data for all coins in parallel
-  const marketLines = await Promise.all(coins.map(fetchMarketData));
-  const marketContext = marketLines.filter(Boolean).join('\n');
-
+  const { threshold, excludeCoins } = parseInstructions(userInstructions);
   const heldSymbols = new Set(positions.map(p => p.symbol));
 
-  // Summarise open positions with live PnL
-  const positionContext = positions.length === 0
-    ? 'No open positions.'
-    : positions.map(p => {
-        const livePrice = parseFloat(prices[p.symbol]?.price || '0') || p.avg_entry_price;
-        const sellProceeds = p.quantity * livePrice * (1 - TAKER_FEE);
-        const costBasis = p.quantity * p.avg_entry_price / (1 - TAKER_FEE);
-        const pnl = sellProceeds - costBasis;
-        const pct = ((livePrice - p.avg_entry_price) / p.avg_entry_price * 100).toFixed(3);
-        return `${p.symbol}: qty=${p.quantity.toFixed(6)} entry=$${p.avg_entry_price.toFixed(4)} live=$${livePrice.toFixed(4)} pnl=${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} (${pct}%)`;
-      }).join('\n');
+  const decisions: AgentDecision[] = [];
+  const watchNotes: string[] = [];
 
-  // Last 10 closed trades for learning context
-  const tradeHistory = recentTrades
-    .filter(t => t.side === 'SELL' && t.pnl !== null)
-    .slice(0, 10)
-    .map(t => `${t.symbol} SELL $${t.pnl! >= 0 ? '+' : ''}${t.pnl!.toFixed(4)} — ${t.reason ?? ''}`)
-    .join('\n') || 'No completed trades yet.';
+  // Fetch indicators for all coins in parallel
+  const results = await Promise.all(
+    coins.map(async sym => ({ sym, data: await fetchIndicators(sym) }))
+  );
 
-  const heldList = heldSymbols.size > 0 ? Array.from(heldSymbols).join(', ') : 'none';
+  for (const { sym, data } of results) {
+    if (!data) continue;
+    if (excludeCoins.includes(sym)) continue;
 
-  const prompt = `CURRENT STATE
-Balance: $${balance.toFixed(2)} USDT free
-Currently holding: ${heldList}
+    const { ind, score } = data;
+    const isHeld = heldSymbols.has(sym);
 
-MARKET DATA (1-min candles, live indicators):
-${marketContext || 'No market data available.'}
+    let action: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
+    let confidence = 50;
+    let reasoning = '';
 
-OPEN POSITIONS:
-${positionContext}
+    if (isHeld) {
+      // Decide whether to keep holding or exit early (stop-loss runs separately)
+      const pos = positions.find(p => p.symbol === sym)!;
+      const livePrice = parseFloat(prices[sym]?.price || '0') || ind.price;
+      const rawGainPct = ((livePrice - pos.avg_entry_price) / pos.avg_entry_price) * 100;
 
-RECENT TRADE OUTCOMES (for learning):
-${tradeHistory}
+      const bearishFlip  = ind.ema9 < ind.ema21 && ind.macd.histogram < 0;
+      const overbought   = ind.rsi > 72;
 
-USER TRADING INSTRUCTIONS:
-${userInstructions || 'No specific instructions. Use your best judgement to make profitable trades.'}
+      if (bearishFlip && rawGainPct > 0.05) {
+        action = 'SELL'; confidence = 78;
+        reasoning = buildReasoning(ind, 'SELL', `EMA flipped bearish, ${rawGainPct.toFixed(2)}% gain secured`);
+      } else if (overbought && rawGainPct > 0.1) {
+        action = 'SELL'; confidence = 72;
+        reasoning = buildReasoning(ind, 'SELL', `RSI overbought at ${ind.rsi.toFixed(1)}, locking in ${rawGainPct.toFixed(2)}% gain`);
+      } else {
+        action = 'HOLD'; confidence = 55;
+        const gain = rawGainPct >= 0 ? `+${rawGainPct.toFixed(2)}%` : `${rawGainPct.toFixed(2)}%`;
+        reasoning = buildReasoning(ind, 'HOLD', `position ${gain} — no exit signal yet`);
+      }
+    } else if (balance >= MIN_NOTIONAL_USDT && score >= threshold) {
+      // Hard filters: reject clearly bad conditions
+      const fullyBearish = ind.ema9 < ind.ema21 && ind.ema21 < ind.ema50;
+      if (fullyBearish || ind.rsi > 75 || ind.spread > 0.5) {
+        action = 'HOLD'; confidence = 40;
+        const why = fullyBearish ? 'bearish EMA stack' : ind.rsi > 75 ? 'RSI overbought' : 'wide spread';
+        reasoning = buildReasoning(ind, 'HOLD', `score ${score}/100 qualifies but filtered — ${why}`);
+      } else {
+        action = 'BUY'; confidence = Math.min(95, score);
+        reasoning = buildReasoning(ind, 'BUY');
+      }
+    } else {
+      action = 'HOLD'; confidence = 35;
+      if (score >= threshold - 10) {
+        watchNotes.push(`${sym.replace('USDT', '')} score ${score}/100 — approaching entry`);
+        reasoning = buildReasoning(ind, 'HOLD', `score ${score}/${threshold} needed — close to entry`);
+      } else {
+        reasoning = buildReasoning(ind, 'HOLD', `score ${score}/${threshold} — waiting`);
+      }
+    }
 
-Analyse the market data above. For every coin listed, decide BUY, SELL, or HOLD.
-- You can only BUY coins not currently held AND where balance > $11 USDT.
-- You can only SELL coins you currently hold.
-- Set action=HOLD for everything else.
-Remember to output ONLY valid JSON matching the required format.`;
+    decisions.push({ symbol: sym, action, confidence, reasoning });
+  }
 
-  const resp = await fetch('/api/agent', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ system: AGENT_SYSTEM, prompt }),
-  });
+  // Summarise recent performance for the "learned" field
+  const recentSells = recentTrades.filter(t => t.side === 'SELL' && t.pnl !== null).slice(0, 10);
+  const wins        = recentSells.filter(t => (t.pnl ?? 0) > 0).length;
+  const totalPnl    = recentSells.reduce((s, t) => s + (t.pnl ?? 0), 0);
+  const learned = recentSells.length === 0
+    ? 'No completed trades yet — building trade history across all selected coins.'
+    : `${wins}/${recentSells.length} recent trades profitable · net ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(4)} USDT. ${
+        wins / recentSells.length >= 0.6 ? 'Strategy performing well — maintaining settings.' :
+        wins / recentSells.length >= 0.4 ? 'Win rate around 50% — normal for scalping.' :
+        'Below 40% win rate — being more selective on entries.'}`;
 
-  if (!resp.ok) throw new Error(`Agent API error: ${resp.status}`);
-  const data = await resp.json();
-
-  if (data.error) throw new Error(data.error);
-
-  // Validate structure
-  const result = data as AgentResponse;
-  if (!Array.isArray(result.decisions)) throw new Error('Invalid agent response structure');
-
-  return result;
+  return {
+    decisions,
+    learned,
+    nextWatch: watchNotes.join(' · ') || 'All coins below entry threshold — monitoring for signals.',
+  };
 }
+
+// ── Trade execution helpers (unchanged) ──────────────────────────────────────
 
 export async function executeBuyDecision(
   decision: AgentDecision,
@@ -189,28 +268,20 @@ export async function executeBuyDecision(
   const price = parseFloat(lp.price);
   if (!price || price <= 0) return balance;
 
-  // Allocate evenly across selected coins, capped at available balance
   const allocation = Math.min(balance / Math.max(coins.length, 1), balance);
   if (allocation < MIN_NOTIONAL_USDT) return balance;
 
   const quantity = (allocation / price) * (1 - TAKER_FEE);
-  const feeUSDT = allocation * TAKER_FEE;
+  const feeUSDT  = allocation * TAKER_FEE;
 
   await sb.from('bot_trade_history').insert({
-    user_session: 'default',
-    symbol: decision.symbol,
-    side: 'BUY',
-    price,
-    quantity,
-    pnl: null,
-    reason: `AI (${decision.confidence}% conf) · ${decision.reasoning.slice(0, 200)} · $${allocation.toFixed(2)} USDT · fee $${feeUSDT.toFixed(4)}`,
+    user_session: 'default', symbol: decision.symbol,
+    side: 'BUY', price, quantity, pnl: null,
+    reason: `Score ${decision.confidence}/100 · ${decision.reasoning.slice(0, 200)} · $${allocation.toFixed(2)} @ $${price.toFixed(4)} · fee $${feeUSDT.toFixed(4)}`,
   });
-
   await sb.from('paper_portfolio').upsert({
-    user_session: 'default',
-    symbol: decision.symbol,
-    quantity,
-    avg_entry_price: price,
+    user_session: 'default', symbol: decision.symbol,
+    quantity, avg_entry_price: price,
     updated_at: new Date().toISOString(),
   }, { onConflict: 'user_session,symbol' });
 
@@ -231,22 +302,16 @@ export async function executeSellDecision(
   if (!price || price <= 0) return 0;
 
   const sellProceeds = position.quantity * price * (1 - TAKER_FEE);
-  const costBasis = position.quantity * position.avg_entry_price / (1 - TAKER_FEE);
-  const pnl = Math.round((sellProceeds - costBasis) * 10000) / 10000;
+  const costBasis    = position.quantity * position.avg_entry_price / (1 - TAKER_FEE);
+  const pnl          = Math.round((sellProceeds - costBasis) * 10000) / 10000;
 
   await sb.from('bot_trade_history').insert({
-    user_session: 'default',
-    symbol: position.symbol,
-    side: 'SELL',
-    price,
-    quantity: position.quantity,
-    pnl,
-    reason: `AI (${decision.confidence}% conf) · ${decision.reasoning.slice(0, 200)}`,
+    user_session: 'default', symbol: position.symbol,
+    side: 'SELL', price, quantity: position.quantity, pnl,
+    reason: `${decision.reasoning.slice(0, 200)} · @ $${price.toFixed(4)}`,
   });
-
   await sb.from('paper_portfolio').delete()
-    .eq('user_session', 'default')
-    .eq('symbol', position.symbol);
+    .eq('user_session', 'default').eq('symbol', position.symbol);
 
   return sellProceeds;
 }
