@@ -106,6 +106,32 @@ function chatProxyPlugin(): Plugin {
   };
 }
 
+function updatePlugin(): Plugin {
+  return {
+    name: "update-puller",
+    configureServer(server) {
+      server.middlewares.use("/api/update", async (req: IncomingMessage, res: ServerResponse) => {
+        if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
+        try {
+          const { execSync } = await import("child_process");
+          const output = execSync("git pull --ff-only origin main", {
+            encoding: "utf-8",
+            timeout: 30_000,
+            cwd: process.cwd(),
+          });
+          // Re-read version.json so HMR reflects new define values on next restart
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true, output: output.trim() }));
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: msg }));
+        }
+      });
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => ({
   server: {
     host: "0.0.0.0",
@@ -121,6 +147,7 @@ export default defineConfig(({ mode }) => ({
   plugins: [
     react(),
     chatProxyPlugin(),
+    updatePlugin(),
     mode === "development" && componentTagger(),
   ].filter(Boolean),
   resolve: {

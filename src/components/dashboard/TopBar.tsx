@@ -11,7 +11,7 @@ interface TopBarProps {
 const APP_VERSION = __APP_VERSION__;
 
 const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
-  const { updateAvailable, checking, checkForUpdates, reload } = useUpdateChecker();
+  const { updateAvailable, checking, updating, checkForUpdates, applyUpdate } = useUpdateChecker();
 
   const handleCheckUpdate = async () => {
     const toastId = toast.loading('Checking for updates…');
@@ -60,11 +60,12 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
           {/* Check for updates button */}
           {updateAvailable ? (
             <button
-              onClick={reload}
-              className="flex items-center gap-1.5 px-3 py-1 rounded-md bg-accent/20 border border-accent/40 text-accent text-xs font-semibold hover:bg-accent/30 transition-colors animate-pulse"
+              onClick={applyUpdate}
+              disabled={updating}
+              className="flex items-center gap-1.5 px-3 py-1 rounded-md bg-accent/20 border border-accent/40 text-accent text-xs font-semibold hover:bg-accent/30 transition-colors animate-pulse disabled:opacity-60 disabled:cursor-not-allowed"
             >
-              <Download className="w-3.5 h-3.5" />
-              Update available — click to reload
+              <Download className={`w-3.5 h-3.5 ${updating ? 'animate-spin' : ''}`} />
+              {updating ? 'Pulling update…' : 'Update available — click to apply'}
             </button>
           ) : (
             <button
