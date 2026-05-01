@@ -85,6 +85,29 @@ if %ERRORLEVEL% NEQ 0 (
 for /f "tokens=*" %%v in ('npm --version') do set NPM_VER=%%v
 call :logline "npm v%NPM_VER% OK"
 
+:: ── Check .env file ──────────────────────────────────────────────────────────
+if not exist ".env" (
+    call :logline "WARNING: .env file not found."
+    echo.
+    echo   ================================================================
+    echo   WARNING: No .env file found.
+    echo   The app will open but show a setup screen in the browser.
+    echo.
+    echo   To fix this:
+    echo    1. Go to https://supabase.com/dashboard/project/wvrrsoggggmvopllyhxo/settings/api
+    echo    2. Copy your "anon / public" key
+    echo    3. Create a file called .env in this folder with:
+    echo.
+    echo       VITE_SUPABASE_URL=https://wvrrsoggggmvopllyhxo.supabase.co
+    echo       VITE_SUPABASE_PUBLISHABLE_KEY=your-anon-key-here
+    echo.
+    echo    4. Save the file and run start.bat again
+    echo   ================================================================
+    echo.
+    echo   Starting anyway so you can see the setup instructions in browser...
+    echo.
+)
+
 :: ── Smart dependency check ───────────────────────────────────────────────────
 :: Only (re)install when package.json has changed since last install.
 :: We store the package.json timestamp in node_modules\.install-marker.
