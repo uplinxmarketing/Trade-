@@ -443,10 +443,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${mode === 'live' ? 'bg-loss/20 text-loss' : 'bg-accent/20 text-accent'}`}>
             {mode === 'live' ? 'LIVE' : 'PAPER TEST'}
           </span>
-          {isRunning && cycleCountdown > 0 && (
-            <span className="text-[9px] text-muted-foreground font-mono">next scan in {cycleCountdown}s</span>
-          )}
-          {scanning && <RefreshCw className="w-3 h-3 animate-spin text-accent" />}
+          {scanning
+            ? <span className="text-[9px] text-accent font-mono flex items-center gap-1"><RefreshCw className="w-2.5 h-2.5 animate-spin" />Checking signals…</span>
+            : isRunning && cycleCountdown > 0
+              ? <span className="text-[9px] text-muted-foreground font-mono">next signal check in {cycleCountdown}s</span>
+              : null
+          }
         </div>
         <div className="flex items-center gap-1.5">
           {isRunning && (
@@ -555,7 +557,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           : isRunning ? <><Square className="w-4 h-4 mr-1.5"/>Stop Agent</>
           : <><Play className="w-4 h-4 mr-1.5"/>Start AI Agent — Paper Test</>}
       </Button>
-      {isRunning && agentStatus && <p className="text-[10px] text-center text-accent -mt-2 font-mono">{agentStatus}</p>}
+      {isRunning
+        ? <p className="text-[10px] text-center text-muted-foreground -mt-2">
+            Every 30s: fetches live candles → checks EMA / RSI / MACD / Volume → buys or holds
+            {agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}
+          </p>
+        : <p className="text-[10px] text-center text-muted-foreground -mt-2">
+            Analyses {selectedCoins.length} coins every 30s · EMA+RSI+MACD+Volume signals · no API key needed
+          </p>
+      }
       {!isRunning && <p className="text-[10px] text-center text-muted-foreground -mt-2">Scans {selectedCoins.length} coins every 30s · EMA+RSI+MACD+Vol signals · no API key needed</p>}
 
       {/* ── Live coin signals ── */}
