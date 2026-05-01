@@ -10,7 +10,6 @@ import ChartPanelV2 from '@/components/dashboard/ChartPanelV2';
 import OrderFormPanel from '@/components/dashboard/OrderFormPanel';
 import WalletPanelV2 from '@/components/dashboard/WalletPanelV2';
 import ReportDashboard from '@/components/dashboard/ReportDashboard';
-import PaperTradingSimulator from '@/components/dashboard/PaperTradingSimulator';
 import CoinSelector from '@/components/dashboard/CoinSelector';
 import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
 import { supabase } from '@/integrations/supabase/client';
@@ -107,9 +106,6 @@ const Index = () => {
               binanceConnected={binanceConnected}
               onConnectBinance={() => setShowBinanceConnect(true)}
             />
-
-            {/* Paper Trading Lab */}
-            <PaperTradingSimulator selectedCoins={selectedCoins} prices={prices} />
 
             {/* Coin selection (for bot) */}
             <div className="trading-card p-3">
