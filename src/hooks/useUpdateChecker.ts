@@ -1,30 +1,31 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
+interface VersionInfo {
+  version: string;
+  buildTime: string;
+  commit: string;
+}
+
 export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [checking, setChecking] = useState(false);
-  const baselineHash = useRef<string | null>(null);
-
-  const extractScriptHash = (html: string): string | null => {
-    const match = html.match(/\/assets\/index-([^.]+)\.js/);
-    return match ? match[1] : null;
-  };
+  const baseline = useRef<string | null>(null);
 
   const checkForUpdates = useCallback(async (): Promise<boolean> => {
     setChecking(true);
     try {
-      const resp = await fetch(`/?nocache=${Date.now()}`, { cache: 'no-store' });
+      const resp = await fetch(`/version.json?t=${Date.now()}`, { cache: 'no-store' });
       if (!resp.ok) return false;
-      const html = await resp.text();
-      const hash = extractScriptHash(html);
-      if (!hash) return false;
+      const data: VersionInfo = await resp.json();
+      // Use commit + buildTime as a unique fingerprint
+      const fingerprint = `${data.commit}:${data.buildTime}`;
 
-      if (baselineHash.current === null) {
-        baselineHash.current = hash;
+      if (baseline.current === null) {
+        baseline.current = fingerprint;
         return false;
       }
 
-      if (hash !== baselineHash.current) {
+      if (fingerprint !== baseline.current) {
         setUpdateAvailable(true);
         return true;
       }
@@ -37,10 +38,7 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
   }, []);
 
   useEffect(() => {
-    // Capture baseline hash on mount
     checkForUpdates();
-
-    // Then poll periodically
     const interval = setInterval(checkForUpdates, pollIntervalMs);
     return () => clearInterval(interval);
   }, [checkForUpdates, pollIntervalMs]);
