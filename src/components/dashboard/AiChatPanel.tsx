@@ -26,17 +26,13 @@ const AiChatPanel = () => {
     setIsLoading(true);
 
     try {
-      const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/trading-chat`;
-      const resp = await fetch(CHAT_URL, {
+      const resp = await fetch('/api/chat', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages: newMessages }),
       });
 
-      if (!resp.ok || !resp.body) throw new Error('Stream failed');
+      if (!resp.ok || !resp.body) throw new Error(`Chat error ${resp.status}`);
 
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
