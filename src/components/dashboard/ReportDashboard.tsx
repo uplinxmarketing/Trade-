@@ -1,156 +1,217 @@
 import { useState, useEffect, useCallback } from 'react';
-import { BarChart3, CheckCircle2, XCircle, DollarSign, Activity, Clock, AlertTriangle, Loader2 } from 'lucide-react';
+import { BarChart3, DollarSign, TrendingUp, Percent, Loader2, RefreshCw } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
+import { TAKER_FEE } from '@/lib/trading-engine';
 
-interface TradeStats {
-  totalTrades: number;
-  successful: number;
-  unsuccessful: number;
-  openTrades: number;
-  totalProfit: number;
-  avgTradeProfit: number;
-  bestTrade: number;
-  worstTrade: number;
-  avgHoldTime: string;
-  winRate: string;
+const BNB_DISCOUNT = 0.25; // 25% BNB fee discount (typical Binance rate)
+
+interface Trade {
+  id: string;
+  symbol: string;
+  side: string;
+  price: number;
+  quantity: number;
+  pnl: number | null;
+  reason: string | null;
+  created_at: string;
+}
+
+function fmt(n: number, d = 2) { return n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }); }
+function fmtDate(iso: string) {
+  const d = new Date(iso);
+  return `${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} ${d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}`;
+}
+
+interface PairTrade {
+  id: string;
+  pair: string;
+  direction: 'LONG' | 'SHORT';
+  entryPrice: number;
+  exitPrice: number;
+  qty: number;
+  budget: number;
+  buyFee: number;
+  sellFee: number;
+  netPnl: number;
+  duration: string;
+  closedAt: string;
 }
 
 const ReportDashboard = () => {
-  const [stats, setStats] = useState<TradeStats>({
-    totalTrades: 0, successful: 0, unsuccessful: 0, openTrades: 0,
-    totalProfit: 0, avgTradeProfit: 0, bestTrade: 0, worstTrade: 0, avgHoldTime: '-', winRate: '0',
-  });
-  const [loading, setLoading] = useState(true);
+  const [trades, setTrades]     = useState<Trade[]>([]);
+  const [loading, setLoading]   = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
 
-  const loadStats = useCallback(async () => {
-    setLoading(true);
-    const { data: trades } = await supabase
-      .from('bot_trade_history')
-      .select('*')
-      .eq('user_session', 'default')
-      .order('created_at', { ascending: true });
-
-    if (!trades || trades.length === 0) {
-      setLoading(false);
-      return;
-    }
-
-    const closedTrades = trades.filter(t => t.pnl !== null);
-    const openTrades = trades.filter(t => t.pnl === null && t.side === 'BUY');
-    const successful = closedTrades.filter(t => Number(t.pnl) > 0);
-    const unsuccessful = closedTrades.filter(t => Number(t.pnl) <= 0);
-    const totalProfit = closedTrades.reduce((s, t) => s + Number(t.pnl), 0);
-    const pnls = closedTrades.map(t => Number(t.pnl));
-
-    // Calculate avg hold time
-    const buyTimes: Record<string, string> = {};
-    let totalHoldMs = 0, holdCount = 0;
-    for (const t of trades) {
-      if (t.side === 'BUY') buyTimes[t.symbol] = t.created_at;
-      else if (t.side === 'SELL' && buyTimes[t.symbol]) {
-        totalHoldMs += new Date(t.created_at).getTime() - new Date(buyTimes[t.symbol]).getTime();
-        holdCount++;
-        delete buyTimes[t.symbol];
-      }
-    }
-    const avgMs = holdCount > 0 ? totalHoldMs / holdCount : 0;
-    const avgHold = avgMs > 0
-      ? avgMs > 3600000 ? `${(avgMs / 3600000).toFixed(1)}h` : `${(avgMs / 60000).toFixed(0)}m`
-      : '-';
-
-    const winRate = closedTrades.length > 0 ? ((successful.length / closedTrades.length) * 100).toFixed(1) : '0';
-
-    setStats({
-      totalTrades: trades.length,
-      successful: successful.length,
-      unsuccessful: unsuccessful.length,
-      openTrades: openTrades.length,
-      totalProfit: Math.round(totalProfit * 100) / 100,
-      avgTradeProfit: closedTrades.length > 0 ? Math.round((totalProfit / closedTrades.length) * 100) / 100 : 0,
-      bestTrade: pnls.length > 0 ? Math.max(...pnls) : 0,
-      worstTrade: pnls.length > 0 ? Math.min(...pnls) : 0,
-      avgHoldTime: avgHold,
-      winRate,
-    });
+  const load = useCallback(async () => {
+    const { data } = await supabase
+      .from('bot_trade_history').select('*')
+      .eq('user_session', 'default').order('created_at', { ascending: true });
+    setTrades((data as Trade[]) ?? []);
     setLoading(false);
+    setRefreshing(false);
   }, []);
 
   useEffect(() => {
-    loadStats();
-    const ch = supabase
-      .channel('report-updates')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'bot_trade_history' }, loadStats)
+    load();
+    const ch = supabase.channel('rd-updates')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_trade_history' }, load)
       .subscribe();
     return () => { supabase.removeChannel(ch); };
-  }, [loadStats]);
+  }, [load]);
 
-  const metrics = [
-    { label: 'Total Trades', value: stats.totalTrades.toString(), icon: Activity, color: 'text-accent' },
-    { label: 'Successful', value: stats.successful.toString(), icon: CheckCircle2, color: 'text-gain' },
-    { label: 'Unsuccessful', value: stats.unsuccessful.toString(), icon: XCircle, color: 'text-loss' },
-    { label: 'Open/Pending', value: stats.openTrades.toString(), icon: Clock, color: 'text-warn' },
-    { label: 'Total Profit', value: `${stats.totalProfit >= 0 ? '+' : '-'}$${Math.abs(stats.totalProfit).toFixed(2)}`, icon: DollarSign, color: stats.totalProfit >= 0 ? 'text-gain' : 'text-loss' },
-    { label: 'Win Rate', value: `${stats.winRate}%`, icon: BarChart3, color: Number(stats.winRate) >= 50 ? 'text-gain' : 'text-warn' },
-    { label: 'Best Trade', value: `+$${stats.bestTrade.toFixed(2)}`, icon: CheckCircle2, color: 'text-gain' },
-    { label: 'Worst Trade', value: `${stats.worstTrade < 0 ? '-' : ''}$${Math.abs(stats.worstTrade).toFixed(2)}`, icon: XCircle, color: 'text-loss' },
+  // Build matched buy→sell pairs for table display
+  const pairTrades: PairTrade[] = (() => {
+    const buyMap: Record<string, Trade> = {};
+    const result: PairTrade[] = [];
+    for (const t of trades) {
+      if (t.side === 'BUY' && t.pnl === null) { buyMap[t.symbol] = t; }
+      else if (t.side === 'SELL' && t.pnl !== null && buyMap[t.symbol]) {
+        const b = buyMap[t.symbol];
+        const budget   = b.quantity * b.price;
+        const buyFee   = budget * TAKER_FEE;
+        const sellFee  = t.quantity * t.price * TAKER_FEE;
+        const durationMs = new Date(t.created_at).getTime() - new Date(b.created_at).getTime();
+        const dur = durationMs > 3600000
+          ? `${(durationMs / 3600000).toFixed(1)}h`
+          : `${(durationMs / 60000).toFixed(0)}m`;
+        result.push({
+          id: t.id, pair: t.symbol.replace('USDT', '/USDT'), direction: 'LONG',
+          entryPrice: b.price, exitPrice: t.price, qty: t.quantity,
+          budget, buyFee, sellFee, netPnl: Number(t.pnl),
+          duration: dur, closedAt: t.created_at,
+        });
+        delete buyMap[t.symbol];
+      }
+    }
+    return result.reverse(); // newest first
+  })();
+
+  // Metrics
+  const closedPnls   = pairTrades.map(p => p.netPnl);
+  const totalProfit  = closedPnls.reduce((s, v) => s + v, 0);
+  const todayProfit  = pairTrades.filter(p => {
+    const d = new Date(p.closedAt);
+    const now = new Date();
+    return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  }).reduce((s, p) => s + p.netPnl, 0);
+  const totalFees    = pairTrades.reduce((s, p) => s + p.buyFee + p.sellFee, 0);
+  const bnbSavings   = totalFees * BNB_DISCOUNT;
+  const wins         = pairTrades.filter(p => p.netPnl > 0).length;
+  const total        = pairTrades.length;
+  const winRate      = total > 0 ? ((wins / total) * 100).toFixed(1) : '—';
+
+  const cards = [
+    {
+      label: 'Total Profit',
+      value: `${totalProfit >= 0 ? '+' : ''}$${fmt(Math.abs(totalProfit))}`,
+      sub: `${total} closed trades`,
+      color: totalProfit >= 0 ? 'text-gain' : 'text-loss',
+      bg: totalProfit >= 0 ? 'bg-gain/10 border-gain/20' : 'bg-loss/10 border-loss/20',
+      Icon: DollarSign,
+    },
+    {
+      label: "Today's Profit",
+      value: `${todayProfit >= 0 ? '+' : ''}$${fmt(Math.abs(todayProfit))}`,
+      sub: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      color: todayProfit >= 0 ? 'text-gain' : 'text-loss',
+      bg: todayProfit >= 0 ? 'bg-gain/10 border-gain/20' : 'bg-muted/20 border-border',
+      Icon: TrendingUp,
+    },
+    {
+      label: 'Total Fees',
+      value: `$${fmt(totalFees)}`,
+      sub: `BNB saves ~$${fmt(bnbSavings)}`,
+      color: 'text-warn',
+      bg: 'bg-warn/10 border-warn/20',
+      Icon: BarChart3,
+    },
+    {
+      label: 'Win Rate',
+      value: total > 0 ? `${winRate}%` : '—',
+      sub: `${wins}W / ${total - wins}L of ${total}`,
+      color: Number(winRate) >= 50 ? 'text-gain' : 'text-muted-foreground',
+      bg: Number(winRate) >= 50 ? 'bg-gain/10 border-gain/20' : 'bg-muted/20 border-border',
+      Icon: Percent,
+    },
   ];
 
   return (
-    <div className="bg-card border border-border rounded-lg p-4">
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <BarChart3 className="w-4 h-4 text-accent" />
-          <h3 className="text-sm font-medium">Trading Report</h3>
-        </div>
-        {loading && <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />}
-      </div>
-
-      {/* Fix L-03: Total = Successful + Unsuccessful + Open */}
-      {stats.totalTrades > 0 && stats.totalTrades !== stats.successful + stats.unsuccessful + stats.openTrades && (
-        <div className="flex items-center gap-1.5 mb-3 text-[10px] text-warn bg-warn/10 rounded px-2 py-1">
-          <AlertTriangle className="w-3 h-3" />
-          <span>Trade count reconciliation in progress</span>
-        </div>
-      )}
-
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-        {metrics.map(m => {
-          const Icon = m.icon;
-          return (
-            <div key={m.label} className="bg-muted/20 rounded-md p-2.5">
-              <div className="flex items-center gap-1.5 mb-1">
-                <Icon className={`w-3 h-3 ${m.color}`} />
-                <span className="text-[10px] uppercase tracking-widest text-muted-foreground">{m.label}</span>
-              </div>
-              <span className={`text-sm font-mono font-semibold tabular-nums ${m.color}`}>{m.value}</span>
+    <div className="space-y-4">
+      {/* Metric cards */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        {cards.map(c => (
+          <div key={c.label} className={`rounded-lg border p-3 ${c.bg}`}>
+            <div className="flex items-center gap-1.5 mb-2">
+              <c.Icon className={`w-3.5 h-3.5 ${c.color}`} />
+              <span className="text-[10px] uppercase tracking-widest text-muted-foreground">{c.label}</span>
             </div>
-          );
-        })}
+            <div className={`text-lg font-mono font-bold tabular-nums ${c.color}`}>{c.value}</div>
+            <div className="text-[10px] text-muted-foreground mt-0.5">{c.sub}</div>
+          </div>
+        ))}
       </div>
 
-      {/* Avg hold time + avg trade P&L */}
-      <div className="grid grid-cols-2 gap-2 mt-2">
-        <div className="bg-muted/20 rounded-md p-2.5">
-          <div className="flex items-center gap-1.5 mb-1">
-            <Clock className="w-3 h-3 text-muted-foreground" />
-            <span className="text-[10px] uppercase tracking-widest text-muted-foreground">Avg Hold Time</span>
-          </div>
-          <span className="text-sm font-mono font-semibold tabular-nums text-muted-foreground">{stats.avgHoldTime}</span>
+      {/* Trade history table */}
+      <div className="trading-card">
+        <div className="p-3 border-b border-border flex items-center gap-2">
+          <BarChart3 className="w-4 h-4 text-primary" />
+          <span className="text-sm font-medium">Trade History</span>
+          <button onClick={() => { setRefreshing(true); load(); }}
+            className="ml-auto text-muted-foreground hover:text-foreground transition-colors" title="Refresh">
+            <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+          </button>
+          {loading && <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground" />}
         </div>
-        <div className="bg-muted/20 rounded-md p-2.5">
-          <div className="flex items-center gap-1.5 mb-1">
-            <DollarSign className={`w-3 h-3 ${stats.avgTradeProfit >= 0 ? 'text-gain' : 'text-loss'}`} />
-            <span className="text-[10px] uppercase tracking-widest text-muted-foreground">Avg Trade P&L</span>
-          </div>
-          <span className={`text-sm font-mono font-semibold tabular-nums ${stats.avgTradeProfit >= 0 ? 'text-gain' : 'text-loss'}`}>
-            {stats.avgTradeProfit >= 0 ? '+' : '-'}${Math.abs(stats.avgTradeProfit).toFixed(2)}
-          </span>
-        </div>
-      </div>
 
-      {stats.totalTrades === 0 && !loading && (
-        <p className="text-xs text-muted-foreground text-center mt-3">Start the bot to generate trading data</p>
-      )}
+        {pairTrades.length === 0 ? (
+          <div className="p-8 text-center text-xs text-muted-foreground">
+            {loading ? 'Loading…' : 'No completed trades yet — start the bot to generate data'}
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-[10px]">
+              <thead>
+                <tr className="border-b border-border text-muted-foreground uppercase tracking-widest">
+                  <th className="text-left px-3 py-2 font-medium">Timestamp</th>
+                  <th className="text-left px-3 py-2 font-medium">Pair</th>
+                  <th className="text-center px-2 py-2 font-medium">Dir.</th>
+                  <th className="text-right px-2 py-2 font-medium">Entry</th>
+                  <th className="text-right px-2 py-2 font-medium">Exit</th>
+                  <th className="text-right px-2 py-2 font-medium">Qty</th>
+                  <th className="text-right px-2 py-2 font-medium">Budget</th>
+                  <th className="text-right px-2 py-2 font-medium">Buy fee</th>
+                  <th className="text-right px-2 py-2 font-medium">Sell fee</th>
+                  <th className="text-right px-2 py-2 font-medium">Net P&L</th>
+                  <th className="text-right px-3 py-2 font-medium">Duration</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pairTrades.map(p => (
+                  <tr key={p.id} className="border-b border-border/50 hover:bg-muted/10 transition-colors">
+                    <td className="px-3 py-2 text-muted-foreground whitespace-nowrap">{fmtDate(p.closedAt)}</td>
+                    <td className="px-3 py-2 font-semibold text-foreground whitespace-nowrap">{p.pair}</td>
+                    <td className="px-2 py-2 text-center">
+                      <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${p.direction === 'LONG' ? 'bg-gain/20 text-gain' : 'bg-loss/20 text-loss'}`}>
+                        {p.direction}
+                      </span>
+                    </td>
+                    <td className="px-2 py-2 text-right font-mono tabular-nums">${fmt(p.entryPrice, 4)}</td>
+                    <td className="px-2 py-2 text-right font-mono tabular-nums">${fmt(p.exitPrice, 4)}</td>
+                    <td className="px-2 py-2 text-right font-mono tabular-nums">{p.qty.toFixed(5)}</td>
+                    <td className="px-2 py-2 text-right font-mono tabular-nums">${fmt(p.budget)}</td>
+                    <td className="px-2 py-2 text-right font-mono tabular-nums text-warn">${fmt(p.buyFee, 4)}</td>
+                    <td className="px-2 py-2 text-right font-mono tabular-nums text-warn">${fmt(p.sellFee, 4)}</td>
+                    <td className={`px-2 py-2 text-right font-mono tabular-nums font-bold ${p.netPnl >= 0 ? 'text-gain' : 'text-loss'}`}>
+                      {p.netPnl >= 0 ? '+' : ''}{fmt(p.netPnl, 4)}
+                    </td>
+                    <td className="px-3 py-2 text-right text-muted-foreground">{p.duration}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 };

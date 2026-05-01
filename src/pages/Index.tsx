@@ -1,20 +1,14 @@
 import { useState, useCallback, useEffect } from 'react';
 import TopBar from '@/components/dashboard/TopBar';
-import PortfolioSummary from '@/components/dashboard/PortfolioSummary';
-import PriceChart from '@/components/dashboard/PriceChart';
-import PnlChart from '@/components/dashboard/PnlChart';
 import ReportDashboard from '@/components/dashboard/ReportDashboard';
 import CoinSelector from '@/components/dashboard/CoinSelector';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
-import AiAnalysisPanel from '@/components/dashboard/AiAnalysisPanel';
 import AITradingAgent from '@/components/dashboard/AITradingAgent';
 import BinanceConnect from '@/components/dashboard/BinanceConnect';
-import ProfitSettings from '@/components/dashboard/ProfitSettings';
-import RecentTrades from '@/components/dashboard/RecentTrades';
-import TradePanel from '@/components/dashboard/TradePanel';
 import NotificationCenter from '@/components/dashboard/NotificationCenter';
-import WalletPanel from '@/components/dashboard/WalletPanel';
-import PaperWalletPanel from '@/components/dashboard/PaperWalletPanel';
+import WalletPanelV2 from '@/components/dashboard/WalletPanelV2';
+import TradingForm from '@/components/dashboard/TradingForm';
+import OrderMonitor from '@/components/dashboard/OrderMonitor';
 import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
@@ -23,17 +17,15 @@ const DEFAULT_COINS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT'];
 
 const Index = () => {
   const [selectedCoins, setSelectedCoins] = useState<string[]>(DEFAULT_COINS);
-  const [activeCoin, setActiveCoin] = useState('BTCUSDT');
+  const [activeCoin, setActiveCoin]        = useState('BTCUSDT');
   const [binanceConnected, setBinanceConnected] = useState(false);
   const [showBinanceConnect, setShowBinanceConnect] = useState(false);
   const [activeTab, setActiveTab] = useState<'dashboard' | 'bot' | 'report'>('dashboard');
+  const [mode, setMode] = useState<'test' | 'live'>('test');
 
   const { prices, connected: wsConnected } = useBinanceWebSocket(selectedCoins);
-  const activePrice = prices[activeCoin];
 
-  // Ensure a single bot_config row exists (ignoreDuplicates = don't overwrite existing)
   useEffect(() => {
-    supabase.from('trading_bots').delete().eq('user_session', 'default').then(() => {});
     supabase.from('bot_config').upsert({
       user_session: 'default',
       selected_coins: DEFAULT_COINS,
@@ -41,13 +33,15 @@ const Index = () => {
       is_running: false,
       current_balance: 10000,
       initial_balance: 10000,
-      min_profit_percent: 0.5,
       stop_loss_percent: 1.5,
       updated_at: new Date().toISOString(),
     }, { onConflict: 'user_session', ignoreDuplicates: true });
+
+    supabase.from('bot_config').select('mode').eq('user_session', 'default').single()
+      .then(({ data }) => { if (data?.mode) setMode(data.mode as 'test' | 'live'); });
   }, []);
 
-  const handleModeChange = useCallback((_mode: 'test' | 'live') => {
+  const handleModeChange = useCallback((_m: 'test' | 'live') => {
     if (!binanceConnected) {
       toast.error('Connect your Binance API first', { description: 'Live trading requires API keys' });
       setShowBinanceConnect(true);
@@ -56,8 +50,8 @@ const Index = () => {
 
   const tabs = [
     { id: 'dashboard' as const, label: 'Dashboard' },
-    { id: 'bot' as const, label: 'AI Bot' },
-    { id: 'report' as const, label: 'Reports' },
+    { id: 'bot' as const,       label: 'AI Bot' },
+    { id: 'report' as const,    label: 'Reports' },
   ];
 
   return (
@@ -121,74 +115,58 @@ const Index = () => {
                 </button>
               );
             })}
+            <div className="ml-auto flex-shrink-0">
+              <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} />
+            </div>
           </div>
 
           {/* ── DASHBOARD TAB ── */}
           {activeTab === 'dashboard' && (
-            <>
-              <PortfolioSummary binanceConnected={binanceConnected} botCount={1} />
+            <div className="space-y-4">
+              {/* Panel A — Wallet (full width) */}
+              <WalletPanelV2
+                binanceConnected={binanceConnected}
+                prices={prices}
+                mode={binanceConnected ? 'live' : 'test'}
+              />
 
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                <div className="lg:col-span-2">
-                  <PriceChart
-                    symbol={activeCoin.replace('USDT', '') + ' / USDT'}
-                    currentPrice={activePrice?.price || '0'}
-                    priceChange={activePrice?.priceChangePercent || '0'}
-                  />
-                </div>
-                <TradePanel selectedCoins={selectedCoins} />
+              {/* Panel B + C — 2 column */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4" style={{ minHeight: '520px' }}>
+                {/* Panel B — Trade Placement */}
+                <TradingForm
+                  selectedCoins={selectedCoins}
+                  prices={prices}
+                  binanceConnected={binanceConnected}
+                />
+                {/* Panel C — Open Orders & Monitor */}
+                <OrderMonitor prices={prices} />
               </div>
 
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                <div className="space-y-4">
-                  <PaperWalletPanel prices={prices} />
-                  <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} />
-                  <ProfitSettings />
-                  {binanceConnected && (
-                    <WalletPanel
-                      binanceConnected={binanceConnected}
-                      selectedTradingCoins={selectedCoins}
-                      onTradingCoinsChange={setSelectedCoins}
-                    />
-                  )}
-                </div>
-                <div className="lg:col-span-2 space-y-4">
-                  <AITradingAgent selectedCoins={selectedCoins} prices={prices} binanceConnected={binanceConnected} onConnectBinance={() => setShowBinanceConnect(true)} />
-                  <AiAnalysisPanel selectedCoins={selectedCoins} />
-                </div>
-              </div>
-            </>
+              {/* Panel D — Reports (full width) */}
+              <ReportDashboard />
+            </div>
           )}
 
           {/* ── AI BOT TAB ── */}
           {activeTab === 'bot' && (
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-              <div className="lg:col-span-2 space-y-4">
-                <PriceChart
-                  symbol={activeCoin.replace('USDT', '') + ' / USDT'}
-                  currentPrice={activePrice?.price || '0'}
-                  priceChange={activePrice?.priceChangePercent || '0'}
-                />
-                <AITradingAgent selectedCoins={selectedCoins} prices={prices} binanceConnected={binanceConnected} onConnectBinance={() => setShowBinanceConnect(true)} />
-              </div>
-              <div className="space-y-4">
-                <PaperWalletPanel prices={prices} />
-                <AiAnalysisPanel selectedCoins={selectedCoins} />
-                <ProfitSettings />
-                <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} />
-              </div>
+            <div className="space-y-4">
+              <AITradingAgent
+                selectedCoins={selectedCoins}
+                prices={prices}
+                binanceConnected={binanceConnected}
+                onConnectBinance={() => setShowBinanceConnect(true)}
+              />
+              <WalletPanelV2
+                binanceConnected={binanceConnected}
+                prices={prices}
+                mode={binanceConnected ? 'live' : 'test'}
+              />
             </div>
           )}
 
           {/* ── REPORTS TAB ── */}
           {activeTab === 'report' && (
-            <div className="space-y-4">
-              <ReportDashboard />
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                <PnlChart />
-                <RecentTrades trades={[]} />
-              </div>
-            </div>
+            <ReportDashboard />
           )}
         </div>
 
