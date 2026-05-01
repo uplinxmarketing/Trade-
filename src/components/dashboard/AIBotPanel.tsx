@@ -2,14 +2,14 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Play, Square, Brain, TrendingUp, TrendingDown, Zap,
   RotateCcw, ChevronDown, ChevronUp, FlaskConical,
-  DollarSign, Settings2,
+  DollarSign, Settings2, Pencil, Check, X,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
 import {
   updateSignals, checkExits, checkEntries, runAnalysisCycle,
-  type SignalData, type LivePrices,
+  type SignalData, type LivePrices, TAKER_FEE,
 } from '@/lib/trading-engine';
 
 interface Trade {
@@ -30,12 +30,17 @@ interface AIBotPanelProps {
 
 const PRESET_BUDGETS = [1000, 5000, 10000, 25000, 50000];
 
+// Break-even price after both buy + sell fees (~0.2% above entry)
+const breakEvenMultiplier = 1 / Math.pow(1 - TAKER_FEE, 2);
+
 const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance }: AIBotPanelProps) => {
   const [mode, setMode] = useState<'test' | 'live'>('test');
   const [isRunning, setIsRunning] = useState(false);
   const [loading, setLoading] = useState(false);
   const [showBudget, setShowBudget] = useState(false);
   const [showAllTrades, setShowAllTrades] = useState(false);
+  const [editingBudget, setEditingBudget] = useState(false);
+  const [budgetDraft, setBudgetDraft] = useState('');
 
   // Budget
   const [totalBudget, setTotalBudget] = useState(10000);
@@ -78,7 +83,7 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
       const t = tradesRes.data as Trade[];
       setTrades(t);
       const sells = t.filter(x => x.side === 'SELL' && x.pnl !== null);
-      setTotalPnl(Math.round(sells.reduce((s, x) => s + (x.pnl || 0), 0) * 100) / 100);
+      setTotalPnl(Math.round(sells.reduce((s, x) => s + (x.pnl || 0), 0) * 10000) / 10000);
       const wins = sells.filter(x => (x.pnl || 0) > 0).length;
       setWinRate(sells.length ? Math.round((wins / sells.length) * 100) : 0);
     }
@@ -112,7 +117,7 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
     return () => clearInterval(id);
   }, [selectedCoins]);
 
-  // Always-on: run AI analysis cycle every 5 min (stores results to DB)
+  // Always-on: run AI analysis cycle every 5 min
   useEffect(() => {
     if (!selectedCoins.length) return;
     runAnalysisCycle(selectedCoins, supabase, setAnalysisStatus);
@@ -171,7 +176,7 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
         setIsRunning(true);
         setBalance(totalBudget);
         toast.success(`Bot started · ${mode.toUpperCase()} mode`, {
-          description: `$${totalBudget.toLocaleString()} · ${selectedCoins.length} coins · instant trade execution`,
+          description: `${totalBudget.toLocaleString()} USDT · ${selectedCoins.length} coins · instant trade execution`,
         });
       } else {
         await supabase.from('bot_config').update({ is_running: false, updated_at: new Date().toISOString() })
@@ -200,7 +205,16 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
     ]);
     setTrades([]); setPositions([]); setBalance(totalBudget);
     setTotalPnl(0); setIsRunning(false);
-    toast.success(`Reset · $${totalBudget.toLocaleString()} restored`);
+    toast.success(`Reset · ${totalBudget.toLocaleString()} USDT restored`);
+  };
+
+  const confirmBudgetEdit = () => {
+    const val = Math.max(100, Number(budgetDraft));
+    if (!isNaN(val) && val >= 100) {
+      setTotalBudget(val);
+      toast.info(`Budget updated to ${val.toLocaleString()} USDT (applies on next Start)`);
+    }
+    setEditingBudget(false);
   };
 
   const pnlColor  = totalPnl >= 0 ? 'text-gain' : 'text-loss';
@@ -220,12 +234,8 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
           </span>
         </div>
         <div className="flex gap-1">
-          <button onClick={() => setShowBudget(!showBudget)}
-            className="p-1.5 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground transition-colors" title="Budget">
-            <Settings2 className="w-3.5 h-3.5" />
-          </button>
           <button onClick={resetBot}
-            className="p-1.5 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground transition-colors" title="Reset">
+            className="p-1.5 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground transition-colors" title="Reset all trades">
             <RotateCcw className="w-3.5 h-3.5" />
           </button>
         </div>
@@ -248,38 +258,68 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
       {mode === 'live' && (
         <div className={`rounded-md px-3 py-2 text-xs ${binanceConnected ? 'bg-loss/10 border border-loss/30 text-loss' : 'bg-warn/10 border border-warn/30 text-warn'}`}>
           {binanceConnected
-            ? '⚠️ LIVE MODE — real funds will be used. Start only when ready.'
+            ? '⚠️ LIVE MODE — real USDT funds will be used. Start only when ready.'
             : <span>Binance API not connected. <button onClick={onConnectBinance} className="underline font-semibold">Connect now →</button></span>}
         </div>
       )}
 
-      {/* ── Budget panel ── */}
-      {showBudget && (
-        <div className="bg-muted/20 border border-border rounded-md p-3 space-y-3">
-          <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-widest text-muted-foreground">
-            <DollarSign className="w-3 h-3" />
-            {mode === 'test' ? 'Paper Budget Allocation' : 'Trade Budget'}
+      {/* ── Budget strip (always visible) ── */}
+      <div className="bg-muted/20 border border-border rounded-md px-3 py-2 space-y-2">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <DollarSign className="w-3.5 h-3.5 text-muted-foreground" />
+            <span className="text-[10px] uppercase tracking-widest text-muted-foreground">
+              {mode === 'test' ? 'Paper' : 'Trade'} Budget
+            </span>
           </div>
+          <button onClick={() => setShowBudget(!showBudget)}
+            className="text-[10px] text-accent hover:underline flex items-center gap-1">
+            <Settings2 className="w-3 h-3" />
+            {showBudget ? 'Hide' : 'Per-coin allocation'}
+          </button>
+        </div>
 
-          {/* Preset buttons + custom input */}
-          <div className="space-y-1">
-            <div className="text-[10px] text-muted-foreground">Total budget</div>
-            <div className="flex items-center gap-1 flex-wrap">
-              {PRESET_BUDGETS.map(p => (
-                <button key={p} onClick={() => setTotalBudget(p)} disabled={isRunning}
-                  className={`text-[10px] px-2 py-1 rounded font-mono transition-colors disabled:opacity-50 ${totalBudget === p ? 'bg-accent text-accent-foreground' : 'bg-muted/50 text-muted-foreground hover:text-foreground'}`}>
-                  ${p.toLocaleString()}
-                </button>
-              ))}
-              <input type="number" value={totalBudget}
-                onChange={e => setTotalBudget(Math.max(100, Number(e.target.value)))}
-                disabled={isRunning} min={100} step={500}
-                className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono text-foreground disabled:opacity-50 focus:outline-none focus:ring-1 focus:ring-accent" />
-            </div>
-          </div>
+        {/* Total budget row with inline edit */}
+        <div className="flex items-center gap-2">
+          {editingBudget ? (
+            <>
+              <input
+                type="number" value={budgetDraft} min={100} step={500} autoFocus
+                onChange={e => setBudgetDraft(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') confirmBudgetEdit(); if (e.key === 'Escape') setEditingBudget(false); }}
+                className="flex-1 bg-muted/40 border border-accent rounded px-2 py-1 text-xs font-mono text-foreground focus:outline-none focus:ring-1 focus:ring-accent"
+              />
+              <span className="text-xs text-muted-foreground">USDT</span>
+              <button onClick={confirmBudgetEdit} className="p-1 rounded hover:bg-gain/20 text-gain"><Check className="w-3.5 h-3.5" /></button>
+              <button onClick={() => setEditingBudget(false)} className="p-1 rounded hover:bg-loss/20 text-loss"><X className="w-3.5 h-3.5" /></button>
+            </>
+          ) : (
+            <>
+              <div className="flex gap-1 flex-wrap flex-1">
+                {PRESET_BUDGETS.map(p => (
+                  <button key={p} onClick={() => { if (!isRunning) setTotalBudget(p); }} disabled={isRunning}
+                    className={`text-[10px] px-2 py-1 rounded font-mono transition-colors disabled:opacity-50 ${totalBudget === p ? 'bg-accent text-accent-foreground' : 'bg-muted/50 text-muted-foreground hover:text-foreground'}`}>
+                    ${p.toLocaleString()}
+                  </button>
+                ))}
+              </div>
+              <button onClick={() => { setBudgetDraft(String(totalBudget)); setEditingBudget(true); }}
+                disabled={isRunning}
+                className="p-1 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground disabled:opacity-50 transition-colors" title="Custom amount">
+                <Pencil className="w-3 h-3" />
+              </button>
+            </>
+          )}
+        </div>
+        <div className="text-[10px] text-muted-foreground">
+          Selected: <span className="font-mono text-foreground font-semibold">${totalBudget.toLocaleString()} USDT</span>
+          {isRunning && <span className="text-warn ml-2">· Stop bot to change budget</span>}
+          {!isRunning && <span className="text-muted-foreground ml-2">· Fee: 0.1%/trade · Break-even: +0.20% per position</span>}
+        </div>
 
-          {/* Per-coin split */}
-          <div className="space-y-1.5">
+        {/* Per-coin allocation (expandable) */}
+        {showBudget && (
+          <div className="space-y-2 pt-1 border-t border-border">
             <div className="flex items-center justify-between">
               <span className="text-[10px] text-muted-foreground">Per-coin allocation</span>
               <button onClick={() => setEqualSplit(!equalSplit)} disabled={isRunning}
@@ -296,24 +336,27 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
                   <div key={coin} className="flex items-center justify-between bg-muted/30 rounded px-2 py-1.5">
                     <span className="text-[10px] font-mono font-semibold">{coin.replace('USDT', '')}</span>
                     {equalSplit ? (
-                      <span className="text-[10px] font-mono text-muted-foreground">${Math.floor(val).toLocaleString()}</span>
+                      <span className="text-[10px] font-mono text-muted-foreground">${Math.floor(val).toLocaleString()} USDT</span>
                     ) : (
-                      <input type="number" value={val}
-                        onChange={e => {
-                          const next = { ...coinBudgets, [coin]: Number(e.target.value) };
-                          setCoinBudgets(next);
-                          coinBudgetsRef.current = next;
-                        }}
-                        disabled={isRunning} min={10} step={50}
-                        className="w-20 bg-transparent text-[10px] font-mono text-right text-foreground border-b border-border focus:outline-none disabled:opacity-50" />
+                      <div className="flex items-center gap-1">
+                        <input type="number" value={val}
+                          onChange={e => {
+                            const next = { ...coinBudgets, [coin]: Number(e.target.value) };
+                            setCoinBudgets(next);
+                            coinBudgetsRef.current = next;
+                          }}
+                          disabled={isRunning} min={11} step={50}
+                          className="w-20 bg-transparent text-[10px] font-mono text-right text-foreground border-b border-border focus:outline-none disabled:opacity-50" />
+                        <span className="text-[9px] text-muted-foreground">USDT</span>
+                      </div>
                     )}
                   </div>
                 );
               })}
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* ── Always-on analysis ── */}
       <div className="flex items-center gap-2 bg-accent/10 border border-accent/20 rounded-md px-3 py-2">
@@ -332,14 +375,14 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
       {/* ── Stats ── */}
       <div className="grid grid-cols-4 gap-1.5">
         {[
-          { label: 'Balance',   value: `$${balance.toLocaleString('en-US', { maximumFractionDigits: 0 })}`, color: '' },
-          { label: 'P&L',       value: `${totalPnl >= 0 ? '+' : ''}$${Math.abs(totalPnl).toFixed(2)}`,     color: pnlColor },
-          { label: 'Return',    value: `${totalPnl >= 0 ? '+' : ''}${pnlPct}%`,                             color: pnlColor },
-          { label: 'Win Rate',  value: `${winRate}%`,  color: winRate >= 50 ? 'text-gain' : trades.filter(t => t.side === 'SELL').length > 0 ? 'text-loss' : '' },
+          { label: 'USDT Free',  value: balance.toLocaleString('en-US', { maximumFractionDigits: 2 }), unit: '', color: '' },
+          { label: 'Net P&L',   value: `${totalPnl >= 0 ? '+' : ''}${Math.abs(totalPnl).toFixed(2)}`, unit: ' USDT', color: pnlColor },
+          { label: 'Return',    value: `${totalPnl >= 0 ? '+' : ''}${pnlPct}%`, unit: '', color: pnlColor },
+          { label: 'Win Rate',  value: `${winRate}%`, unit: '', color: winRate >= 50 ? 'text-gain' : trades.filter(t => t.side === 'SELL').length > 0 ? 'text-loss' : '' },
         ].map(s => (
           <div key={s.label} className="bg-muted/20 rounded-md p-2 text-center">
             <div className="text-[9px] uppercase tracking-widest text-muted-foreground">{s.label}</div>
-            <div className={`text-xs font-mono font-semibold tabular-nums ${s.color}`}>{s.value}</div>
+            <div className={`text-xs font-mono font-semibold tabular-nums ${s.color}`}>{s.value}<span className="text-[9px] opacity-70">{s.unit}</span></div>
           </div>
         ))}
       </div>
@@ -358,7 +401,7 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
       </Button>
       {!isRunning && (
         <p className="text-[10px] text-center text-muted-foreground -mt-2">
-          ${totalBudget.toLocaleString()} · {selectedCoins.length} coins · trades instantly on signal
+          {totalBudget.toLocaleString()} USDT · {selectedCoins.length} coins · 0.1%/trade fee · instant execution
         </p>
       )}
 
@@ -371,19 +414,32 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
           <div className="space-y-1">
             {positions.map(pos => {
               const live = parseFloat(prices[pos.symbol]?.price || '0') || pos.avg_entry_price;
-              const uPnl = (live - pos.avg_entry_price) * pos.quantity;
-              const pct  = ((live - pos.avg_entry_price) / pos.avg_entry_price) * 100;
+              // Fee-correct unrealized PnL
+              const sellUsdt   = pos.quantity * live * (1 - TAKER_FEE);
+              const costUsdt   = pos.quantity * pos.avg_entry_price / (1 - TAKER_FEE);
+              const uPnl       = sellUsdt - costUsdt;
+              const pct        = costUsdt > 0 ? (uPnl / costUsdt) * 100 : 0;
+              const breakEven  = pos.avg_entry_price * breakEvenMultiplier;
+              const aboveBreak = live >= breakEven;
               return (
-                <div key={pos.symbol} className="flex items-center justify-between bg-muted/20 rounded px-2.5 py-1.5 text-xs">
-                  <div className="flex items-center gap-2">
-                    <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${uPnl >= 0 ? 'bg-gain' : 'bg-loss'}`} />
-                    <span className="font-mono font-semibold">{pos.symbol.replace('USDT', '')}</span>
-                    <span className="text-muted-foreground font-mono text-[10px]">×{Number(pos.quantity).toFixed(6)}</span>
+                <div key={pos.symbol} className="bg-muted/20 rounded px-2.5 py-2 text-xs">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${uPnl >= 0 ? 'bg-gain' : 'bg-loss'}`} />
+                      <span className="font-mono font-semibold">{pos.symbol.replace('USDT', '')}</span>
+                      <span className="text-muted-foreground font-mono text-[10px]">×{Number(pos.quantity).toFixed(6)}</span>
+                    </div>
+                    <span className={`font-mono font-semibold ${uPnl >= 0 ? 'text-gain' : 'text-loss'}`}>
+                      {uPnl >= 0 ? '+' : ''}{uPnl.toFixed(4)} USDT
+                      <span className="font-normal opacity-70 ml-1">({pct.toFixed(2)}%)</span>
+                    </span>
                   </div>
-                  <span className={`font-mono font-semibold ${uPnl >= 0 ? 'text-gain' : 'text-loss'}`}>
-                    {uPnl >= 0 ? '+' : ''}{uPnl.toFixed(2)}{' '}
-                    <span className="font-normal opacity-70">({pct.toFixed(2)}%)</span>
-                  </span>
+                  <div className="flex items-center justify-between mt-1 text-[9px] text-muted-foreground font-mono">
+                    <span>Entry ${pos.avg_entry_price.toLocaleString('en-US', { maximumFractionDigits: 4 })}</span>
+                    <span className={aboveBreak ? 'text-gain' : 'text-warn'}>
+                      Break-even ${breakEven.toLocaleString('en-US', { maximumFractionDigits: 4 })} {aboveBreak ? '✓' : '↑ need'}
+                    </span>
+                  </div>
                 </div>
               );
             })}
@@ -419,13 +475,13 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
                         <span className={`text-[9px] font-bold px-1 py-0.5 rounded ${isBuy ? 'bg-accent/20 text-accent' : profit ? 'bg-gain/20 text-gain' : 'bg-loss/20 text-loss'}`}>{t.side}</span>
                         <span className="text-muted-foreground font-mono">${Number(t.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</span>
                       </div>
-                      {t.reason && <p className="text-[9px] text-muted-foreground truncate max-w-[200px]">{t.reason}</p>}
+                      {t.reason && <p className="text-[9px] text-muted-foreground truncate max-w-[220px]">{t.reason}</p>}
                     </div>
                   </div>
                   <div className="text-right flex-shrink-0 ml-2">
                     {t.pnl !== null && (
-                      <div className={`font-mono font-bold ${t.pnl >= 0 ? 'text-gain' : 'text-loss'}`}>
-                        {t.pnl >= 0 ? '+' : ''}{t.pnl.toFixed(2)}
+                      <div className={`font-mono font-bold text-[10px] ${t.pnl >= 0 ? 'text-gain' : 'text-loss'}`}>
+                        {t.pnl >= 0 ? '+' : ''}{t.pnl.toFixed(4)} USDT
                       </div>
                     )}
                     <div className="text-[9px] text-muted-foreground font-mono">{time}</div>

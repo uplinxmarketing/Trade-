@@ -49,13 +49,12 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
       const resp = await fetch('/api/update', { method: 'POST' });
       const data = await resp.json();
       if (data.success) {
-        toast.success('Update applied! Reloading…', { id: toastId, description: data.output || 'Code is up to date' });
-        setTimeout(() => window.location.reload(), 1500);
+        toast.success('Update pulled! Server restarting…', { id: toastId, description: (data.output || 'Done') + ' — reloading in 5 s' });
+        // Give Vite time to restart before reloading the page
+        setTimeout(() => window.location.reload(), 5000);
       } else {
-        toast.error('Pull failed — restart the app manually', { id: toastId, description: data.error });
+        toast.error('Pull failed', { id: toastId, description: data.error || 'Restart start.bat / start.sh manually' });
         setUpdating(false);
-        // Still reload in case files were partially updated
-        setTimeout(() => window.location.reload(), 2000);
       }
     } catch {
       toast.error('Could not reach update server', { id: toastId, description: 'Close and rerun start.bat / start.sh to update' });

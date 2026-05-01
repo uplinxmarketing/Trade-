@@ -3,6 +3,14 @@ import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcATR, calcSMA, calcE
 
 const B = 'https://api.binance.com/api/v3';
 
+// ── Binance fee constants ────────────────────────────────────────────────────
+// Default spot taker fee: 0.1% per trade.
+// Buy: fee taken from COINS received → coins_out = (usdt_in / price) * (1 - FEE)
+// Sell: fee taken from USDT received → usdt_out = coins_in * price * (1 - FEE)
+// Round-trip break-even: price must rise ≈ +0.2005% to cover both legs.
+export const TAKER_FEE = 0.001;          // 0.1%
+const MIN_NOTIONAL_USDT = 11;             // Binance requires $10; we add $1 buffer
+
 export interface SignalData {
   symbol: string;
   entryScore: number;
@@ -29,7 +37,6 @@ export async function updateSignals(
 ): Promise<Record<string, SignalData>> {
   const result: Record<string, SignalData> = {};
 
-  // Get latest AI signal boosts from Supabase
   const aiBoosts: Record<string, number> = {};
   if (sb) {
     const { data } = await sb
@@ -68,9 +75,9 @@ export async function updateSignals(
       const bestAsk = asks.length ? parseFloat(asks[0][0]) : 0;
       const spread = bestAsk > 0 ? ((bestAsk - bestBid) / bestAsk) * 100 : 999;
 
-      const closes = klines.map((k: any[]) => parseFloat(k[4]));
-      const highs  = klines.map((k: any[]) => parseFloat(k[2]));
-      const lows   = klines.map((k: any[]) => parseFloat(k[3]));
+      const closes  = klines.map((k: any[]) => parseFloat(k[4]));
+      const highs   = klines.map((k: any[]) => parseFloat(k[2]));
+      const lows    = klines.map((k: any[]) => parseFloat(k[3]));
       const volumes = klines.map((k: any[]) => parseFloat(k[5]));
 
       const ema9  = calcEMA(closes, 9);
@@ -89,7 +96,6 @@ export async function updateSignals(
       const obRatio = bidVol / (askVol || 1);
       const price = closes[closes.length - 1];
 
-      // Skip abnormal spike
       const prev = closes[closes.length - 2] || price;
       if (Math.abs(((price - prev) / prev) * 100) > 2) return;
 
@@ -117,7 +123,11 @@ export async function checkExits(
     .from('paper_portfolio').select('*').eq('user_session', 'default').gt('quantity', 0);
   if (!holdings || holdings.length === 0) return 0;
 
-  const tpPercent = Math.max(minProfitPct, 0.25); // at least 0.25% to cover fees + profit
+  // Take-profit trigger = desired net profit + fee overhead for both trade legs.
+  // Both legs cost 0.1% each. Price must rise ~0.2005% just to break even.
+  // So add 0.2% on top of the desired net profit as the price-change trigger.
+  const FEE_OVERHEAD_PCT = (1 / Math.pow(1 - TAKER_FEE, 2) - 1) * 100; // ≈ 0.2005%
+  const tpTrigger = Math.max(minProfitPct + FEE_OVERHEAD_PCT, FEE_OVERHEAD_PCT + 0.05);
 
   const { data: cfg } = await sb
     .from('bot_config').select('current_balance').eq('user_session', 'default').maybeSingle();
@@ -132,16 +142,23 @@ export async function checkExits(
     if (!price) continue;
 
     const avgEntry = Number(h.avg_entry_price);
-    const qty      = Number(h.quantity);
-    const gainPct  = ((price - avgEntry) / avgEntry) * 100;
-    const pnl      = Math.round((price - avgEntry) * qty * 100) / 100;
+    const qty      = Number(h.quantity);           // coins held (buy fee already deducted)
+
+    // Raw price-change % — used for stop-loss and take-profit triggers
+    const rawGainPct = ((price - avgEntry) / avgEntry) * 100;
+
+    // Fee-correct PnL: sell proceeds minus original USDT cost
+    // cost_usdt = qty * avgEntry / (1 - FEE) recovers the original USDT spent
+    const sellProceeds = qty * price * (1 - TAKER_FEE);
+    const costBasis    = qty * avgEntry / (1 - TAKER_FEE);
+    const pnl          = Math.round((sellProceeds - costBasis) * 10000) / 10000;
 
     let reason: string | null = null;
 
-    if (gainPct <= -stopLossPct) {
-      reason = `🛑 Stop loss ${gainPct.toFixed(2)}%`;
-    } else if (gainPct >= tpPercent) {
-      reason = `✅ Take profit +${gainPct.toFixed(2)}%`;
+    if (rawGainPct <= -stopLossPct) {
+      reason = `🛑 Stop loss ${rawGainPct.toFixed(2)}% · net ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} USDT`;
+    } else if (rawGainPct >= tpTrigger) {
+      reason = `✅ Take profit +${rawGainPct.toFixed(2)}% · net +$${pnl.toFixed(4)} USDT`;
     }
 
     if (reason) {
@@ -151,14 +168,14 @@ export async function checkExits(
       });
       await sb.from('paper_portfolio').delete()
         .eq('user_session', 'default').eq('symbol', h.symbol);
-      balance += price * qty;
+      balance += sellProceeds; // credit actual USDT received (after sell fee)
       executed++;
     }
   }
 
   if (executed > 0) {
     await sb.from('bot_config').update({
-      current_balance: Math.round(balance * 100) / 100,
+      current_balance: Math.round(balance * 10000) / 10000,
       updated_at: new Date().toISOString(),
     }).eq('user_session', 'default');
   }
@@ -180,7 +197,7 @@ export async function checkEntries(
     .from('bot_config').select('current_balance, stop_loss_percent').eq('user_session', 'default').maybeSingle();
   if (!cfg) return 0;
   let balance = Number(cfg.current_balance);
-  if (balance < 5) return 0;
+  if (balance < MIN_NOTIONAL_USDT) return 0;
 
   // Rate limit: max 30 buys per hour
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
@@ -216,12 +233,15 @@ export async function checkEntries(
     if (sig.rsi > 70) continue;
     if (sig.volumeRatio < 1.0) continue;
 
+    // USDT to spend on this trade (capped at available balance)
     const defaultBudget = balance / Math.max(coins.length, 1);
     const budget     = coinBudgets[symbol] ?? defaultBudget;
-    const allocation = Math.min(budget, balance * 0.25, balance);
-    if (allocation < 5) continue;
+    const allocation = Math.min(budget, balance); // USDT to spend
+    if (allocation < MIN_NOTIONAL_USDT) continue; // Binance minimum notional
 
-    const quantity = Math.round((allocation / price) * 1e6) / 1e6;
+    // Coins received after Binance takes the 0.1% buy fee from the coin amount
+    const quantity   = (allocation / price) * (1 - TAKER_FEE);
+
     const reasons: string[] = [];
     if (sig.ema9 > sig.ema21)      reasons.push('EMA✓');
     if (sig.rsi < 50)              reasons.push(`RSI ${sig.rsi.toFixed(0)}`);
@@ -229,24 +249,25 @@ export async function checkEntries(
     if (sig.volumeRatio > 1.3)     reasons.push(`Vol ${sig.volumeRatio.toFixed(1)}x`);
     if (sig.aiBoost > 0)           reasons.push('AI✓');
 
+    const feeUSDT = allocation * TAKER_FEE;
     await sb.from('bot_trade_history').insert({
       user_session: 'default', symbol,
       side: 'BUY', price, quantity, pnl: null,
-      reason: `Score ${score.toFixed(0)}/100 (${reasons.join(', ')})`,
+      reason: `Score ${score.toFixed(0)}/100 (${reasons.join(', ')}) · spent $${allocation.toFixed(2)} USDT · fee $${feeUSDT.toFixed(4)}`,
     });
     await sb.from('paper_portfolio').upsert({
       user_session: 'default', symbol, quantity,
-      avg_entry_price: Math.round(price * 100) / 100,
+      avg_entry_price: price,
       updated_at: new Date().toISOString(),
     }, { onConflict: 'user_session,symbol' });
 
-    balance -= price * quantity;
+    balance -= allocation; // deduct full USDT spent (fee taken in received coins, not USDT)
     executed++;
   }
 
   if (executed > 0) {
     await sb.from('bot_config').update({
-      current_balance: Math.round(balance * 100) / 100,
+      current_balance: Math.round(balance * 10000) / 10000,
       updated_at: new Date().toISOString(),
     }).eq('user_session', 'default');
   }

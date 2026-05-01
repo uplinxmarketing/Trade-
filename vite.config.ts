@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react-swc";
 import path from "path";
 import fs from "fs";
 import { componentTagger } from "lovable-tagger";
-import type { Plugin } from "vite";
+import type { Plugin, ViteDevServer } from "vite";
 import type { IncomingMessage, ServerResponse } from "http";
 
 const versionJson = JSON.parse(fs.readFileSync("./public/version.json", "utf-8"));
@@ -109,7 +109,7 @@ function chatProxyPlugin(): Plugin {
 function updatePlugin(): Plugin {
   return {
     name: "update-puller",
-    configureServer(server) {
+    configureServer(server: ViteDevServer) {
       server.middlewares.use("/api/update", async (req: IncomingMessage, res: ServerResponse) => {
         if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
         try {
@@ -119,9 +119,11 @@ function updatePlugin(): Plugin {
             timeout: 30_000,
             cwd: process.cwd(),
           });
-          // Re-read version.json so HMR reflects new define values on next restart
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: true, output: output.trim() }));
+          // Restart Vite dev server so the new bundle picks up updated source + version.json
+          // The client will reload after receiving the success response
+          setTimeout(() => server.restart(), 800);
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
           res.writeHead(200, { "Content-Type": "application/json" });
