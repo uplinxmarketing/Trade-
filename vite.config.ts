@@ -106,6 +106,65 @@ function chatProxyPlugin(): Plugin {
   };
 }
 
+function agentPlugin(): Plugin {
+  return {
+    name: "ai-agent",
+    configureServer(server) {
+      server.middlewares.use("/api/agent", async (req: IncomingMessage, res: ServerResponse) => {
+        if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
+
+        let body = "";
+        for await (const chunk of req) body += chunk;
+
+        const apiKey = process.env.ANTHROPIC_API_KEY;
+        if (!apiKey) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "ANTHROPIC_API_KEY not set" }));
+          return;
+        }
+
+        try {
+          const payload = JSON.parse(body);
+          const upstream = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "x-api-key": apiKey,
+              "anthropic-version": "2023-06-01",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              model: "claude-haiku-4-5-20251001",
+              max_tokens: 1024,
+              system: payload.system,
+              messages: [{ role: "user", content: payload.prompt }],
+            }),
+          });
+
+          if (!upstream.ok) {
+            const txt = await upstream.text();
+            throw new Error(`Anthropic ${upstream.status}: ${txt}`);
+          }
+
+          const data = await upstream.json();
+          const text = data.content?.[0]?.text ?? "";
+
+          // Extract JSON from the response (may be wrapped in markdown)
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (!jsonMatch) throw new Error("No JSON in agent response");
+          const parsed = JSON.parse(jsonMatch[0]);
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(parsed));
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: msg }));
+        }
+      });
+    },
+  };
+}
+
 function updatePlugin(): Plugin {
   return {
     name: "update-puller",
@@ -157,6 +216,7 @@ export default defineConfig(({ mode }) => ({
   plugins: [
     react(),
     chatProxyPlugin(),
+    agentPlugin(),
     updatePlugin(),
     mode === "development" && componentTagger(),
   ].filter(Boolean),

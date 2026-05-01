@@ -7,7 +7,7 @@ import ReportDashboard from '@/components/dashboard/ReportDashboard';
 import CoinSelector from '@/components/dashboard/CoinSelector';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import AiAnalysisPanel from '@/components/dashboard/AiAnalysisPanel';
-import AIBotPanel from '@/components/dashboard/AIBotPanel';
+import AITradingAgent from '@/components/dashboard/AITradingAgent';
 import BinanceConnect from '@/components/dashboard/BinanceConnect';
 import ProfitSettings from '@/components/dashboard/ProfitSettings';
 import RecentTrades from '@/components/dashboard/RecentTrades';
@@ -153,7 +153,7 @@ const Index = () => {
                   )}
                 </div>
                 <div className="lg:col-span-2 space-y-4">
-                  <AIBotPanel selectedCoins={selectedCoins} prices={prices} binanceConnected={binanceConnected} onConnectBinance={() => setShowBinanceConnect(true)} />
+                  <AITradingAgent selectedCoins={selectedCoins} prices={prices} binanceConnected={binanceConnected} onConnectBinance={() => setShowBinanceConnect(true)} />
                   <AiAnalysisPanel selectedCoins={selectedCoins} />
                 </div>
               </div>
@@ -169,7 +169,7 @@ const Index = () => {
                   currentPrice={activePrice?.price || '0'}
                   priceChange={activePrice?.priceChangePercent || '0'}
                 />
-                <AIBotPanel selectedCoins={selectedCoins} prices={prices} binanceConnected={binanceConnected} onConnectBinance={() => setShowBinanceConnect(true)} />
+                <AITradingAgent selectedCoins={selectedCoins} prices={prices} binanceConnected={binanceConnected} onConnectBinance={() => setShowBinanceConnect(true)} />
               </div>
               <div className="space-y-4">
                 <PaperWalletPanel prices={prices} />
