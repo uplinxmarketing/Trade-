@@ -97,15 +97,20 @@ if not exist ".env" (
     call :logline ".env file found"
 )
 
-:: ── Auto-update from GitHub (no git required — uses Node.js + PowerShell) ────
-:: Downloads the latest release as a ZIP directly from GitHub and applies it.
-:: Works even when git is not installed — only Node.js (already found above) needed.
-call :logline "Checking for app updates..."
-if exist "scripts\update.js" (
-    node scripts\update.js >> "%LOG_FILE%" 2>&1
+:: ── Auto-update from GitHub (no git required) ────────────────────────────────
+:: Always downloads the LATEST updater script from GitHub raw and runs it.
+:: This is self-bootstrapping — works even if local scripts\update.js is old
+:: or missing. Only requires Node.js (found above) and PowerShell (built-in).
+call :logline "Checking for updates..."
+set "TMPUPD=%TEMP%\tb_updater_%RANDOM%.js"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "(New-Object Net.WebClient).DownloadFile('https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/scripts/update.js','%TMPUPD%')" >nul 2>&1
+if exist "%TMPUPD%" (
+    call :logline "Updater downloaded — running..."
+    node "%TMPUPD%" >> "%LOG_FILE%" 2>&1
+    del "%TMPUPD%" >nul 2>&1
     call :logline "Update check done."
 ) else (
-    call :logline "Update script missing — skipping update."
+    call :logline "Could not reach GitHub (offline?) — skipping update, continuing with local version."
 )
 
 :: ── Smart dependency check ───────────────────────────────────────────────────

@@ -181,23 +181,69 @@ function updatePlugin(): Plugin {
       server.middlewares.use("/api/update", async (req: IncomingMessage, res: ServerResponse) => {
         if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
         try {
+          const nodeOs   = await import("os");
+          const nodePath = await import("path");
+          const nodeFs   = await import("fs");
+          const https    = await import("https");
+          const http     = await import("http");
           const { execSync } = await import("child_process");
-          const nodePath     = await import("path");
 
-          // Use the same update.js script that start.bat uses.
-          // It downloads the ZIP from GitHub using only Node.js + PowerShell —
-          // no git installation required.
-          const updateScript = nodePath.join(process.cwd(), "scripts", "update.js");
-          const output = execSync(`node "${updateScript}"`, {
-            encoding: "utf-8",
-            timeout: 120_000,   // ZIP download can take a minute on slow connections
-            cwd: process.cwd(),
+          const ZIP_URL = "https://github.com/uplinxmarketing/Trade-/archive/refs/heads/main.zip";
+          const appDir  = process.cwd();
+          const uid     = Date.now();
+          const zipPath = nodePath.join(nodeOs.tmpdir(), `tb_upd_${uid}.zip`);
+          const extPath = nodePath.join(nodeOs.tmpdir(), `tb_upd_ext_${uid}`);
+
+          // Download ZIP following redirects (GitHub → S3)
+          await new Promise<void>((resolve, reject) => {
+            function get(url: string) {
+              const mod = url.startsWith("https") ? https : http;
+              (mod as typeof https).get(url, { headers: { "User-Agent": "TradeBot-Updater/1.0" } }, (r) => {
+                if (r.statusCode && r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) {
+                  return get(r.headers.location);
+                }
+                const out = nodeFs.createWriteStream(zipPath);
+                r.pipe(out);
+                out.on("finish", () => out.close(() => resolve()));
+                out.on("error", reject);
+                r.on("error", reject);
+              }).on("error", reject);
+            }
+            get(ZIP_URL);
           });
 
+          // Extract with PowerShell (built into every modern Windows)
+          if (nodeFs.existsSync(extPath)) {
+            execSync(`powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item '${extPath}' -Recurse -Force"`, { timeout: 30_000 });
+          }
+          execSync(
+            `powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${extPath}' -Force"`,
+            { timeout: 120_000 }
+          );
+
+          // Copy all files except protected dirs — use Node.js built-in fs.cpSync (Node 18+)
+          const entries = nodeFs.readdirSync(extPath);
+          if (!entries.length) throw new Error("Extracted ZIP is empty");
+          const srcDir = nodePath.join(extPath, entries[0]);
+          const skip   = new Set(["node_modules", "logs", ".env", "dist", ".git"]);
+
+          for (const entry of nodeFs.readdirSync(srcDir)) {
+            if (skip.has(entry)) continue;
+            const src = nodePath.join(srcDir, entry);
+            const dst = nodePath.join(appDir, entry);
+            nodeFs.cpSync(src, dst, { recursive: true, force: true });
+          }
+
+          // Cleanup temp files
+          try { nodeFs.unlinkSync(zipPath); } catch { /* ok */ }
+          try {
+            execSync(`powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item '${extPath}' -Recurse -Force -ErrorAction SilentlyContinue"`, { timeout: 20_000, stdio: "ignore" });
+          } catch { /* ok */ }
+
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true, output: output.trim() }));
-          // Restart Vite so the new bundle picks up the freshly-copied source files.
-          // Client polls /api/ping every second and reloads once the server is back.
+          res.end(JSON.stringify({ success: true, output: "Update downloaded and applied." }));
+          // Vite restart rebundles with the new version.json.
+          // Client polls /api/ping and reloads once the server is back up.
           setTimeout(() => server.restart(), 1500);
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
