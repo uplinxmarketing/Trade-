@@ -64,12 +64,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [expandedLog, setExpandedLog] = useState<string | null>(null);
   const [agentStatus, setAgentStatus] = useState('');
   const [cycleCountdown, setCycleCountdown] = useState(0);
+  const [learningStatus, setLearningStatus] = useState('Initialising…');
+  const [learningActive, setLearningActive] = useState(false);
 
   const isRunningRef = useRef(false);
   const processingRef = useRef(false);
   const balanceRef = useRef(balance);
   const cycleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const learningTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const stopLossRef = useRef(1.5);
   // minProfit removed — agent exits as soon as pnl > 0 after fees
 
@@ -249,6 +252,40 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     }
   }, [selectedCoins, instructions, loadData]);
 
+  // Always-on learning — runs every 60 s regardless of trading state
+  const runLearningCycle = useCallback(async () => {
+    if (!selectedCoins.length || !Object.keys(pricesRef.current).length) return;
+    setLearningActive(true);
+    try {
+      const [posRes, histRes] = await Promise.all([
+        supabase.from('paper_portfolio').select('*').eq('user_session', 'default').gt('quantity', 0),
+        supabase.from('bot_trade_history').select('*').eq('user_session', 'default').order('created_at', { ascending: false }).limit(10),
+      ]);
+      const result = await runAgentCycle(
+        selectedCoins, pricesRef.current,
+        (posRes.data ?? []) as OpenPosition[],
+        (histRes.data ?? []) as RecentTrade[],
+        balanceRef.current,
+        instructions,
+      );
+      const buys  = result.decisions.filter(d => d.action === 'BUY').length;
+      const sells = result.decisions.filter(d => d.action === 'SELL').length;
+      const holds = result.decisions.filter(d => d.action === 'HOLD').length;
+      setLearningStatus(`${new Date().toLocaleTimeString()} · ${buys}↑ ${sells}↓ ${holds}◼ · ${result.learned.slice(0, 80)}`);
+    } catch {
+      setLearningStatus('Offline — retrying…');
+    } finally {
+      setLearningActive(false);
+    }
+  }, [selectedCoins, instructions]);
+
+  useEffect(() => {
+    // Kick off first learning pass after a short delay
+    const t = setTimeout(() => runLearningCycle(), 3000);
+    learningTimerRef.current = setInterval(() => runLearningCycle(), 60_000);
+    return () => { clearTimeout(t); if (learningTimerRef.current) clearInterval(learningTimerRef.current); };
+  }, [runLearningCycle]);
+
   const scheduleNextCycle = useCallback(() => {
     if (cycleTimerRef.current) clearTimeout(cycleTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
@@ -348,12 +385,16 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         <div className="flex items-center gap-2">
           <div className={`w-2.5 h-2.5 rounded-full animate-pulse ${isRunning ? 'bg-accent' : 'bg-muted-foreground'}`} />
           <Brain className="w-3.5 h-3.5 text-accent" />
-          <h3 className="text-sm font-semibold">Claude AI Agent</h3>
+          <h3 className="text-sm font-semibold">AI Trading Agent</h3>
           <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${mode === 'live' ? 'bg-loss/20 text-loss' : 'bg-accent/20 text-accent'}`}>
             {mode === 'live' ? 'LIVE' : 'PAPER'}
           </span>
+          {/* Always-on learning indicator */}
+          <span className={`flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-blue-500/10 border border-blue-500/30 text-blue-400 ${learningActive ? 'animate-pulse' : ''}`}>
+            <BookOpen className="w-2.5 h-2.5" /> {learningActive ? 'Learning…' : 'Learning ✓'}
+          </span>
           {isRunning && cycleCountdown > 0 && (
-            <span className="text-[9px] text-muted-foreground font-mono">next cycle in {cycleCountdown}s</span>
+            <span className="text-[9px] text-muted-foreground font-mono">next in {cycleCountdown}s</span>
           )}
         </div>
         <button onClick={resetBot} className="p-1.5 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground" title="Reset">
@@ -484,6 +525,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       {isRunning && agentStatus && (
         <p className="text-[10px] text-center text-accent -mt-2 font-mono">{agentStatus}</p>
       )}
+      {/* Always-on learning status (shown even when bot is stopped) */}
+      <div className="flex items-start gap-1.5 text-[9px] text-blue-400/70 bg-blue-500/5 border border-blue-500/15 rounded px-2 py-1.5 font-mono leading-relaxed">
+        <BookOpen className="w-3 h-3 flex-shrink-0 mt-px" />
+        <span className="truncate">{learningStatus}</span>
+      </div>
 
       {/* ── Open Positions ── */}
       {positions.length > 0 && (

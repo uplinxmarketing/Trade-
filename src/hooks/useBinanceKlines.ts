@@ -3,6 +3,7 @@ import type { KlineData } from '@/lib/binance-types';
 
 const INTERVAL_MAP: Record<string, { binance: string; limit: number }> = {
   '1m': { binance: '1m', limit: 60 },
+  '3m': { binance: '3m', limit: 60 },
   '5m': { binance: '5m', limit: 60 },
   '15m': { binance: '15m', limit: 60 },
   '1h': { binance: '1h', limit: 48 },
