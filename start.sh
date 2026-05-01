@@ -41,6 +41,18 @@ if ! command -v npm &>/dev/null; then
 fi
 log "npm $(npm --version) OK"
 
+# ── Auto-create .env if missing ──────────────────────────────────────────────
+if [ ! -f ".env" ]; then
+  log "Creating .env file with Supabase credentials..."
+  cat > .env << 'ENVEOF'
+VITE_SUPABASE_URL=https://hkwirofdkgdamqnlcjqf.supabase.co
+VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_6p26q62HNaU7pqv9k9jb_w_8S0ixNrP
+ENVEOF
+  log ".env created OK"
+else
+  log ".env file found"
+fi
+
 # ── Smart dependency check ────────────────────────────────────────────────────
 # Only reinstall when package.json changes — stores its timestamp as a marker.
 MARKER="node_modules/.install-marker"

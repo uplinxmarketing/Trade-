@@ -85,27 +85,16 @@ if %ERRORLEVEL% NEQ 0 (
 for /f "tokens=*" %%v in ('npm --version') do set NPM_VER=%%v
 call :logline "npm v%NPM_VER% OK"
 
-:: ── Check .env file ──────────────────────────────────────────────────────────
+:: ── Auto-create .env if missing ──────────────────────────────────────────────
 if not exist ".env" (
-    call :logline "WARNING: .env file not found."
-    echo.
-    echo   ================================================================
-    echo   WARNING: No .env file found.
-    echo   The app will open but show a setup screen in the browser.
-    echo.
-    echo   To fix this:
-    echo    1. Go to https://supabase.com/dashboard/project/hkwirofdkgdamqnlcjqf/settings/api
-    echo    2. Copy your "anon / public" key
-    echo    3. Create a file called .env in this folder with:
-    echo.
-    echo       VITE_SUPABASE_URL=https://hkwirofdkgdamqnlcjqf.supabase.co
-    echo       VITE_SUPABASE_PUBLISHABLE_KEY=your-anon-key-here
-    echo.
-    echo    4. Save the file and run start.bat again
-    echo   ================================================================
-    echo.
-    echo   Starting anyway so you can see the setup instructions in browser...
-    echo.
+    call :logline "Creating .env file with Supabase credentials..."
+    (
+        echo VITE_SUPABASE_URL=https://hkwirofdkgdamqnlcjqf.supabase.co
+        echo VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_6p26q62HNaU7pqv9k9jb_w_8S0ixNrP
+    ) > .env
+    call :logline ".env created OK"
+) else (
+    call :logline ".env file found"
 )
 
 :: ── Smart dependency check ───────────────────────────────────────────────────
