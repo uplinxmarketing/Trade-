@@ -5,17 +5,17 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# ── Log setup ────────────────────────────────────────────────────────────────
-LOG_DIR="logs"
-mkdir -p "$LOG_DIR"
+mkdir -p logs
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="$LOG_DIR/tradebot_$TIMESTAMP.log"
+LOG_FILE="logs/tradebot_$TIMESTAMP.log"
+echo "TradeBot AI — Session $TIMESTAMP" > "$LOG_FILE"
+
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 bail() {
-  echo "[$(date '+%H:%M:%S')] ERROR: $*"
-  osascript -e "display alert \"TradeBot AI Error\" message \"$*\n\nFull log: $LOG_FILE\""
+  log "ERROR: $*"
+  osascript -e "display alert \"TradeBot AI Error\" message \"$*\n\nFull log:\n$LOG_FILE\""
   exit 1
 }
 
@@ -24,34 +24,65 @@ echo "  ╔═══════════════════════
 echo "  ║      TradeBot AI v2.1.0      ║"
 echo "  ╚══════════════════════════════╝"
 echo ""
-log "Log file: $LOG_FILE"
+log "Log: $LOG_FILE"
 
-# ── Check Node.js ─────────────────────────────────────────────────────────────
 if ! command -v node &>/dev/null; then
-  bail "Node.js not found. Install from https://nodejs.org (v18+)"
+  bail "Node.js not installed. Download from https://nodejs.org (v18+)"
 fi
-
 NODE_VER=$(node -e "process.stdout.write(process.versions.node)")
 MAJOR=${NODE_VER%%.*}
 if [ "$MAJOR" -lt 18 ]; then
-  bail "Node.js v$NODE_VER is too old. Please install v18 or higher."
+  bail "Node.js v$NODE_VER is too old — need v18+."
 fi
-log "Node.js $NODE_VER ✔"
+log "Node.js v$NODE_VER OK"
 
-# ── Install dependencies ──────────────────────────────────────────────────────
-if [ ! -d "node_modules" ] || [ ! -f "node_modules/.package-lock.json" ]; then
-  log "Installing dependencies (first run only)..."
-  npm install || bail "npm install failed. See log: $LOG_FILE"
-  log "Dependencies installed ✔"
+if ! command -v npm &>/dev/null; then
+  bail "npm not found — reinstall Node.js from https://nodejs.org"
+fi
+log "npm $(npm --version) OK"
+
+# ── Smart dependency check ────────────────────────────────────────────────────
+MARKER="node_modules/.install-marker"
+NEED_INSTALL=0
+
+if [ ! -d "node_modules" ]; then
+  log "node_modules not found — installing..."
+  NEED_INSTALL=1
+elif [ ! -f "$MARKER" ]; then
+  log "Install marker missing — reinstalling..."
+  NEED_INSTALL=1
 else
-  log "Dependencies ready ✔"
+  PKG_TIME=$(stat -f %m package.json 2>/dev/null || date -r package.json +%s 2>/dev/null || echo "0")
+  STORED_TIME=$(cat "$MARKER" 2>/dev/null || echo "")
+  if [ "$PKG_TIME" != "$STORED_TIME" ]; then
+    log "package.json changed — updating dependencies..."
+    NEED_INSTALL=1
+  else
+    log "Dependencies up to date — skipping install."
+  fi
+fi
+
+if [ "$NEED_INSTALL" = "1" ]; then
+  echo ""
+  log "Installing dependencies — output visible below and in log..."
+  echo ""
+  if ! npm install; then
+    bail "npm install failed — check the log for details."
+  fi
+  if [ ! -d "node_modules/vite" ]; then
+    bail "Install incomplete — vite missing. Try running 'npm install' manually."
+  fi
+  PKG_TIME=$(stat -f %m package.json 2>/dev/null || date -r package.json +%s 2>/dev/null || echo "0")
+  echo "$PKG_TIME" > "$MARKER"
+  log "Dependencies installed OK — marker saved."
+  echo ""
 fi
 
 echo ""
-log "Starting TradeBot AI — browser will open automatically..."
-log "Close this window to stop."
+log "Starting TradeBot AI on http://localhost:8080 ..."
+echo "  Browser will open automatically. Close this window to stop."
 echo ""
 
 trap 'log "Server stopped."; exit 0' INT TERM
 
-npm run dev -- --open || bail "Dev server crashed. See log: $LOG_FILE"
+npm run dev -- --open || bail "Dev server crashed — check the log."
