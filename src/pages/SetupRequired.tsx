@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Bot, Key, ExternalLink, CheckCircle2, Copy, Check } from 'lucide-react';
 
-const SUPABASE_PROJECT_ID = 'wvrrsoggggmvopllyhxo';
+const SUPABASE_PROJECT_ID = 'hkwirofdkgdamqnlcjqf';
 
 const SetupRequired = () => {
   const [copied, setCopied] = useState<string | null>(null);
