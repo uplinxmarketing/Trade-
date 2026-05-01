@@ -71,7 +71,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const cycleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const stopLossRef = useRef(1.5);
-  const minProfitRef = useRef(0.25);
+  // minProfit removed — agent exits as soon as pnl > 0 after fees
 
   useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
   useEffect(() => { balanceRef.current = balance; }, [balance]);
@@ -108,13 +108,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
   useEffect(() => {
     supabase.from('bot_config')
-      .select('stop_loss_percent, min_profit_percent')
+      .select('stop_loss_percent')
       .eq('user_session', 'default').maybeSingle()
       .then(({ data }) => {
-        if (data) {
-          stopLossRef.current = Number(data.stop_loss_percent ?? 1.5);
-          minProfitRef.current = Number(data.min_profit_percent ?? 0.25);
-        }
+        if (data) stopLossRef.current = Number(data.stop_loss_percent ?? 1.5);
       });
   }, []);
 
@@ -136,7 +133,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (!Object.keys(prices).length) return;
 
     processingRef.current = true;
-    checkExits(prices, supabase, stopLossRef.current, minProfitRef.current)
+    checkExits(prices, supabase, stopLossRef.current)
       .then(exits => {
         if (exits > 0) {
           loadData();

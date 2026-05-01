@@ -117,20 +117,15 @@ export async function updateSignals(
 }
 
 // ── Check open positions — runs on every price tick (~1 s) ───────────────────
-// No minimum hold time — a trade profitable in 2 seconds exits in 2 seconds.
+// Exits as soon as the fee-correct PnL turns positive — no minimum hold time.
 export async function checkExits(
   prices: LivePrices,
   sb: SupabaseClient,
   stopLossPct = 1.5,
-  minProfitPct = 0.25
 ): Promise<number> {
   const { data: holdings } = await sb
     .from('paper_portfolio').select('*').eq('user_session', 'default').gt('quantity', 0);
   if (!holdings || holdings.length === 0) return 0;
-
-  // Take-profit price trigger = desired net profit + fee round-trip overhead (≈0.2%)
-  const FEE_OVERHEAD_PCT = (1 / Math.pow(1 - TAKER_FEE, 2) - 1) * 100; // ≈0.2005%
-  const tpTrigger = Math.max(minProfitPct + FEE_OVERHEAD_PCT, FEE_OVERHEAD_PCT + 0.05);
 
   const { data: cfg } = await sb
     .from('bot_config').select('current_balance').eq('user_session', 'default').maybeSingle();
@@ -145,12 +140,11 @@ export async function checkExits(
     if (!price) continue;
 
     const avgEntry = Number(h.avg_entry_price);
-    const qty      = Number(h.quantity); // coins held (buy fee already deducted)
+    const qty      = Number(h.quantity);
 
-    // Raw price-change % for trigger logic
     const rawGainPct = ((price - avgEntry) / avgEntry) * 100;
 
-    // Fee-correct PnL: recover original USDT cost, deduct sell fee
+    // Fee-correct PnL: what we actually receive minus what we actually spent
     const sellProceeds = qty * price * (1 - TAKER_FEE);
     const costBasis    = qty * avgEntry / (1 - TAKER_FEE);
     const pnl          = Math.round((sellProceeds - costBasis) * 10000) / 10000;
@@ -158,8 +152,9 @@ export async function checkExits(
     let reason: string | null = null;
     if (rawGainPct <= -stopLossPct) {
       reason = `🛑 Stop loss ${rawGainPct.toFixed(2)}% · net ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} USDT`;
-    } else if (rawGainPct >= tpTrigger) {
-      reason = `✅ Take profit +${rawGainPct.toFixed(2)}% · net +$${pnl.toFixed(4)} USDT`;
+    } else if (pnl > 0) {
+      // Sell the instant the position is profitable after both fees
+      reason = `✅ Profit +$${pnl.toFixed(4)} USDT · +${rawGainPct.toFixed(3)}%`;
     }
 
     if (reason) {
