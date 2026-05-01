@@ -106,11 +106,40 @@ function chatProxyPlugin(): Plugin {
   };
 }
 
-// No update plugin needed — the app is browser-hosted.
-// Updates deploy automatically when code is pushed to GitHub.
-// The client simply reloads the page to get the latest bundle.
 function updatePlugin(): Plugin {
-  return { name: "update-puller" };
+  return {
+    name: "update-puller",
+    configureServer(server) {
+      server.middlewares.use("/api/ping", (_req: IncomingMessage, res: ServerResponse) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      });
+
+      server.middlewares.use("/api/update", async (req: IncomingMessage, res: ServerResponse) => {
+        if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
+        try {
+          const { execSync } = await import("child_process");
+          // shell:true uses cmd.exe on Windows — the same PATH the user's terminal
+          // sees, so git is found even when not in Node's default process.env.PATH.
+          const output = execSync("git pull --ff-only origin main", {
+            encoding: "utf-8",
+            timeout: 30_000,
+            cwd: process.cwd(),
+            shell: true,
+          });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true, output: output.trim() }));
+          // Restart Vite so the new bundle picks up the pulled code + version.json.
+          // Client polls /api/ping and reloads once the server is back.
+          setTimeout(() => server.restart(), 1500);
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: msg }));
+        }
+      });
+    },
+  };
 }
 
 export default defineConfig(({ mode }) => ({

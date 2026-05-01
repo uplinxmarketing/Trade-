@@ -1,5 +1,5 @@
 {
-  "version": "2.4.2",
-  "buildTime": "2026-05-01T23:00:00Z",
-  "commit": "browser-hosted-simple-reload"
+  "version": "2.4.3",
+  "buildTime": "2026-05-02T00:00:00Z",
+  "commit": "fix-update-windows-shell-true"
 }
