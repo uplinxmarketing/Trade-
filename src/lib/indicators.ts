@@ -66,23 +66,45 @@ export interface EntryScoreParams {
   volumeIncreasing: boolean;
 }
 
+// Score 0-100 based on confluence of signals.
+// Threshold to place a trade is ENTRY_SCORE_THRESHOLD (55).
+// Getting 55 requires at least 2-3 agreeing indicators, not perfection.
+//
+// Breakdown (max per group):
+//   EMA trend  : 25 pts
+//   RSI zone   : 25 pts
+//   MACD       : 25 pts
+//   Volume     : 15 pts
+//   OB + BB    : 10 pts
+//   Total max  : 100 pts
 export function calcEntryScore(p: EntryScoreParams): number {
   let score = 0;
-  if (p.ema9 > p.ema21) score += 10;
-  if (p.ema21 > p.ema50) score += 5;
-  if (p.price > p.ema9) score += 5;
-  if (p.rsi > 30 && p.rsi < 50) score += 25;
-  else if (p.rsi >= 50 && p.rsi < 60) score += 15;
-  else if (p.rsi < 30) score += 10;
-  if (p.macd.histogram > 0) score += 15;
-  if (p.macd.macdLine > p.macd.signalLine) score += 10;
-  if (p.volumeRatio > 1.5) score += 15;
-  else if (p.volumeRatio > 1.3) score += 10;
-  else if (p.volumeIncreasing) score += 5;
-  if (p.obRatio > 1.5) score += 10;
-  else if (p.obRatio > 1.2) score += 7;
-  if (p.bb.position < 0.3) score += 5;
-  else if (p.bb.position < 0.5) score += 3;
+
+  // EMA trend structure (max 25)
+  if (p.ema9 > p.ema21) score += 15;   // short-term momentum up
+  if (p.ema21 > p.ema50) score += 7;   // medium-term trend up
+  if (p.price > p.ema9) score += 3;    // price above short EMA
+
+  // RSI zones — prime buy zone is 30-50, not narrow 30-50 only (max 25)
+  if (p.rsi >= 30 && p.rsi < 45)       score += 25; // prime: recovering from oversold
+  else if (p.rsi >= 45 && p.rsi < 60)  score += 18; // neutral-bullish: fine to enter
+  else if (p.rsi >= 60 && p.rsi < 70)  score += 8;  // elevated but not extreme
+  else if (p.rsi < 30)                  score += 15; // oversold bounce potential
+
+  // MACD momentum (max 25)
+  if (p.macd.histogram > 0)                      score += 15; // momentum turning up
+  if (p.macd.macdLine > p.macd.signalLine)       score += 10; // crossover confirmed
+
+  // Volume confirmation (max 15)
+  if (p.volumeRatio > 1.5)       score += 15;
+  else if (p.volumeRatio > 1.2)  score += 10;
+  else if (p.volumeIncreasing)   score +=  5;
+
+  // Order book + Bollinger Bands (max 10)
+  if (p.obRatio > 1.3)           score += 7;
+  else if (p.obRatio > 1.0)      score += 3;
+  if (p.bb.position < 0.35)      score += 3; // near lower band — potential support
+
   return Math.min(100, score);
 }
 

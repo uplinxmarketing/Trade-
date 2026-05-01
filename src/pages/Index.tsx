@@ -14,6 +14,7 @@ import RecentTrades from '@/components/dashboard/RecentTrades';
 import TradePanel from '@/components/dashboard/TradePanel';
 import NotificationCenter from '@/components/dashboard/NotificationCenter';
 import WalletPanel from '@/components/dashboard/WalletPanel';
+import PaperWalletPanel from '@/components/dashboard/PaperWalletPanel';
 import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
@@ -30,10 +31,9 @@ const Index = () => {
   const { prices, connected: wsConnected } = useBinanceWebSocket(selectedCoins);
   const activePrice = prices[activeCoin];
 
-  // Delete all legacy multi-bots on first load to start fresh
+  // Ensure a single bot_config row exists (ignoreDuplicates = don't overwrite existing)
   useEffect(() => {
     supabase.from('trading_bots').delete().eq('user_session', 'default').then(() => {});
-    // Ensure a single bot_config row exists
     supabase.from('bot_config').upsert({
       user_session: 'default',
       selected_coins: DEFAULT_COINS,
@@ -141,6 +141,7 @@ const Index = () => {
 
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
                 <div className="space-y-4">
+                  <PaperWalletPanel prices={prices} />
                   <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} />
                   <ProfitSettings />
                   {binanceConnected && (
@@ -171,6 +172,7 @@ const Index = () => {
                 <AIBotPanel selectedCoins={selectedCoins} prices={prices} binanceConnected={binanceConnected} onConnectBinance={() => setShowBinanceConnect(true)} />
               </div>
               <div className="space-y-4">
+                <PaperWalletPanel prices={prices} />
                 <AiAnalysisPanel selectedCoins={selectedCoins} />
                 <ProfitSettings />
                 <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} />

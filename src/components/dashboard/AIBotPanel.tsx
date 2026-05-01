@@ -2,14 +2,14 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Play, Square, Brain, TrendingUp, TrendingDown, Zap,
   RotateCcw, ChevronDown, ChevronUp, FlaskConical,
-  DollarSign, Settings2, Pencil, Check, X,
+  DollarSign, Pencil, Check, X, Settings2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
 import {
   updateSignals, checkExits, checkEntries, runAnalysisCycle,
-  type SignalData, type LivePrices, TAKER_FEE,
+  type SignalData, type LivePrices, TAKER_FEE, ENTRY_SCORE_THRESHOLD,
 } from '@/lib/trading-engine';
 
 interface Trade {
@@ -54,6 +54,8 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
   const [totalPnl, setTotalPnl]   = useState(0);
   const [winRate, setWinRate]     = useState(0);
   const [analysisStatus, setAnalysisStatus] = useState('Initializing analysis...');
+  const [signalScores, setSignalScores]     = useState<Record<string, number>>({});
+  const [signalRefreshedAt, setSignalRefreshedAt] = useState<string>('');
 
   // Refs — avoid stale closures in the price-tick effect
   const signalsRef      = useRef<Record<string, SignalData>>({});
@@ -120,17 +122,24 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
     return () => { supabase.removeChannel(ch); };
   }, [loadData]);
 
-  // Always-on: refresh indicator signals every 2 min
+  // Always-on: refresh indicator signals every 2 min + expose scores to UI
+  const refreshSignals = useCallback(async (coins: string[]) => {
+    const sigs = await updateSignals(coins, supabase);
+    signalsRef.current = sigs;
+    const scores: Record<string, number> = {};
+    for (const [sym, sig] of Object.entries(sigs)) {
+      scores[sym] = sig.entryScore + sig.aiBoost;
+    }
+    setSignalScores(scores);
+    setSignalRefreshedAt(new Date().toLocaleTimeString());
+  }, []);
+
   useEffect(() => {
     if (!selectedCoins.length) return;
-    const refresh = async () => {
-      const sigs = await updateSignals(selectedCoins, supabase);
-      signalsRef.current = sigs;
-    };
-    refresh();
-    const id = setInterval(refresh, 2 * 60 * 1000);
+    refreshSignals(selectedCoins);
+    const id = setInterval(() => refreshSignals(selectedCoins), 2 * 60 * 1000);
     return () => clearInterval(id);
-  }, [selectedCoins]);
+  }, [selectedCoins, refreshSignals]);
 
   // Always-on: run AI analysis cycle every 5 min
   useEffect(() => {
@@ -174,6 +183,10 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
     setLoading(true);
     try {
       if (!isRunning) {
+        // Always refresh signals before starting so first ticks have data ready
+        toast.info('Loading market signals…', { duration: 2000 });
+        await refreshSignals(selectedCoins);
+
         await supabase.from('bot_config').upsert({
           user_session: 'default',
           selected_coins: selectedCoins,
@@ -369,19 +382,45 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
         )}
       </div>
 
-      {/* ── Always-on analysis ── */}
-      <div className="flex items-center gap-2 bg-accent/10 border border-accent/20 rounded-md px-3 py-2">
-        <Brain className="w-3.5 h-3.5 text-accent animate-pulse flex-shrink-0" />
-        <div className="flex-1 min-w-0">
+      {/* ── Signal scores ── */}
+      <div className="bg-accent/10 border border-accent/20 rounded-md px-3 py-2.5 space-y-2">
+        <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <span className="text-xs text-accent font-semibold">AI Analysis Always Active</span>
+            <Brain className="w-3.5 h-3.5 text-accent animate-pulse flex-shrink-0" />
+            <span className="text-xs text-accent font-semibold">Signal Scores</span>
             {isRunning && (
               <span className="text-[9px] font-mono text-gain flex items-center gap-0.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-gain animate-ping inline-block" />exits checked every ~1 s
+                <span className="w-1.5 h-1.5 rounded-full bg-gain animate-ping inline-block" />exits ~1 s
               </span>
             )}
           </div>
-          <p className="text-[10px] text-muted-foreground truncate">{analysisStatus}</p>
+          <span className="text-[9px] text-muted-foreground font-mono">
+            {signalRefreshedAt ? `updated ${signalRefreshedAt}` : 'loading…'}
+          </span>
+        </div>
+
+        {/* Per-coin score bars */}
+        {selectedCoins.map(coin => {
+          const score  = signalScores[coin] ?? null;
+          const ready  = score !== null && score >= ENTRY_SCORE_THRESHOLD;
+          const width  = score !== null ? `${Math.min(score, 100)}%` : '0%';
+          const color  = ready ? 'bg-gain' : score !== null && score >= 40 ? 'bg-warn' : 'bg-loss/40';
+          return (
+            <div key={coin} className="flex items-center gap-2">
+              <span className="text-[10px] font-mono w-10 text-muted-foreground shrink-0">{coin.replace('USDT', '')}</span>
+              <div className="flex-1 h-1.5 bg-muted/30 rounded-full overflow-hidden">
+                <div className={`h-full rounded-full transition-all duration-500 ${color}`} style={{ width }} />
+              </div>
+              <span className={`text-[10px] font-mono w-7 text-right tabular-nums ${ready ? 'text-gain font-semibold' : 'text-muted-foreground'}`}>
+                {score !== null ? score : '—'}
+              </span>
+              {ready && <span className="text-[9px] text-gain">✓</span>}
+            </div>
+          );
+        })}
+        <div className="text-[9px] text-muted-foreground flex justify-between">
+          <span>Score ≥{ENTRY_SCORE_THRESHOLD} → trade · refreshes every 2 min</span>
+          <span>{analysisStatus.includes('Analyzed') ? analysisStatus : ''}</span>
         </div>
       </div>
 

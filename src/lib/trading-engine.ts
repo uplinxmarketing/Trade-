@@ -4,12 +4,16 @@ import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcATR, calcSMA, calcE
 const B = 'https://api.binance.com/api/v3';
 
 // ── Binance fee constants ────────────────────────────────────────────────────
-// Default spot taker fee: 0.1% per trade.
-// Buy: fee taken from COINS received → coins_out = (usdt_in / price) * (1 - FEE)
-// Sell: fee taken from USDT received → usdt_out = coins_in * price * (1 - FEE)
-// Round-trip break-even: price must rise ≈ +0.2005% to cover both legs.
-export const TAKER_FEE = 0.001;          // 0.1%
-const MIN_NOTIONAL_USDT = 11;             // Binance requires $10; we add $1 buffer
+// Spot taker fee: 0.1% per trade.
+// BUY:  fee taken from coins received  → coins_out = (usdt_in / price) × (1 − FEE)
+// SELL: fee taken from USDT received  → usdt_out  = coins_in × price × (1 − FEE)
+// Break-even: price must rise ≈ +0.2005% to cover both legs.
+export const TAKER_FEE = 0.001;     // 0.1%
+const MIN_NOTIONAL_USDT = 11;        // Binance minimum is $10; we add $1 buffer
+
+// Minimum score to place an entry trade.
+// 55 requires roughly 2-3 agreeing indicators (EMA + MACD, or EMA + RSI + vol).
+export const ENTRY_SCORE_THRESHOLD = 55;
 
 export interface SignalData {
   symbol: string;
@@ -30,13 +34,14 @@ export interface SignalData {
 
 export type LivePrices = Record<string, { price: string; priceChangePercent: string }>;
 
-// ── Fetch indicators from klines (runs every 2 min) ──────────────────────────
+// ── Fetch indicators from Binance klines ─────────────────────────────────────
 export async function updateSignals(
   coins: string[],
   sb?: SupabaseClient
 ): Promise<Record<string, SignalData>> {
   const result: Record<string, SignalData> = {};
 
+  // Latest AI signal boosts from Supabase (optional, non-blocking)
   const aiBoosts: Record<string, number> = {};
   if (sb) {
     const { data } = await sb
@@ -87,32 +92,32 @@ export async function updateSignals(
       const macd  = calcMACD(closes);
       const bb    = calcBollingerBands(closes);
       const atr   = calcATR(highs, lows, closes, 14);
-      const volumeSma    = calcSMA(volumes, 20);
-      const currentVol   = volumes[volumes.length - 1] || 0;
-      const volumeRatio  = volumeSma > 0 ? currentVol / volumeSma : 1;
-      const recentVol    = volumes.slice(-15).reduce((a, b) => a + b, 0);
-      const prevVol      = volumes.slice(-30, -15).reduce((a, b) => a + b, 0);
+      const volumeSma     = calcSMA(volumes, 20);
+      const currentVol    = volumes[volumes.length - 1] || 0;
+      const volumeRatio   = volumeSma > 0 ? currentVol / volumeSma : 1;
+      const recentVol     = volumes.slice(-15).reduce((a, b) => a + b, 0);
+      const prevVol       = volumes.slice(-30, -15).reduce((a, b) => a + b, 0);
       const volumeIncreasing = recentVol > prevVol;
       const obRatio = bidVol / (askVol || 1);
       const price = closes[closes.length - 1];
 
-      const prev = closes[closes.length - 2] || price;
-      if (Math.abs(((price - prev) / prev) * 100) > 2) return;
-
-      const entryScore = calcEntryScore({ ema9, ema21, ema50, price, rsi, macd, volumeRatio, obRatio, bb, volumeIncreasing });
+      const entryScore = calcEntryScore({
+        ema9, ema21, ema50, price, rsi, macd, volumeRatio, obRatio, bb, volumeIncreasing,
+      });
 
       result[symbol] = {
         symbol, entryScore, rsi, ema9, ema21, ema50, macd, bb,
         atr, volumeRatio, obRatio, spread, volumeIncreasing,
         aiBoost: aiBoosts[symbol] || 0,
       };
-    } catch { /* skip coin */ }
+    } catch { /* skip coin on error */ }
   }));
 
   return result;
 }
 
-// ── Check open positions — runs on every price tick ──────────────────────────
+// ── Check open positions — runs on every price tick (~1 s) ───────────────────
+// No minimum hold time — a trade profitable in 2 seconds exits in 2 seconds.
 export async function checkExits(
   prices: LivePrices,
   sb: SupabaseClient,
@@ -123,15 +128,13 @@ export async function checkExits(
     .from('paper_portfolio').select('*').eq('user_session', 'default').gt('quantity', 0);
   if (!holdings || holdings.length === 0) return 0;
 
-  // Take-profit trigger = desired net profit + fee overhead for both trade legs.
-  // Both legs cost 0.1% each. Price must rise ~0.2005% just to break even.
-  // So add 0.2% on top of the desired net profit as the price-change trigger.
-  const FEE_OVERHEAD_PCT = (1 / Math.pow(1 - TAKER_FEE, 2) - 1) * 100; // ≈ 0.2005%
+  // Take-profit price trigger = desired net profit + fee round-trip overhead (≈0.2%)
+  const FEE_OVERHEAD_PCT = (1 / Math.pow(1 - TAKER_FEE, 2) - 1) * 100; // ≈0.2005%
   const tpTrigger = Math.max(minProfitPct + FEE_OVERHEAD_PCT, FEE_OVERHEAD_PCT + 0.05);
 
   const { data: cfg } = await sb
     .from('bot_config').select('current_balance').eq('user_session', 'default').maybeSingle();
-  let balance = Number(cfg?.current_balance || 10000);
+  let balance = Number(cfg?.current_balance || 0);
 
   let executed = 0;
 
@@ -142,19 +145,17 @@ export async function checkExits(
     if (!price) continue;
 
     const avgEntry = Number(h.avg_entry_price);
-    const qty      = Number(h.quantity);           // coins held (buy fee already deducted)
+    const qty      = Number(h.quantity); // coins held (buy fee already deducted)
 
-    // Raw price-change % — used for stop-loss and take-profit triggers
+    // Raw price-change % for trigger logic
     const rawGainPct = ((price - avgEntry) / avgEntry) * 100;
 
-    // Fee-correct PnL: sell proceeds minus original USDT cost
-    // cost_usdt = qty * avgEntry / (1 - FEE) recovers the original USDT spent
+    // Fee-correct PnL: recover original USDT cost, deduct sell fee
     const sellProceeds = qty * price * (1 - TAKER_FEE);
     const costBasis    = qty * avgEntry / (1 - TAKER_FEE);
     const pnl          = Math.round((sellProceeds - costBasis) * 10000) / 10000;
 
     let reason: string | null = null;
-
     if (rawGainPct <= -stopLossPct) {
       reason = `🛑 Stop loss ${rawGainPct.toFixed(2)}% · net ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} USDT`;
     } else if (rawGainPct >= tpTrigger) {
@@ -168,7 +169,7 @@ export async function checkExits(
       });
       await sb.from('paper_portfolio').delete()
         .eq('user_session', 'default').eq('symbol', h.symbol);
-      balance += sellProceeds; // credit actual USDT received (after sell fee)
+      balance += sellProceeds;
       executed++;
     }
   }
@@ -194,18 +195,16 @@ export async function checkEntries(
   if (Object.keys(signals).length === 0) return 0;
 
   const { data: cfg } = await sb
-    .from('bot_config').select('current_balance, stop_loss_percent').eq('user_session', 'default').maybeSingle();
+    .from('bot_config').select('current_balance').eq('user_session', 'default').maybeSingle();
   if (!cfg) return 0;
   let balance = Number(cfg.current_balance);
   if (balance < MIN_NOTIONAL_USDT) return 0;
 
-  // Rate limit: max 30 buys per hour
+  // Rate limit: max 30 buys per hour to avoid overtrading
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
   const { count } = await sb.from('bot_trade_history')
     .select('*', { count: 'exact', head: true })
-    .eq('user_session', 'default')
-    .eq('side', 'BUY')
-    .gte('created_at', oneHourAgo);
+    .eq('user_session', 'default').eq('side', 'BUY').gte('created_at', oneHourAgo);
   if ((count || 0) >= 30) return 0;
 
   const { data: holdings } = await sb.from('paper_portfolio')
@@ -215,7 +214,7 @@ export async function checkEntries(
   const candidates = coins
     .filter(s => !held.has(s) && signals[s])
     .map(s => ({ symbol: s, score: signals[s].entryScore + signals[s].aiBoost }))
-    .filter(c => c.score >= 65)
+    .filter(c => c.score >= ENTRY_SCORE_THRESHOLD)
     .sort((a, b) => b.score - a.score);
 
   let executed = 0;
@@ -227,33 +226,32 @@ export async function checkEntries(
     const price = parseFloat(lp.price);
     if (!price || price <= 0) continue;
 
-    // Hard filters
-    if (sig.spread > 0.15) continue;
-    if (sig.ema9 < sig.ema21 && sig.ema21 < sig.ema50) continue;
-    if (sig.rsi > 70) continue;
-    if (sig.volumeRatio < 1.0) continue;
+    // Hard filters — only exclude clearly bad conditions
+    if (sig.spread > 0.5) continue;                                  // extremely wide spread
+    if (sig.ema9 < sig.ema21 && sig.ema21 < sig.ema50) continue;    // fully bearish trend
+    if (sig.rsi > 75) continue;                                      // extremely overbought
 
-    // USDT to spend on this trade (capped at available balance)
+    // USDT to spend (capped at available balance only)
     const defaultBudget = balance / Math.max(coins.length, 1);
     const budget     = coinBudgets[symbol] ?? defaultBudget;
-    const allocation = Math.min(budget, balance); // USDT to spend
-    if (allocation < MIN_NOTIONAL_USDT) continue; // Binance minimum notional
+    const allocation = Math.min(budget, balance);
+    if (allocation < MIN_NOTIONAL_USDT) continue;
 
-    // Coins received after Binance takes the 0.1% buy fee from the coin amount
-    const quantity   = (allocation / price) * (1 - TAKER_FEE);
+    // Coins received after Binance takes 0.1% buy fee from the coin amount
+    const quantity = (allocation / price) * (1 - TAKER_FEE);
+    const feeUSDT  = allocation * TAKER_FEE;
 
     const reasons: string[] = [];
-    if (sig.ema9 > sig.ema21)      reasons.push('EMA✓');
-    if (sig.rsi < 50)              reasons.push(`RSI ${sig.rsi.toFixed(0)}`);
-    if (sig.macd.histogram > 0)    reasons.push('MACD✓');
-    if (sig.volumeRatio > 1.3)     reasons.push(`Vol ${sig.volumeRatio.toFixed(1)}x`);
-    if (sig.aiBoost > 0)           reasons.push('AI✓');
+    if (sig.ema9 > sig.ema21)   reasons.push('EMA✓');
+    if (sig.rsi < 50)           reasons.push(`RSI ${sig.rsi.toFixed(0)}`);
+    if (sig.macd.histogram > 0) reasons.push('MACD✓');
+    if (sig.volumeRatio > 1.2)  reasons.push(`Vol ${sig.volumeRatio.toFixed(1)}x`);
+    if (sig.aiBoost > 0)        reasons.push('AI✓');
 
-    const feeUSDT = allocation * TAKER_FEE;
     await sb.from('bot_trade_history').insert({
       user_session: 'default', symbol,
       side: 'BUY', price, quantity, pnl: null,
-      reason: `Score ${score.toFixed(0)}/100 (${reasons.join(', ')}) · spent $${allocation.toFixed(2)} USDT · fee $${feeUSDT.toFixed(4)}`,
+      reason: `Score ${score}/100 · ${reasons.join(' · ')} · $${allocation.toFixed(2)} USDT · fee $${feeUSDT.toFixed(4)}`,
     });
     await sb.from('paper_portfolio').upsert({
       user_session: 'default', symbol, quantity,
@@ -261,7 +259,7 @@ export async function checkEntries(
       updated_at: new Date().toISOString(),
     }, { onConflict: 'user_session,symbol' });
 
-    balance -= allocation; // deduct full USDT spent (fee taken in received coins, not USDT)
+    balance -= allocation;
     executed++;
   }
 
@@ -275,7 +273,7 @@ export async function checkEntries(
   return executed;
 }
 
-// ── Background AI analysis (stores signals to Supabase) ──────────────────────
+// ── Background AI analysis ───────────────────────────────────────────────────
 export async function runAnalysisCycle(
   coins: string[],
   sb: SupabaseClient,
