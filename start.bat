@@ -97,6 +97,20 @@ if not exist ".env" (
     call :logline ".env file found"
 )
 
+:: ── Auto-update from GitHub ──────────────────────────────────────────────────
+where git >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+    call :logline "Checking for app updates (git pull)..."
+    git pull --ff-only origin main >> "%LOG_FILE%" 2>&1
+    if !ERRORLEVEL! EQU 0 (
+        call :logline "App is up to date."
+    ) else (
+        call :logline "Auto-update skipped (offline or merge conflict — continuing with local version)."
+    )
+) else (
+    call :logline "git not found — skipping auto-update."
+)
+
 :: ── Smart dependency check ───────────────────────────────────────────────────
 :: Only (re)install when package.json has changed since last install.
 :: We store the package.json timestamp in node_modules\.install-marker.

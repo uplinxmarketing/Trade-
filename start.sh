@@ -53,6 +53,18 @@ else
   log ".env file found"
 fi
 
+# ── Auto-update from GitHub ──────────────────────────────────────────────────
+if command -v git &>/dev/null && [ -d ".git" ]; then
+  log "Checking for app updates (git pull)..."
+  if git pull --ff-only origin main 2>&1; then
+    log "App is up to date."
+  else
+    log "Auto-update skipped (offline or merge conflict — continuing with local version)."
+  fi
+else
+  log "git not found or not a git repo — skipping auto-update."
+fi
+
 # ── Smart dependency check ────────────────────────────────────────────────────
 # Only reinstall when package.json changes — stores its timestamp as a marker.
 MARKER="node_modules/.install-marker"

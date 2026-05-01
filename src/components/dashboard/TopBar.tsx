@@ -8,15 +8,22 @@ interface TopBarProps {
   onConnectClick?: () => void;
 }
 
-const APP_VERSION = '2.1.0';
+const APP_VERSION = '2.1.1';
 
 const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
   const { updateAvailable, checking, checkForUpdates, reload } = useUpdateChecker();
 
   const handleCheckUpdate = async () => {
-    const found = await checkForUpdates();
-    if (!found) {
-      toast.success('You\'re up to date', { description: `Version ${APP_VERSION}` });
+    const toastId = toast.loading('Checking for updates…');
+    try {
+      const found = await checkForUpdates();
+      if (found) {
+        toast.success('Update available!', { id: toastId, description: 'Click the banner to reload' });
+      } else {
+        toast.success('You\'re up to date', { id: toastId, description: `Version ${APP_VERSION}` });
+      }
+    } catch {
+      toast.error('Update check failed', { id: toastId, description: 'Check your connection and try again' });
     }
   };
 
