@@ -1,21 +1,27 @@
 """
-Trade execution engine.
-- Reads strategy.json every tick (cheap file stat, full parse only when changed)
-- Never calls Claude — only executes what strategy.json says
-- Sells the instant price exceeds breakeven
-- Never sells at a loss
+Trade execution engine — two-speed architecture.
+
+Process 1 (realtime_monitor):  Called on every WebSocket trade tick.
+                                 Only handles stop-loss / take-profit exits.
+
+Process 2 (signal_scanner):    Async coroutine, runs every SCAN_INTERVAL_SEC.
+                                 Reads fresh 1m klines, evaluates 4 signals,
+                                 and opens new positions when enough are bullish.
 """
 
+import asyncio
 import json
 import os
 import time
 import math
 import threading
+import urllib.request
 from datetime import datetime
 from typing import Dict, List, Optional
 
 import config
 import database
+import indicators
 import learning
 from connection import client, get_mode
 
@@ -28,6 +34,21 @@ _strategy_cache: dict = {}
 _fee_rate = config.FEE_RATE_BNB if config.BNB_FEE_MODE else config.FEE_RATE_STANDARD
 _breakeven_mult = 1.0 + _fee_rate + _fee_rate   # 1.0015 with BNB, 1.002 without
 
+_cooldowns: dict = {}  # symbol -> unix timestamp when cooldown expires
+
+
+# ── Cooldown helpers ──────────────────────────────────────────────────────────
+
+def _set_cooldown(symbol: str):
+    _cooldowns[symbol] = time.time() + config.COOLDOWN_AFTER_LOSS
+
+
+def _in_cooldown(symbol: str) -> bool:
+    exp = _cooldowns.get(symbol, 0)
+    return time.time() < exp
+
+
+# ── DB / startup helpers ──────────────────────────────────────────────────────
 
 def load_positions_from_db():
     """Called on startup — restores open positions from SQLite."""
@@ -42,6 +63,8 @@ def get_open_positions() -> List[dict]:
     with _positions_lock:
         return list(_positions)
 
+
+# ── Strategy loader ───────────────────────────────────────────────────────────
 
 def _load_strategy() -> dict:
     global _strategy_mtime, _strategy_cache
@@ -58,6 +81,8 @@ def _load_strategy() -> dict:
         pass
     return _strategy_cache
 
+
+# ── Account helpers ───────────────────────────────────────────────────────────
 
 def _get_usdt_balance() -> float:
     try:
@@ -76,11 +101,153 @@ def _floor_qty(qty: float, decimals: int = 6) -> float:
     return math.floor(qty * factor) / factor
 
 
-def trade_loop(prices: Dict[str, float]):
+# ── Indicator helpers (derive from candle dict) ───────────────────────────────
+
+def _derive_ma_pos(price: float, ma20: Optional[float]) -> Optional[str]:
+    if ma20 is None or ma20 == 0:
+        return None
+    diff = abs(price - ma20) / ma20
+    if diff <= 0.001:
+        return "at"
+    return "above" if price > ma20 else "below"
+
+
+def _derive_bb_pos(price: float, candle: dict) -> Optional[str]:
+    upper = candle.get("bb_upper")
+    lower = candle.get("bb_lower")
+    mid   = candle.get("bb_mid")
+    if upper is None or lower is None or mid is None:
+        return None
+    bw = upper - lower
+    if bw == 0:
+        return "mid_zone"
+    near = 0.01 * bw
+    if price > upper:
+        return "above_upper"
+    if price >= upper - near:
+        return "near_upper"
+    if price <= lower:
+        return "below_lower"
+    if price <= lower + near:
+        return "near_lower"
+    return "mid_zone"
+
+
+# ── Shared sell execution (used by both realtime_monitor and signal_scanner) ──
+
+def _execute_sell(pos: dict, price: float, reason: str):
+    """Execute a market sell for pos at price. Logs trade, cleans up state."""
+    sym  = pos["symbol"]
+    qty  = _floor_qty(pos["quantity"])
+    mode = get_mode()
+    now  = datetime.utcnow().isoformat()
+
+    if qty <= 0 or price <= 0:
+        return
+
+    try:
+        result = client.order_market_sell(symbol=sym, quantity=qty)
+    except Exception as e:
+        print(f"[TradeEngine] SELL failed {sym}: {e}")
+        return
+
+    fill_price = float(result["fills"][0]["price"]) if result.get("fills") else price
+    sell_fee   = float(result["fills"][0]["commission"]) * fill_price if result.get("fills") else (qty * fill_price * _fee_rate)
+    buy_fee    = pos["budget_usdt"] * _fee_rate
+    gross      = qty * fill_price
+    net_profit = gross - sell_fee - pos["budget_usdt"] - buy_fee
+
+    buy_ts  = pos.get("timestamp", now)
+    sell_ts = now
+    try:
+        buy_dt  = datetime.fromisoformat(buy_ts)
+        sell_dt = datetime.fromisoformat(sell_ts)
+        duration = int((sell_dt - buy_dt).total_seconds())
+    except Exception:
+        duration = 0
+        buy_dt   = datetime.utcnow()
+
+    trade_record = {
+        "coin":               sym,
+        "mode":               mode,
+        "entry_price":        pos["entry_price"],
+        "exit_price":         fill_price,
+        "quantity":           qty,
+        "budget_usdt":        pos["budget_usdt"],
+        "buy_fee":            buy_fee,
+        "sell_fee":           sell_fee,
+        "net_profit":         net_profit,
+        "profitable":         1 if net_profit > 0 else 0,
+        "duration_seconds":   duration,
+        "entry_rsi":          pos.get("entry_rsi"),
+        "entry_ma_position":  pos.get("entry_ma_position"),
+        "entry_bb_position":  pos.get("entry_bb_position"),
+        "entry_volume_trend": pos.get("entry_volume_trend"),
+        "hour_of_day":        buy_dt.hour,
+        "day_of_week":        buy_dt.weekday(),
+        "timestamp_buy":      buy_ts,
+        "timestamp_sell":     sell_ts,
+    }
+    database.log_trade(trade_record)
+    learning.learn_from_trade(trade_record)
+
+    if pos.get("id"):
+        database.delete_position(pos["id"])
+    with _positions_lock:
+        _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
+
+    profit_sign = "+" if net_profit >= 0 else ""
+    print(
+        f"[TradeEngine] SOLD ({reason}) {sym} @ ${fill_price:.4f} "
+        f"| net {profit_sign}${net_profit:.4f} | held {duration}s"
+    )
+
+
+# ── Process 1: realtime monitor (called on every WebSocket tick) ──────────────
+
+def realtime_monitor(prices: Dict[str, float]):
     """
-    Called on every price tick by data_collector.
-    Checks exits first, then opens new positions if strategy approves.
+    Synchronous. Called on every WebSocket trade tick.
+    Handles take-profit and stop-loss exits only — no new buys.
     """
+    with _positions_lock:
+        snapshot = list(_positions)
+
+    for pos in snapshot:
+        sym   = pos["symbol"]
+        price = prices.get(sym, 0.0)
+        if price <= 0:
+            continue
+
+        entry     = pos["entry_price"]
+        breakeven = entry * _breakeven_mult
+        stop_loss = entry * (1 - config.STOP_LOSS_PCT)
+
+        if price > breakeven:
+            _execute_sell(pos, price, "take-profit")
+        elif price <= stop_loss:
+            _execute_sell(pos, price, "stop-loss")
+            _set_cooldown(sym)
+
+
+# ── Process 2: signal scanner (async, runs every SCAN_INTERVAL_SEC) ──────────
+
+async def signal_scanner(prices: dict):
+    """
+    Async coroutine. Loops forever with asyncio.sleep(SCAN_INTERVAL_SEC).
+    Fetches fresh 1m klines, evaluates 4 technical signals, and opens
+    new positions when MIN_SIGNALS_TO_BUY or more are bullish.
+    """
+    while True:
+        try:
+            await _run_signal_scan(prices)
+        except Exception as e:
+            print(f"[SignalScanner] Unexpected error in scan loop: {e}")
+
+        await asyncio.sleep(config.SCAN_INTERVAL_SEC)
+
+
+async def _run_signal_scan(prices: dict):
     strategy = _load_strategy()
     if not strategy:
         return
@@ -96,106 +263,100 @@ def trade_loop(prices: Dict[str, float]):
     mode       = get_mode()
     now        = datetime.utcnow().isoformat()
 
-    # ── 1. Check exits ────────────────────────────────────────────────────────
-    to_close = []
     with _positions_lock:
-        for pos in _positions:
-            sym   = pos["symbol"]
-            price = prices.get(sym, 0.0)
-            if price <= 0:
-                continue
-            breakeven = pos["entry_price"] * _breakeven_mult
-            if price > breakeven:
-                to_close.append(dict(pos))
+        global_open = len(_positions)
 
-    for pos in to_close:
-        sym      = pos["symbol"]
-        qty      = _floor_qty(pos["quantity"])
-        price    = prices.get(sym, 0.0)
-        if qty <= 0 or price <= 0:
-            continue
-
-        try:
-            result = client.order_market_sell(symbol=sym, quantity=qty)
-        except Exception as e:
-            print(f"[TradeEngine] SELL failed {sym}: {e}")
-            continue
-
-        fill_price = float(result["fills"][0]["price"]) if result.get("fills") else price
-        sell_fee   = float(result["fills"][0]["commission"]) * fill_price if result.get("fills") else (qty * fill_price * _fee_rate)
-        buy_fee    = pos["budget_usdt"] * _fee_rate
-        gross      = qty * fill_price
-        net_profit = gross - sell_fee - pos["budget_usdt"] - buy_fee
-
-        buy_ts  = pos.get("timestamp", now)
-        sell_ts = now
-        try:
-            buy_dt  = datetime.fromisoformat(buy_ts)
-            sell_dt = datetime.fromisoformat(sell_ts)
-            duration = int((sell_dt - buy_dt).total_seconds())
-        except Exception:
-            duration = 0
-
-        trade_record = {
-            "coin":               sym,
-            "mode":               mode,
-            "entry_price":        pos["entry_price"],
-            "exit_price":         fill_price,
-            "quantity":           qty,
-            "budget_usdt":        pos["budget_usdt"],
-            "buy_fee":            buy_fee,
-            "sell_fee":           sell_fee,
-            "net_profit":         net_profit,
-            "profitable":         1 if net_profit > 0 else 0,
-            "duration_seconds":   duration,
-            "entry_rsi":          pos.get("entry_rsi"),
-            "entry_ma_position":  pos.get("entry_ma_position"),
-            "entry_bb_position":  pos.get("entry_bb_position"),
-            "entry_volume_trend": pos.get("entry_volume_trend"),
-            "hour_of_day":        buy_dt.hour if buy_ts else 0,
-            "day_of_week":        buy_dt.weekday() if buy_ts else 0,
-            "timestamp_buy":      buy_ts,
-            "timestamp_sell":     sell_ts,
-        }
-        database.log_trade(trade_record)
-        learning.learn_from_trade(trade_record)
-
-        # Remove from memory and DB
-        if pos.get("id"):
-            database.delete_position(pos["id"])
-        with _positions_lock:
-            _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
-
-        profit_sign = "+" if net_profit >= 0 else ""
-        print(f"[TradeEngine] SOLD {sym} @ ${fill_price:.4f} | net {profit_sign}${net_profit:.4f} | held {duration}s")
-
-    # ── 2. Open new positions ─────────────────────────────────────────────────
-    with _positions_lock:
-        current_open = list(_positions)
-
-    global_open = len(current_open)
     if global_open >= global_max:
         return
 
     usdt_balance = _get_usdt_balance()
 
     for sym, coin_cfg in approved_coins.items():
-        price = prices.get(sym, 0.0)
-        if price <= 0:
+        # Gate checks
+        if _in_cooldown(sym):
+            print(f"[SignalScanner] {sym} is in cooldown — skipping.")
             continue
-
-        budget   = float(coin_cfg.get("budget_usdt", config.BUDGET_PER_TRADE_USDT))
-        max_conc = int(coin_cfg.get("max_concurrent", 2))
 
         with _positions_lock:
-            coin_open = sum(1 for p in _positions if p["symbol"] == sym)
-
-        if coin_open >= max_conc:
+            already_held = any(p["symbol"] == sym for p in _positions)
+        if already_held:
             continue
+
+        with _positions_lock:
+            global_open = len(_positions)
         if global_open >= global_max:
             break
+
+        budget = float(coin_cfg.get("budget_usdt", config.BUDGET_PER_TRADE_USDT))
         if usdt_balance < budget:
             continue
+
+        # Fetch 1m klines via REST
+        try:
+            url = (
+                f"https://api.binance.com/api/v3/klines"
+                f"?symbol={sym}&interval=1m&limit=50"
+            )
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                raw_klines = json.loads(resp.read())
+        except Exception as e:
+            print(f"[SignalScanner] {sym}: kline fetch failed — {e}")
+            continue
+
+        try:
+            closes  = [float(k[4]) for k in raw_klines]
+            volumes = [float(k[5]) for k in raw_klines]
+
+            if len(closes) < 27:   # need at least slow EMA period + a couple candles
+                print(f"[SignalScanner] {sym}: not enough candles ({len(closes)}) — skipping.")
+                continue
+
+            ema9      = indicators.calc_ema(closes, 9)
+            ema21     = indicators.calc_ema(closes, 21)
+            rsi       = indicators.calc_rsi(closes, 14)
+            _, _, histogram = indicators.calc_macd(closes)
+            vol_ma    = indicators.calc_volume_ma(volumes, 20)
+
+            # Use index -2 (last completed candle, not the still-open one)
+            trend_bullish = (
+                ema9[-2] is not None
+                and ema21[-2] is not None
+                and ema9[-2] > ema21[-2]
+            )
+            rsi_bullish = (
+                rsi[-2] is not None
+                and config.RSI_BUY_MIN <= rsi[-2] <= config.RSI_BUY_MAX
+            )
+            macd_bullish = (
+                histogram[-2] is not None
+                and histogram[-3] is not None
+                and histogram[-2] > 0
+                and histogram[-2] > histogram[-3]
+            )
+            vol_bullish = (
+                volumes[-2] is not None
+                and vol_ma[-2] is not None
+                and volumes[-2] > vol_ma[-2] * config.VOLUME_RATIO_MIN
+            )
+
+            bullish_count = sum([trend_bullish, rsi_bullish, macd_bullish, vol_bullish])
+
+            print(
+                f"[SignalScanner] {sym} signals — "
+                f"trend={trend_bullish} rsi={rsi_bullish} "
+                f"macd={macd_bullish} vol={vol_bullish} "
+                f"→ {bullish_count}/4 bullish"
+            )
+
+            if bullish_count < config.MIN_SIGNALS_TO_BUY:
+                continue
+
+        except Exception as e:
+            print(f"[SignalScanner] {sym}: indicator error — {e}")
+            continue
+
+        # ── Execute buy ───────────────────────────────────────────────────────
+        price = prices.get(sym, closes[-1])
 
         # Gather entry indicators from latest candle
         entry_rsi = entry_ma = entry_bb = entry_vol = None
@@ -213,7 +374,7 @@ def trade_loop(prices: Dict[str, float]):
         try:
             result = client.order_market_buy(symbol=sym, quoteOrderQty=budget)
         except Exception as e:
-            print(f"[TradeEngine] BUY failed {sym}: {e}")
+            print(f"[SignalScanner] BUY failed {sym}: {e}")
             continue
 
         fill = result.get("fills", [{}])[0]
@@ -245,34 +406,8 @@ def trade_loop(prices: Dict[str, float]):
         global_open  += 1
 
         breakeven = fill_price * _breakeven_mult
-        print(f"[TradeEngine] BOUGHT {sym} @ ${fill_price:.4f} | qty={qty:.6f} | BEP=${breakeven:.4f}")
-
-
-def _derive_ma_pos(price: float, ma20: Optional[float]) -> Optional[str]:
-    if ma20 is None or ma20 == 0:
-        return None
-    diff = abs(price - ma20) / ma20
-    if diff <= 0.001:
-        return "at"
-    return "above" if price > ma20 else "below"
-
-
-def _derive_bb_pos(price: float, candle: dict) -> Optional[str]:
-    upper = candle.get("bb_upper")
-    lower = candle.get("bb_lower")
-    mid   = candle.get("bb_mid")
-    if upper is None or lower is None or mid is None:
-        return None
-    bw = upper - lower
-    if bw == 0:
-        return "mid_zone"
-    near = 0.01 * bw
-    if price > upper:
-        return "above_upper"
-    if price >= upper - near:
-        return "near_upper"
-    if price <= lower:
-        return "below_lower"
-    if price <= lower + near:
-        return "near_lower"
-    return "mid_zone"
+        print(
+            f"[SignalScanner] BOUGHT {sym} @ ${fill_price:.4f} "
+            f"| qty={qty:.6f} | BEP=${breakeven:.4f} "
+            f"| signals={bullish_count}/4"
+        )

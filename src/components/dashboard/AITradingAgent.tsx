@@ -38,7 +38,7 @@ async function analyseCoin(sym: string): Promise<CoinSignal> {
   const timeout = setTimeout(() => ctrl.abort(), 8000);
   try {
     const res = await fetch(
-      `${BIN}/klines?symbol=${sym}&interval=5m&limit=60`,
+      `${BIN}/klines?symbol=${sym}&interval=1m&limit=60`,
       { signal: ctrl.signal }
     );
     clearTimeout(timeout);

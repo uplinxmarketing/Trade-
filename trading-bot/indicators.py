@@ -121,3 +121,58 @@ def classify_volume_trend(volumes: List[float], lookback: int = 3) -> str:
     elif ratio < 0.95:
         return "decreasing"
     return "flat"
+
+
+def calc_ema(values: List[float], period: int) -> List[Optional[float]]:
+    """EMA as a full list. First period-1 entries are None."""
+    result: List[Optional[float]] = [None] * (period - 1)
+    if len(values) < period:
+        return [None] * len(values)
+    sma = sum(values[:period]) / period
+    result.append(sma)
+    k = 2 / (period + 1)
+    for v in values[period:]:
+        result.append(v * k + result[-1] * (1 - k))
+    return result
+
+
+def calc_macd(
+    closes: List[float],
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> tuple:
+    """
+    Returns (macd_line, sig_padded, histogram) — all lists aligned to closes.
+
+    macd_line[i]  = ema_fast[i] - ema_slow[i], None if either is None
+    sig_padded    = EMA(signal period) of the non-None macd values,
+                    padded with Nones at the front to match len(closes)
+    histogram[i]  = macd_line[i] - sig_padded[i], None if either is None
+    """
+    ema_fast = calc_ema(closes, fast)
+    ema_slow = calc_ema(closes, slow)
+
+    macd_line: List[Optional[float]] = []
+    for f, s in zip(ema_fast, ema_slow):
+        if f is None or s is None:
+            macd_line.append(None)
+        else:
+            macd_line.append(f - s)
+
+    # Collect non-None macd values to compute signal EMA
+    macd_values = [v for v in macd_line if v is not None]
+    sig_raw = calc_ema(macd_values, signal) if len(macd_values) >= signal else [None] * len(macd_values)
+
+    # Pad sig_raw with Nones at the front so it aligns with closes
+    none_count = len(closes) - len(sig_raw)
+    sig_padded: List[Optional[float]] = [None] * none_count + list(sig_raw)
+
+    histogram: List[Optional[float]] = []
+    for m, s in zip(macd_line, sig_padded):
+        if m is None or s is None:
+            histogram.append(None)
+        else:
+            histogram.append(m - s)
+
+    return macd_line, sig_padded, histogram

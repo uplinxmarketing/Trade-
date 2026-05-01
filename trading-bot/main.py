@@ -57,7 +57,7 @@ def main():
     data_collector.download_history()
 
     # 6. Register trade engine as the price callback
-    data_collector.register_price_callback(trade_engine.trade_loop)
+    data_collector.register_price_callback(trade_engine.realtime_monitor)
 
     print("\n[Main] All systems ready. Starting live feeds…\n")
 
@@ -68,10 +68,12 @@ def main():
 async def _run_loops():
     import data_collector
     import strategy_engine
+    import trade_engine
 
     await asyncio.gather(
         data_collector.start_websocket(),
         strategy_engine.strategy_loop(),
+        trade_engine.signal_scanner(data_collector.prices),
     )
 
 
