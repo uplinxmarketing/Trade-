@@ -15,7 +15,7 @@ echo TradeBot AI — Session %TIMESTAMP% > "%LOG_FILE%"
 
 echo.
 echo   ============================================
-echo       TradeBot AI v2.1.0
+echo       TradeBot AI v2.5.0
 echo   ============================================
 echo.
 call :logline "Log file: %LOG_FILE%"
@@ -98,18 +98,43 @@ if not exist ".env" (
 )
 
 :: ── Auto-update from GitHub ──────────────────────────────────────────────────
+:: Find git — system PATH first, then every common install location on Windows.
+set "GITEXE="
 where git >nul 2>nul
-if %ERRORLEVEL% EQU 0 (
-    call :logline "Checking for app updates (git pull)..."
-    git pull --ff-only origin main >> "%LOG_FILE%" 2>&1
-    if !ERRORLEVEL! EQU 0 (
-        call :logline "App is up to date."
-    ) else (
-        call :logline "Auto-update skipped (offline or merge conflict — continuing with local version)."
+if %ERRORLEVEL% EQU 0 ( set "GITEXE=git" & goto :git_found )
+
+:: Git for Windows (64-bit and 32-bit)
+if exist "%ProgramFiles%\Git\cmd\git.exe"        set "GITEXE=%ProgramFiles%\Git\cmd\git.exe"
+if not defined GITEXE if exist "%ProgramFiles(x86)%\Git\cmd\git.exe" set "GITEXE=%ProgramFiles(x86)%\Git\cmd\git.exe"
+:: Git installed via winget / scoop to LocalAppData
+if not defined GITEXE if exist "%LOCALAPPDATA%\Programs\Git\cmd\git.exe" set "GITEXE=%LOCALAPPDATA%\Programs\Git\cmd\git.exe"
+:: GitHub Desktop bundles its own private git (app-X.Y.Z subfolder)
+if not defined GITEXE (
+    for /d %%D in ("%LOCALAPPDATA%\GitHubDesktop\app-*") do (
+        if exist "%%D\resources\app\git\cmd\git.exe" set "GITEXE=%%D\resources\app\git\cmd\git.exe"
     )
-) else (
-    call :logline "git not found — skipping auto-update."
 )
+:: Git from Scoop
+if not defined GITEXE if exist "%USERPROFILE%\scoop\shims\git.exe" set "GITEXE=%USERPROFILE%\scoop\shims\git.exe"
+:: Git from Chocolatey
+if not defined GITEXE if exist "C:\ProgramData\chocolatey\bin\git.exe" set "GITEXE=C:\ProgramData\chocolatey\bin\git.exe"
+
+:git_found
+if not defined GITEXE (
+    call :logline "git not found on this machine — skipping auto-update."
+    call :logline "Install Git for Windows from https://git-scm.com to enable auto-updates."
+    goto :after_update
+)
+
+call :logline "Pulling latest version from GitHub using: %GITEXE%"
+"%GITEXE%" pull --ff-only origin main >> "%LOG_FILE%" 2>&1
+if !ERRORLEVEL! EQU 0 (
+    call :logline "Update check complete — app is up to date."
+) else (
+    call :logline "Pull returned non-zero (may be offline or already up to date — continuing)."
+)
+
+:after_update
 
 :: ── Smart dependency check ───────────────────────────────────────────────────
 :: Only (re)install when package.json has changed since last install.

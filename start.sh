@@ -19,7 +19,7 @@ bail() { log "ERROR: $*"; echo; echo "  Log: $LOG_FILE"; exit 1; }
 
 echo ""
 echo "  ╔══════════════════════════════╗"
-echo "  ║      TradeBot AI v2.1.0      ║"
+echo "  ║      TradeBot AI v2.5.0      ║"
 echo "  ╚══════════════════════════════╝"
 echo ""
 log "Log: $LOG_FILE"

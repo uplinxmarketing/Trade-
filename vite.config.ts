@@ -177,15 +177,71 @@ function updatePlugin(): Plugin {
       server.middlewares.use("/api/update", async (req: IncomingMessage, res: ServerResponse) => {
         if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
         try {
-          const { execSync } = await import("child_process");
-          // shell:true uses cmd.exe on Windows — the same PATH the user's terminal
-          // sees, so git is found even when not in Node's default process.env.PATH.
-          const output = execSync("git pull --ff-only origin main", {
-            encoding: "utf-8",
-            timeout: 30_000,
-            cwd: process.cwd(),
-            shell: true,
-          });
+          const { execSync, execFileSync } = await import("child_process");
+          const nodePath = await import("path");
+          const nodeFs   = await import("fs");
+
+          // ── Locate git on Windows even when it isn't in the system PATH ─────
+          // GitHub Desktop, Git for Windows, Scoop, Chocolatey all install to
+          // predictable locations that cmd.exe may not know about.
+          const localAppData  = process.env.LOCALAPPDATA  ?? "";
+          const programFiles  = process.env.ProgramFiles  ?? "C:\\Program Files";
+          const programFiles86= process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+          const userProfile   = process.env.USERPROFILE   ?? "";
+
+          // GitHub Desktop bundles git inside its versioned app folder
+          const ghDesktopApps: string[] = [];
+          const ghDesktopBase = nodePath.join(localAppData, "GitHubDesktop");
+          if (nodeFs.existsSync(ghDesktopBase)) {
+            for (const entry of nodeFs.readdirSync(ghDesktopBase)) {
+              if (entry.startsWith("app-")) {
+                ghDesktopApps.push(nodePath.join(ghDesktopBase, entry, "resources", "app", "git", "cmd"));
+              }
+            }
+          }
+
+          const extraGitDirs = [
+            nodePath.join(programFiles, "Git", "cmd"),
+            nodePath.join(programFiles86, "Git", "cmd"),
+            nodePath.join(localAppData, "Programs", "Git", "cmd"),
+            nodePath.join(userProfile, "scoop", "shims"),
+            "C:\\ProgramData\\chocolatey\\bin",
+            ...ghDesktopApps,
+          ].filter(Boolean);
+
+          // Inject these dirs at the front of PATH so cmd.exe can find git
+          const extendedPath = [
+            ...extraGitDirs,
+            process.env.PATH ?? "",
+          ].join(nodePath.delimiter);
+
+          const env = { ...process.env, PATH: extendedPath };
+
+          // First try: fast exec with enriched PATH (works when git is anywhere above)
+          let output: string;
+          try {
+            output = execSync("git pull --ff-only origin main", {
+              encoding: "utf-8",
+              timeout: 30_000,
+              cwd: process.cwd(),
+              shell: true,
+              env,
+            });
+          } catch (firstErr) {
+            // Second try: locate git.exe directly and exec it without shell
+            const gitExe = extraGitDirs
+              .map(d => nodePath.join(d, "git.exe"))
+              .find(p => nodeFs.existsSync(p));
+
+            if (!gitExe) throw firstErr; // nothing worked — re-throw original error
+
+            output = execFileSync(gitExe, ["pull", "--ff-only", "origin", "main"], {
+              encoding: "utf-8",
+              timeout: 30_000,
+              cwd: process.cwd(),
+            });
+          }
+
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: true, output: output.trim() }));
           // Restart Vite so the new bundle picks up the pulled code + version.json.
