@@ -8,6 +8,19 @@ import type { IncomingMessage, ServerResponse } from "http";
 
 const versionJson = JSON.parse(fs.readFileSync("./public/version.json", "utf-8"));
 
+// Use real git short hash if available — guarantees the fingerprint changes on every push.
+// Falls back to version.json commit field if git isn't installed (Windows without git).
+let gitHash = versionJson.commit;
+try {
+  const { execSync: _exec } = require("child_process");
+  gitHash = _exec("git rev-parse --short HEAD", { encoding: "utf-8", stdio: ["pipe","pipe","ignore"] }).trim() || versionJson.commit;
+  // Also keep version.json in sync so GitHub raw shows the same hash
+  if (gitHash !== versionJson.commit) {
+    versionJson.commit = gitHash;
+    fs.writeFileSync("./public/version.json", JSON.stringify(versionJson, null, 2) + "\n");
+  }
+} catch { /* git not available — use static commit from version.json */ }
+
 const SYSTEM_PROMPT = `You are DeepTrade AI, an expert crypto trading assistant built into a live paper-trading bot dashboard.
 You help the user by:
 - Explaining what the bot is doing and why it entered/exited trades
@@ -263,7 +276,7 @@ export default defineConfig(({ mode }) => ({
   },
   // Bake version into the JS bundle so update checker works even after git pull
   define: {
-    __APP_COMMIT__: JSON.stringify(versionJson.commit),
+    __APP_COMMIT__: JSON.stringify(gitHash),
     __APP_BUILD_TIME__: JSON.stringify(versionJson.buildTime),
     __APP_VERSION__: JSON.stringify(versionJson.version),
   },
