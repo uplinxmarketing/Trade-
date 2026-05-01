@@ -11,7 +11,9 @@ const path    = require('path');
 const os      = require('os');
 const { execSync } = require('child_process');
 
-const APP_DIR            = path.resolve(__dirname, '..');
+// start.bat does `cd /d "%~dp0"` before running this script, so cwd = app root.
+// __dirname is the %TEMP% folder when run as a downloaded script — never use it.
+const APP_DIR            = process.cwd();
 const REMOTE_VERSION_URL = 'https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/public/version.json';
 const ZIP_URL            = 'https://github.com/uplinxmarketing/Trade-/archive/refs/heads/main.zip';
 
