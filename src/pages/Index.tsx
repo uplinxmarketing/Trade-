@@ -152,7 +152,7 @@ const Index = () => {
                   )}
                 </div>
                 <div className="lg:col-span-2 space-y-4">
-                  <AIBotPanel selectedCoins={selectedCoins} prices={prices} />
+                  <AIBotPanel selectedCoins={selectedCoins} prices={prices} binanceConnected={binanceConnected} onConnectBinance={() => setShowBinanceConnect(true)} />
                   <AiAnalysisPanel selectedCoins={selectedCoins} />
                 </div>
               </div>
@@ -168,7 +168,7 @@ const Index = () => {
                   currentPrice={activePrice?.price || '0'}
                   priceChange={activePrice?.priceChangePercent || '0'}
                 />
-                <AIBotPanel selectedCoins={selectedCoins} prices={prices} />
+                <AIBotPanel selectedCoins={selectedCoins} prices={prices} binanceConnected={binanceConnected} onConnectBinance={() => setShowBinanceConnect(true)} />
               </div>
               <div className="space-y-4">
                 <AiAnalysisPanel selectedCoins={selectedCoins} />

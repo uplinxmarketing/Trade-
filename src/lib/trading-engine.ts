@@ -1,262 +1,288 @@
 import { SupabaseClient } from '@supabase/supabase-js';
 import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcATR, calcSMA, calcEntryScore, calcTechnicalSignal } from './indicators';
 
-const BINANCE_BASE = 'https://api.binance.com/api/v3';
+const B = 'https://api.binance.com/api/v3';
 
-async function fetchBinanceData(symbol: string) {
-  try {
-    const [priceRes, depthRes, klineRes] = await Promise.all([
-      fetch(`${BINANCE_BASE}/ticker/price?symbol=${symbol}`),
-      fetch(`${BINANCE_BASE}/depth?symbol=${symbol}&limit=20`),
-      fetch(`${BINANCE_BASE}/klines?symbol=${symbol}&interval=1m&limit=200`),
-    ]);
-    const priceData = await priceRes.json();
-    const depth = await depthRes.json();
-    const klines = await klineRes.json();
-    const price = parseFloat(priceData.price);
-    const bids = (depth.bids || []).slice(0, 10);
-    const asks = (depth.asks || []).slice(0, 10);
-    const bidVol = bids.reduce((s: number, b: string[]) => s + parseFloat(b[1]), 0);
-    const askVol = asks.reduce((s: number, a: string[]) => s + parseFloat(a[1]), 0);
-    const bestBid = bids.length > 0 ? parseFloat(bids[0][0]) : 0;
-    const bestAsk = asks.length > 0 ? parseFloat(asks[0][0]) : 0;
-    const spread = bestAsk > 0 ? ((bestAsk - bestBid) / bestAsk) * 100 : 999;
-    return { price, bidVol, askVol, spread, klines: Array.isArray(klines) ? klines : [] };
-  } catch {
-    return null;
-  }
+export interface SignalData {
+  symbol: string;
+  entryScore: number;
+  rsi: number;
+  ema9: number;
+  ema21: number;
+  ema50: number;
+  macd: { histogram: number; macdLine: number; signalLine: number };
+  bb: { position: number; upper: number; lower: number; middle: number };
+  atr: number;
+  volumeRatio: number;
+  obRatio: number;
+  spread: number;
+  volumeIncreasing: boolean;
+  aiBoost: number;
 }
 
-export async function runTradeCycle(
+export type LivePrices = Record<string, { price: string; priceChangePercent: string }>;
+
+// ── Fetch indicators from klines (runs every 2 min) ──────────────────────────
+export async function updateSignals(
   coins: string[],
-  sb: SupabaseClient,
-  onStatus?: (msg: string) => void
-): Promise<{ traded: number; message: string }> {
-  onStatus?.('Fetching market data...');
+  sb?: SupabaseClient
+): Promise<Record<string, SignalData>> {
+  const result: Record<string, SignalData> = {};
 
-  const [configRes] = await Promise.all([
-    sb.from('bot_config').select('*').eq('user_session', 'default').maybeSingle(),
-  ]);
-  const config = configRes.data;
-  if (!config) return { traded: 0, message: 'No bot config' };
-
-  let currentBalance = Number(config.current_balance);
-  const configMinProfit = Number(config.min_profit_percent ?? 0.25);
-  const configStopLoss = Number(config.stop_loss_percent ?? 1.5);
-  const feePerLeg = 0.10;
-  const minSellTrigger = feePerLeg * 2 + 0.05;
-
-  // Rate limit check
-  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-  const { count: recentCount } = await sb.from('bot_trade_history')
-    .select('*', { count: 'exact', head: true })
-    .eq('user_session', 'default')
-    .gte('created_at', oneHourAgo);
-  if ((recentCount || 0) >= 20) return { traded: 0, message: 'Max 20 trades/hr reached' };
-
-  // Get current holdings
-  const { data: holdings } = await sb.from('paper_portfolio').select('*').eq('user_session', 'default');
-  const holdingsMap: Record<string, { qty: number; avgPrice: number }> = {};
-  if (holdings) {
-    for (const h of holdings) {
-      holdingsMap[h.symbol] = { qty: Number(h.quantity), avgPrice: Number(h.avg_entry_price) };
-    }
-  }
-
-  // Get latest AI analyses
-  const { data: aiAnalyses } = await sb.from('ai_analyses')
-    .select('symbol, signal, confidence')
-    .eq('user_session', 'default')
-    .in('symbol', coins)
-    .order('created_at', { ascending: false })
-    .limit(coins.length * 3);
-  const latestAnalysis: Record<string, any> = {};
-  if (aiAnalyses) {
-    for (const a of aiAnalyses) {
-      if (!latestAnalysis[a.symbol]) latestAnalysis[a.symbol] = a;
-    }
-  }
-
-  onStatus?.('Analyzing signals...');
-  const decisions: any[] = [];
-
-  for (const symbol of coins) {
-    const data = await fetchBinanceData(symbol);
-    if (!data || !data.price || data.klines.length < 50) continue;
-
-    const { price, bidVol, askVol, spread, klines } = data;
-    if (spread > 0.15) continue;
-
-    const closes = klines.map((k: any[]) => parseFloat(k[4]));
-    const highs = klines.map((k: any[]) => parseFloat(k[2]));
-    const lows = klines.map((k: any[]) => parseFloat(k[3]));
-    const volumes = klines.map((k: any[]) => parseFloat(k[5]));
-
-    const lastClose = closes[closes.length - 1] || price;
-    const prevClose = closes[closes.length - 2] || price;
-    if (Math.abs(((lastClose - prevClose) / prevClose) * 100) > 2) continue;
-
-    const ema9 = calcEMA(closes, 9);
-    const ema21 = calcEMA(closes, 21);
-    const ema50 = calcEMA(closes, 50);
-    const rsi = calcRSI(closes, 14);
-    const macd = calcMACD(closes);
-    const bb = calcBollingerBands(closes);
-    const atr = calcATR(highs, lows, closes, 14);
-    const volumeSma = calcSMA(volumes, 20);
-    const currentVolume = volumes[volumes.length - 1] || 0;
-    const volumeRatio = volumeSma > 0 ? currentVolume / volumeSma : 1;
-    const obRatio = bidVol / (askVol || 1);
-    const recentVol = volumes.slice(-15).reduce((a, b) => a + b, 0);
-    const prevVol = volumes.slice(-30, -15).reduce((a, b) => a + b, 0);
-    const volumeIncreasing = recentVol > prevVol;
-
-    const holding = holdingsMap[symbol];
-
-    if (holding && holding.qty > 0) {
-      const gainPercent = ((price - holding.avgPrice) / holding.avgPrice) * 100;
-      const tpPercent = Math.max(configMinProfit, minSellTrigger);
-      const atrStopLoss = atr > 0 ? (atr * 1.5 / holding.avgPrice) * 100 : configStopLoss;
-      const effectiveSL = Math.min(configStopLoss, atrStopLoss);
-
-      if (gainPercent <= -effectiveSL) {
-        const pnl = (price - holding.avgPrice) * holding.qty;
-        decisions.push({ symbol, side: 'SELL', price, quantity: holding.qty, pnl: Math.round(pnl * 100) / 100, reason: `🛑 Stop loss ${gainPercent.toFixed(2)}%`, score: -100 });
-      } else if (gainPercent >= tpPercent) {
-        const pnl = (price - holding.avgPrice) * holding.qty;
-        decisions.push({ symbol, side: 'SELL', price, quantity: holding.qty, pnl: Math.round(pnl * 100) / 100, reason: `✅ Take profit ${gainPercent.toFixed(2)}%`, score: gainPercent * 10 });
-      } else if (rsi > 75 && gainPercent > 0) {
-        const sellQty = holding.qty * 0.5;
-        const pnl = (price - holding.avgPrice) * sellQty;
-        decisions.push({ symbol, side: 'SELL', price, quantity: sellQty, pnl: Math.round(pnl * 100) / 100, reason: `⚡ RSI extreme (${rsi.toFixed(0)}) — partial 50%`, score: 20 });
-      }
-    } else {
-      if (ema9 < ema21 && ema21 < ema50) continue;
-      if (rsi > 70) continue;
-      if (volumeRatio < 1.0) continue;
-
-      const entryScore = calcEntryScore({ ema9, ema21, ema50, price, rsi, macd, volumeRatio, obRatio, bb, volumeIncreasing });
-      const aiSignal = latestAnalysis[symbol]?.signal || 'hold';
-      const aiBoost = aiSignal === 'strong_buy' ? 10 : aiSignal === 'buy' ? 5 : 0;
-      const finalScore = entryScore + aiBoost;
-
-      if (finalScore >= 65) {
-        const riskAmount = currentBalance * 0.02;
-        const maxAllocation = Math.min(currentBalance * 0.25, currentBalance);
-        const atrSL = atr > 0 ? (atr * 1.5 / price) * 100 : configStopLoss;
-        const effectiveSL = Math.min(configStopLoss, atrSL);
-        const allocation = Math.min(maxAllocation, Math.max(5, riskAmount / (effectiveSL / 100)));
-        if (allocation >= 5 && currentBalance >= allocation) {
-          const signalReasons: string[] = [];
-          if (ema9 > ema21) signalReasons.push('EMA✓');
-          if (rsi < 50) signalReasons.push(`RSI ${rsi.toFixed(0)}`);
-          if (macd.histogram > 0) signalReasons.push('MACD✓');
-          if (volumeRatio > 1.3) signalReasons.push(`Vol ${volumeRatio.toFixed(1)}x`);
-          if (obRatio > 1.2) signalReasons.push('OB✓');
-          if (aiSignal === 'buy' || aiSignal === 'strong_buy') signalReasons.push(`AI ${aiSignal}`);
-          decisions.push({ symbol, side: 'BUY', price, quantity: Math.round((allocation / price) * 1e6) / 1e6, reason: `Score ${finalScore.toFixed(0)}/100 (${signalReasons.join(', ')})`, score: finalScore });
+  // Get latest AI signal boosts from Supabase
+  const aiBoosts: Record<string, number> = {};
+  if (sb) {
+    const { data } = await sb
+      .from('ai_analyses')
+      .select('symbol, signal')
+      .eq('user_session', 'default')
+      .in('symbol', coins)
+      .order('created_at', { ascending: false })
+      .limit(coins.length * 2);
+    if (data) {
+      const seen = new Set<string>();
+      for (const a of data) {
+        if (!seen.has(a.symbol)) {
+          seen.add(a.symbol);
+          aiBoosts[a.symbol] = a.signal === 'strong_buy' ? 10 : a.signal === 'buy' ? 5 : 0;
         }
       }
     }
   }
 
-  decisions.sort((a, b) => {
-    if (a.reason.includes('🛑') && !b.reason.includes('🛑')) return -1;
-    if (!a.reason.includes('🛑') && b.reason.includes('🛑')) return 1;
-    return (b.score || 0) - (a.score || 0);
-  });
+  await Promise.all(coins.map(async (symbol) => {
+    try {
+      const [depthRes, klineRes] = await Promise.all([
+        fetch(`${B}/depth?symbol=${symbol}&limit=20`),
+        fetch(`${B}/klines?symbol=${symbol}&interval=1m&limit=200`),
+      ]);
+      const depth = await depthRes.json();
+      const klines = await klineRes.json();
+      if (!Array.isArray(klines) || klines.length < 50) return;
 
-  const toExecute = [
-    ...decisions.filter(d => d.reason.includes('🛑')),
-    ...decisions.filter(d => d.side === 'SELL' && !d.reason.includes('🛑')).slice(0, 1),
-    ...decisions.filter(d => d.side === 'BUY').slice(0, 1),
-  ];
+      const bids = (depth.bids || []).slice(0, 10);
+      const asks = (depth.asks || []).slice(0, 10);
+      const bidVol = bids.reduce((s: number, b: string[]) => s + parseFloat(b[1]), 0);
+      const askVol = asks.reduce((s: number, a: string[]) => s + parseFloat(a[1]), 0);
+      const bestBid = bids.length ? parseFloat(bids[0][0]) : 0;
+      const bestAsk = asks.length ? parseFloat(asks[0][0]) : 0;
+      const spread = bestAsk > 0 ? ((bestAsk - bestBid) / bestAsk) * 100 : 999;
 
-  if (toExecute.length === 0) return { traded: 0, message: `No signals (${decisions.length} assessed)` };
+      const closes = klines.map((k: any[]) => parseFloat(k[4]));
+      const highs  = klines.map((k: any[]) => parseFloat(k[2]));
+      const lows   = klines.map((k: any[]) => parseFloat(k[3]));
+      const volumes = klines.map((k: any[]) => parseFloat(k[5]));
 
-  onStatus?.(`Executing ${toExecute.length} trade(s)...`);
+      const ema9  = calcEMA(closes, 9);
+      const ema21 = calcEMA(closes, 21);
+      const ema50 = calcEMA(closes, 50);
+      const rsi   = calcRSI(closes, 14);
+      const macd  = calcMACD(closes);
+      const bb    = calcBollingerBands(closes);
+      const atr   = calcATR(highs, lows, closes, 14);
+      const volumeSma    = calcSMA(volumes, 20);
+      const currentVol   = volumes[volumes.length - 1] || 0;
+      const volumeRatio  = volumeSma > 0 ? currentVol / volumeSma : 1;
+      const recentVol    = volumes.slice(-15).reduce((a, b) => a + b, 0);
+      const prevVol      = volumes.slice(-30, -15).reduce((a, b) => a + b, 0);
+      const volumeIncreasing = recentVol > prevVol;
+      const obRatio = bidVol / (askVol || 1);
+      const price = closes[closes.length - 1];
 
-  for (const trade of toExecute) {
-    await sb.from('bot_trade_history').insert({
-      user_session: 'default',
-      symbol: trade.symbol,
-      side: trade.side,
-      price: trade.price,
-      quantity: trade.quantity,
-      pnl: trade.pnl || null,
-      reason: trade.reason,
-    });
+      // Skip abnormal spike
+      const prev = closes[closes.length - 2] || price;
+      if (Math.abs(((price - prev) / prev) * 100) > 2) return;
 
-    if (trade.side === 'BUY') {
-      const cost = trade.price * trade.quantity;
-      currentBalance -= cost;
-      const existing = holdingsMap[trade.symbol];
-      const newQty = (existing?.qty || 0) + trade.quantity;
-      const newAvg = existing
-        ? (existing.avgPrice * existing.qty + trade.price * trade.quantity) / newQty
-        : trade.price;
-      await sb.from('paper_portfolio').upsert({
-        user_session: 'default', symbol: trade.symbol,
-        quantity: newQty, avg_entry_price: Math.round(newAvg * 100) / 100,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'user_session,symbol' });
-    } else {
-      const proceeds = trade.price * trade.quantity;
-      currentBalance += proceeds;
-      const remaining = (holdingsMap[trade.symbol]?.qty || 0) - trade.quantity;
-      if (remaining <= 0.000001) {
-        await sb.from('paper_portfolio').delete().eq('user_session', 'default').eq('symbol', trade.symbol);
-      } else {
-        await sb.from('paper_portfolio').update({ quantity: remaining, updated_at: new Date().toISOString() })
-          .eq('user_session', 'default').eq('symbol', trade.symbol);
-      }
+      const entryScore = calcEntryScore({ ema9, ema21, ema50, price, rsi, macd, volumeRatio, obRatio, bb, volumeIncreasing });
+
+      result[symbol] = {
+        symbol, entryScore, rsi, ema9, ema21, ema50, macd, bb,
+        atr, volumeRatio, obRatio, spread, volumeIncreasing,
+        aiBoost: aiBoosts[symbol] || 0,
+      };
+    } catch { /* skip coin */ }
+  }));
+
+  return result;
+}
+
+// ── Check open positions — runs on every price tick ──────────────────────────
+export async function checkExits(
+  prices: LivePrices,
+  sb: SupabaseClient,
+  stopLossPct = 1.5,
+  minProfitPct = 0.25
+): Promise<number> {
+  const { data: holdings } = await sb
+    .from('paper_portfolio').select('*').eq('user_session', 'default').gt('quantity', 0);
+  if (!holdings || holdings.length === 0) return 0;
+
+  const tpPercent = Math.max(minProfitPct, 0.25); // at least 0.25% to cover fees + profit
+
+  const { data: cfg } = await sb
+    .from('bot_config').select('current_balance').eq('user_session', 'default').maybeSingle();
+  let balance = Number(cfg?.current_balance || 10000);
+
+  let executed = 0;
+
+  for (const h of holdings) {
+    const lp = prices[h.symbol];
+    if (!lp) continue;
+    const price = parseFloat(lp.price);
+    if (!price) continue;
+
+    const avgEntry = Number(h.avg_entry_price);
+    const qty      = Number(h.quantity);
+    const gainPct  = ((price - avgEntry) / avgEntry) * 100;
+    const pnl      = Math.round((price - avgEntry) * qty * 100) / 100;
+
+    let reason: string | null = null;
+
+    if (gainPct <= -stopLossPct) {
+      reason = `🛑 Stop loss ${gainPct.toFixed(2)}%`;
+    } else if (gainPct >= tpPercent) {
+      reason = `✅ Take profit +${gainPct.toFixed(2)}%`;
+    }
+
+    if (reason) {
+      await sb.from('bot_trade_history').insert({
+        user_session: 'default', symbol: h.symbol,
+        side: 'SELL', price, quantity: qty, pnl, reason,
+      });
+      await sb.from('paper_portfolio').delete()
+        .eq('user_session', 'default').eq('symbol', h.symbol);
+      balance += price * qty;
+      executed++;
     }
   }
 
-  await sb.from('bot_config').update({
-    current_balance: Math.round(currentBalance * 100) / 100,
-    last_trade_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-  }).eq('user_session', 'default');
+  if (executed > 0) {
+    await sb.from('bot_config').update({
+      current_balance: Math.round(balance * 100) / 100,
+      updated_at: new Date().toISOString(),
+    }).eq('user_session', 'default');
+  }
 
-  return { traded: toExecute.length, message: `Executed ${toExecute.length} trade(s)` };
+  return executed;
 }
 
+// ── Check entry opportunities — runs on every price tick ─────────────────────
+export async function checkEntries(
+  coins: string[],
+  signals: Record<string, SignalData>,
+  prices: LivePrices,
+  coinBudgets: Record<string, number>,
+  sb: SupabaseClient
+): Promise<number> {
+  if (Object.keys(signals).length === 0) return 0;
+
+  const { data: cfg } = await sb
+    .from('bot_config').select('current_balance, stop_loss_percent').eq('user_session', 'default').maybeSingle();
+  if (!cfg) return 0;
+  let balance = Number(cfg.current_balance);
+  if (balance < 5) return 0;
+
+  // Rate limit: max 30 buys per hour
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const { count } = await sb.from('bot_trade_history')
+    .select('*', { count: 'exact', head: true })
+    .eq('user_session', 'default')
+    .eq('side', 'BUY')
+    .gte('created_at', oneHourAgo);
+  if ((count || 0) >= 30) return 0;
+
+  const { data: holdings } = await sb.from('paper_portfolio')
+    .select('symbol').eq('user_session', 'default').gt('quantity', 0);
+  const held = new Set<string>((holdings || []).map((h: any) => h.symbol));
+
+  const candidates = coins
+    .filter(s => !held.has(s) && signals[s])
+    .map(s => ({ symbol: s, score: signals[s].entryScore + signals[s].aiBoost }))
+    .filter(c => c.score >= 65)
+    .sort((a, b) => b.score - a.score);
+
+  let executed = 0;
+
+  for (const { symbol, score } of candidates) {
+    const sig = signals[symbol];
+    const lp  = prices[symbol];
+    if (!lp) continue;
+    const price = parseFloat(lp.price);
+    if (!price || price <= 0) continue;
+
+    // Hard filters
+    if (sig.spread > 0.15) continue;
+    if (sig.ema9 < sig.ema21 && sig.ema21 < sig.ema50) continue;
+    if (sig.rsi > 70) continue;
+    if (sig.volumeRatio < 1.0) continue;
+
+    const defaultBudget = balance / Math.max(coins.length, 1);
+    const budget     = coinBudgets[symbol] ?? defaultBudget;
+    const allocation = Math.min(budget, balance * 0.25, balance);
+    if (allocation < 5) continue;
+
+    const quantity = Math.round((allocation / price) * 1e6) / 1e6;
+    const reasons: string[] = [];
+    if (sig.ema9 > sig.ema21)      reasons.push('EMA✓');
+    if (sig.rsi < 50)              reasons.push(`RSI ${sig.rsi.toFixed(0)}`);
+    if (sig.macd.histogram > 0)    reasons.push('MACD✓');
+    if (sig.volumeRatio > 1.3)     reasons.push(`Vol ${sig.volumeRatio.toFixed(1)}x`);
+    if (sig.aiBoost > 0)           reasons.push('AI✓');
+
+    await sb.from('bot_trade_history').insert({
+      user_session: 'default', symbol,
+      side: 'BUY', price, quantity, pnl: null,
+      reason: `Score ${score.toFixed(0)}/100 (${reasons.join(', ')})`,
+    });
+    await sb.from('paper_portfolio').upsert({
+      user_session: 'default', symbol, quantity,
+      avg_entry_price: Math.round(price * 100) / 100,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'user_session,symbol' });
+
+    balance -= price * quantity;
+    executed++;
+  }
+
+  if (executed > 0) {
+    await sb.from('bot_config').update({
+      current_balance: Math.round(balance * 100) / 100,
+      updated_at: new Date().toISOString(),
+    }).eq('user_session', 'default');
+  }
+
+  return executed;
+}
+
+// ── Background AI analysis (stores signals to Supabase) ──────────────────────
 export async function runAnalysisCycle(
   coins: string[],
   sb: SupabaseClient,
   onStatus?: (msg: string) => void
 ): Promise<void> {
-  onStatus?.('Running AI analysis...');
+  onStatus?.('Running analysis...');
   for (const symbol of coins) {
     try {
       const [klineRes, tickerRes] = await Promise.all([
-        fetch(`${BINANCE_BASE}/klines?symbol=${symbol}&interval=1h&limit=48`),
-        fetch(`${BINANCE_BASE}/ticker/24hr?symbol=${symbol}`),
+        fetch(`${B}/klines?symbol=${symbol}&interval=1h&limit=48`),
+        fetch(`${B}/ticker/24hr?symbol=${symbol}`),
       ]);
       const klines = await klineRes.json();
       const ticker = await tickerRes.json();
       if (!Array.isArray(klines) || klines.length < 20) continue;
 
-      const closes = klines.map((k: any[]) => parseFloat(k[4]));
+      const closes  = klines.map((k: any[]) => parseFloat(k[4]));
       const volumes = klines.map((k: any[]) => parseFloat(k[5]));
       const { signal, confidence, reasoning } = calcTechnicalSignal(closes, volumes);
-      const currentPrice = parseFloat(ticker.lastPrice || '0');
 
       await sb.from('ai_analyses').insert({
-        user_session: 'default',
-        symbol,
-        analysis_type: 'chart',
-        signal,
-        confidence,
-        reasoning,
-        price_at_analysis: currentPrice,
+        user_session: 'default', symbol,
+        analysis_type: 'chart', signal, confidence, reasoning,
+        price_at_analysis: parseFloat(ticker.lastPrice || '0'),
         predicted_direction: signal.includes('buy') ? 'up' : signal.includes('sell') ? 'down' : 'sideways',
         predicted_change_percent: signal.includes('strong') ? 1.5 : signal === 'hold' ? 0 : 0.5,
       });
-    } catch {
-      // skip this coin
-    }
+    } catch { /* skip */ }
   }
-  onStatus?.(`Analysis done: ${new Date().toLocaleTimeString()}`);
+  onStatus?.(`Analyzed ${coins.length} coins · ${new Date().toLocaleTimeString()}`);
 }
