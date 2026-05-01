@@ -18,8 +18,6 @@ const SESSION = 'default';
 const MAX_POSITIONS = 3;
 const ALLOC_PCT     = 0.25;   // 25% of balance per trade
 const MIN_USDT      = 11;
-const STOP_PCT      = 0.015;  // 1.5% stop-loss
-const TP_PCT        = 0.004;  // 0.4% take-profit (>0.2% fee round-trip)
 
 interface CoinSignal {
   symbol: string;
@@ -33,14 +31,19 @@ interface CoinSignal {
   reason: string;
 }
 
-async function analyseAll(symbols: string[]): Promise<CoinSignal[]> {
-  const settled = await Promise.allSettled(symbols.map(async (sym): Promise<CoinSignal> => {
-    const [kRes, dRes] = await Promise.all([
-      fetch(`${BIN}/klines?symbol=${sym}&interval=5m&limit=60`),
-      fetch(`${BIN}/depth?symbol=${sym}&limit=5`),
-    ]);
-    const klines = await kRes.json();
-    const depth  = await dRes.json();
+// Fetch one coin sequentially — avoids Binance rate-limit on parallel bulk requests.
+// Uses klines only (no depth endpoint) to halve the request count.
+async function analyseCoin(sym: string): Promise<CoinSignal> {
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const res = await fetch(
+      `${BIN}/klines?symbol=${sym}&interval=5m&limit=60`,
+      { signal: ctrl.signal }
+    );
+    clearTimeout(timeout);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const klines = await res.json();
     if (!Array.isArray(klines) || klines.length < 30) throw new Error('insufficient data');
 
     const closes  = klines.map((k: any[]) => parseFloat(k[4]));
@@ -56,17 +59,15 @@ async function analyseAll(symbols: string[]): Promise<CoinSignal[]> {
     const volRat = volSma > 0 ? curVol / volSma : 1;
     const bb     = calcBollingerBands(closes);
 
-    const bids   = (depth.bids ?? []).slice(0, 5) as string[][];
-    const asks   = (depth.asks ?? []).slice(0, 5) as string[][];
-    const bidV   = bids.reduce((s, b) => s + parseFloat(b[1]), 0);
-    const askV   = asks.reduce((s, a) => s + parseFloat(a[1]), 0);
-    const obBull = askV > 0 && bidV / askV > 1.1;
+    const recentVol = volumes.slice(-10).reduce((a, b) => a + b, 0);
+    const prevVol   = volumes.slice(-20, -10).reduce((a, b) => a + b, 0);
+    const volTrend  = recentVol > prevVol;
 
     const emaBullish = ema9 > ema21;
-    const rsiOk      = rsi >= 30 && rsi < 68;
+    const rsiOk      = rsi >= 28 && rsi < 70;
     const macdPos    = macd.histogram > 0;
-    const volUp      = volRat > 1.1 || obBull;
-    const nearLow    = bb.position < 0.35;
+    const volUp      = volRat > 1.05 || volTrend;
+    const nearLow    = bb.position < 0.40;
 
     let score = 0;
     if (emaBullish) score++;
@@ -74,8 +75,9 @@ async function analyseAll(symbols: string[]): Promise<CoinSignal[]> {
     if (macdPos)    score++;
     if (volUp)      score++;
 
+    // BUY: 3/4 signals, or EMA+RSI+near-BB-low (relaxed entry for learning)
     const isBuy  = score >= 3 || (emaBullish && rsiOk && nearLow);
-    const isHold = !emaBullish || rsi >= 70 || rsi < 25;
+    const isHold = rsi >= 72 || rsi < 24;   // only block extreme RSI
 
     const parts: string[] = [];
     parts.push(emaBullish ? 'EMA↑' : 'EMA↓');
@@ -90,13 +92,22 @@ async function analyseAll(symbols: string[]): Promise<CoinSignal[]> {
       signal: isHold ? 'HOLD' : isBuy ? 'BUY' : 'HOLD',
       reason: parts.join(' · '),
     };
-  }));
+  } catch (e: any) {
+    clearTimeout(timeout);
+    return { symbol: sym, price: 0, rsi: 50, emaBullish: false, rsiOk: false, macdPos: false, volUp: false, signal: 'error', reason: e.message ?? 'Fetch failed' };
+  }
+}
 
-  return settled.map((r, i) =>
-    r.status === 'fulfilled'
-      ? r.value
-      : { symbol: symbols[i], price: 0, rsi: 50, emaBullish: false, rsiOk: false, macdPos: false, volUp: false, signal: 'error' as const, reason: 'Fetch failed' }
-  );
+// Sequential fetch with 300 ms gap to stay well inside Binance rate limits.
+async function analyseAll(symbols: string[]): Promise<CoinSignal[]> {
+  const results: CoinSignal[] = [];
+  for (const sym of symbols) {
+    results.push(await analyseCoin(sym));
+    if (symbols.indexOf(sym) < symbols.length - 1) {
+      await new Promise(r => setTimeout(r, 300));
+    }
+  }
+  return results;
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────

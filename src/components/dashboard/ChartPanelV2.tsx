@@ -260,38 +260,67 @@ export default function ChartPanelV2({ activeCoin, prices }: Props) {
     { key: 'volume', label: 'Volume' },
   ];
 
+  // Mini sparkline from last 30 closes — shown before timeframe buttons
+  const sparkPts = klines.slice(-30).map(k => k.close);
+  const sparkPath = (() => {
+    if (sparkPts.length < 2) return '';
+    const mn = Math.min(...sparkPts), mx = Math.max(...sparkPts);
+    const rng = mx - mn || 1;
+    return sparkPts.map((p, i) => {
+      const x = (i / (sparkPts.length - 1)) * 52;
+      const y = 18 - ((p - mn) / rng) * 18;
+      return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+  })();
+  const sparkUp = sparkPts.length >= 2 && sparkPts[sparkPts.length - 1] >= sparkPts[0];
+
   return (
-    <div className="trading-card flex flex-col h-full">
-      {/* Toolbar */}
-      <div className="flex items-center gap-1 px-3 py-2 border-b border-border flex-wrap">
+    <div className="trading-card flex flex-col h-full overflow-hidden">
+      {/* Toolbar — single scrollable row, never wraps */}
+      <div className="flex items-center gap-0.5 px-2 py-1 border-b border-border overflow-x-auto scrollbar-none shrink-0">
+
+        {/* Live sparkline preview */}
+        {sparkPath && (
+          <>
+            <svg width="52" height="20" viewBox="0 0 52 20" className="shrink-0 mr-1.5">
+              <path d={sparkPath} fill="none" stroke={sparkUp ? '#0ecb81' : '#f6465d'} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            <div className="w-px h-3.5 bg-border mx-1 shrink-0" />
+          </>
+        )}
+
         {/* Timeframes */}
         {TF.map(tf => (
           <button key={tf.key} onClick={() => setInterval(tf.key)}
-            className={`px-2 py-0.5 text-[10px] rounded transition-colors ${
+            className={`shrink-0 px-2 py-0.5 text-[10px] rounded transition-colors ${
               interval === tf.key ? 'bg-secondary text-foreground font-semibold' : 'text-muted-foreground hover:text-foreground hover:bg-secondary/50'
             }`}>
             {tf.label}
           </button>
         ))}
-        <div className="w-px h-4 bg-border mx-1" />
+
+        <div className="w-px h-3.5 bg-border mx-1 shrink-0" />
+
         {/* Chart type */}
         {(['Candles', 'Line', 'Area'] as const).map(ct => (
           <button key={ct} onClick={() => setChartType(ct.toLowerCase() as ChartType)}
-            className={`px-2 py-0.5 text-[10px] rounded transition-colors ${
+            className={`shrink-0 px-2 py-0.5 text-[10px] rounded transition-colors ${
               chartType === ct.toLowerCase() ? 'bg-secondary text-foreground font-semibold' : 'text-muted-foreground hover:text-foreground hover:bg-secondary/50'
             }`}>
             {ct}
           </button>
         ))}
-        <div className="w-px h-4 bg-border mx-1" />
+
+        <div className="w-px h-3.5 bg-border mx-1 shrink-0" />
+
         {/* Overlay toggles */}
         {overlayBtns.map(o => (
           <button key={o.key} onClick={() => toggle(o.key)}
-            className={`px-2 py-0.5 text-[10px] rounded border transition-colors ${
+            className={`shrink-0 px-1.5 py-0.5 text-[10px] rounded border transition-colors ${
               overlays[o.key]
-                ? o.key === 'ma' ? 'bg-blue-500/20 border-blue-500/50 text-blue-400'
-                : o.key === 'bb' ? 'bg-amber-500/20 border-amber-500/50 text-amber-400'
-                : o.key === 'entry' ? 'bg-gain/20 border-gain/50 text-gain'
+                ? o.key === 'ma'        ? 'bg-blue-500/20 border-blue-500/50 text-blue-400'
+                : o.key === 'bb'        ? 'bg-amber-500/20 border-amber-500/50 text-amber-400'
+                : o.key === 'entry'     ? 'bg-gain/20 border-gain/50 text-gain'
                 : o.key === 'breakeven' ? 'bg-accent/20 border-accent/50 text-accent'
                 : 'bg-secondary border-border text-foreground'
                 : 'border-border/50 text-muted-foreground hover:text-foreground'
@@ -312,7 +341,7 @@ export default function ChartPanelV2({ activeCoin, prices }: Props) {
       </div>
 
       {/* Legend */}
-      <div className="flex gap-4 px-3 py-1.5 border-t border-border text-[9px] flex-wrap">
+      <div className="flex gap-3 px-3 py-1 border-t border-border text-[9px] overflow-x-auto scrollbar-none shrink-0">
         <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-gain inline-block" /> Up candle</span>
         <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-loss inline-block" /> Down candle</span>
         {overlays.ma && <span className="flex items-center gap-1"><span className="w-4 h-0.5 bg-blue-500 inline-block" /> MA(20)</span>}
