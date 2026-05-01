@@ -120,16 +120,49 @@ function updatePlugin(): Plugin {
         if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
         try {
           const { execSync } = await import("child_process");
-          const output = execSync("git pull --ff-only origin main", {
+          const isWin = process.platform === "win32";
+
+          // On Windows, the Node.js process may not inherit git in its PATH.
+          // Resolve the git executable before running the pull.
+          let gitExe = "git";
+          if (isWin) {
+            const winCandidates = [
+              "C:\\Program Files\\Git\\cmd\\git.exe",
+              "C:\\Program Files\\Git\\bin\\git.exe",
+              "C:\\Program Files (x86)\\Git\\cmd\\git.exe",
+              (process.env.LOCALAPPDATA || "") + "\\Programs\\Git\\cmd\\git.exe",
+              (process.env.APPDATA || "") + "\\Local\\Programs\\Git\\cmd\\git.exe",
+            ];
+            // First try: resolve via cmd.exe PATH (most reliable on Windows)
+            let foundViaShell = false;
+            try {
+              execSync("git --version", { shell: true, encoding: "utf-8", timeout: 5000 });
+              foundViaShell = true;
+            } catch { /* not in shell PATH */ }
+
+            if (foundViaShell) {
+              gitExe = "git"; // use shell: true below
+            } else {
+              // Fallback: try common installation directories
+              for (const p of winCandidates) {
+                try {
+                  execSync(`"${p}" --version`, { encoding: "utf-8", timeout: 3000 });
+                  gitExe = `"${p}"`;
+                  break;
+                } catch { /* try next */ }
+              }
+            }
+          }
+
+          const output = execSync(`${gitExe} pull --ff-only origin main`, {
             encoding: "utf-8",
             timeout: 30_000,
             cwd: process.cwd(),
+            shell: isWin, // cmd.exe on Windows resolves PATH correctly
           });
           const trimmed = output.trim();
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: true, output: trimmed }));
-          // Restart Vite 1.5 s after responding so the response is fully sent first.
-          // The client then polls /api/ping every second and reloads when it gets a reply.
           setTimeout(() => server.restart(), 1500);
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
