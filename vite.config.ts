@@ -1,9 +1,12 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
+import fs from "fs";
 import { componentTagger } from "lovable-tagger";
 import type { Plugin } from "vite";
 import type { IncomingMessage, ServerResponse } from "http";
+
+const versionJson = JSON.parse(fs.readFileSync("./public/version.json", "utf-8"));
 
 const SYSTEM_PROMPT = `You are DeepTrade AI, an expert crypto trading assistant built into a live paper-trading bot dashboard.
 You help the user by:
@@ -108,6 +111,12 @@ export default defineConfig(({ mode }) => ({
     host: "0.0.0.0",
     port: 8080,
     hmr: { overlay: false },
+  },
+  // Bake version into the JS bundle so update checker works even after git pull
+  define: {
+    __APP_COMMIT__: JSON.stringify(versionJson.commit),
+    __APP_BUILD_TIME__: JSON.stringify(versionJson.buildTime),
+    __APP_VERSION__: JSON.stringify(versionJson.version),
   },
   plugins: [
     react(),

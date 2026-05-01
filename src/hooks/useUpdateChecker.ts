@@ -1,7 +1,13 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 
 const REMOTE_VERSION_URL =
   'https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/public/version.json';
+
+// These constants are injected by Vite at startup from public/version.json.
+// They are frozen in the running bundle — if we push new code with an updated
+// version.json, users still running the old bundle will see a different
+// fingerprint vs the remote, triggering the update banner.
+const LOCAL_FINGERPRINT = `${__APP_COMMIT__}:${__APP_BUILD_TIME__}`;
 
 interface VersionInfo {
   version: string;
@@ -12,20 +18,6 @@ interface VersionInfo {
 export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [checking, setChecking] = useState(false);
-  const localFingerprint = useRef<string | null>(null);
-
-  // On mount, record what version is currently running locally
-  useEffect(() => {
-    fetch(`/version.json?t=${Date.now()}`, { cache: 'no-store' })
-      .then(r => r.json())
-      .then((data: VersionInfo) => {
-        localFingerprint.current = `${data.commit}:${data.buildTime}`;
-      })
-      .catch(() => {
-        // fallback fingerprint so checks still work
-        localFingerprint.current = 'unknown';
-      });
-  }, []);
 
   const checkForUpdates = useCallback(async (): Promise<boolean> => {
     setChecking(true);
@@ -35,10 +27,7 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
       const data: VersionInfo = await resp.json();
       const remoteFingerprint = `${data.commit}:${data.buildTime}`;
 
-      // If we don't know our local version yet, treat as up to date
-      if (!localFingerprint.current || localFingerprint.current === 'unknown') return false;
-
-      if (remoteFingerprint !== localFingerprint.current) {
+      if (remoteFingerprint !== LOCAL_FINGERPRINT) {
         setUpdateAvailable(true);
         return true;
       }
@@ -51,7 +40,6 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
   }, []);
 
   useEffect(() => {
-    // Poll periodically in background
     const interval = setInterval(() => {
       checkForUpdates().catch(() => {});
     }, pollIntervalMs);
