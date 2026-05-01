@@ -8,7 +8,7 @@ interface TopBarProps {
   onConnectClick?: () => void;
 }
 
-const APP_VERSION = '2.1.0';
+const APP_VERSION = '2.1.1';
 
 const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
   const { updateAvailable, checking, checkForUpdates, reload } = useUpdateChecker();
