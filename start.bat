@@ -111,37 +111,37 @@ if not exist "node_modules\" (
 
 if "!NEED_INSTALL!" == "1" (
     echo.
-    echo   ── Installing dependencies ──────────────────────────────────────
-    echo   Output below is live. Errors will be visible here and in the log.
-    echo   ─────────────────────────────────────────────────────────────────
+    echo   --- Installing dependencies ------------------------------------
+    echo   All output below is live. Errors will show here directly.
+    echo   ----------------------------------------------------------------
     echo.
+    call :logline "Running: npm install"
 
-    :: Run npm install with output visible in terminal AND captured to log
-    :: PowerShell Tee-Object streams both simultaneously
-    powershell -NoProfile -Command ^
-        "& { npm install 2>&1 } | Tee-Object -FilePath '%LOG_FILE%' -Append"
+    :: Run npm install directly — output goes straight to terminal window
+    call npm install
     set NPM_EXIT=!ERRORLEVEL!
 
-    :: Tee exits 0 even if npm failed, so double-check node_modules
     if !NPM_EXIT! NEQ 0 (
         call :logline "ERROR: npm install failed. Exit code: !NPM_EXIT!"
         echo.
-        echo   Install FAILED. Scroll up to see the error, or open:
-        echo   %LOG_FILE%
+        echo   ════════════════════════════════════════════════════
+        echo   Install FAILED  ^(exit code !NPM_EXIT!^)
+        echo   Scroll up to read the error messages above.
+        echo   Log: %LOG_FILE%
+        echo   ════════════════════════════════════════════════════
         echo.
         pause & exit /b 1
     )
     if not exist "node_modules\vite" (
-        call :logline "ERROR: npm install seemed to succeed but vite is missing."
+        call :logline "ERROR: install exited OK but vite package is missing."
         echo.
-        echo   Install did not complete properly. Try running:
-        echo     npm install
-        echo   in this folder manually, then run start.bat again.
+        echo   Install appeared to finish but is incomplete.
+        echo   Delete the node_modules folder and run start.bat again.
         echo.
         pause & exit /b 1
     )
 
-    :: Save package.json timestamp so we skip install next time
+    :: Save package.json timestamp — skips install on every future launch
     for %%F in ("package.json") do echo %%~tF > "%MARKER%"
     call :logline "Dependencies installed OK — marker saved."
     echo.
@@ -154,20 +154,21 @@ echo   Browser will open automatically.
 echo   Keep this window open while using the app.
 echo   Press Ctrl+C or close this window to stop.
 echo.
-echo   ── Server output ────────────────────────────────────────────────────
+echo   --- Server output -----------------------------------------------
 echo.
 
-:: Run dev server — output visible in terminal AND saved to log
-powershell -NoProfile -Command ^
-    "& { npm run dev -- --open 2>&1 } | Tee-Object -FilePath '%LOG_FILE%' -Append"
+:: Run dev server directly — output prints to terminal window
+call npm run dev -- --open
 set DEV_EXIT=!ERRORLEVEL!
 
 echo.
 if !DEV_EXIT! NEQ 0 (
     call :logline "ERROR: Server stopped unexpectedly. Exit code: !DEV_EXIT!"
-    echo   The server stopped with an error. Scroll up or open the log:
+    echo   ════════════════════════════════════════════════════
+    echo   Server stopped with an error  ^(exit code !DEV_EXIT!^)
+    echo   Scroll up to read the error, or open:
     echo   %LOG_FILE%
-    echo.
+    echo   ════════════════════════════════════════════════════
 ) else (
     call :logline "Server stopped cleanly."
 )
