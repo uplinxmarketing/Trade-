@@ -48,6 +48,7 @@ const BotDashboard = ({ selectedCoins, mode, onModeChange, binanceConnected }: B
     const { data } = await supabase
       .from('bot_trade_history')
       .select('*')
+      .eq('user_session', 'default')
       .order('created_at', { ascending: false })
       .limit(20);
     if (data) setTrades(data as BotTrade[]);
@@ -236,23 +237,30 @@ const BotDashboard = ({ selectedCoins, mode, onModeChange, binanceConnected }: B
       </div>
 
       {/* Mode toggle */}
-      <div className="grid grid-cols-2 gap-1 bg-muted/30 rounded-md p-0.5">
-        <button
-          onClick={() => onModeChange('test')}
-          className={`flex items-center justify-center gap-1.5 py-2 rounded text-xs font-semibold transition-colors ${
-            mode === 'test' ? 'bg-warn/20 text-warn' : 'text-muted-foreground hover:text-foreground'
-          }`}
-        >
-          <FlaskConical className="w-3.5 h-3.5" /> Test Mode
-        </button>
-        <button
-          onClick={() => onModeChange('live')}
-          className={`flex items-center justify-center gap-1.5 py-2 rounded text-xs font-semibold transition-colors ${
-            mode === 'live' ? 'bg-gain/20 text-gain' : 'text-muted-foreground hover:text-foreground'
-          }`}
-        >
-          <Zap className="w-3.5 h-3.5" /> Live Mode
-        </button>
+      <div className="space-y-0.5">
+        {isRunning && (
+          <p className="text-[10px] text-muted-foreground text-center">Stop the bot to change mode</p>
+        )}
+        <div className={`grid grid-cols-2 gap-1 bg-muted/30 rounded-md p-0.5 ${isRunning ? 'opacity-50 pointer-events-none' : ''}`}>
+          <button
+            onClick={() => onModeChange('test')}
+            disabled={isRunning}
+            className={`flex items-center justify-center gap-1.5 py-2 rounded text-xs font-semibold transition-colors ${
+              mode === 'test' ? 'bg-warn/20 text-warn' : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            <FlaskConical className="w-3.5 h-3.5" /> Test Mode
+          </button>
+          <button
+            onClick={() => onModeChange('live')}
+            disabled={isRunning}
+            className={`flex items-center justify-center gap-1.5 py-2 rounded text-xs font-semibold transition-colors ${
+              mode === 'live' ? 'bg-gain/20 text-gain' : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            <Zap className="w-3.5 h-3.5" /> Live Mode
+          </button>
+        </div>
       </div>
 
       {/* Auto-trade interval */}

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Plus, Trash2, Play, Pause, Square, Settings2, DollarSign, Coins, Shield, AlertTriangle, Bot, Search } from 'lucide-react';
+import { Plus, Trash2, Play, Pause, Square, Settings2, DollarSign, Coins, Shield, AlertTriangle, Bot, Search, ChevronUp } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { supabase } from '@/integrations/supabase/client';
@@ -42,11 +42,16 @@ interface BotManagerProps {
 const BotCoinSelector = ({ selectedCoins, onToggle }: { selectedCoins: string[]; onToggle: (coin: string) => void }) => {
   const [coinSearch, setCoinSearch] = useState('');
   const [showAll, setShowAll] = useState(false);
-  
+
   const filtered = coinSearch.trim()
     ? BINANCE_COINS.filter(c => c.toUpperCase().includes(coinSearch.toUpperCase()))
     : BINANCE_COINS;
   const displayCoins = showAll ? filtered : filtered.slice(0, 15);
+
+  const handleToggle = (coin: string) => {
+    onToggle(coin);
+    setCoinSearch(''); // clear search after selecting
+  };
 
   return (
     <div className="space-y-1.5">
@@ -71,23 +76,42 @@ const BotCoinSelector = ({ selectedCoins, onToggle }: { selectedCoins: string[];
           value={coinSearch}
           onChange={e => { setCoinSearch(e.target.value); setShowAll(true); }}
           onFocus={() => setShowAll(true)}
-          className="w-full bg-muted/30 border border-border rounded pl-7 pr-3 py-1 text-[10px] font-mono text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-accent/50"
+          className="w-full bg-muted/30 border border-border rounded pl-7 pr-8 py-1 text-[10px] font-mono text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-accent/50"
         />
+        {showAll && (
+          <button
+            type="button"
+            onMouseDown={e => { e.preventDefault(); setShowAll(false); setCoinSearch(''); }}
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+            title="Close"
+          >
+            <ChevronUp className="w-3 h-3" />
+          </button>
+        )}
       </div>
       {showAll && (
-        <div className="flex flex-wrap gap-1 max-h-28 overflow-y-auto scrollbar-thin">
-          {displayCoins.filter(c => !selectedCoins.includes(c)).map(coin => (
-            <button
-              key={coin}
-              onClick={() => onToggle(coin)}
-              className="px-1.5 py-0.5 rounded text-[10px] font-mono text-muted-foreground hover:text-foreground bg-muted/20 hover:bg-muted/40 transition-colors"
-            >
-              {coin.replace('USDT', '')}
-            </button>
-          ))}
-          {displayCoins.filter(c => !selectedCoins.includes(c)).length === 0 && (
-            <span className="text-[10px] text-muted-foreground">No results</span>
-          )}
+        <div className="border border-border/50 rounded-md bg-card/50">
+          <div className="flex flex-wrap gap-1 max-h-28 overflow-y-auto scrollbar-thin p-1.5">
+            {displayCoins.filter(c => !selectedCoins.includes(c)).map(coin => (
+              <button
+                key={coin}
+                onMouseDown={e => { e.preventDefault(); handleToggle(coin); }}
+                className="px-1.5 py-0.5 rounded text-[10px] font-mono text-muted-foreground hover:text-foreground bg-muted/20 hover:bg-muted/40 transition-colors"
+              >
+                {coin.replace('USDT', '')}
+              </button>
+            ))}
+            {displayCoins.filter(c => !selectedCoins.includes(c)).length === 0 && (
+              <span className="text-[10px] text-muted-foreground p-1">No results</span>
+            )}
+          </div>
+          <button
+            type="button"
+            onMouseDown={e => { e.preventDefault(); setShowAll(false); setCoinSearch(''); }}
+            className="w-full text-[10px] text-muted-foreground hover:text-foreground border-t border-border/30 py-1 flex items-center justify-center gap-1"
+          >
+            <ChevronUp className="w-3 h-3" /> Collapse
+          </button>
         </div>
       )}
       {!showAll && (
