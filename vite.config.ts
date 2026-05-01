@@ -110,6 +110,12 @@ function updatePlugin(): Plugin {
   return {
     name: "update-puller",
     configureServer(server: ViteDevServer) {
+      // Simple ping — client polls this to detect when server is back after restart
+      server.middlewares.use("/api/ping", (_req: IncomingMessage, res: ServerResponse) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      });
+
       server.middlewares.use("/api/update", async (req: IncomingMessage, res: ServerResponse) => {
         if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
         try {
@@ -119,11 +125,12 @@ function updatePlugin(): Plugin {
             timeout: 30_000,
             cwd: process.cwd(),
           });
+          const trimmed = output.trim();
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true, output: output.trim() }));
-          // Restart Vite dev server so the new bundle picks up updated source + version.json
-          // The client will reload after receiving the success response
-          setTimeout(() => server.restart(), 800);
+          res.end(JSON.stringify({ success: true, output: trimmed }));
+          // Restart Vite 1.5 s after responding so the response is fully sent first.
+          // The client then polls /api/ping every second and reloads when it gets a reply.
+          setTimeout(() => server.restart(), 1500);
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
           res.writeHead(200, { "Content-Type": "application/json" });

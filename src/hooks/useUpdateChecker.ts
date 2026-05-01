@@ -41,21 +41,41 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
     return () => clearInterval(id);
   }, [checkForUpdates, pollIntervalMs]);
 
-  // Pull latest code from GitHub via local Vite server, then reload
+  // Pull latest code, then wait for Vite server to restart before reloading
   const applyUpdate = useCallback(async () => {
     setUpdating(true);
     const toastId = toast.loading('Pulling latest code from GitHub…');
     try {
       const resp = await fetch('/api/update', { method: 'POST' });
       const data = await resp.json();
-      if (data.success) {
-        toast.success('Update pulled! Server restarting…', { id: toastId, description: (data.output || 'Done') + ' — reloading in 5 s' });
-        // Give Vite time to restart before reloading the page
-        setTimeout(() => window.location.reload(), 5000);
-      } else {
+      if (!data.success) {
         toast.error('Pull failed', { id: toastId, description: data.error || 'Restart start.bat / start.sh manually' });
         setUpdating(false);
+        return;
       }
+
+      // Git pull succeeded. Vite will restart ~1.5 s from now.
+      // Poll /api/ping every second: while it errors = server restarting;
+      // once it responds = server is back with new bundle → reload.
+      toast.loading('Server restarting with new code…', { id: toastId, description: data.output || 'Waiting for Vite to restart…' });
+
+      let attempts = 0;
+      const poll = setInterval(async () => {
+        attempts++;
+        if (attempts > 30) { // bail after 30 s
+          clearInterval(poll);
+          window.location.reload();
+          return;
+        }
+        try {
+          const ping = await fetch('/api/ping', { cache: 'no-store' });
+          if (ping.ok) {
+            clearInterval(poll);
+            toast.success('Update complete! Reloading…', { id: toastId });
+            setTimeout(() => window.location.reload(), 300);
+          }
+        } catch { /* server still restarting — keep polling */ }
+      }, 1000);
     } catch {
       toast.error('Could not reach update server', { id: toastId, description: 'Close and rerun start.bat / start.sh to update' });
       setUpdating(false);

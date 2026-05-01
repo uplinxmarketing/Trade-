@@ -61,6 +61,8 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
   const processingRef   = useRef(false);
   const coinBudgetsRef  = useRef<Record<string, number>>({});
   const selectedRef     = useRef(selectedCoins);
+  const stopLossRef     = useRef(1.5);
+  const minProfitRef    = useRef(0.25);
 
   useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
   useEffect(() => { selectedRef.current = selectedCoins; }, [selectedCoins]);
@@ -95,6 +97,19 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
     }
   }, []);
 
+  // Load stop-loss / profit config once (avoid fetching on every price tick)
+  useEffect(() => {
+    supabase.from('bot_config')
+      .select('stop_loss_percent, min_profit_percent')
+      .eq('user_session', 'default').maybeSingle()
+      .then(({ data }) => {
+        if (data) {
+          stopLossRef.current  = Number(data.stop_loss_percent  ?? 1.5);
+          minProfitRef.current = Number(data.min_profit_percent ?? 0.25);
+        }
+      });
+  }, []);
+
   // Initial load + realtime updates
   useEffect(() => {
     loadData();
@@ -126,6 +141,8 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
   }, [selectedCoins]);
 
   // ── REAL-TIME LOOP — fires on every WebSocket price tick (~1 s) ─────────────
+  // Exits are checked on every single tick — a trade profitable after 2 seconds
+  // will be closed on the very next tick after that threshold is reached.
   useEffect(() => {
     if (!isRunningRef.current || processingRef.current) return;
     if (!Object.keys(prices).length) return;
@@ -133,14 +150,8 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
     processingRef.current = true;
     (async () => {
       try {
-        const cfgRes = await supabase.from('bot_config')
-          .select('stop_loss_percent, min_profit_percent')
-          .eq('user_session', 'default').maybeSingle();
-        const stopLoss  = Number(cfgRes.data?.stop_loss_percent  ?? 1.5);
-        const minProfit = Number(cfgRes.data?.min_profit_percent ?? 0.25);
-
         const [exits, entries] = await Promise.all([
-          checkExits(prices, supabase, stopLoss, minProfit),
+          checkExits(prices, supabase, stopLossRef.current, minProfitRef.current),
           checkEntries(selectedRef.current, signalsRef.current, prices, coinBudgetsRef.current, supabase),
         ]);
         if (exits > 0 || entries > 0) {
@@ -362,14 +373,16 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
       <div className="flex items-center gap-2 bg-accent/10 border border-accent/20 rounded-md px-3 py-2">
         <Brain className="w-3.5 h-3.5 text-accent animate-pulse flex-shrink-0" />
         <div className="flex-1 min-w-0">
-          <span className="text-xs text-accent font-semibold">AI Analysis Always Active</span>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-accent font-semibold">AI Analysis Always Active</span>
+            {isRunning && (
+              <span className="text-[9px] font-mono text-gain flex items-center gap-0.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-gain animate-ping inline-block" />exits checked every ~1 s
+              </span>
+            )}
+          </div>
           <p className="text-[10px] text-muted-foreground truncate">{analysisStatus}</p>
         </div>
-        {isRunning && (
-          <span className="flex items-center gap-1 text-[9px] font-mono text-gain flex-shrink-0">
-            <span className="w-1.5 h-1.5 rounded-full bg-gain animate-ping" />LIVE
-          </span>
-        )}
       </div>
 
       {/* ── Stats ── */}

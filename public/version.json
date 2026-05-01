@@ -1,5 +1,5 @@
 {
-  "version": "2.3.0",
-  "buildTime": "2026-05-01T17:00:00Z",
-  "commit": "binance-fee-correct-usdt"
+  "version": "2.3.1",
+  "buildTime": "2026-05-01T19:00:00Z",
+  "commit": "ping-poll-update-realtime-exits"
 }
