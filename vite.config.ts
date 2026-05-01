@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react-swc";
 import path from "path";
 import fs from "fs";
 import { componentTagger } from "lovable-tagger";
-import type { Plugin, ViteDevServer } from "vite";
+import type { Plugin } from "vite";
 import type { IncomingMessage, ServerResponse } from "http";
 
 const versionJson = JSON.parse(fs.readFileSync("./public/version.json", "utf-8"));
@@ -106,72 +106,11 @@ function chatProxyPlugin(): Plugin {
   };
 }
 
+// No update plugin needed — the app is browser-hosted.
+// Updates deploy automatically when code is pushed to GitHub.
+// The client simply reloads the page to get the latest bundle.
 function updatePlugin(): Plugin {
-  return {
-    name: "update-puller",
-    configureServer(server: ViteDevServer) {
-      // Simple ping — client polls this to detect when server is back after restart
-      server.middlewares.use("/api/ping", (_req: IncomingMessage, res: ServerResponse) => {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      });
-
-      server.middlewares.use("/api/update", async (req: IncomingMessage, res: ServerResponse) => {
-        if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
-        try {
-          const { execSync } = await import("child_process");
-          const isWin = process.platform === "win32";
-
-          // On Windows, the Node.js process may not inherit git in its PATH.
-          // Resolve the git executable before running the pull.
-          let gitExe = "git";
-          if (isWin) {
-            const winCandidates = [
-              "C:\\Program Files\\Git\\cmd\\git.exe",
-              "C:\\Program Files\\Git\\bin\\git.exe",
-              "C:\\Program Files (x86)\\Git\\cmd\\git.exe",
-              (process.env.LOCALAPPDATA || "") + "\\Programs\\Git\\cmd\\git.exe",
-              (process.env.APPDATA || "") + "\\Local\\Programs\\Git\\cmd\\git.exe",
-            ];
-            // First try: resolve via cmd.exe PATH (most reliable on Windows)
-            let foundViaShell = false;
-            try {
-              execSync("git --version", { shell: true, encoding: "utf-8", timeout: 5000 });
-              foundViaShell = true;
-            } catch { /* not in shell PATH */ }
-
-            if (foundViaShell) {
-              gitExe = "git"; // use shell: true below
-            } else {
-              // Fallback: try common installation directories
-              for (const p of winCandidates) {
-                try {
-                  execSync(`"${p}" --version`, { encoding: "utf-8", timeout: 3000 });
-                  gitExe = `"${p}"`;
-                  break;
-                } catch { /* try next */ }
-              }
-            }
-          }
-
-          const output = execSync(`${gitExe} pull --ff-only origin main`, {
-            encoding: "utf-8",
-            timeout: 30_000,
-            cwd: process.cwd(),
-            shell: isWin, // cmd.exe on Windows resolves PATH correctly
-          });
-          const trimmed = output.trim();
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true, output: trimmed }));
-          setTimeout(() => server.restart(), 1500);
-        } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : String(e);
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: msg }));
-        }
-      });
-    },
-  };
+  return { name: "update-puller" };
 }
 
 export default defineConfig(({ mode }) => ({

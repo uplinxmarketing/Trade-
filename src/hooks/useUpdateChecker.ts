@@ -4,17 +4,16 @@ import { toast } from 'sonner';
 const REMOTE_VERSION_URL =
   'https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/public/version.json';
 
-// Baked into the JS bundle at startup by Vite — frozen for the life of this run.
-// When new code is pushed with an updated version.json, running bundles keep the
-// old fingerprint; the remote URL returns the new one → mismatch → update detected.
+// Baked into the JS bundle at deploy time by Vite.
+// When new code is deployed, the remote version.json changes → mismatch → update banner.
 const LOCAL_FINGERPRINT = `${__APP_COMMIT__}:${__APP_BUILD_TIME__}`;
 
 interface VersionInfo { version: string; buildTime: string; commit: string; }
 
 export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
   const [updateAvailable, setUpdateAvailable] = useState(false);
-  const [checking, setChecking]   = useState(false);
-  const [updating, setUpdating]   = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [updating, setUpdating] = useState(false);
 
   const checkForUpdates = useCallback(async (): Promise<boolean> => {
     setChecking(true);
@@ -35,51 +34,18 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
     }
   }, []);
 
-  // Background polling
+  // Background polling every 5 min
   useEffect(() => {
     const id = setInterval(() => { checkForUpdates().catch(() => {}); }, pollIntervalMs);
     return () => clearInterval(id);
   }, [checkForUpdates, pollIntervalMs]);
 
-  // Pull latest code, then wait for Vite server to restart before reloading
-  const applyUpdate = useCallback(async () => {
+  // Browser-hosted app: updates deploy automatically when code is pushed.
+  // Reloading the page fetches the latest deployed bundle — no git pull needed.
+  const applyUpdate = useCallback(() => {
     setUpdating(true);
-    const toastId = toast.loading('Pulling latest code from GitHub…');
-    try {
-      const resp = await fetch('/api/update', { method: 'POST' });
-      const data = await resp.json();
-      if (!data.success) {
-        toast.error('Pull failed', { id: toastId, description: data.error || 'Restart start.bat / start.sh manually' });
-        setUpdating(false);
-        return;
-      }
-
-      // Git pull succeeded. Vite will restart ~1.5 s from now.
-      // Poll /api/ping every second: while it errors = server restarting;
-      // once it responds = server is back with new bundle → reload.
-      toast.loading('Server restarting with new code…', { id: toastId, description: data.output || 'Waiting for Vite to restart…' });
-
-      let attempts = 0;
-      const poll = setInterval(async () => {
-        attempts++;
-        if (attempts > 30) { // bail after 30 s
-          clearInterval(poll);
-          window.location.reload();
-          return;
-        }
-        try {
-          const ping = await fetch('/api/ping', { cache: 'no-store' });
-          if (ping.ok) {
-            clearInterval(poll);
-            toast.success('Update complete! Reloading…', { id: toastId });
-            setTimeout(() => window.location.reload(), 300);
-          }
-        } catch { /* server still restarting — keep polling */ }
-      }, 1000);
-    } catch {
-      toast.error('Could not reach update server', { id: toastId, description: 'Close and rerun start.bat / start.sh to update' });
-      setUpdating(false);
-    }
+    toast.success('Reloading to apply update…', { duration: 1500 });
+    setTimeout(() => window.location.reload(), 800);
   }, []);
 
   const dismiss = () => setUpdateAvailable(false);

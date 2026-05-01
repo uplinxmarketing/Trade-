@@ -1,5 +1,5 @@
 {
-  "version": "2.4.1",
-  "buildTime": "2026-05-01T22:00:00Z",
-  "commit": "fix-git-windows-path"
+  "version": "2.4.2",
+  "buildTime": "2026-05-01T23:00:00Z",
+  "commit": "browser-hosted-simple-reload"
 }
