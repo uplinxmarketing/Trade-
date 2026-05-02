@@ -15,9 +15,10 @@ import os
 import time
 import math
 import threading
-import urllib.request
 from datetime import datetime
 from typing import Dict, List, Optional
+
+import aiohttp
 
 import config
 import database
@@ -353,11 +354,20 @@ async def signal_scanner(prices: dict):
         await asyncio.sleep(config.SCAN_INTERVAL_SEC)
 
 
+async def _fetch_klines(session: aiohttp.ClientSession, sym: str) -> list:
+    """Fetch 50 1m klines from Binance REST — fully async, non-blocking."""
+    url = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval=1m&limit=50"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+
 async def _run_signal_scan(prices: dict):
     strategy = _load_strategy()
     if not strategy:
         return
     if not strategy.get("trading_active", True):
+        database.log_activity("Signal scan skipped — trading_active=false", "info")
         return
 
     approved_coins = {
@@ -373,127 +383,134 @@ async def _run_signal_scan(prices: dict):
         global_open = len(_positions)
 
     if global_open >= global_max:
+        database.log_activity(f"Signal scan skipped — {global_open}/{global_max} positions full", "info")
         return
 
     usdt_balance = _get_usdt_balance()
+    database.log_activity(
+        f"Scan started — {len(approved_coins)} coins, {global_open}/{global_max} positions, "
+        f"USDT={usdt_balance:.2f}",
+        "info",
+    )
 
-    for sym, coin_cfg in approved_coins.items():
-        # Gate checks
-        if _in_cooldown(sym):
-            print(f"[SignalScanner] {sym} is in cooldown — skipping.")
-            continue
-
-        with _positions_lock:
-            already_held = any(p["symbol"] == sym for p in _positions)
-        if already_held:
-            continue
-
-        with _positions_lock:
-            global_open = len(_positions)
-        if global_open >= global_max:
-            break
-
-        budget = get_budget_for_coin(sym, usdt_balance)
-        if budget <= 0:
-            continue
-
-        # Fetch 1m klines via REST
-        try:
-            url = (
-                f"https://api.binance.com/api/v3/klines"
-                f"?symbol={sym}&interval=1m&limit=50"
-            )
-            with urllib.request.urlopen(url, timeout=8) as resp:
-                raw_klines = json.loads(resp.read())
-        except Exception as e:
-            print(f"[SignalScanner] {sym}: kline fetch failed — {e}")
-            continue
-
-        try:
-            closes  = [float(k[4]) for k in raw_klines]
-            volumes = [float(k[5]) for k in raw_klines]
-
-            if len(closes) < 27:   # need at least slow EMA period + a couple candles
-                print(f"[SignalScanner] {sym}: not enough candles ({len(closes)}) — skipping.")
+    async with aiohttp.ClientSession() as session:
+        for sym, coin_cfg in approved_coins.items():
+            # Gate checks
+            if _in_cooldown(sym):
                 continue
 
-            # evaluate_signals() returns exactly {"trend","rsi","macd","volume"}
-            signals       = evaluate_signals(closes, volumes)
-            bullish_count = sum(signals.values())   # all four keys included
-
-            # Print full dict + count immediately before the buy decision
-            print(
-                f"[SignalScanner] {sym} signals={signals} "
-                f"→ {bullish_count}/4 bullish"
-            )
-
-            if bullish_count < config.MIN_SIGNALS_TO_BUY:
+            with _positions_lock:
+                already_held = any(p["symbol"] == sym for p in _positions)
+            if already_held:
                 continue
 
-        except Exception as e:
-            print(f"[SignalScanner] {sym}: indicator error — {e}")
-            continue
+            with _positions_lock:
+                global_open = len(_positions)
+            if global_open >= global_max:
+                break
 
-        # ── Execute buy ───────────────────────────────────────────────────────
-        price = prices.get(sym, closes[-1])
+            budget = get_budget_for_coin(sym, usdt_balance)
+            if budget <= 0:
+                continue
 
-        # Gather entry indicators from latest candle
-        entry_rsi = entry_ma = entry_bb = entry_vol = None
-        try:
-            candles = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=1)
-            if candles:
-                last = candles[-1]
-                entry_rsi = last.get("rsi14")
-                entry_ma  = last.get("ma_position") or _derive_ma_pos(price, last.get("ma20"))
-                entry_bb  = last.get("bb_position") or _derive_bb_pos(price, last)
-                entry_vol = last.get("volume_trend")
-        except Exception:
-            pass
+            # Fetch 1m klines via async REST (non-blocking)
+            try:
+                raw_klines = await _fetch_klines(session, sym)
+            except Exception as e:
+                print(f"[SignalScanner] {sym}: kline fetch failed — {e}")
+                database.log_activity(f"{sym}: kline fetch failed — {e}", "warn")
+                continue
 
-        # Final pre-buy guard — reads _positions directly, never a copy
-        buy_cfg = {**coin_cfg, "symbol": sym, "budget_usdt": budget}
-        allowed, reason = can_execute_buy(buy_cfg, client)
-        if not allowed:
-            print(f"[SKIP] {sym}: {reason}")
-            continue
+            try:
+                closes  = [float(k[4]) for k in raw_klines]
+                volumes = [float(k[5]) for k in raw_klines]
 
-        try:
-            result = client.order_market_buy(symbol=sym, quoteOrderQty=budget)
-        except Exception as e:
-            print(f"[SignalScanner] BUY failed {sym}: {e}")
-            continue
+                if len(closes) < 27:
+                    continue
 
-        fill = result.get("fills", [{}])[0]
-        fill_price = float(fill.get("price", price))
-        qty        = float(result.get("executedQty", 0))
+                # evaluate_signals() returns exactly {"trend","rsi","macd","volume"}
+                signals       = evaluate_signals(closes, volumes)
+                bullish_count = sum(signals.values())
 
-        if qty <= 0:
-            continue
+                print(
+                    f"[SignalScanner] {sym} signals={signals} "
+                    f"→ {bullish_count}/4 bullish"
+                )
+                database.log_activity(
+                    f"{sym}: {bullish_count}/4 signals bullish {signals}", "info"
+                )
 
-        pos_record = {
-            "symbol":              sym,
-            "entry_price":         fill_price,
-            "quantity":            qty,
-            "budget_usdt":         budget,
-            "timestamp":           now,
-            "mode":                mode,
-            "entry_rsi":           entry_rsi,
-            "entry_ma_position":   entry_ma,
-            "entry_bb_position":   entry_bb,
-            "entry_volume_trend":  entry_vol,
-        }
-        pos_id = database.save_position(pos_record)
-        pos_record["id"] = pos_id
+                if bullish_count < config.MIN_SIGNALS_TO_BUY:
+                    continue
 
-        with _positions_lock:
-            _positions.append(pos_record)
+            except Exception as e:
+                print(f"[SignalScanner] {sym}: indicator error — {e}")
+                continue
 
-        usdt_balance -= budget + budget * _fee_rate
-        global_open  += 1
+            # ── Execute buy ───────────────────────────────────────────────────────
+            price = prices.get(sym, closes[-1])
 
-        breakeven = fill_price * _breakeven_mult
-        print(
-            f"[SignalScanner] BOUGHT {sym} @ ${fill_price:.4f} "
-            f"| qty={qty:.6f} | BEP=${breakeven:.4f} "
-            f"| signals={bullish_count}/4"
-        )
+            # Gather entry indicators from latest candle
+            entry_rsi = entry_ma = entry_bb = entry_vol = None
+            try:
+                candles = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=1)
+                if candles:
+                    last = candles[-1]
+                    entry_rsi = last.get("rsi14")
+                    entry_ma  = last.get("ma_position") or _derive_ma_pos(price, last.get("ma20"))
+                    entry_bb  = last.get("bb_position") or _derive_bb_pos(price, last)
+                    entry_vol = last.get("volume_trend")
+            except Exception:
+                pass
+
+            # Final pre-buy guard — reads _positions directly, never a copy
+            buy_cfg = {**coin_cfg, "symbol": sym, "budget_usdt": budget}
+            allowed, reason = can_execute_buy(buy_cfg, client)
+            if not allowed:
+                print(f"[SKIP] {sym}: {reason}")
+                database.log_activity(f"{sym}: buy skipped — {reason}", "info")
+                continue
+
+            try:
+                result = client.order_market_buy(symbol=sym, quoteOrderQty=budget)
+            except Exception as e:
+                print(f"[SignalScanner] BUY failed {sym}: {e}")
+                database.log_activity(f"{sym}: BUY failed — {e}", "error")
+                continue
+
+            fill = result.get("fills", [{}])[0]
+            fill_price = float(fill.get("price", price))
+            qty        = float(result.get("executedQty", 0))
+
+            if qty <= 0:
+                continue
+
+            pos_record = {
+                "symbol":              sym,
+                "entry_price":         fill_price,
+                "quantity":            qty,
+                "budget_usdt":         budget,
+                "timestamp":           now,
+                "mode":                mode,
+                "entry_rsi":           entry_rsi,
+                "entry_ma_position":   entry_ma,
+                "entry_bb_position":   entry_bb,
+                "entry_volume_trend":  entry_vol,
+            }
+            pos_id = database.save_position(pos_record)
+            pos_record["id"] = pos_id
+
+            with _positions_lock:
+                _positions.append(pos_record)
+
+            usdt_balance -= budget + budget * _fee_rate
+            global_open  += 1
+
+            breakeven = fill_price * _breakeven_mult
+            msg = (
+                f"BOUGHT {sym} @ ${fill_price:.4f} "
+                f"| qty={qty:.6f} | BEP=${breakeven:.4f} "
+                f"| signals={bullish_count}/4"
+            )
+            print(f"[SignalScanner] {msg}")
+            database.log_activity(msg, "info")
