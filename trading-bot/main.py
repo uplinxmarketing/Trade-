@@ -6,6 +6,14 @@ Start order: DB → strategy.json → control API → history download → WebSo
 import asyncio
 import os
 import sys
+
+# Ensure CWD is the trading-bot directory regardless of where the process
+# was launched from (e.g. Railway runs from repo root: python trading-bot/main.py)
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+# Add trading-bot dir to sys.path so sibling imports work from any CWD
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from dotenv import load_dotenv
 
 load_dotenv()
