@@ -644,9 +644,10 @@ def api_set_mode(req: ModeRequest):
 
 
 def start_control_api():
+    port = int(os.getenv("PORT", 8000))
     t = threading.Thread(
-        target=lambda: uvicorn.run(app, host="0.0.0.0", port=8000, log_level="error"),
+        target=lambda: uvicorn.run(app, host="0.0.0.0", port=port, log_level="error"),
         daemon=True,
     )
     t.start()
-    print("[ControlAPI] Dashboard running at http://localhost:8000")
+    print(f"[ControlAPI] Dashboard running at http://0.0.0.0:{port}")

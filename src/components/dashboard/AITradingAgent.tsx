@@ -277,10 +277,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
   useEffect(() => {
     loadData().then(() => {
-      // Restart the scheduler if the bot was running before the page refresh.
-      // runCycleRef and scheduleNextRef are populated by effects registered
-      // further down, which have all fired by the time this .then() resolves.
-      if (isRunningRef.current && scheduleNextRef.current) {
+      // After refresh: resume the JS scheduler only in local mode.
+      // Server mode restart is handled by the polling useEffect above.
+      if (isRunningRef.current && !isServerModeRef.current && scheduleNextRef.current) {
         addLog('=== Resumed after page refresh — restarting cycle ===');
         runCycleRef.current?.().then(() => scheduleNextRef.current?.());
       }
@@ -298,6 +297,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   useEffect(() => { pricesRef.current = prices; }, [prices]);
 
   useEffect(() => {
+    // Exit checker only runs in local mode — Railway handles exits server-side
+    if (isServerMode) return;
     if (!isRunning || processingRef.current) return;
     if (!Object.keys(prices).length) return;
     processingRef.current = true;
@@ -307,7 +308,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       .then(n => { if (n > 0) { loadData(); toast.success(`Closed ${n} position(s)`, { duration: 2500 }); } })
       .catch(() => {})
       .finally(() => { processingRef.current = false; });
-  }, [prices]); // eslint-disable-line
+  }, [prices, isServerMode]); // eslint-disable-line
 
   // ── Core cycle ───────────────────────────────────────────────────────────
   const runCycle = useCallback(async () => {
@@ -417,15 +418,101 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   useEffect(() => { runCycleRef.current    = runCycle;    }, [runCycle]);
   useEffect(() => { scheduleNextRef.current = scheduleNext; }, [scheduleNext]);
 
+  // ── Railway server-mode poller ─────────────────────────────────────────────
+  // When a Railway URL is configured the JS trading loop is disabled.
+  // Instead we poll the Railway bot's REST API every 30 s and mirror its state
+  // into the same React state variables so the UI shows live Railway data.
+  const serverPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const pollRailway = useCallback(async () => {
+    if (!railwayUrl) return;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 8000);
+      const [sRes, pRes, tRes] = await Promise.all([
+        fetch(`${railwayUrl}/api/status`,    { signal: ctrl.signal }),
+        fetch(`${railwayUrl}/api/positions`, { signal: ctrl.signal }),
+        fetch(`${railwayUrl}/api/trades`,    { signal: ctrl.signal }),
+      ]);
+      clearTimeout(timer);
+
+      if (sRes.ok) {
+        const s = await sRes.json();
+        const running = Boolean(s.running);
+        isRunningRef.current = running;
+        setIsRunning(running);
+        const bal = Number(s.balance_usdt ?? 0);
+        setBalance(bal); balanceRef.current = bal;
+        setInitialBalance(Number(s.initial_balance ?? bal));
+        setAgentStatus(`Railway · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${new Date().toLocaleTimeString()}`);
+      }
+
+      if (pRes.ok) {
+        const p = await pRes.json();
+        const mapped: OpenPosition[] = (p.positions ?? []).map((pos: any) => ({
+          symbol:          pos.symbol,
+          quantity:        Number(pos.quantity),
+          avg_entry_price: Number(pos.entry_price ?? pos.avg_entry_price ?? 0),
+        }));
+        setPositions(mapped);
+        positionsRef.current = mapped;
+      }
+
+      if (tRes.ok) {
+        const t = await tRes.json();
+        const mapped: TradeRow[] = (t.trades ?? [])
+          .filter((tr: any) => tr.exit_price != null)
+          .map((tr: any) => ({
+            id:         String(tr.id),
+            created_at: tr.timestamp_sell ?? tr.timestamp_buy ?? new Date().toISOString(),
+            symbol:     tr.coin,
+            side:       'SELL' as const,
+            price:      Number(tr.exit_price),
+            quantity:   Number(tr.quantity),
+            pnl:        Number(tr.net_profit ?? 0),
+            reason:     null,
+          }));
+        setTrades(mapped);
+      }
+    } catch (e: any) {
+      if (e.name !== 'AbortError') addLog(`[Railway] poll failed: ${e.message}`);
+    }
+  }, [railwayUrl, addLog]);
+
+  // Start/stop the polling interval whenever server mode changes
+  useEffect(() => {
+    if (!isServerMode) {
+      if (serverPollRef.current) { clearInterval(serverPollRef.current); serverPollRef.current = null; }
+      return;
+    }
+    // Immediate poll then every 30 s
+    pollRailway();
+    serverPollRef.current = setInterval(pollRailway, 30_000);
+    return () => { if (serverPollRef.current) { clearInterval(serverPollRef.current); serverPollRef.current = null; } };
+  }, [isServerMode, pollRailway]);
+
   // ── Start / Stop ─────────────────────────────────────────────────────────
   const toggleBot = async () => {
-    if (mode === 'live' && !binanceConnected) { toast.error('Connect Binance API first'); onConnectBinance?.(); return; }
     setLoading(true);
     try {
+      // ── Server mode: delegate to Railway ──
+      if (isServerMode) {
+        const endpoint = isRunning ? '/api/agent/stop' : '/api/agent/start';
+        const res  = await fetch(`${railwayUrl}${endpoint}`, { method: 'POST' });
+        const data = await res.json();
+        if (data.ok === false) throw new Error(data.error ?? 'Railway call failed');
+        addLog(isRunning ? '=== Railway bot STOPPED ===' : '=== Railway bot STARTED ===');
+        toast[isRunning ? 'info' : 'success'](isRunning ? 'Railway bot paused' : 'Railway bot started', {
+          description: 'Runs 24/7 on Railway — this browser tab can be closed.',
+        });
+        await pollRailway();
+        return;
+      }
+
+      // ── Local paper mode: JS trading loop ──
+      if (mode === 'live' && !binanceConnected) { toast.error('Connect Binance API first'); onConnectBinance?.(); return; }
       if (!isRunning) {
         const startBal = getPaperCfg().startingBalance ?? 1000;
-        // Preserve existing balance if the bot was previously running (e.g. after a page refresh).
-        // Only reset to startBal on a genuine fresh start (no prior balance in DB).
         const existingBal  = balanceRef.current  > 0 ? balanceRef.current  : startBal;
         const existingInit = initialBalance       > 0 ? initialBalance      : startBal;
         await supabase.from('bot_config').upsert({
@@ -442,7 +529,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         setBalance(existingBal); balanceRef.current = existingBal;
         setInitialBalance(existingInit);
         addLog(`=== Agent STARTED · ${existingBal.toFixed(2)} USDT · ${mode.toUpperCase()} ===`);
-        toast.success(`AI Agent started — PAPER mode`, { description: `${existingBal.toLocaleString()} USDT · ${selectedCoins.length} coins · every 30s` });
+        toast.success('AI Agent started — PAPER mode', { description: `${existingBal.toLocaleString()} USDT · ${selectedCoins.length} coins · every 30s` });
         runCycle().then(scheduleNext);
       } else {
         if (cycleTimerRef.current) clearTimeout(cycleTimerRef.current);
@@ -534,6 +621,21 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // ── Reset ────────────────────────────────────────────────────────────────
   const resetBot = async () => {
     if (!confirm('Reset all paper trades and restore budget?')) return;
+    if (isServerMode) {
+      try {
+        setLoading(true);
+        const res  = await fetch(`${railwayUrl}/api/reset`, { method: 'POST' });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error ?? 'Reset failed');
+        setTrades([]); setPositions([]); setActLog([]);
+        addLog('=== Railway wallet reset ===');
+        toast.success(`Railway reset · ${data.balance_usdt?.toLocaleString()} USDT restored`);
+        await pollRailway();
+      } catch (e: any) {
+        toast.error(`Reset failed: ${e.message}`);
+      } finally { setLoading(false); }
+      return;
+    }
     if (cycleTimerRef.current) clearTimeout(cycleTimerRef.current);
     if (countdownRef.current)  clearInterval(countdownRef.current);
     isRunningRef.current = false;
@@ -572,40 +674,51 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${mode === 'live' ? 'bg-loss/20 text-loss' : 'bg-accent/20 text-accent'}`}>
             {mode === 'live' ? 'LIVE' : 'PAPER TEST'}
           </span>
-          {scanning
-            ? <span className="text-[9px] text-accent font-mono flex items-center gap-1"><RefreshCw className="w-2.5 h-2.5 animate-spin" />Checking signals…</span>
-            : isRunning && cycleCountdown > 0
-              ? <span className="text-[9px] text-muted-foreground font-mono flex items-center gap-1.5">
-                  <span className="text-gain">●</span>exits live
-                  <span className="opacity-40">·</span>buy scan in {cycleCountdown}s
+          {isServerMode
+            ? isRunning
+              ? <span className="text-[9px] text-gain font-mono flex items-center gap-1">
+                  <span className="animate-pulse">●</span>Railway 24/7 · {agentStatus ? agentStatus.split('·').slice(-1)[0]?.trim() : 'live'}
                 </span>
-              : null
+              : <span className="text-[9px] text-muted-foreground font-mono">Railway · paused</span>
+            : scanning
+              ? <span className="text-[9px] text-accent font-mono flex items-center gap-1"><RefreshCw className="w-2.5 h-2.5 animate-spin" />Checking signals…</span>
+              : isRunning && cycleCountdown > 0
+                ? <span className="text-[9px] text-muted-foreground font-mono flex items-center gap-1.5">
+                    <span className="text-gain">●</span>exits live
+                    <span className="opacity-40">·</span>buy scan in {cycleCountdown}s
+                  </span>
+                : null
           }
         </div>
         <div className="flex items-center gap-1.5">
           {isRunning && (
-            <Button size="sm" variant="outline" className="h-6 text-[10px] px-2" onClick={() => runCycle()} disabled={scanning}>
-              <Zap className="w-3 h-3 mr-0.5" />Now
+            <Button size="sm" variant="outline" className="h-6 text-[10px] px-2"
+              onClick={() => isServerMode ? pollRailway() : runCycle()}
+              disabled={scanning}
+              title={isServerMode ? 'Refresh Railway state' : 'Run cycle now'}>
+              <Zap className="w-3 h-3 mr-0.5" />{isServerMode ? 'Sync' : 'Now'}
             </Button>
           )}
-          <button onClick={resetBot} className="p-1.5 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground" title="Reset">
+          <button onClick={resetBot} disabled={loading} className="p-1.5 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground disabled:opacity-40" title="Reset">
             <RotateCcw className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
 
-      {/* ── Mode toggle ── */}
-      <div className="grid grid-cols-2 gap-1 bg-muted/30 rounded-md p-0.5">
-        {(['test', 'live'] as const).map(m => (
-          <button key={m} onClick={() => { if (!isRunning) setMode(m); }} disabled={isRunning}
-            className={`flex items-center justify-center gap-1.5 py-2 rounded text-xs font-semibold transition-colors disabled:opacity-60
-              ${mode === m ? (m === 'live' ? 'bg-loss/80 text-white' : 'bg-accent text-accent-foreground') : 'text-muted-foreground hover:text-foreground'}`}>
-            {m === 'test' ? <><FlaskConical className="w-3.5 h-3.5" />TEST · Paper</> : <><Zap className="w-3.5 h-3.5" />LIVE · Real{!binanceConnected && <span className="text-[9px] px-1 bg-warn/20 text-warn rounded ml-1">API needed</span>}</>}
-          </button>
-        ))}
-      </div>
+      {/* ── Mode toggle — hidden in server mode (Railway controls its own mode) ── */}
+      {!isServerMode && (
+        <div className="grid grid-cols-2 gap-1 bg-muted/30 rounded-md p-0.5">
+          {(['test', 'live'] as const).map(m => (
+            <button key={m} onClick={() => { if (!isRunning) setMode(m); }} disabled={isRunning}
+              className={`flex items-center justify-center gap-1.5 py-2 rounded text-xs font-semibold transition-colors disabled:opacity-60
+                ${mode === m ? (m === 'live' ? 'bg-loss/80 text-white' : 'bg-accent text-accent-foreground') : 'text-muted-foreground hover:text-foreground'}`}>
+              {m === 'test' ? <><FlaskConical className="w-3.5 h-3.5" />TEST · Paper</> : <><Zap className="w-3.5 h-3.5" />LIVE · Real{!binanceConnected && <span className="text-[9px] px-1 bg-warn/20 text-warn rounded ml-1">API needed</span>}</>}
+            </button>
+          ))}
+        </div>
+      )}
 
-      {mode === 'live' && (
+      {!isServerMode && mode === 'live' && (
         <div className={`rounded-md px-3 py-2 text-xs ${binanceConnected ? 'bg-loss/10 border border-loss/30 text-loss' : 'bg-warn/10 border border-warn/30 text-warn'}`}>
           {binanceConnected ? '⚠️ LIVE MODE — real USDT will be used.' : <span>Binance API not connected. <button onClick={onConnectBinance} className="underline font-semibold">Connect now →</button></span>}
         </div>
@@ -691,19 +804,23 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       </div>
 
       {/* ── Start / Stop ── */}
-      <Button onClick={toggleBot} disabled={loading||!selectedCoins.length}
+      <Button onClick={toggleBot} disabled={loading || (!isServerMode && !selectedCoins.length)}
         className={`w-full font-semibold py-5 ${isRunning?'bg-loss/90 hover:bg-loss text-white':'bg-gain/90 hover:bg-gain text-background'}`}>
         {loading ? <span className="animate-spin mr-1.5">⟳</span>
-          : isRunning ? <><Square className="w-4 h-4 mr-1.5"/>Stop Agent</>
-          : <><Play className="w-4 h-4 mr-1.5"/>Start AI Agent — Paper Test</>}
+          : isRunning
+            ? <><Square className="w-4 h-4 mr-1.5"/>{isServerMode ? 'Pause Railway Bot' : 'Stop Agent'}</>
+            : <><Play className="w-4 h-4 mr-1.5"/>{isServerMode ? 'Start Railway Bot (24/7)' : 'Start AI Agent — Paper Test'}</>}
       </Button>
       {isRunning
         ? <p className="text-[10px] text-center text-muted-foreground -mt-2">
-            Every 30s: fetches live candles → checks EMA / RSI / MACD / Volume → buys or holds
-            {agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}
+            {isServerMode
+              ? <>Railway bot running 24/7 · closes browser safe · polling every 30s{agentStatus && <> · <span className="text-gain font-mono">{agentStatus}</span></>}</>
+              : <>Every 30s: fetches live candles → checks EMA / RSI / MACD / Volume → buys or holds{agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}</>}
           </p>
         : <p className="text-[10px] text-center text-muted-foreground -mt-2">
-            Sells on every price tick · Buys checked every 30s · EMA+RSI+MACD+Volume signals · no API key needed
+            {isServerMode
+              ? 'Railway bot handles all trading 24/7 — no browser required'
+              : 'Sells on every price tick · Buys checked every 30s · EMA+RSI+MACD+Volume signals · no API key needed'}
           </p>
       }
 
