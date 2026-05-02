@@ -387,9 +387,15 @@ async def _run_signal_scan(prices: dict):
         return
 
     usdt_balance = _get_usdt_balance()
+
+    # Show warmup progress: how many coins have ≥27 DB candles ready
+    db_ready = sum(
+        1 for s in approved_coins
+        if len(database.get_candles(s, config.CANDLE_TIMEFRAME, limit=27)) >= 27
+    )
     database.log_activity(
         f"Scan started — {len(approved_coins)} coins, {global_open}/{global_max} positions, "
-        f"USDT={usdt_balance:.2f}",
+        f"USDT={usdt_balance:.2f} | candles ready: {db_ready}/{len(approved_coins)}",
         "info",
     )
 
@@ -413,21 +419,25 @@ async def _run_signal_scan(prices: dict):
             if budget <= 0:
                 continue
 
-            # Fetch 1m klines via async REST (non-blocking)
+            # Fetch klines — try Binance REST first; when REST is geo-blocked
+            # (HTTP 451 on Railway US servers) fall back to candles the WebSocket
+            # has already saved to the DB.  On cold start the DB is empty and
+            # fills at 1 candle/minute per coin; signals fire once ≥27 candles exist.
+            closes = volumes = None
             try:
                 raw_klines = await _fetch_klines(session, sym)
-            except Exception as e:
-                print(f"[SignalScanner] {sym}: kline fetch failed — {e}")
-                database.log_activity(f"{sym}: kline fetch failed — {e}", "warn")
-                continue
-
-            try:
                 closes  = [float(k[4]) for k in raw_klines]
                 volumes = [float(k[5]) for k in raw_klines]
+            except Exception:
+                db_rows = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=50)
+                if len(db_rows) >= 27:
+                    closes  = [float(c["close"])  for c in db_rows]
+                    volumes = [float(c["volume"]) for c in db_rows]
 
-                if len(closes) < 27:
-                    continue
+            if closes is None or len(closes) < 27:
+                continue  # REST blocked and not enough WebSocket candles yet
 
+            try:
                 # evaluate_signals() returns exactly {"trend","rsi","macd","volume"}
                 signals       = evaluate_signals(closes, volumes)
                 bullish_count = sum(signals.values())

@@ -29,13 +29,28 @@ def register_price_callback(cb: Callable[[Dict[str, float]], None]):
 
 # ── REST historical download ─────────────────────────────────────────────────
 
+# Binance has several base URLs. api.binance.com returns HTTP 451 (geo-block)
+# from Railway's US servers; the numbered subdomains are often not restricted.
+_BINANCE_BASES = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+]
+
+
 def _fetch_klines_rest(symbol: str, interval: str, limit: int = 500):
-    url = (
-        f"https://api.binance.com/api/v3/klines"
-        f"?symbol={symbol}&interval={interval}&limit={limit}"
-    )
-    with urllib.request.urlopen(url, timeout=15) as resp:
-        return json.loads(resp.read())
+    """Try each Binance base URL in order; return first successful response."""
+    last_err = None
+    for base in _BINANCE_BASES:
+        url = f"{base}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        try:
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            last_err = e
+    raise last_err  # all bases failed
 
 
 def _compute_and_save(symbol: str, raw_klines: list):

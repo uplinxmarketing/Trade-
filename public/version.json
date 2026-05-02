@@ -1,5 +1,5 @@
 {
-  "version": "3.5.25",
-  "buildTime": "2026-05-03T03:00:00Z",
-  "commit": "fix-paper-client-price-missing-blocks-all-trades"
+  "version": "3.5.26",
+  "buildTime": "2026-05-03T04:00:00Z",
+  "commit": "fix-binance-451-geo-block-rest-fallback-db-candles"
 }
