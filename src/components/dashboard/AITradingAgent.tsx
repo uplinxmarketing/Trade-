@@ -376,7 +376,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         addLog(`SELL ${symbol} @ ${price.toFixed(4)} USDT · ${usdtReceived.toFixed(4)} USDT · P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDT`);
       })
         .then(n => { if (n > 0) { loadData(); toast.success(`Closed ${n} position(s)`, { duration: 2500 }); } })
-        .catch(() => {})
+        .catch((e: unknown) => { addLog(`[ERR] Exit check: ${e instanceof Error ? e.message : String(e)}`); })
         .finally(() => { exitProcessingRef.current = false; });
     }
 
@@ -384,7 +384,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (!buyProcessingRef.current && signalCacheRef.current.length > 0) {
       buyProcessingRef.current = true;
       executePendingBuys()
-        .catch(() => {})
+        .catch((e: unknown) => { addLog(`[ERR] Buy exec: ${e instanceof Error ? e.message : String(e)}`); })
         .finally(() => { buyProcessingRef.current = false; });
     }
   }, [prices]); // eslint-disable-line
@@ -505,12 +505,23 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   };
 
   // ── Computed stats ───────────────────────────────────────────────────────
-  const sellTrades  = trades.filter(t => t.side === 'SELL' && t.pnl !== null);
-  const wins        = sellTrades.filter(t => (t.pnl ?? 0) > 0).length;
-  const totalPnl    = sellTrades.reduce((s, t) => s + (t.pnl ?? 0), 0);
-  const winRate     = sellTrades.length ? Math.round((wins / sellTrades.length) * 100) : 0;
-  const pnlColor    = totalPnl >= 0 ? 'text-gain' : 'text-loss';
-  const pnlPct      = initialBalance > 0 ? ((totalPnl / initialBalance) * 100).toFixed(2) : '0.00';
+  const sellTrades    = trades.filter(t => t.side === 'SELL' && t.pnl !== null);
+  const wins          = sellTrades.filter(t => (t.pnl ?? 0) > 0).length;
+  const realizedPnl   = sellTrades.reduce((s, t) => s + (t.pnl ?? 0), 0);
+  const winRate       = sellTrades.length ? Math.round((wins / sellTrades.length) * 100) : 0;
+
+  // Unrealized P&L from open positions (updates every price tick)
+  const unrealizedPnl = positions.reduce((s, pos) => {
+    const livePrice = parseFloat(pricesRef.current[pos.symbol]?.price || '0');
+    if (!livePrice) return s;
+    const qty = Number(pos.quantity);
+    const entry = Number(pos.avg_entry_price);
+    return s + (qty * livePrice * (1 - TAKER_FEE)) - (qty * entry / (1 - TAKER_FEE));
+  }, 0);
+
+  const totalPnl  = realizedPnl + unrealizedPnl;
+  const pnlColor  = totalPnl >= 0 ? 'text-gain' : 'text-loss';
+  const pnlPct    = initialBalance > 0 ? ((totalPnl / initialBalance) * 100).toFixed(2) : '0.00';
   const displayedTrades = showAll ? trades : trades.slice(0, 12);
 
   return (
@@ -594,9 +605,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       <div className="grid grid-cols-4 gap-1.5">
         {[
           { label: 'Balance', value: `${balance.toFixed(2)} USDT`, color: '' },
-          { label: 'Net P&L', value: `${totalPnl>=0?'+':''}${Math.abs(totalPnl).toFixed(2)} USDT`, color: pnlColor },
-          { label: 'Return', value: `${totalPnl>=0?'+':''}${pnlPct}%`, color: pnlColor },
-          { label: 'Win Rate', value: sellTrades.length ? `${winRate}%` : '—', color: winRate>=50?'text-gain':sellTrades.length?'text-loss':'' },
+          { label: positions.length ? 'Open P&L' : 'Realized P&L', value: `${(positions.length ? unrealizedPnl : realizedPnl) >= 0 ? '+' : ''}${Math.abs(positions.length ? unrealizedPnl : realizedPnl).toFixed(2)} USDT`, color: (positions.length ? unrealizedPnl : realizedPnl) >= 0 ? 'text-gain' : 'text-loss' },
+          { label: 'Total Return', value: `${totalPnl>=0?'+':''}${pnlPct}%`, color: pnlColor },
+          { label: 'Win Rate', value: sellTrades.length ? `${winRate}% (${wins}W/${sellTrades.length-wins}L)` : '—', color: winRate>=50?'text-gain':sellTrades.length?'text-loss':'' },
         ].map(s => (
           <div key={s.label} className="bg-muted/20 rounded-md p-2 text-center">
             <div className="text-[9px] uppercase tracking-widest text-muted-foreground">{s.label}</div>
@@ -614,11 +625,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       </Button>
       {isRunning
         ? <p className="text-[10px] text-center text-muted-foreground -mt-2">
-            Every 30s: fetches live candles → checks EMA / RSI / MACD / Volume → buys or holds
+            Exits live on every tick · Signals refresh every 12s · EMA+RSI+MACD+Volume
             {agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}
           </p>
         : <p className="text-[10px] text-center text-muted-foreground -mt-2">
-            Sells on every price tick · Buys checked every 30s · EMA+RSI+MACD+Volume signals · no API key needed
+            Exits fire on every price tick · Buy signals refresh every 12s · EMA+RSI+MACD+Volume · no API key needed
           </p>
       }
 
@@ -722,10 +733,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             Trade History ({trades.length})
           </div>
           {sellTrades.length > 0 && (
-            <div className="flex items-center gap-3 text-[10px] font-mono">
-              <span className="text-muted-foreground">{wins}W/{sellTrades.length-wins}L</span>
-              <span className={pnlColor}>{totalPnl>=0?'+':''}{totalPnl.toFixed(4)} USDT</span>
-            </div>
+            <span className={`text-[10px] font-mono ${realizedPnl>=0?'text-gain':'text-loss'}`}>
+              {realizedPnl>=0?'+':''}{realizedPnl.toFixed(4)} USDT realized
+            </span>
           )}
         </div>
         {!trades.length ? (

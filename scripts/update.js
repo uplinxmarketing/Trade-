@@ -17,8 +17,14 @@ const APP_DIR            = process.cwd();
 const REMOTE_VERSION_URL = 'https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/public/version.json';
 const ZIP_URL            = 'https://github.com/uplinxmarketing/Trade-/archive/refs/heads/main.zip';
 
+// .local-version tracks what commit was ACTUALLY applied to this install.
+// It is in SKIP so the ZIP never overwrites it — only this script writes it
+// after a fully successful update. This prevents the bug where public/version.json
+// gets updated by the ZIP while src/ files are only partially copied.
+const LOCAL_VER_FILE = path.join(APP_DIR, '.local-version');
+
 // Never overwrite these — they contain user data or are too large to re-copy
-const SKIP = new Set(['node_modules', 'logs', '.env', 'dist', '.git', 'scripts']);
+const SKIP = new Set(['node_modules', 'logs', '.env', 'dist', '.git', 'scripts', '.local-version']);
 
 function log(msg) {
   process.stdout.write('[update] ' + msg + '\n');
@@ -116,25 +122,26 @@ async function main() {
     return; // offline or GitHub down — not a fatal error
   }
 
-  // 2. Read local version.json
-  const localVersionPath = path.join(APP_DIR, 'public', 'version.json');
-  let localVersion = { commit: '', version: '0.0.0' };
-  try { localVersion = JSON.parse(fs.readFileSync(localVersionPath, 'utf8')); } catch { /* first run */ }
+  // 2. Read local applied-version from .local-version (NOT public/version.json).
+  //    .local-version is only written here after a full successful copy, so it
+  //    accurately reflects what source files the user actually has.
+  let localCommit = '';
+  try { localCommit = fs.readFileSync(LOCAL_VER_FILE, 'utf8').trim(); } catch { /* first run or missing */ }
 
   // 3. Check for force-update sentinel — bypasses version comparison
   const sentinelPath = path.join(APP_DIR, '.force-update');
   const forceUpdate = fs.existsSync(sentinelPath);
 
-  if (!forceUpdate && remoteVersion.commit === localVersion.commit) {
-    log('Already up to date (v' + localVersion.version + ').');
+  if (!forceUpdate && remoteVersion.commit === localCommit) {
+    log('Already up to date (v' + remoteVersion.version + ').');
     return;
   }
 
   if (forceUpdate) {
     log('Force-update sentinel detected — applying update regardless of version.');
+  } else {
+    log('Update available: ' + (localCommit || 'unknown') + ' → ' + remoteVersion.commit + ' (v' + remoteVersion.version + ')');
   }
-
-  log('Update available: v' + localVersion.version + ' → v' + remoteVersion.version);
   log('Downloading ZIP from GitHub…');
 
   const uid       = Date.now();
@@ -172,8 +179,11 @@ async function main() {
       copyEntry(path.join(srcDir, entry), APP_DIR);
     }
 
+    // Write the applied commit to .local-version — ONLY after all files are copied.
+    // This is the single source of truth for "what version is actually installed".
+    fs.writeFileSync(LOCAL_VER_FILE, remoteVersion.commit, 'utf8');
     log('Successfully updated to v' + remoteVersion.version + '!');
-    // Remove force-update sentinel now that update succeeded
+    // Remove force-update sentinel
     try { fs.unlinkSync(sentinelPath); } catch { /* may not exist */ }
   } finally {
     // 7. Clean up temp files regardless of success/failure
