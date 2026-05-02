@@ -133,7 +133,7 @@ interface AITradingAgentProps {
   prices: LivePrices;
   binanceConnected?: boolean;
   onConnectBinance?: () => void;
-  onStateChange?: (positions: {symbol:string;quantity:number;avg_entry_price:number}[], balance: number) => void;
+  onStateChange?: (positions: {symbol:string;quantity:number;avg_entry_price:number}[], balance: number, initialBalance?: number, trades?: {side:'BUY'|'SELL';pnl:number|null;quantity:number;price:number}[]) => void;
   onCoinsChange?: (coins: string[]) => void;
 }
 
@@ -319,7 +319,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const pricesRef = useRef(prices);
   useEffect(() => { pricesRef.current = prices; }, [prices]);
 
-  // ── Poll Railway when in server mode ─────────────────────────────────────
+  // ── Poll Railway when in server mode ────────────────────────────────────��
   useEffect(() => {
     if (!isServerMode) return;
     const poll = async () => {
@@ -336,9 +336,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
         setIsRunning(Boolean(status.running));
         isRunningRef.current = Boolean(status.running);
-        const bal = Number(status.balance_usdt ?? 0);
+        const bal     = Number(status.balance_usdt ?? 0);
+        const initBal = Number(status.initial_balance ?? 0);
         setBalance(bal);
         balanceRef.current = bal;
+        if (initBal > 0) setInitialBalance(initBal);
         setRailwayConnected(true);
         if (status.mode === 'live' || status.mode === 'paper') {
           setServerBotMode(status.mode);
@@ -351,9 +353,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         }));
         setPositions(mappedPos);
         positionsRef.current = mappedPos;
-        onStateChangeRef.current?.(mappedPos, bal);
 
-        setTrades((tradesData.trades ?? []).map((t: any): TradeRow => ({
+        // Map Railway trade records → TradeRow (sells only for history)
+        const mapped = (tradesData.trades ?? []).map((t: any): TradeRow => ({
           id: String(t.id),
           created_at: t.timestamp_sell ?? t.timestamp_buy ?? new Date().toISOString(),
           symbol: t.coin,
@@ -361,8 +363,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           price: Number(t.exit_price ?? t.entry_price),
           quantity: Number(t.quantity),
           pnl: t.net_profit != null ? Number(t.net_profit) : null,
-          reason: null,
-        })));
+          reason: t.exit_price != null
+            ? (Number(t.net_profit) >= 0 ? 'take-profit' : 'stop-loss')
+            : null,
+        }));
+        setTrades(mapped);
+        const walletTrades = mapped.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
+        onStateChangeRef.current?.(mappedPos, bal, initBal > 0 ? initBal : undefined, walletTrades);
       } catch {
         setRailwayConnected(false);
       }
@@ -371,6 +378,16 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     const id = setInterval(poll, 5000);
     return () => clearInterval(id);
   }, [railwayUrl, isServerMode]); // eslint-disable-line
+
+  // ── Push coin selection to Railway when in server mode ───────────────────
+  useEffect(() => {
+    if (!isServerMode || !railwayConnected || !selectedCoins.length) return;
+    fetch(`${railwayUrl}/api/coins`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ coins: selectedCoins }),
+    }).catch(() => {});
+  }, [selectedCoins, isServerMode, railwayConnected, railwayUrl]); // eslint-disable-line
 
   // ── Pure signal recomputation from in-memory kline buffers — zero network calls ──
   const recomputeSignals = useCallback(() => {

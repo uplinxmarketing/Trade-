@@ -55,6 +55,8 @@ interface Props {
   selectedCoins?: string[];
   agentPositions?: { symbol: string; quantity: number; avg_entry_price: number }[];
   agentBalance?: number;
+  agentInitialBalance?: number;
+  agentTrades?: { side: 'BUY' | 'SELL'; pnl: number | null; quantity: number; price: number }[];
   onReset?: () => void;
 }
 
@@ -89,7 +91,7 @@ function PnlPill({ pnl, pct }: { pnl: number; pct: number }) {
   );
 }
 
-const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPositions, agentBalance, onReset }: Props) => {
+const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPositions, agentBalance, agentInitialBalance, agentTrades, onReset }: Props) => {
   const [usdtFree, setUsdtFree]         = useState(0);
   const [initialBalance, setInitialBalance] = useState(0);
   const [positions, setPositions]       = useState<Position[]>([]);
@@ -207,13 +209,25 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
 
   const isPaper = mode === 'test' || !binanceConnected;
 
-  // ── Use agent-provided state when available (instant sync after trades) ──────
-  const effectivePositions = (agentPositions !== undefined && agentBalance !== undefined && agentBalance > 0)
-    ? agentPositions
-    : positions;
-  const effectiveUsdtFree = (agentBalance !== undefined && agentBalance > 0)
-    ? agentBalance
-    : usdtFree;
+  // ── Use agent-provided state when available (instant sync / server mode) ─────
+  const hasAgentData = agentBalance !== undefined && agentBalance > 0;
+  const effectivePositions = hasAgentData ? (agentPositions ?? positions) : positions;
+  const effectiveUsdtFree  = hasAgentData ? agentBalance : usdtFree;
+  const effectiveInitBal   = (agentInitialBalance && agentInitialBalance > 0) ? agentInitialBalance : initialBalance;
+
+  // Session stats: prefer agent trades (Railway server) over Supabase
+  const effectiveSells = agentTrades
+    ? agentTrades.filter(t => t.side === 'SELL' && t.pnl != null)
+    : [];
+  const effectiveSessionGain = effectiveSells.length > 0
+    ? Math.round(effectiveSells.reduce((s, t) => s + (t.pnl ?? 0), 0) * 100) / 100
+    : sessionGain;
+  const effectiveFees = effectiveSells.length > 0
+    ? Math.round(effectiveSells.reduce((s, t) => {
+        const qty = Number(t.quantity), price = Number(t.price);
+        return s + qty * price * TAKER_FEE;
+      }, 0) * 10000) / 10000
+    : totalFees;
 
   // ── Reset paper wallet ───────────────────────────────────────────────────────
   const resetWallet = async () => {
@@ -260,7 +274,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
 
   const paperPositionTotal = positionRows.reduce((s,r)=>s+r.currentValue, 0);
   const totalPortfolio     = effectiveUsdtFree + paperPositionTotal;
-  const sessionGainPct     = initialBalance > 0 ? ((totalPortfolio-initialBalance)/initialBalance)*100 : 0;
+  const sessionGainPct     = effectiveInitBal > 0 ? ((totalPortfolio - effectiveInitBal) / effectiveInitBal) * 100 : 0;
 
   // ── Live mode totals ─────────────────────────────────────────────────────────
   const liveTotal = liveAssets.reduce((s,a)=>s+a.usdValue, 0);
@@ -296,14 +310,14 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
         <div className="text-right space-y-0.5 shrink-0">
           {isPaper && (
             <>
-              <div className={`text-xs font-mono font-semibold ${sessionGain >= 0 ? 'text-gain' : 'text-loss'}`}>
-                {sessionGain >= 0 ? '+' : ''}{sessionGain.toFixed(2)} USDT realized
+              <div className={`text-xs font-mono font-semibold ${effectiveSessionGain >= 0 ? 'text-gain' : 'text-loss'}`}>
+                {effectiveSessionGain >= 0 ? '+' : ''}{effectiveSessionGain.toFixed(2)} USDT realized
               </div>
               <div className={`text-[10px] font-mono ${sessionGainPct >= 0 ? 'text-gain' : 'text-loss'}`}>
                 {sessionGainPct >= 0 ? '+' : ''}{sessionGainPct.toFixed(2)}% since session open
               </div>
               <div className="text-[10px] text-muted-foreground">
-                Fees paid: <span className="font-mono text-foreground">{totalFees.toFixed(4)} USDT</span>
+                Fees paid: <span className="font-mono text-foreground">{effectiveFees.toFixed(4)} USDT</span>
               </div>
             </>
           )}

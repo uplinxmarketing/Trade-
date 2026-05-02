@@ -463,13 +463,26 @@ def dashboard():
 @app.get("/api/status")
 def api_status():
     strategy = _load_strategy()
+    trades   = database.get_recent_trades(limit=500)
+    sells    = [t for t in trades if t.get("exit_price") is not None]
+    wins     = sum(1 for t in sells if (t.get("net_profit") or 0) > 0)
+    realized = sum(t.get("net_profit") or 0 for t in sells)
+    initial  = float(strategy.get("initial_balance_usdt", 0))
+    balance  = round(_get_usdt_balance(), 2)
+    approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
     return {
-        "running":       strategy.get("trading_active", False),
-        "mode":          get_mode(),
-        "balance_usdt":  round(_get_usdt_balance(), 2),
-        "open_positions": len(_get_positions()),
-        "trades_today":  database.get_trades_today_count(),
-        "win_rate":      database.get_win_rate_overall(),
+        "running":          strategy.get("trading_active", False),
+        "mode":             get_mode(),
+        "balance_usdt":     balance,
+        "initial_balance":  initial,
+        "open_positions":   len(_get_positions()),
+        "trades_today":     database.get_trades_today_count(),
+        "win_rate":         round(wins / len(sells), 3) if sells else 0.0,
+        "wins":             wins,
+        "losses":           len(sells) - wins,
+        "total_trades":     len(sells),
+        "realized_pnl":     round(realized, 4),
+        "watched_coins":    approved or config.WATCHED_COINS,
     }
 
 
@@ -480,7 +493,34 @@ def api_positions():
 
 @app.get("/api/trades")
 def api_trades():
-    return {"trades": database.get_recent_trades(limit=100)}
+    return {"trades": database.get_recent_trades(limit=200)}
+
+
+class CoinsRequest(BaseModel):
+    coins: list[str]
+
+
+@app.post("/api/coins")
+def api_set_coins(req: CoinsRequest):
+    """Update the approved coin list in strategy.json without restarting."""
+    valid = [c.upper() for c in req.coins if c.upper().endswith("USDT")]
+    if not valid:
+        return {"ok": False, "error": "No valid USDT pairs provided"}
+    strategy = _load_strategy()
+    existing = {c["symbol"]: c for c in strategy.get("approved_coins", [])}
+    new_approved = []
+    for sym in valid:
+        cfg = existing.get(sym, {})
+        new_approved.append({
+            "symbol":         sym,
+            "approved":       True,
+            "budget_usdt":    cfg.get("budget_usdt", config.BUDGET_PER_TRADE_USDT),
+            "max_concurrent": cfg.get("max_concurrent", 2),
+            "confidence":     cfg.get("confidence", 0.5),
+            "reason":         cfg.get("reason", "Updated via dashboard"),
+        })
+    _write_strategy_patch({"approved_coins": new_approved})
+    return {"ok": True, "coins": valid}
 
 
 @app.get("/api/activity")

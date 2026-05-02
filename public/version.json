@@ -1,5 +1,5 @@
 {
-  "version": "3.5.20",
+  "version": "3.5.21",
   "buildTime": "2026-05-03T00:00:00Z",
-  "commit": "feat-live-mode-switcher-railway"
+  "commit": "fix-bot-not-trading-numbers-mismatch"
 }

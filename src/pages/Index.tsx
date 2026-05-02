@@ -23,6 +23,8 @@ const Index = () => {
   const [showBinanceConnect, setShowBinanceConnect] = useState(false);
   const [agentPositions, setAgentPositions] = useState<{symbol:string;quantity:number;avg_entry_price:number}[]>([]);
   const [agentBalance, setAgentBalance] = useState(0);
+  const [agentInitialBalance, setAgentInitialBalance] = useState(0);
+  const [agentTrades, setAgentTrades] = useState<{side:'BUY'|'SELL';pnl:number|null;quantity:number;price:number}[]>([]);
 
   const { prices, connected: wsConnected } = useBinanceWebSocket(selectedCoins);
 
@@ -115,6 +117,8 @@ const Index = () => {
               selectedCoins={selectedCoins}
               agentPositions={agentPositions}
               agentBalance={agentBalance}
+              agentInitialBalance={agentInitialBalance}
+              agentTrades={agentTrades}
               onReset={() => { setAgentPositions([]); setAgentBalance(0); }}
             />
 
@@ -124,7 +128,12 @@ const Index = () => {
               prices={prices}
               binanceConnected={binanceConnected}
               onConnectBinance={() => setShowBinanceConnect(true)}
-              onStateChange={(pos, bal) => { setAgentPositions(pos); setAgentBalance(bal); }}
+              onStateChange={(pos, bal, initBal, trades) => {
+                setAgentPositions(pos);
+                setAgentBalance(bal);
+                if (initBal) setAgentInitialBalance(initBal);
+                if (trades) setAgentTrades(trades);
+              }}
               onCoinsChange={setSelectedCoins}
             />
 

@@ -1,17 +1,18 @@
 WATCHED_COINS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "BNBUSDT",
-    "SOLUSDT",
-    "XRPUSDT",
+    "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "DOGEUSDT",
+    "XRPUSDT",  "ADAUSDT",  "AVAXUSDT", "DOTUSDT",  "LINKUSDT",
+    "MATICUSDT","UNIUSDT",  "LTCUSDT",  "ATOMUSDT", "SHIBUSDT",
+    "ARBUSDT",  "OPUSDT",   "INJUSDT",  "FETUSDT",  "NEARUSDT",
+    "TRXUSDT",  "TONUSDT",  "APTUSDT",  "SUIUSDT",  "PEPEUSDT",
+    "WIFUSDT",  "BONKUSDT", "JUPUSDT",  "RENDERUSDT","TIAUSDT",
 ]
 
 BUDGET_PER_TRADE_USDT   = 100.0
-MAX_OPEN_POSITIONS      = 5
+MAX_OPEN_POSITIONS      = 10
 DECISION_INTERVAL_SEC   = 600       # Claude strategy runs every 10 minutes
 MIN_CLAUDE_CONFIDENCE   = 0.65
-RSI_OVERBOUGHT          = 72
-RSI_OVERSOLD            = 28
+RSI_OVERBOUGHT          = 75
+RSI_OVERSOLD            = 25
 CANDLE_TIMEFRAME        = "1m"
 CANDLE_LOOKBACK         = 50
 BNB_FEE_MODE            = True
@@ -22,19 +23,19 @@ CLAUDE_MAX_TOKENS       = 400
 STRATEGY_FILE           = "strategy.json"
 
 # ── Two-speed architecture constants ─────────────────────────────────────────
-SCAN_INTERVAL_SEC    = 30      # signal scanner frequency (Process 2)
+SCAN_INTERVAL_SEC    = 20      # signal scanner frequency
 STOP_LOSS_PCT        = 0.015   # 1.5%
-COOLDOWN_AFTER_LOSS  = 300     # 5 min cooldown after stop-loss
-MIN_SIGNALS_TO_BUY   = 3       # out of 4 signals must be bullish
-RSI_BUY_MIN          = 40
-RSI_BUY_MAX          = 65
-VOLUME_RATIO_MIN     = 1.5
+COOLDOWN_AFTER_LOSS  = 180     # 3 min cooldown after stop-loss
+MIN_SIGNALS_TO_BUY   = 2       # out of 4 signals must be bullish
+RSI_BUY_MIN          = 35
+RSI_BUY_MAX          = 70
+VOLUME_RATIO_MIN     = 1.05    # current volume just 5% above 20-candle average
 
 # ── Budget allocation settings ────────────────────────────────────────────────
-BUDGET_MODE           = "fixed"   # fixed | percent | capped | per_coin
+BUDGET_MODE           = "percent" # fixed | percent | capped | per_coin
 BUDGET_FIXED_USDT     = 100.0
-BUDGET_PCT_OF_FREE    = 10.0      # % of free USDT per trade
-BUDGET_TOTAL_CAP_USDT = 500.0     # max total USDT deployed by bot at once
+BUDGET_PCT_OF_FREE    = 5.0       # 5% of free USDT per trade
+BUDGET_TOTAL_CAP_USDT = 1000.0
 BUDGET_PER_COIN = {
     "BTCUSDT":  200.0,
     "ETHUSDT":  150.0,

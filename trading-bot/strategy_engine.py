@@ -51,18 +51,20 @@ def _build_market_data() -> dict:
 
 def write_default_strategy():
     """Write a permissive default strategy. Called on startup and as fallback."""
+    starting_usdt = float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
     strategy = {
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "trading_active": True,
-        "pause_reason": "No Claude API key — using default strategy" if not os.getenv("ANTHROPIC_API_KEY") else None,
+        "updated_at":           datetime.now(timezone.utc).isoformat(),
+        "trading_active":       True,
+        "pause_reason":         None,
+        "initial_balance_usdt": starting_usdt,
         "approved_coins": [
             {
-                "symbol":        coin,
-                "approved":      True,
-                "budget_usdt":   config.BUDGET_PER_TRADE_USDT,
+                "symbol":         coin,
+                "approved":       True,
+                "budget_usdt":    config.BUDGET_PER_TRADE_USDT,
                 "max_concurrent": 2,
-                "confidence":    0.5,
-                "reason":        "Default paper mode — all coins approved",
+                "confidence":     0.5,
+                "reason":         "Default — all coins approved",
             }
             for coin in config.WATCHED_COINS
         ],
