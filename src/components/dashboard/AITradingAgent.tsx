@@ -509,21 +509,34 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     try {
       if (!isRunning) {
         const startBal = getPaperCfg().startingBalance ?? 1000;
+
+        // Read existing config — never reset current_balance on restart,
+        // only use startBal on first-ever launch (no existing config row).
+        const existing = await supabase.from('bot_config')
+          .select('current_balance, initial_balance')
+          .eq('user_session', SESSION)
+          .maybeSingle();
+        const existingBal     = Number(existing.data?.current_balance ?? 0);
+        const existingInitBal = Number(existing.data?.initial_balance ?? 0);
+        const useBal     = existingBal     > 0 ? existingBal     : startBal;
+        const useInitBal = existingInitBal > 0 ? existingInitBal : startBal;
+
         await supabase.from('bot_config').upsert({
           user_session: SESSION,
           selected_coins: selectedCoins,
           mode, is_running: true,
-          current_balance: startBal,
-          initial_balance: startBal,
+          current_balance: useBal,
+          initial_balance: useInitBal,
           stop_loss_percent: 1.5,
           updated_at: new Date().toISOString(),
         }, { onConflict: 'user_session' });
+
         isRunningRef.current = true;
         setIsRunning(true);
-        setBalance(startBal); balanceRef.current = startBal;
-        setInitialBalance(startBal);
-        addLog(`=== Agent STARTED · ${startBal} USDT · ${mode.toUpperCase()} ===`);
-        toast.success(`AI Agent started — PAPER mode`, { description: `${startBal.toLocaleString()} USDT · ${selectedCoins.length} coins · live signals` });
+        setBalance(useBal); balanceRef.current = useBal;
+        setInitialBalance(useInitBal);
+        addLog(`=== Agent STARTED · ${useBal.toFixed(2)} USDT · ${mode.toUpperCase()} ===`);
+        toast.success(`AI Agent started — PAPER mode`, { description: `${useBal.toLocaleString()} USDT · ${selectedCoins.length} coins · live signals` });
         // Seed kline buffers from REST once, then keep live via WebSocket
         seedBuffers();
         connectKlineWs();
