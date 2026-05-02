@@ -164,7 +164,13 @@ interface AITradingAgentProps {
   prices: LivePrices;
   binanceConnected?: boolean;
   onConnectBinance?: () => void;
-  onStateChange?: (positions: {symbol:string;quantity:number;avg_entry_price:number}[], balance: number) => void;
+  onCoinsChange?: (coins: string[]) => void;
+  onStateChange?: (
+    positions: {symbol:string;quantity:number;avg_entry_price:number}[],
+    balance: number,
+    initialBalance?: number,
+    trades?: {side:'BUY'|'SELL';pnl:number|null;quantity:number;price:number}[]
+  ) => void;
 }
 
 const INSTRUCTIONS_KEY  = 'ai_agent_instructions';
@@ -173,7 +179,7 @@ const AGENT_CYCLE_MS    = 30_000;
 const BEP_MULT          = 1 / Math.pow(1 - TAKER_FEE, 2);
 
 // ── Component ────────────────────────────────────────────────────────────────
-const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onStateChange }: AITradingAgentProps) => {
+const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onCoinsChange, onStateChange }: AITradingAgentProps) => {
   const [mode, setMode]           = useState<'test' | 'live'>('test');
   const [isRunning, setIsRunning] = useState(false);
   const [loading, setLoading]     = useState(false);
@@ -271,7 +277,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
     // Notify parent with fresh state for instant wallet sync
     if (posRes.data) {
-      onStateChangeRef.current?.(posRes.data as OpenPosition[], display);
+      const tradePayload = trdRes.data?.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
+      onStateChangeRef.current?.(posRes.data as OpenPosition[], display, initialBalance || display, tradePayload);
     }
   }, []);
 
@@ -388,7 +395,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
       // Optimistic wallet update — no need to wait for loadData
       if (newlyBought.length > 0) {
-        onStateChangeRef.current?.([...currentPositions, ...newlyBought], runBal);
+        onStateChangeRef.current?.([...currentPositions, ...newlyBought], runBal, initialBalance);
       }
 
       setAgentStatus(`Done · ${new Date().toLocaleTimeString()}`);
@@ -473,6 +480,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             reason:     null,
           }));
         setTrades(mapped);
+        // Keep parent wallet in sync with Railway state
+        const tradePayload = mapped.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
+        onStateChangeRef.current?.(positionsRef.current, balanceRef.current, initialBalance, tradePayload);
       }
     } catch (e: any) {
       if (e.name !== 'AbortError') addLog(`[Railway] poll failed: ${e.message}`);
