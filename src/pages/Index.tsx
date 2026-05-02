@@ -2,7 +2,6 @@ import { useState, useCallback, useEffect } from 'react';
 import TopBar from '@/components/dashboard/TopBar';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import AITradingAgent from '@/components/dashboard/AITradingAgent';
-import BudgetPanel from '@/components/dashboard/BudgetPanel';
 import BinanceConnect from '@/components/dashboard/BinanceConnect';
 import NotificationCenter from '@/components/dashboard/NotificationCenter';
 import CoinSelectorPanel from '@/components/dashboard/CoinSelectorPanel';
@@ -11,7 +10,6 @@ import ChartPanelV2 from '@/components/dashboard/ChartPanelV2';
 import OrderFormPanel from '@/components/dashboard/OrderFormPanel';
 import WalletPanelV2 from '@/components/dashboard/WalletPanelV2';
 import ReportDashboard from '@/components/dashboard/ReportDashboard';
-import CoinSelector from '@/components/dashboard/CoinSelector';
 import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
@@ -27,16 +25,30 @@ const Index = () => {
   const { prices, connected: wsConnected } = useBinanceWebSocket(selectedCoins);
 
   useEffect(() => {
-    supabase.from('bot_config').upsert({
-      user_session: 'default',
-      selected_coins: DEFAULT_COINS,
-      mode: 'test',
-      is_running: false,
-      current_balance: 10000,
-      initial_balance: 10000,
-      stop_loss_percent: 1.5,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'user_session', ignoreDuplicates: true });
+    (async () => {
+      const { data } = await supabase
+        .from('bot_config')
+        .select('current_balance')
+        .eq('user_session', 'default')
+        .maybeSingle();
+      if (!data || !Number(data.current_balance)) {
+        let startBal = 1000;
+        try {
+          const cfg = JSON.parse(localStorage.getItem('paper_wallet_config') ?? '{}');
+          startBal = cfg.startingBalance ?? 1000;
+        } catch { /* use default */ }
+        await supabase.from('bot_config').upsert({
+          user_session: 'default',
+          selected_coins: DEFAULT_COINS,
+          mode: 'test',
+          is_running: false,
+          current_balance: startBal,
+          initial_balance: startBal,
+          stop_loss_percent: 1.5,
+          updated_at: new Date().toISOString(),
+        }, { onConflict: 'user_session' });
+      }
+    })();
   }, []);
 
   const handleModeChange = useCallback((_m: 'test' | 'live') => {
@@ -93,11 +105,12 @@ const Index = () => {
 
           {/* Below chart: all panels */}
           <div className="p-4 space-y-4">
-            {/* Wallet */}
+            {/* Wallet — includes budget settings and reset */}
             <WalletPanelV2
               binanceConnected={binanceConnected}
               prices={prices}
               mode={binanceConnected ? 'live' : 'test'}
+              selectedCoins={selectedCoins}
             />
 
             {/* AI Trading Bot */}
@@ -107,15 +120,6 @@ const Index = () => {
               binanceConnected={binanceConnected}
               onConnectBinance={() => setShowBinanceConnect(true)}
             />
-
-            {/* Bot budget configuration */}
-            <BudgetPanel watchedCoins={selectedCoins} />
-
-            {/* Coin selection (for bot) */}
-            <div className="trading-card p-3">
-              <div className="text-xs font-medium text-muted-foreground mb-2">Bot Watch List</div>
-              <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} />
-            </div>
 
             {/* Reports */}
             <ReportDashboard />

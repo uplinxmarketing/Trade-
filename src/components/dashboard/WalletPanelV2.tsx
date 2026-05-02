@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
-import { RefreshCw, Loader2, Wifi, FlaskConical } from 'lucide-react';
+import { RefreshCw, Loader2, Wifi, FlaskConical, RotateCcw, Lock, Percent, Zap, Layers, ChevronDown, ChevronUp } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
 import { TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
 import { toast } from 'sonner';
+
+const PAPER_CFG_KEY = 'paper_wallet_config';
 
 const COIN_COLORS: Record<string, string> = {
   BTC: '#F7931A', ETH: '#627EEA', SOL: '#9945FF', BNB: '#F3BA2F',
@@ -17,10 +19,40 @@ const BREAK_EVEN = 1 / Math.pow(1 - TAKER_FEE, 2);
 interface Position { symbol: string; quantity: number; avg_entry_price: number; }
 interface LiveAsset { asset: string; free: string; locked: string; usdValue: number; }
 
+type BudgetMode = 'fixed' | 'percent' | 'capped' | 'per_coin';
+
+interface WalletCfg {
+  startingBalance: number;
+  budgetMode: BudgetMode;
+  budgetFixed: number;
+  budgetPct: number;
+  budgetCap: number;
+  budgetPerCoin: Record<string, number>;
+}
+
+const DEFAULT_CFG: WalletCfg = {
+  startingBalance: 1000,
+  budgetMode: 'percent',
+  budgetFixed: 100,
+  budgetPct: 25,
+  budgetCap: 500,
+  budgetPerCoin: { BTCUSDT: 200, ETHUSDT: 150, SOLUSDT: 100, BNBUSDT: 100, DOGEUSDT: 50 },
+};
+
+const PRESET_BALANCES = [500, 1000, 5000, 10000];
+
+const BUDGET_MODES: { key: BudgetMode; label: string; icon: React.ReactNode; desc: string }[] = [
+  { key: 'fixed',    label: 'Fixed',   icon: <Lock className="w-3 h-3" />,    desc: 'Same USDT each trade' },
+  { key: 'percent',  label: '% Bal',   icon: <Percent className="w-3 h-3" />, desc: 'Scales with balance' },
+  { key: 'capped',   label: 'Cap',     icon: <Zap className="w-3 h-3" />,     desc: 'Max total deployed' },
+  { key: 'per_coin', label: 'Per Coin',icon: <Layers className="w-3 h-3" />,  desc: 'Per-coin limit' },
+];
+
 interface Props {
   binanceConnected: boolean;
   prices: LivePrices;
   mode: 'test' | 'live';
+  selectedCoins?: string[];
 }
 
 function CoinIcon({ coin }: { coin: string }) {
@@ -54,7 +86,7 @@ function PnlPill({ pnl, pct }: { pnl: number; pct: number }) {
   );
 }
 
-const WalletPanelV2 = ({ binanceConnected, prices, mode }: Props) => {
+const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props) => {
   const [usdtFree, setUsdtFree]         = useState(0);
   const [initialBalance, setInitialBalance] = useState(0);
   const [positions, setPositions]       = useState<Position[]>([]);
@@ -62,18 +94,44 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode }: Props) => {
   const [sessionGain, setSessionGain]   = useState(0);
   const [totalFees, setTotalFees]       = useState(0);
   const [loading, setLoading]           = useState(false);
+  const [resetting, setResetting]       = useState(false);
   const [lastUpdated, setLastUpdated]   = useState('');
+  const [showBudget, setShowBudget]     = useState(false);
+
+  // ── Budget config (localStorage) ────────────────────────────────────────────
+  const [walletCfg, setWalletCfg] = useState<WalletCfg>(DEFAULT_CFG);
+
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(PAPER_CFG_KEY) ?? '{}');
+      setWalletCfg(c => ({ ...c, ...saved }));
+    } catch { /* use defaults */ }
+  }, []);
+
+  const saveCfg = useCallback((updates: Partial<WalletCfg>) => {
+    setWalletCfg(prev => {
+      const next = { ...prev, ...updates };
+      try { localStorage.setItem(PAPER_CFG_KEY, JSON.stringify(next)); } catch { /* */ }
+      return next;
+    });
+  }, []);
 
   // ── Paper / test mode ────────────────────────────────────────────────────────
   const loadPaper = useCallback(async () => {
     const [cfgRes, posRes, tradeRes] = await Promise.all([
-      supabase.from('bot_config').select('current_balance,initial_balance').eq('user_session','default').maybeSingle(),
+      supabase.from('bot_config').select('current_balance,initial_balance,selected_coins').eq('user_session','default').maybeSingle(),
       supabase.from('paper_portfolio').select('*').eq('user_session','default').gt('quantity',0),
       supabase.from('bot_trade_history').select('side,pnl,quantity,price').eq('user_session','default'),
     ]);
     if (cfgRes.data) {
-      setUsdtFree(Number(cfgRes.data.current_balance));
-      setInitialBalance(Number(cfgRes.data.initial_balance));
+      const bal = Number(cfgRes.data.current_balance);
+      const initBal = Number(cfgRes.data.initial_balance);
+      const localStartBal = walletCfg.startingBalance;
+      setUsdtFree(bal > 0 ? bal : initBal > 0 ? initBal : localStartBal);
+      setInitialBalance(initBal > 0 ? initBal : localStartBal);
+    } else {
+      setUsdtFree(walletCfg.startingBalance);
+      setInitialBalance(walletCfg.startingBalance);
     }
     if (posRes.data) setPositions(posRes.data as Position[]);
     if (tradeRes.data) {
@@ -88,7 +146,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode }: Props) => {
       setTotalFees(Math.round(fees*10000)/10000);
     }
     setLastUpdated(new Date().toLocaleTimeString());
-  }, []);
+  }, [walletCfg.startingBalance]);
 
   // ── Live mode ────────────────────────────────────────────────────────────────
   const loadLive = useCallback(async () => {
@@ -135,6 +193,30 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode }: Props) => {
 
   const isPaper = mode === 'test' || !binanceConnected;
 
+  // ── Reset paper wallet ───────────────────────────────────────────────────────
+  const resetWallet = async () => {
+    if (!confirm(`Reset paper wallet to ${walletCfg.startingBalance.toLocaleString()} USDT and clear all positions?`)) return;
+    setResetting(true);
+    try {
+      await Promise.all([
+        supabase.from('paper_portfolio').delete().eq('user_session', 'default'),
+        supabase.from('bot_trade_history').delete().eq('user_session', 'default'),
+        supabase.from('bot_config').update({
+          current_balance: walletCfg.startingBalance,
+          initial_balance: walletCfg.startingBalance,
+          is_running: false,
+          updated_at: new Date().toISOString(),
+        }).eq('user_session', 'default'),
+      ]);
+      setPositions([]);
+      setUsdtFree(walletCfg.startingBalance);
+      setInitialBalance(walletCfg.startingBalance);
+      setSessionGain(0);
+      setTotalFees(0);
+      toast.success(`Paper wallet reset · ${walletCfg.startingBalance.toLocaleString()} USDT`);
+    } finally { setResetting(false); }
+  };
+
   // ── Compute portfolio totals (paper mode) ────────────────────────────────────
   const positionRows = positions.map(pos => {
     const coin = pos.symbol.replace('USDT','');
@@ -154,10 +236,13 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode }: Props) => {
   // ── Live mode totals ─────────────────────────────────────────────────────────
   const liveTotal = liveAssets.reduce((s,a)=>s+a.usdValue, 0);
 
+  // ── Budget mode description for active mode ──────────────────────────────────
+  const watchCoins = selectedCoins ?? Object.keys(walletCfg.budgetPerCoin);
+
   return (
     <div className="bg-card border border-border rounded-lg overflow-hidden">
       <div className="px-4 py-2 border-b border-border bg-muted/20 flex items-center gap-2">
-        <span className="text-[9px] uppercase tracking-widest text-muted-foreground font-semibold">A — Wallet Panel (Spot)</span>
+        <span className="text-[9px] uppercase tracking-widest text-muted-foreground font-semibold">Wallet (Spot)</span>
         <span className={`ml-auto text-[9px] px-2 py-0.5 rounded border font-semibold ${isPaper ? 'border-accent/40 text-accent bg-accent/10' : 'border-gain/40 text-gain bg-gain/10'}`}>
           {isPaper ? <><FlaskConical className="w-2.5 h-2.5 inline mr-1" />PAPER</> : <><Wifi className="w-2.5 h-2.5 inline mr-1" />LIVE</>}
         </span>
@@ -176,14 +261,14 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode }: Props) => {
             <span className="text-sm text-muted-foreground ml-1 font-normal">USDT</span>
           </div>
           <div className="text-[10px] text-muted-foreground font-mono mt-0.5">
-            ≈ {(isPaper ? totalPortfolio : liveTotal).toFixed(2)} USD · updated {lastUpdated || 'live via WebSocket'}
+            ≈ ${(isPaper ? totalPortfolio : liveTotal).toFixed(2)} USD · updated {lastUpdated || 'live via WebSocket'}
           </div>
         </div>
         <div className="text-right space-y-0.5 shrink-0">
           {isPaper && (
             <>
               <div className={`text-xs font-mono font-semibold ${sessionGain >= 0 ? 'text-gain' : 'text-loss'}`}>
-                {sessionGain >= 0 ? '+' : ''}{sessionGain.toFixed(2)} USDT today
+                {sessionGain >= 0 ? '+' : ''}{sessionGain.toFixed(2)} USDT realized
               </div>
               <div className={`text-[10px] font-mono ${sessionGainPct >= 0 ? 'text-gain' : 'text-loss'}`}>
                 {sessionGainPct >= 0 ? '+' : ''}{sessionGainPct.toFixed(2)}% since session open
@@ -212,16 +297,16 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode }: Props) => {
                 <CoinIcon coin={coin} />
                 <div>
                   <div className="text-xs font-bold">{coin}</div>
-                  <div className="text-[9px] text-muted-foreground">{coin}</div>
+                  <div className="text-[9px] text-muted-foreground">{coin} <span className="opacity-60">(paper)</span></div>
                 </div>
               </div>
-              <div className="font-mono text-xs tabular-nums">{pos.quantity.toFixed(6)}</div>
+              <div className="font-mono text-xs tabular-nums">{pos.quantity < 0.01 ? pos.quantity.toFixed(6) : pos.quantity.toFixed(4)}</div>
               <div className="font-mono text-xs tabular-nums text-right">
                 <div>{currentValue.toFixed(2)} USDT</div>
-                <div className="text-[9px] text-muted-foreground">@ {livePrice.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4})}</div>
+                <div className="text-[9px] text-muted-foreground">@ {livePrice.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4})} USDT</div>
               </div>
               <div className="font-mono text-xs tabular-nums text-right">
-                {costBasis.toFixed(2)}
+                {costBasis.toFixed(2)} USDT
               </div>
               <PnlPill pnl={pnl} pct={pct} />
             </div>
@@ -233,13 +318,13 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode }: Props) => {
               <CoinIcon coin="USDT" />
               <div>
                 <div className="text-xs font-bold">USDT</div>
-                <div className="text-[9px] text-muted-foreground">Tether</div>
+                <div className="text-[9px] text-muted-foreground">Tether <span className="opacity-60">(paper)</span></div>
               </div>
             </div>
             <div className="font-mono text-xs tabular-nums text-muted-foreground">—</div>
             <div className="font-mono text-xs tabular-nums text-right">
               <div>{usdtFree.toFixed(2)} USDT</div>
-              <div className="text-[9px] text-muted-foreground">available to trade</div>
+              <div className="text-[9px] text-muted-foreground">≈ ${usdtFree.toFixed(2)} USD</div>
             </div>
             <div className="font-mono text-xs tabular-nums text-right text-muted-foreground">—</div>
             <div className="rounded px-2 py-1 bg-muted/20 border border-border text-right min-w-[80px]">
@@ -274,7 +359,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode }: Props) => {
                 <div className="font-mono text-xs tabular-nums">{parseFloat(a.free).toFixed(6)}</div>
                 <div className="font-mono text-xs tabular-nums text-right">
                   <div>{a.usdValue.toFixed(2)} USDT</div>
-                  {livePrice > 0 && <div className="text-[9px] text-muted-foreground">@ {livePrice.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4})}</div>}
+                  {livePrice > 0 && <div className="text-[9px] text-muted-foreground">@ {livePrice.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4})} USDT</div>}
                 </div>
                 <div className="font-mono text-xs tabular-nums text-right text-muted-foreground">—</div>
                 {isStable ? (
@@ -297,10 +382,161 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode }: Props) => {
         </div>
       )}
 
+      {/* ── Paper wallet controls (budget + reset) ── */}
+      {isPaper && (
+        <div className="border-t border-border/50">
+          {/* collapsible header */}
+          <button
+            onClick={() => setShowBudget(p => !p)}
+            className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/10 text-left"
+          >
+            <span className="text-[9px] uppercase tracking-widest text-muted-foreground font-semibold">
+              Paper Settings · Starting {walletCfg.startingBalance.toLocaleString()} USDT · Mode: {walletCfg.budgetMode}
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={e => { e.stopPropagation(); resetWallet(); }}
+                disabled={resetting}
+                className="flex items-center gap-1 text-[9px] text-loss hover:text-loss/80 px-2 py-0.5 rounded border border-loss/30 hover:border-loss/60 transition-colors disabled:opacity-40"
+                title="Reset paper wallet"
+              >
+                <RotateCcw className={`w-2.5 h-2.5 ${resetting ? 'animate-spin' : ''}`} />
+                Reset wallet
+              </button>
+              {showBudget ? <ChevronUp className="w-3 h-3 text-muted-foreground" /> : <ChevronDown className="w-3 h-3 text-muted-foreground" />}
+            </div>
+          </button>
+
+          {showBudget && (
+            <div className="px-4 pb-4 space-y-4 border-t border-border/30 pt-3">
+
+              {/* Starting balance */}
+              <div>
+                <div className="text-[9px] uppercase tracking-widest text-muted-foreground mb-2">Starting Balance (USDT)</div>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {PRESET_BALANCES.map(p => (
+                    <button
+                      key={p}
+                      onClick={() => saveCfg({ startingBalance: p })}
+                      className={`text-[10px] px-2.5 py-1 rounded font-mono transition-colors border
+                        ${walletCfg.startingBalance === p
+                          ? 'bg-accent text-accent-foreground border-accent'
+                          : 'bg-muted/30 text-muted-foreground border-border hover:text-foreground hover:border-accent/50'
+                        }`}
+                    >
+                      {p.toLocaleString()} USDT
+                    </button>
+                  ))}
+                  <input
+                    type="number"
+                    min={100}
+                    step={100}
+                    value={walletCfg.startingBalance}
+                    onChange={e => saveCfg({ startingBalance: Math.max(100, Number(e.target.value) || 1000) })}
+                    className="w-28 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-accent"
+                    placeholder="Custom"
+                  />
+                </div>
+              </div>
+
+              {/* Budget mode */}
+              <div>
+                <div className="text-[9px] uppercase tracking-widest text-muted-foreground mb-2">Trade Size Mode</div>
+                <div className="grid grid-cols-4 gap-1">
+                  {BUDGET_MODES.map(m => (
+                    <button
+                      key={m.key}
+                      onClick={() => saveCfg({ budgetMode: m.key })}
+                      className={`flex flex-col items-center gap-0.5 py-2 px-1 rounded text-[9px] font-semibold border transition-colors
+                        ${walletCfg.budgetMode === m.key
+                          ? 'bg-accent text-accent-foreground border-accent'
+                          : 'bg-muted/20 text-muted-foreground border-border hover:border-accent/40 hover:text-foreground'
+                        }`}
+                    >
+                      {m.icon}
+                      <span>{m.label}</span>
+                      <span className="text-[7px] font-normal opacity-70 text-center leading-tight">{m.desc}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Mode-specific input */}
+              <div className="bg-muted/20 rounded-md px-3 py-2.5 space-y-2">
+                {walletCfg.budgetMode === 'fixed' && (
+                  <div className="flex items-center gap-3">
+                    <span className="text-[10px] text-muted-foreground w-28">Amount per trade</span>
+                    <input
+                      type="number" min={10} step={10}
+                      value={walletCfg.budgetFixed}
+                      onChange={e => saveCfg({ budgetFixed: Math.max(10, Number(e.target.value)) })}
+                      className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-accent"
+                    />
+                    <span className="text-[10px] text-muted-foreground">USDT per trade</span>
+                  </div>
+                )}
+                {walletCfg.budgetMode === 'percent' && (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center gap-3">
+                      <span className="text-[10px] text-muted-foreground w-28">% of free balance</span>
+                      <input
+                        type="range" min={1} max={50} step={1}
+                        value={walletCfg.budgetPct}
+                        onChange={e => saveCfg({ budgetPct: Number(e.target.value) })}
+                        className="flex-1 accent-accent"
+                      />
+                      <span className="text-sm font-mono font-bold w-10 text-right">{walletCfg.budgetPct}%</span>
+                    </div>
+                    <div className="text-[9px] text-muted-foreground">
+                      At {usdtFree.toFixed(0)} USDT free → <span className="text-accent font-mono">{(usdtFree * walletCfg.budgetPct / 100).toFixed(2)} USDT</span> per trade
+                    </div>
+                  </div>
+                )}
+                {walletCfg.budgetMode === 'capped' && (
+                  <div className="flex items-center gap-3">
+                    <span className="text-[10px] text-muted-foreground w-28">Max total cap</span>
+                    <input
+                      type="number" min={50} step={50}
+                      value={walletCfg.budgetCap}
+                      onChange={e => saveCfg({ budgetCap: Math.max(50, Number(e.target.value)) })}
+                      className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-accent"
+                    />
+                    <span className="text-[10px] text-muted-foreground">USDT (÷3 slots = {(walletCfg.budgetCap/3).toFixed(0)} USDT/trade)</span>
+                  </div>
+                )}
+                {walletCfg.budgetMode === 'per_coin' && (
+                  <div className="space-y-1.5">
+                    <div className="text-[9px] text-muted-foreground mb-1">USDT per coin</div>
+                    {watchCoins.map(sym => {
+                      const ticker = sym.replace('USDT', '');
+                      const val = walletCfg.budgetPerCoin[sym] ?? 100;
+                      return (
+                        <div key={sym} className="flex items-center gap-2">
+                          <span className="text-[10px] font-mono font-bold w-12">{ticker}</span>
+                          <input
+                            type="number" min={10} step={10}
+                            value={val}
+                            onChange={e => saveCfg({
+                              budgetPerCoin: { ...walletCfg.budgetPerCoin, [sym]: Math.max(10, Number(e.target.value)) },
+                            })}
+                            className="w-20 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-accent"
+                          />
+                          <span className="text-[9px] text-muted-foreground">USDT</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="px-4 py-2 border-t border-border/30 bg-muted/10">
         <p className="text-[9px] text-muted-foreground">
           {isPaper
-            ? 'Paper wallet — all positions are simulated · green = profitable · red = at loss · gray = at breakeven · Last updated: live via WebSocket'
+            ? 'Paper wallet — all positions are simulated · green = profitable · red = at loss · gray = at breakeven · values in USDT'
             : 'Live Binance spot wallet · values update with WebSocket prices'}
         </p>
       </div>

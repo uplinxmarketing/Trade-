@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Play, Square, Brain, TrendingUp, TrendingDown, Zap,
   RotateCcw, ChevronDown, ChevronUp, FlaskConical,
-  DollarSign, Pencil, Check, X, BookOpen, Activity,
+  Pencil, Check, X, BookOpen, Activity,
   ShoppingCart, Banknote, RefreshCw,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -16,8 +16,26 @@ import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcSMA } from '@/lib/i
 const BIN = 'https://api.binance.com/api/v3';
 const SESSION = 'default';
 const MAX_POSITIONS = 3;
-const ALLOC_PCT     = 0.25;   // 25% of balance per trade
 const MIN_USDT      = 11;
+const PAPER_CFG_KEY = 'paper_wallet_config';
+
+function getPaperCfg() {
+  try { return JSON.parse(localStorage.getItem(PAPER_CFG_KEY) ?? '{}'); }
+  catch { return {}; }
+}
+
+// Compute USDT to allocate for one trade based on wallet's budget mode setting.
+function getAllocation(runBal: number, symbol: string): number {
+  const cfg = getPaperCfg();
+  const mode = cfg.budgetMode ?? 'percent';
+  switch (mode) {
+    case 'fixed':    return Math.min(cfg.budgetFixed ?? 100, runBal);
+    case 'percent':  return Math.min(runBal * (cfg.budgetPct ?? 25) / 100, runBal);
+    case 'capped':   return Math.min((cfg.budgetCap ?? 500) / MAX_POSITIONS, runBal);
+    case 'per_coin': return Math.min(cfg.budgetPerCoin?.[symbol] ?? 100, runBal);
+    default:         return Math.min(runBal * 0.25, runBal);
+  }
+}
 
 // RSI thresholds — match config.py: RSI_BUY_MIN=40, RSI_BUY_MAX=65
 // RSI 65 passes (<=), RSI 66 fails (>)
@@ -148,7 +166,6 @@ interface AITradingAgentProps {
   onConnectBinance?: () => void;
 }
 
-const PRESET_BUDGETS  = [500, 1000, 5000, 10000];
 const INSTRUCTIONS_KEY = 'ai_agent_instructions';
 const AGENT_CYCLE_MS   = 30_000;
 const BEP_MULT         = 1 / Math.pow(1 - TAKER_FEE, 2);
@@ -158,8 +175,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [mode, setMode]           = useState<'test' | 'live'>('test');
   const [isRunning, setIsRunning] = useState(false);
   const [loading, setLoading]     = useState(false);
-  const [totalBudget, setTotalBudget] = useState(1000);
-  const [balance, setBalance]     = useState(1000);
+  const [balance, setBalance]     = useState(0);
+  const [initialBalance, setInitialBalance] = useState(0);
   const [positions, setPositions] = useState<OpenPosition[]>([]);
   const [trades, setTrades]       = useState<TradeRow[]>([]);
   const [coinSignals, setCoinSignals] = useState<CoinSignal[]>([]);
@@ -169,8 +186,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [showAll, setShowAll]     = useState(false);
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
-  const [editingBudget, setEditingBudget] = useState(false);
-  const [budgetDraft, setBudgetDraft]     = useState('');
   const [instructions, setInstructions]   = useState(() => localStorage.getItem(INSTRUCTIONS_KEY) ?? '');
   const [editingInstr, setEditingInstr]   = useState(false);
   const [instrDraft, setInstrDraft]       = useState('');
@@ -207,6 +222,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (cfgRes.data) {
       const bal = Number(cfgRes.data.current_balance);
       setBalance(bal); balanceRef.current = bal;
+      setInitialBalance(Number(cfgRes.data.initial_balance ?? 0));
       stopLossRef.current = Number(cfgRes.data.stop_loss_percent ?? 1.5);
       const running = Boolean(cfgRes.data.is_running);
       isRunningRef.current = running;
@@ -277,7 +293,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         const price   = wsPrice > 0 ? wsPrice : sig.price;
         if (!price) continue;
 
-        const alloc = Math.min(runBal * ALLOC_PCT, runBal);
+        const alloc  = getAllocation(runBal, sig.symbol);
+        const needed = alloc * 1.002;
+        if (runBal < needed) {
+          addLog(`[SKIP] ${sig.symbol}: Insufficient USDT — have ${runBal.toFixed(2)}, need ${needed.toFixed(2)}`);
+          continue;
+        }
         if (alloc < MIN_USDT) { addLog(`  SKIP ${sig.symbol} — alloc ${alloc.toFixed(2)} USDT too low`); continue; }
 
         const fee = alloc * TAKER_FEE;
@@ -336,20 +357,22 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     setLoading(true);
     try {
       if (!isRunning) {
+        const startBal = getPaperCfg().startingBalance ?? 1000;
         await supabase.from('bot_config').upsert({
           user_session: SESSION,
           selected_coins: selectedCoins,
           mode, is_running: true,
-          current_balance: totalBudget,
-          initial_balance: totalBudget,
+          current_balance: startBal,
+          initial_balance: startBal,
           stop_loss_percent: 1.5,
           updated_at: new Date().toISOString(),
         }, { onConflict: 'user_session' });
         isRunningRef.current = true;
         setIsRunning(true);
-        setBalance(totalBudget); balanceRef.current = totalBudget;
-        addLog(`=== Agent STARTED · ${totalBudget} USDT · ${mode.toUpperCase()} ===`);
-        toast.success(`AI Agent started — PAPER mode`, { description: `${totalBudget.toLocaleString()} USDT · ${selectedCoins.length} coins · every 30s` });
+        setBalance(startBal); balanceRef.current = startBal;
+        setInitialBalance(startBal);
+        addLog(`=== Agent STARTED · ${startBal} USDT · ${mode.toUpperCase()} ===`);
+        toast.success(`AI Agent started — PAPER mode`, { description: `${startBal.toLocaleString()} USDT · ${selectedCoins.length} coins · every 30s` });
         runCycle().then(scheduleNext);
       } else {
         if (cycleTimerRef.current) clearTimeout(cycleTimerRef.current);
@@ -370,7 +393,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     setForcingBuy(sym);
     try {
       const bal   = balanceRef.current;
-      const alloc = Math.min(bal * ALLOC_PCT, bal);
+      const alloc = getAllocation(bal, sym);
       if (alloc < MIN_USDT) { toast.error(`Balance too low (${bal.toFixed(2)} USDT)`); return; }
       const fee = alloc * TAKER_FEE;
       const qty = (alloc - fee) / wsPrice;
@@ -424,17 +447,18 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (cycleTimerRef.current) clearTimeout(cycleTimerRef.current);
     if (countdownRef.current)  clearInterval(countdownRef.current);
     isRunningRef.current = false;
+    const startBal = getPaperCfg().startingBalance ?? 1000;
     await Promise.all([
       supabase.from('bot_trade_history').delete().eq('user_session', SESSION),
       supabase.from('paper_portfolio').delete().eq('user_session', SESSION),
       supabase.from('bot_config').update({
-        current_balance: totalBudget, initial_balance: totalBudget,
+        current_balance: startBal, initial_balance: startBal,
         is_running: false, updated_at: new Date().toISOString(),
       }).eq('user_session', SESSION),
     ]);
-    setTrades([]); setPositions([]); setBalance(totalBudget);
+    setTrades([]); setPositions([]); setBalance(startBal); setInitialBalance(startBal);
     setIsRunning(false); setCycleCountdown(0); setActLog([]);
-    toast.success(`Reset · ${totalBudget.toLocaleString()} USDT restored`);
+    toast.success(`Reset · ${startBal.toLocaleString()} USDT restored`);
   };
 
   // ── Computed stats ───────────────────────────────────────────────────────
@@ -443,7 +467,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const totalPnl    = sellTrades.reduce((s, t) => s + (t.pnl ?? 0), 0);
   const winRate     = sellTrades.length ? Math.round((wins / sellTrades.length) * 100) : 0;
   const pnlColor    = totalPnl >= 0 ? 'text-gain' : 'text-loss';
-  const pnlPct      = totalBudget > 0 ? ((totalPnl / totalBudget) * 100).toFixed(2) : '0.00';
+  const pnlPct      = initialBalance > 0 ? ((totalPnl / initialBalance) * 100).toFixed(2) : '0.00';
   const displayedTrades = showAll ? trades : trades.slice(0, 12);
 
   return (
@@ -493,35 +517,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           {binanceConnected ? '⚠️ LIVE MODE — real USDT will be used.' : <span>Binance API not connected. <button onClick={onConnectBinance} className="underline font-semibold">Connect now →</button></span>}
         </div>
       )}
-
-      {/* ── Budget ── */}
-      <div className="bg-muted/20 border border-border rounded-md px-3 py-2 space-y-2">
-        <div className="flex items-center gap-2">
-          <DollarSign className="w-3.5 h-3.5 text-muted-foreground" />
-          <span className="text-[10px] uppercase tracking-widest text-muted-foreground">Paper Budget</span>
-        </div>
-        {editingBudget ? (
-          <div className="flex items-center gap-2">
-            <input type="number" value={budgetDraft} min={100} step={100} autoFocus
-              onChange={e => setBudgetDraft(e.target.value)}
-              onKeyDown={e => { if (e.key==='Enter') { setTotalBudget(Math.max(100,Number(budgetDraft)||1000)); setEditingBudget(false); } if (e.key==='Escape') setEditingBudget(false); }}
-              className="flex-1 bg-muted/40 border border-accent rounded px-2 py-1 text-xs font-mono focus:outline-none" />
-            <button onClick={() => { setTotalBudget(Math.max(100,Number(budgetDraft)||1000)); setEditingBudget(false); }} className="p-1 rounded hover:bg-gain/20 text-gain"><Check className="w-3.5 h-3.5" /></button>
-            <button onClick={() => setEditingBudget(false)} className="p-1 rounded hover:bg-loss/20 text-loss"><X className="w-3.5 h-3.5" /></button>
-          </div>
-        ) : (
-          <div className="flex items-center gap-1 flex-wrap">
-            {PRESET_BUDGETS.map(p => (
-              <button key={p} onClick={() => { if (!isRunning) setTotalBudget(p); }} disabled={isRunning}
-                className={`text-[10px] px-2 py-1 rounded font-mono transition-colors disabled:opacity-50 ${totalBudget===p?'bg-accent text-accent-foreground':'bg-muted/50 text-muted-foreground hover:text-foreground'}`}>
-                {p.toLocaleString()} USDT
-              </button>
-            ))}
-            <button onClick={() => { setBudgetDraft(String(totalBudget)); setEditingBudget(true); }} disabled={isRunning}
-              className="p-1 rounded hover:bg-muted/40 text-muted-foreground disabled:opacity-50"><Pencil className="w-3 h-3" /></button>
-          </div>
-        )}
-      </div>
 
       {/* ── Instructions ── */}
       <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-2">
@@ -581,7 +576,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             Analyses {selectedCoins.length} coins every 30s · EMA+RSI+MACD+Volume signals · no API key needed
           </p>
       }
-      {!isRunning && <p className="text-[10px] text-center text-muted-foreground -mt-2">Scans {selectedCoins.length} coins every 30s · EMA+RSI+MACD+Vol signals · no API key needed</p>}
 
       {/* ── Live coin signals ── */}
       {coinSignals.length > 0 && (
