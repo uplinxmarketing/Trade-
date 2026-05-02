@@ -530,6 +530,10 @@ def api_activity():
 
 @app.post("/api/agent/start")
 def api_agent_start():
+    import strategy_engine
+    # Refresh approved coins from config before starting so stale strategy.json
+    # never limits which coins are scanned.
+    strategy_engine.write_default_strategy()
     _write_strategy_patch({"trading_active": True, "pause_reason": None})
     return {"ok": True, "running": True}
 

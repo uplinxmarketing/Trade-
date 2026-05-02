@@ -40,9 +40,9 @@ def main():
     import control_api
     from connection import get_mode
 
-    # 2. Write a default strategy.json immediately so trade_engine never waits
-    if not os.path.exists("strategy.json"):
-        strategy_engine.write_default_strategy()
+    # 2. Always regenerate strategy.json so config.py changes (coin list, thresholds)
+    #    take effect on every restart. trading_active state is preserved internally.
+    strategy_engine.write_default_strategy()
 
     # 3. Restore open positions from DB (crash recovery)
     trade_engine.load_positions_from_db()

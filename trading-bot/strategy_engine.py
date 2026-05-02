@@ -50,11 +50,25 @@ def _build_market_data() -> dict:
 
 
 def write_default_strategy():
-    """Write a permissive default strategy. Called on startup and as fallback."""
+    """
+    Write a default strategy using current config.py settings.
+    Always called on startup — preserves trading_active from any existing file
+    so restarts don't stop a running bot.
+    """
     starting_usdt = float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+
+    # Preserve running state across restarts
+    existing_active = True
+    if os.path.exists(config.STRATEGY_FILE):
+        try:
+            with open(config.STRATEGY_FILE) as f:
+                existing_active = json.load(f).get("trading_active", True)
+        except Exception:
+            pass
+
     strategy = {
         "updated_at":           datetime.now(timezone.utc).isoformat(),
-        "trading_active":       True,
+        "trading_active":       existing_active,
         "pause_reason":         None,
         "initial_balance_usdt": starting_usdt,
         "approved_coins": [
@@ -73,7 +87,7 @@ def write_default_strategy():
     }
     with open(config.STRATEGY_FILE, "w") as f:
         json.dump(strategy, f, indent=2)
-    print("[StrategyEngine] Default strategy.json written.")
+    print(f"[StrategyEngine] strategy.json written — {len(config.WATCHED_COINS)} coins, active={existing_active}.")
     return strategy
 
 

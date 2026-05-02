@@ -1,5 +1,5 @@
 {
-  "version": "3.5.22",
-  "buildTime": "2026-05-03T00:00:00Z",
-  "commit": "fix-update-on-vercel-hard-reload"
+  "version": "3.5.23",
+  "buildTime": "2026-05-03T01:00:00Z",
+  "commit": "fix-strategy-always-regen-on-startup"
 }
