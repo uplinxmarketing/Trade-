@@ -2,8 +2,6 @@
   "$schema": "https://railway.app/railway-schema.json",
   "services": {
     "backend": {
-      "buildCommand": "pip3 install -r trading-bot/requirements.txt",
-      "startCommand": "cd trading-bot && python3 main.py",
       "healthcheckPath": "/health"
     }
   }
