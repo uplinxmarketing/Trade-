@@ -239,15 +239,19 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   };
 
   // ── Compute portfolio totals (paper mode) ────────────────────────────────────
+  // Number() casts guard against Supabase PostgREST returning NUMERIC columns as strings.
   const positionRows = effectivePositions.map(pos => {
-    const coin = pos.symbol.replace('USDT','');
-    const livePrice = parseFloat(prices[pos.symbol]?.price||'0') || pos.avg_entry_price;
-    const currentValue = pos.quantity * livePrice;
-    const costBasis    = pos.quantity * pos.avg_entry_price / (1-TAKER_FEE);
+    const qty        = Number(pos.quantity);
+    const entryPrice = Number(pos.avg_entry_price);
+    const coin       = pos.symbol.replace('USDT','');
+    const wsPrice    = parseFloat(prices[pos.symbol]?.price || '0');
+    const livePrice  = wsPrice > 0 ? wsPrice : entryPrice;
+    const currentValue = qty * livePrice;
+    const costBasis    = qty * entryPrice / (1 - TAKER_FEE);
     const pnl          = currentValue - costBasis;
-    const pct          = costBasis > 0 ? (pnl/costBasis)*100 : 0;
-    const breakEven    = pos.avg_entry_price * BREAK_EVEN;
-    return { coin, pos, livePrice, currentValue, costBasis, pnl, pct, breakEven };
+    const pct          = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
+    const breakEven    = entryPrice * BREAK_EVEN;
+    return { coin, pos, qty, entryPrice, livePrice, currentValue, costBasis, pnl, pct, breakEven };
   });
 
   const paperPositionTotal = positionRows.reduce((s,r)=>s+r.currentValue, 0);
@@ -312,7 +316,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
       {/* ── Paper mode rows ── */}
       {isPaper && (
         <div id="wallet-tbody" className="divide-y divide-border/30">
-          {positionRows.map(({ coin, pos, livePrice, currentValue, costBasis, pnl, pct }) => (
+          {positionRows.map(({ coin, pos, qty, livePrice, currentValue, costBasis, pnl, pct }) => (
             <div key={pos.symbol} className="grid grid-cols-[auto_1fr_auto_auto_auto] gap-x-4 items-center px-4 py-2.5 hover:bg-muted/10 transition-colors">
               <div className="flex items-center gap-2">
                 <CoinIcon coin={coin} />
@@ -321,7 +325,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                   <div className="text-[9px] text-muted-foreground">{coin} <span className="opacity-60">(paper)</span></div>
                 </div>
               </div>
-              <div className="font-mono text-xs tabular-nums">{pos.quantity < 0.01 ? pos.quantity.toFixed(6) : pos.quantity.toFixed(4)}</div>
+              <div className="font-mono text-xs tabular-nums">{qty < 0.01 ? qty.toFixed(6) : qty.toFixed(4)}</div>
               <div className="font-mono text-xs tabular-nums text-right">
                 <div>{currentValue.toFixed(2)} USDT</div>
                 <div className="text-[9px] text-muted-foreground">@ {livePrice.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4})} USDT</div>

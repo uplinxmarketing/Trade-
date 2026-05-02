@@ -167,9 +167,9 @@ interface AITradingAgentProps {
   onStateChange?: (positions: {symbol:string;quantity:number;avg_entry_price:number}[], balance: number) => void;
 }
 
-const INSTRUCTIONS_KEY = 'ai_agent_instructions';
-const AGENT_CYCLE_MS   = 30_000;
-const BEP_MULT         = 1 / Math.pow(1 - TAKER_FEE, 2);
+const INSTRUCTIONS_KEY    = 'ai_agent_instructions';
+const SIGNAL_REFRESH_MS   = 12_000; // refresh klines & signals every 12s (well within Binance limits)
+const BEP_MULT            = 1 / Math.pow(1 - TAKER_FEE, 2);
 
 // ── Component ────────────────────────────────────────────────────────────────
 const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onStateChange }: AITradingAgentProps) => {
@@ -181,7 +181,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [positions, setPositions] = useState<OpenPosition[]>([]);
   const [trades, setTrades]       = useState<TradeRow[]>([]);
   const [coinSignals, setCoinSignals] = useState<CoinSignal[]>([]);
-  const [cycleCountdown, setCycleCountdown] = useState(0);
   const [agentStatus, setAgentStatus]       = useState('');
   const [scanning, setScanning]   = useState(false);
   const [showAll, setShowAll]     = useState(false);
@@ -193,13 +192,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [actLog, setActLog]       = useState<string[]>([]);
   const [showLog, setShowLog]     = useState(false);
 
-  const isRunningRef   = useRef(false);
-  const processingRef  = useRef(false);
-  const balanceRef     = useRef(balance);
-  const positionsRef   = useRef(positions);
-  const cycleTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const countdownRef   = useRef<ReturnType<typeof setInterval> | null>(null);
-  const stopLossRef    = useRef(1.5);
+  const isRunningRef    = useRef(false);
+  const exitProcessingRef = useRef(false);
+  const buyProcessingRef  = useRef(false);
+  const balanceRef      = useRef(balance);
+  const positionsRef    = useRef(positions);
+  const signalCacheRef  = useRef<CoinSignal[]>([]);
+  const signalRefreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const stopLossRef     = useRef(1.5);
   const onStateChangeRef = useRef(onStateChange);
 
   useEffect(() => { isRunningRef.current = isRunning; },   [isRunning]);
@@ -272,123 +272,125 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     return () => { supabase.removeChannel(ch); };
   }, [loadData]);
 
-  // ── Exit checker on every WS price tick ─────────────────────────────────
+  // ── Price refs ───────────────────────────────────────────────────────────
   const pricesRef = useRef(prices);
   useEffect(() => { pricesRef.current = prices; }, [prices]);
 
-  useEffect(() => {
-    if (!isRunning || processingRef.current) return;
-    if (!Object.keys(prices).length) return;
-    processingRef.current = true;
-    checkExits(prices, supabase, stopLossRef.current, 0, ({ symbol, price, usdtReceived, pnl }) => {
-      addLog(`SELL ${symbol} @ ${price.toFixed(4)} USDT · ${usdtReceived.toFixed(4)} USDT · P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDT`);
-    })
-      .then(n => { if (n > 0) { loadData(); toast.success(`Closed ${n} position(s)`, { duration: 2500 }); } })
-      .catch(() => {})
-      .finally(() => { processingRef.current = false; });
-  }, [prices]); // eslint-disable-line
-
-  // ── Core cycle ───────────────────────────────────────────────────────────
-  const runCycle = useCallback(async () => {
+  // ── Signal refresh (every SIGNAL_REFRESH_MS) ─────────────────────────────
+  // Fetches klines from Binance and updates the signal cache.
+  // Kept on a timer (not every tick) to stay within Binance rate limits.
+  const refreshSignals = useCallback(async () => {
     if (!isRunningRef.current) return;
     setScanning(true);
     setAgentStatus('Scanning market…');
-    addLog('── Cycle started');
-
     try {
-      const [posRes, cfgRes] = await Promise.all([
-        supabase.from('paper_portfolio').select('*').eq('user_session', SESSION).gt('quantity', 0),
-        supabase.from('bot_config').select('current_balance').eq('user_session', SESSION).maybeSingle(),
-      ]);
-      const currentPositions: OpenPosition[] = (posRes.data ?? []) as OpenPosition[];
-      let runBal = Number(cfgRes.data?.current_balance ?? balanceRef.current);
-      const heldSet = new Set(currentPositions.map(p => p.symbol));
-
-      // — Analyse all coins using simple 4-signal method —
       const signals = await analyseAll(selectedCoins);
+      signalCacheRef.current = signals;
       setCoinSignals(signals);
-
-      const buySigs  = signals.filter(s => s.signal === 'BUY');
-      const holdSigs = signals.filter(s => s.signal === 'HOLD');
-      addLog(`Signals: ${buySigs.length} BUY · ${holdSigs.length} HOLD · ${signals.filter(s=>s.signal==='error').length} err`);
+      const buySigs = signals.filter(s => s.signal === 'BUY');
+      addLog(`Signals: ${buySigs.length} BUY · ${signals.filter(s=>s.signal==='HOLD').length} HOLD · ${signals.filter(s=>s.signal==='error').length} err`);
       signals.forEach(s => {
         const count = [s.emaBullish, s.rsiOk, s.macdPos, s.volUp].filter(Boolean).length;
         addLog(`[SIGNALS] ${s.symbol}: trend=${s.emaBullish} rsi=${s.rsiOk} macd=${s.macdPos} vol=${s.volUp} count=${count}/4`);
       });
+      setAgentStatus(`Done · ${new Date().toLocaleTimeString()}`);
+    } catch (e: any) {
+      addLog(`Signal refresh error: ${e.message}`);
+    } finally {
+      setScanning(false);
+    }
+  }, [selectedCoins, addLog]);
 
-      // — Execute BUYs — dynamic heldSet check so every iteration sees the latest count
-      const newlyBought: OpenPosition[] = [];
-      for (const sig of buySigs) {
-        if (heldSet.size >= MAX_POSITIONS) { addLog(`  Max ${MAX_POSITIONS} positions held — exits handled by price ticker`); break; }
-        if (runBal < MIN_USDT) break;
-        if (heldSet.has(sig.symbol)) continue;
-        const wsPrice = parseFloat(pricesRef.current[sig.symbol]?.price || '0');
-        const price   = wsPrice > 0 ? wsPrice : sig.price;
-        if (!price) continue;
+  // ── Buy executor — runs on every price tick using cached signals ──────────
+  // No API calls here — just reads the signal cache and executes if conditions met.
+  const executePendingBuys = useCallback(async () => {
+    if (!isRunningRef.current) return;
+    const signals = signalCacheRef.current;
+    const buySigs = signals.filter(s => s.signal === 'BUY');
+    if (!buySigs.length) return;
 
-        const alloc  = getAllocation(runBal, sig.symbol);
-        const needed = alloc * 1.002;
-        if (runBal < needed) {
-          addLog(`[SKIP] ${sig.symbol}: Insufficient USDT — have ${runBal.toFixed(2)}, need ${needed.toFixed(2)}`);
-          continue;
-        }
-        if (alloc < MIN_USDT) { addLog(`  SKIP ${sig.symbol} — alloc ${alloc.toFixed(2)} USDT too low`); continue; }
+    const currentPositions = positionsRef.current;
+    const heldSet = new Set(currentPositions.map(p => p.symbol));
+    let runBal = balanceRef.current;
 
-        const fee = alloc * TAKER_FEE;
-        const qty = (alloc - fee) / price;
+    const newlyBought: OpenPosition[] = [];
+    for (const sig of buySigs) {
+      if (heldSet.size >= MAX_POSITIONS) break;
+      if (runBal < MIN_USDT) break;
+      if (heldSet.has(sig.symbol)) continue;
 
-        await Promise.all([
-          supabase.from('bot_trade_history').insert({
-            user_session: SESSION, symbol: sig.symbol,
-            side: 'BUY', price, quantity: qty, pnl: null,
-            reason: `[AI Paper] ${sig.reason} · ${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`,
-          }),
-          supabase.from('paper_portfolio').upsert({
-            user_session: SESSION, symbol: sig.symbol,
-            quantity: qty, avg_entry_price: price,
-            updated_at: new Date().toISOString(),
-          }, { onConflict: 'user_session,symbol' }),
-        ]);
+      const wsPrice = parseFloat(pricesRef.current[sig.symbol]?.price || '0');
+      const price   = wsPrice > 0 ? wsPrice : sig.price;
+      if (!price) continue;
 
-        runBal -= alloc;
-        newlyBought.push({ symbol: sig.symbol, quantity: qty, avg_entry_price: price });
-        heldSet.add(sig.symbol);
-        addLog(`  BUY  ${sig.symbol} @ ${price.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT`);
-        toast.info(`AI Paper BUY: ${sig.symbol.replace('USDT','')}`, { description: `${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`, duration: 3000 });
-      }
+      const alloc  = getAllocation(runBal, sig.symbol);
+      const needed = alloc * 1.002;
+      if (runBal < needed) { addLog(`[SKIP] ${sig.symbol}: need ${needed.toFixed(2)} have ${runBal.toFixed(2)}`); continue; }
+      if (alloc < MIN_USDT) continue;
 
+      const fee = alloc * TAKER_FEE;
+      const qty = (alloc - fee) / price;
+
+      await Promise.all([
+        supabase.from('bot_trade_history').insert({
+          user_session: SESSION, symbol: sig.symbol,
+          side: 'BUY', price, quantity: qty, pnl: null,
+          reason: `[AI Paper] ${sig.reason} · ${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`,
+        }),
+        supabase.from('paper_portfolio').upsert({
+          user_session: SESSION, symbol: sig.symbol,
+          quantity: qty, avg_entry_price: price,
+          updated_at: new Date().toISOString(),
+        }, { onConflict: 'user_session,symbol' }),
+      ]);
+
+      runBal -= alloc;
+      newlyBought.push({ symbol: sig.symbol, quantity: qty, avg_entry_price: price });
+      heldSet.add(sig.symbol);
+      addLog(`  BUY  ${sig.symbol} @ ${price.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT`);
+      toast.info(`AI Paper BUY: ${sig.symbol.replace('USDT','')}`, { description: `${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`, duration: 3000 });
+    }
+
+    if (newlyBought.length > 0) {
       await supabase.from('bot_config').update({
         current_balance: Math.round(runBal * 10000) / 10000,
         updated_at: new Date().toISOString(),
       }).eq('user_session', SESSION);
 
-      // Optimistic wallet update — no need to wait for loadData
-      if (newlyBought.length > 0) {
-        onStateChangeRef.current?.([...currentPositions, ...newlyBought], runBal);
-      }
-
-      setAgentStatus(`Done · ${new Date().toLocaleTimeString()}`);
+      const updated = [...currentPositions, ...newlyBought];
+      setPositions(updated); positionsRef.current = updated;
+      setBalance(runBal);    balanceRef.current   = runBal;
+      onStateChangeRef.current?.(updated, runBal);
       await loadData();
-    } catch (e: any) {
-      addLog(`ERROR: ${e.message}`);
-      setAgentStatus(`Error: ${e.message?.slice(0, 50)}`);
-    } finally {
-      setScanning(false);
     }
-  }, [selectedCoins, loadData, addLog]);
+  }, [addLog, loadData]);
 
-  // ── Scheduler ────────────────────────────────────────────────────────────
-  const scheduleNext = useCallback(() => {
-    if (cycleTimerRef.current)  clearTimeout(cycleTimerRef.current);
-    if (countdownRef.current)   clearInterval(countdownRef.current);
-    if (!isRunningRef.current)  return;
+  // ── Price tick: exits (real-time) + buy execution (uses cached signals) ───
+  useEffect(() => {
+    if (!isRunning || !Object.keys(prices).length) return;
 
-    setCycleCountdown(AGENT_CYCLE_MS / 1000);
-    countdownRef.current = setInterval(() => {
-      setCycleCountdown(p => { if (p <= 1) { clearInterval(countdownRef.current!); return 0; } return p - 1; });
-    }, 1000);
-    cycleTimerRef.current = setTimeout(() => runCycle().then(scheduleNext), AGENT_CYCLE_MS);
-  }, [runCycle]);
+    // Exit check
+    if (!exitProcessingRef.current) {
+      exitProcessingRef.current = true;
+      checkExits(prices, supabase, stopLossRef.current, 0, ({ symbol, price, usdtReceived, pnl }) => {
+        addLog(`SELL ${symbol} @ ${price.toFixed(4)} USDT · ${usdtReceived.toFixed(4)} USDT · P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDT`);
+      })
+        .then(n => { if (n > 0) { loadData(); toast.success(`Closed ${n} position(s)`, { duration: 2500 }); } })
+        .catch(() => {})
+        .finally(() => { exitProcessingRef.current = false; });
+    }
+
+    // Buy check — only if signal cache is populated and no concurrent buy running
+    if (!buyProcessingRef.current && signalCacheRef.current.length > 0) {
+      buyProcessingRef.current = true;
+      executePendingBuys()
+        .catch(() => {})
+        .finally(() => { buyProcessingRef.current = false; });
+    }
+  }, [prices]); // eslint-disable-line
+
+  // ── Manual "Now" button — refresh signals immediately ────────────────────
+  const runCycle = useCallback(() => refreshSignals(), [refreshSignals]);
 
   // ── Start / Stop ─────────────────────────────────────────────────────────
   const toggleBot = async () => {
@@ -411,14 +413,16 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         setBalance(startBal); balanceRef.current = startBal;
         setInitialBalance(startBal);
         addLog(`=== Agent STARTED · ${startBal} USDT · ${mode.toUpperCase()} ===`);
-        toast.success(`AI Agent started — PAPER mode`, { description: `${startBal.toLocaleString()} USDT · ${selectedCoins.length} coins · every 30s` });
-        runCycle().then(scheduleNext);
+        toast.success(`AI Agent started — PAPER mode`, { description: `${startBal.toLocaleString()} USDT · ${selectedCoins.length} coins · live signals` });
+        // Immediate first signal fetch, then refresh on interval
+        refreshSignals();
+        signalRefreshRef.current = setInterval(refreshSignals, SIGNAL_REFRESH_MS);
       } else {
-        if (cycleTimerRef.current) clearTimeout(cycleTimerRef.current);
-        if (countdownRef.current)  clearInterval(countdownRef.current);
+        if (signalRefreshRef.current) clearInterval(signalRefreshRef.current);
+        signalCacheRef.current = [];
         await supabase.from('bot_config').update({ is_running: false, updated_at: new Date().toISOString() }).eq('user_session', SESSION);
         isRunningRef.current = false;
-        setIsRunning(false); setCycleCountdown(0);
+        setIsRunning(false);
         addLog('=== Agent STOPPED ===');
         toast.info('AI Agent stopped');
       }
@@ -483,8 +487,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // ── Reset ────────────────────────────────────────────────────────────────
   const resetBot = async () => {
     if (!confirm('Reset all paper trades and restore budget?')) return;
-    if (cycleTimerRef.current) clearTimeout(cycleTimerRef.current);
-    if (countdownRef.current)  clearInterval(countdownRef.current);
+    if (signalRefreshRef.current) clearInterval(signalRefreshRef.current);
+    signalCacheRef.current = [];
     isRunningRef.current = false;
     const startBal = getPaperCfg().startingBalance ?? 1000;
     await Promise.all([
@@ -496,7 +500,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       }).eq('user_session', SESSION),
     ]);
     setTrades([]); setPositions([]); setBalance(startBal); setInitialBalance(startBal);
-    setIsRunning(false); setCycleCountdown(0); setActLog([]);
+    setIsRunning(false); setActLog([]);
     toast.success(`Reset · ${startBal.toLocaleString()} USDT restored`);
   };
 
@@ -523,10 +527,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           </span>
           {scanning
             ? <span className="text-[9px] text-accent font-mono flex items-center gap-1"><RefreshCw className="w-2.5 h-2.5 animate-spin" />Checking signals…</span>
-            : isRunning && cycleCountdown > 0
+            : isRunning
               ? <span className="text-[9px] text-muted-foreground font-mono flex items-center gap-1.5">
-                  <span className="text-gain">●</span>exits live
-                  <span className="opacity-40">·</span>buy scan in {cycleCountdown}s
+                  <span className="text-gain">●</span>live
                 </span>
               : null
           }
