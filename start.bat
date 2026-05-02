@@ -15,7 +15,7 @@ echo TradeBot AI — Session %TIMESTAMP% > "%LOG_FILE%"
 
 echo.
 echo   ============================================
-echo       TradeBot AI v3.5.0
+echo       TradeBot AI v3.5.6
 echo   ============================================
 echo.
 call :logline "Log file: %LOG_FILE%"
@@ -106,7 +106,9 @@ set "TMPUPD=%TEMP%\tb_updater_%RANDOM%.js"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $ts=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); Invoke-WebRequest -Uri ('https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/scripts/update.js?t='+$ts) -OutFile '%TMPUPD%' -UseBasicParsing -Headers @{'Cache-Control'='no-cache';'Pragma'='no-cache'} } catch { exit 1 }" >nul 2>&1
 if exist "%TMPUPD%" (
     call :logline "Updater downloaded — running..."
-    node "%TMPUPD%" >> "%LOG_FILE%" 2>&1
+    echo.
+    node "%TMPUPD%"
+    echo.
     del "%TMPUPD%" >nul 2>&1
     call :logline "Update check done."
 ) else (

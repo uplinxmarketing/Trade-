@@ -35,7 +35,7 @@ function fetchText(url) {
   return new Promise((resolve, reject) => {
     function get(u) {
       const mod = u.startsWith('https') ? https : http;
-      mod.get(u, { headers: { 'User-Agent': 'TradeBot-Updater/1.0' } }, (res) => {
+      mod.get(u, { headers: { 'User-Agent': 'TradeBot-Updater/1.0', 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' } }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           return get(res.headers.location);
         }
@@ -58,7 +58,7 @@ function download(url, destPath) {
   return new Promise((resolve, reject) => {
     function get(u) {
       const mod = u.startsWith('https') ? https : http;
-      mod.get(u, { headers: { 'User-Agent': 'TradeBot-Updater/1.0' } }, (res) => {
+      mod.get(u, { headers: { 'User-Agent': 'TradeBot-Updater/1.0', 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' } }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           return get(res.headers.location);
         }
