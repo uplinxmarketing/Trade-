@@ -110,7 +110,7 @@ async function main() {
   // 1. Fetch remote version.json
   let remoteVersion;
   try {
-    remoteVersion = JSON.parse(await fetchText(REMOTE_VERSION_URL));
+    remoteVersion = JSON.parse(await fetchText(REMOTE_VERSION_URL + '?t=' + Date.now()));
   } catch (e) {
     log('Could not reach GitHub (' + e.message + ') — skipping update.');
     return; // offline or GitHub down — not a fatal error

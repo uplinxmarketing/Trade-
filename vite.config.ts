@@ -182,18 +182,71 @@ function updatePlugin(): Plugin {
         if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
         try {
           const { execSync } = await import("child_process");
-          const appDir = process.cwd();
-          // Cross-platform: git pull works on Linux, Mac, and Windows
-          const output = execSync("git fetch origin main && git reset --hard origin/main", {
-            cwd: appDir,
-            timeout: 60_000,
-            encoding: "utf8",
-            env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-          });
+          const nodeOs   = await import("os");
+          const nodePath = await import("path");
+          const nodeFs   = await import("fs");
+          const https    = await import("https");
+          const http     = await import("http");
+          const appDir   = process.cwd();
+          const SKIP     = new Set(["node_modules", "logs", ".env", "dist", ".git"]);
+
+          // ── Try git first (fastest for git clones) ──────────────────────
+          let gitWorked = false;
+          try {
+            execSync("git fetch origin main && git reset --hard origin/main", {
+              cwd: appDir, timeout: 30_000, encoding: "utf8",
+              env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+            });
+            gitWorked = true;
+          } catch { /* not a git repo or no network — fall through to ZIP */ }
+
+          // ── ZIP fallback (works for non-git downloads) ───────────────────
+          if (!gitWorked) {
+            const ZIP_URL = "https://github.com/uplinxmarketing/Trade-/archive/refs/heads/main.zip";
+            const uid     = Date.now();
+            const zipPath = nodePath.join(nodeOs.tmpdir(), `tb_upd_${uid}.zip`);
+            const extPath = nodePath.join(nodeOs.tmpdir(), `tb_upd_ext_${uid}`);
+
+            // Download ZIP following redirects
+            await new Promise<void>((resolve, reject) => {
+              function get(url: string) {
+                const mod = url.startsWith("https") ? https : http;
+                (mod as typeof https).get(url, { headers: { "User-Agent": "TradeBot-Updater/1.0" } }, (r) => {
+                  if (r.statusCode && r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) return get(r.headers.location);
+                  const out = nodeFs.createWriteStream(zipPath);
+                  r.pipe(out);
+                  out.on("finish", () => out.close(() => resolve()));
+                  out.on("error", reject);
+                  r.on("error", reject);
+                }).on("error", reject);
+              }
+              get(ZIP_URL);
+            });
+
+            // Extract — PowerShell on Windows, unzip on Linux/Mac
+            nodeFs.mkdirSync(extPath, { recursive: true });
+            if (process.platform === "win32") {
+              execSync(`powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${extPath}' -Force"`, { timeout: 120_000 });
+            } else {
+              execSync(`unzip -o "${zipPath}" -d "${extPath}"`, { timeout: 120_000 });
+            }
+
+            // Copy all files except protected dirs
+            const entries = nodeFs.readdirSync(extPath);
+            if (!entries.length) throw new Error("Extracted ZIP is empty");
+            const srcDir = nodePath.join(extPath, entries[0]);
+            for (const entry of nodeFs.readdirSync(srcDir)) {
+              if (SKIP.has(entry)) continue;
+              nodeFs.cpSync(nodePath.join(srcDir, entry), nodePath.join(appDir, entry), { recursive: true, force: true });
+            }
+
+            // Cleanup
+            try { nodeFs.unlinkSync(zipPath); } catch { /* ok */ }
+            try { nodeFs.rmSync(extPath, { recursive: true, force: true }); } catch { /* ok */ }
+          }
+
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true, output }));
-          // Vite restart rebundles with the new version.json.
-          // Client polls /api/ping and reloads once the server is back up.
+          res.end(JSON.stringify({ success: true, output: gitWorked ? "git pull" : "zip download" }));
           setTimeout(() => server.restart(), 1500);
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
