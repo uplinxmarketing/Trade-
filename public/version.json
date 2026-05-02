@@ -1,5 +1,5 @@
 {
-  "version": "3.5.13",
-  "buildTime": "2026-05-02T18:00:00Z",
-  "commit": "railway-deploy-python-backend"
+  "version": "3.5.14",
+  "buildTime": "2026-05-02T20:00:00Z",
+  "commit": "fix-railway-python3-cmd"
 }

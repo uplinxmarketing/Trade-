@@ -1,1 +1,1 @@
-web: cd trading-bot && python main.py
+web: cd trading-bot && python3 main.py
