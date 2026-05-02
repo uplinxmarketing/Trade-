@@ -8,7 +8,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
-import { checkExits, TAKER_FEE } from '@/lib/trading-engine';
+import { TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
 import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcSMA } from '@/lib/indicators';
 
@@ -168,7 +168,7 @@ interface AITradingAgentProps {
 }
 
 const INSTRUCTIONS_KEY    = 'ai_agent_instructions';
-const SIGNAL_REFRESH_MS   = 12_000; // refresh klines & signals every 12s (well within Binance limits)
+const SIGNAL_REFRESH_MS   = 5_000; // refresh klines & signals every 5s
 const BEP_MULT            = 1 / Math.pow(1 - TAKER_FEE, 2);
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -195,6 +195,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const isRunningRef    = useRef(false);
   const exitProcessingRef = useRef(false);
   const buyProcessingRef  = useRef(false);
+  const pendingSellsRef   = useRef<Set<string>>(new Set());
   const balanceRef      = useRef(balance);
   const positionsRef    = useRef(positions);
   const signalCacheRef  = useRef<CoinSignal[]>([]);
@@ -367,17 +368,83 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     }
   }, [addLog, loadData]);
 
+  // ── Exit executor — pure computation, zero DB reads, fires on every tick ──
+  // Reads positionsRef + pricesRef in-memory only; DB writes are fire-and-forget.
+  const executeExits = useCallback(async () => {
+    if (!isRunningRef.current) return;
+    const currentPositions = positionsRef.current;
+    if (!currentPositions.length) return;
+
+    type SellItem = { pos: OpenPosition; price: number; pnl: number; proceeds: number };
+    const toSell: SellItem[] = [];
+
+    for (const pos of currentPositions) {
+      if (pendingSellsRef.current.has(pos.symbol)) continue;
+      const wsPrice = parseFloat(pricesRef.current[pos.symbol]?.price || '0');
+      if (!wsPrice) continue;
+
+      const qty   = Number(pos.quantity);
+      const entry = Number(pos.avg_entry_price);
+      const bep   = entry * BEP_MULT;
+      const stopPrice = entry * (1 - stopLossRef.current / 100);
+
+      if (wsPrice < bep && wsPrice > stopPrice) continue;
+
+      const proceeds = qty * wsPrice * (1 - TAKER_FEE);
+      const cost     = qty * entry / (1 - TAKER_FEE);
+      const pnl      = Math.round((proceeds - cost) * 10000) / 10000;
+
+      pendingSellsRef.current.add(pos.symbol);
+      toSell.push({ pos, price: wsPrice, pnl, proceeds });
+    }
+
+    if (!toSell.length) return;
+
+    // Optimistic state update — happens before any DB round-trip
+    const soldSymbols = new Set(toSell.map(s => s.pos.symbol));
+    const remaining   = currentPositions.filter(p => !soldSymbols.has(p.symbol));
+    const totalProceeds = toSell.reduce((s, t) => s + t.proceeds, 0);
+    const newBal = Math.round((balanceRef.current + totalProceeds) * 10000) / 10000;
+
+    setPositions(remaining);  positionsRef.current = remaining;
+    setBalance(newBal);        balanceRef.current   = newBal;
+    onStateChangeRef.current?.(remaining, newBal);
+
+    for (const { pos, price, pnl } of toSell) {
+      addLog(`SELL ${pos.symbol} @ ${price.toFixed(4)} USDT · P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDT`);
+    }
+
+    // Non-blocking DB writes
+    const writes = toSell.map(({ pos, price, pnl }) =>
+      Promise.all([
+        supabase.from('bot_trade_history').insert({
+          user_session: SESSION, symbol: pos.symbol, side: 'SELL',
+          price, quantity: Number(pos.quantity), pnl,
+          reason: `[AI Paper] exit · @ ${price.toFixed(4)} USDT · pnl ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDT`,
+        }),
+        supabase.from('paper_portfolio').delete().eq('user_session', SESSION).eq('symbol', pos.symbol),
+      ])
+    );
+
+    await Promise.all([
+      ...writes,
+      supabase.from('bot_config').update({ current_balance: newBal, updated_at: new Date().toISOString() }).eq('user_session', SESSION),
+    ]);
+
+    for (const { pos } of toSell) pendingSellsRef.current.delete(pos.symbol);
+
+    toast.success(`Closed ${toSell.length} position(s)`, { duration: 2500 });
+    await loadData();
+  }, [addLog, loadData]);
+
   // ── Price tick: exits (real-time) + buy execution (uses cached signals) ───
   useEffect(() => {
     if (!isRunning || !Object.keys(prices).length) return;
 
-    // Exit check
+    // Exit check — zero DB reads, pure in-memory computation
     if (!exitProcessingRef.current) {
       exitProcessingRef.current = true;
-      checkExits(prices, supabase, stopLossRef.current, 0, ({ symbol, price, usdtReceived, pnl }) => {
-        addLog(`SELL ${symbol} @ ${price.toFixed(4)} USDT · ${usdtReceived.toFixed(4)} USDT · P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDT`);
-      })
-        .then(n => { if (n > 0) { loadData(); toast.success(`Closed ${n} position(s)`, { duration: 2500 }); } })
+      executeExits()
         .catch((e: unknown) => { addLog(`[ERR] Exit check: ${e instanceof Error ? e.message : String(e)}`); })
         .finally(() => { exitProcessingRef.current = false; });
     }
@@ -627,11 +694,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       </Button>
       {isRunning
         ? <p className="text-[10px] text-center text-muted-foreground -mt-2">
-            Exits live on every tick · Signals refresh every 12s · EMA+RSI+MACD+Volume
+            Exits live on every tick · Signals refresh every 5s · EMA+RSI+MACD+Volume
             {agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}
           </p>
         : <p className="text-[10px] text-center text-muted-foreground -mt-2">
-            Exits fire on every price tick · Buy signals refresh every 12s · EMA+RSI+MACD+Volume · no API key needed
+            Exits fire on every price tick · Buy signals refresh every 5s · EMA+RSI+MACD+Volume · no API key needed
           </p>
       }
 
