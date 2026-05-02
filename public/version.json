@@ -1,5 +1,5 @@
 {
-  "version": "3.5.17",
+  "version": "3.5.18",
   "buildTime": "2026-05-02T23:00:00Z",
-  "commit": "fix-sqlite-init-order-no-such-table-paper-state"
+  "commit": "feat-railway-server-mode-24-7-trading"
 }

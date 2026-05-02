@@ -11,6 +11,7 @@ import { toast } from 'sonner';
 import { TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
 import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcSMA } from '@/lib/indicators';
+import { API_BASE } from '@/config';
 
 // ── All coins available for the bot to trade ─────────────────────────────────
 const ALL_TRADABLE_COINS = [
@@ -160,6 +161,16 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [actLog, setActLog]       = useState<string[]>([]);
   const [showLog, setShowLog]     = useState(false);
 
+  // ── Railway server mode ──────────────────────────────────────────────────
+  const RAILWAY_URL_KEY = 'railway_bot_url';
+  const [railwayUrl, setRailwayUrl] = useState<string>(() => {
+    if (API_BASE) return API_BASE;
+    return localStorage.getItem(RAILWAY_URL_KEY) ?? '';
+  });
+  const [railwayConnected, setRailwayConnected] = useState(false);
+  const [showUrlInput, setShowUrlInput] = useState(false);
+  const [urlDraft, setUrlDraft] = useState('');
+
   const isRunningRef      = useRef(false);
   const exitProcessingRef = useRef(false);
   const buyProcessingRef  = useRef(false);
@@ -179,6 +190,17 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   useEffect(() => { selectedCoinsRef.current = selectedCoins; },  [selectedCoins]);
   useEffect(() => { localStorage.setItem(INSTRUCTIONS_KEY, instructions); }, [instructions]);
   useEffect(() => { onStateChangeRef.current = onStateChange; }, [onStateChange]);
+
+  const isServerMode = railwayUrl.trim().length > 0;
+
+  const saveRailwayUrl = useCallback((url: string) => {
+    const trimmed = url.trim().replace(/\/$/, '');
+    setRailwayUrl(trimmed);
+    localStorage.setItem(RAILWAY_URL_KEY, trimmed);
+    setShowUrlInput(false);
+    if (trimmed) toast.success('Railway URL saved — bot will run 24/7 on server');
+    else toast.info('Railway URL cleared — running in browser');
+  }, []);
 
   const addLog = useCallback((msg: string) => {
     const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -259,6 +281,56 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // ── Price refs ───────────────────────────────────────────────────────────
   const pricesRef = useRef(prices);
   useEffect(() => { pricesRef.current = prices; }, [prices]);
+
+  // ── Poll Railway when in server mode ─────────────────────────────────────
+  useEffect(() => {
+    if (!isServerMode) return;
+    const poll = async () => {
+      try {
+        const [statusRes, posRes, tradesRes] = await Promise.all([
+          fetch(`${railwayUrl}/api/status`),
+          fetch(`${railwayUrl}/api/positions`),
+          fetch(`${railwayUrl}/api/trades`),
+        ]);
+        if (!statusRes.ok) throw new Error('unreachable');
+        const status     = await statusRes.json();
+        const posData    = await posRes.json();
+        const tradesData = await tradesRes.json();
+
+        setIsRunning(Boolean(status.running));
+        isRunningRef.current = Boolean(status.running);
+        const bal = Number(status.balance_usdt ?? 0);
+        setBalance(bal);
+        balanceRef.current = bal;
+        setRailwayConnected(true);
+
+        const mappedPos: OpenPosition[] = (posData.positions ?? []).map((p: any) => ({
+          symbol: p.symbol,
+          quantity: Number(p.quantity),
+          avg_entry_price: Number(p.entry_price),
+        }));
+        setPositions(mappedPos);
+        positionsRef.current = mappedPos;
+        onStateChangeRef.current?.(mappedPos, bal);
+
+        setTrades((tradesData.trades ?? []).map((t: any): TradeRow => ({
+          id: String(t.id),
+          created_at: t.timestamp_sell ?? t.timestamp_buy ?? new Date().toISOString(),
+          symbol: t.coin,
+          side: t.exit_price != null ? 'SELL' : 'BUY',
+          price: Number(t.exit_price ?? t.entry_price),
+          quantity: Number(t.quantity),
+          pnl: t.net_profit != null ? Number(t.net_profit) : null,
+          reason: null,
+        })));
+      } catch {
+        setRailwayConnected(false);
+      }
+    };
+    poll();
+    const id = setInterval(poll, 5000);
+    return () => clearInterval(id);
+  }, [railwayUrl, isServerMode]); // eslint-disable-line
 
   // ── Pure signal recomputation from in-memory kline buffers — zero network calls ──
   const recomputeSignals = useCallback(() => {
@@ -536,6 +608,27 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
   // ── Start / Stop ─────────────────────────────────────────────────────────
   const toggleBot = async () => {
+    // Server mode: delegate to Railway, don't run in browser
+    if (isServerMode) {
+      setLoading(true);
+      try {
+        const endpoint = isRunning ? 'stop' : 'start';
+        const res = await fetch(`${railwayUrl}/api/agent/${endpoint}`, { method: 'POST' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        setIsRunning(Boolean(data.running));
+        isRunningRef.current = Boolean(data.running);
+        toast[data.running ? 'success' : 'info'](
+          data.running ? 'Bot started on Railway server — runs 24/7' : 'Bot stopped on Railway server'
+        );
+      } catch (e) {
+        toast.error(`Railway unreachable: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
     if (mode === 'live' && !binanceConnected) { toast.error('Connect Binance API first'); onConnectBinance?.(); return; }
     setLoading(true);
     try {
@@ -719,9 +812,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${mode === 'live' ? 'bg-loss/20 text-loss' : 'bg-accent/20 text-accent'}`}>
             {mode === 'live' ? 'LIVE' : 'PAPER TEST'}
           </span>
-          {scanning
+          {isServerMode
+            ? <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${railwayConnected ? 'bg-gain/20 text-gain' : 'bg-warn/20 text-warn'}`}>
+                {railwayConnected ? '⚡ SERVER 24/7' : '⚡ SERVER …'}
+              </span>
+            : <span className="text-[9px] px-1.5 py-0.5 rounded bg-muted/50 text-muted-foreground">BROWSER</span>
+          }
+          {!isServerMode && scanning
             ? <span className="text-[9px] text-accent font-mono flex items-center gap-1"><RefreshCw className="w-2.5 h-2.5 animate-spin" />Checking signals…</span>
-            : isRunning
+            : !isServerMode && isRunning
               ? <span className="text-[9px] text-muted-foreground font-mono flex items-center gap-1.5">
                   <span className="text-gain">●</span>live
                 </span>
@@ -729,16 +828,65 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           }
         </div>
         <div className="flex items-center gap-1.5">
-          {isRunning && (
+          {isRunning && !isServerMode && (
             <Button size="sm" variant="outline" className="h-6 text-[10px] px-2" onClick={() => runCycle()} disabled={scanning}>
               <Zap className="w-3 h-3 mr-0.5" />Now
             </Button>
           )}
+          <button
+            onClick={() => { setUrlDraft(railwayUrl); setShowUrlInput(v => !v); }}
+            className={`p-1.5 rounded hover:bg-muted/40 ${isServerMode ? 'text-gain' : 'text-muted-foreground hover:text-foreground'}`}
+            title="Set Railway server URL for 24/7 trading"
+          >
+            <Activity className="w-3.5 h-3.5" />
+          </button>
           <button onClick={resetBot} className="p-1.5 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground" title="Reset">
             <RotateCcw className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
+
+      {/* ── Railway URL settings ── */}
+      {showUrlInput && (
+        <div className="bg-muted/20 border border-gain/30 rounded-md px-3 py-2.5 space-y-2">
+          <div className="flex items-center gap-1.5">
+            <Activity className="w-3.5 h-3.5 text-gain" />
+            <span className="text-xs font-semibold text-gain">Railway Server URL</span>
+          </div>
+          <p className="text-[10px] text-muted-foreground leading-relaxed">
+            Paste your Railway app URL to run the bot 24/7 on a server. Leave empty to run in browser (stops when tab closes).
+          </p>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={urlDraft}
+              onChange={e => setUrlDraft(e.target.value)}
+              placeholder="https://your-app.railway.app"
+              className="flex-1 bg-muted/40 border border-border rounded px-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-gain/60"
+            />
+            <button
+              onClick={() => saveRailwayUrl(urlDraft)}
+              className="px-3 py-1.5 rounded bg-gain/90 hover:bg-gain text-background text-xs font-semibold"
+            >
+              Save
+            </button>
+            {railwayUrl && (
+              <button
+                onClick={() => saveRailwayUrl('')}
+                className="px-2 py-1.5 rounded bg-muted hover:bg-muted/60 text-muted-foreground text-xs"
+                title="Clear Railway URL"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+          {isServerMode && (
+            <p className={`text-[10px] font-medium ${railwayConnected ? 'text-gain' : 'text-warn'}`}>
+              {railwayConnected ? `✓ Connected — ${railwayUrl}` : `⟳ Connecting to ${railwayUrl}…`}
+            </p>
+          )}
+        </div>
+      )}
 
       {/* ── Mode toggle ── */}
       <div className="grid grid-cols-2 gap-1 bg-muted/30 rounded-md p-0.5">
@@ -847,20 +995,30 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       </div>
 
       {/* ── Start / Stop ── */}
-      <Button onClick={toggleBot} disabled={loading||!selectedCoins.length}
+      <Button onClick={toggleBot} disabled={loading || (!isServerMode && !selectedCoins.length)}
         className={`w-full font-semibold py-5 ${isRunning?'bg-loss/90 hover:bg-loss text-white':'bg-gain/90 hover:bg-gain text-background'}`}>
         {loading ? <span className="animate-spin mr-1.5">⟳</span>
-          : isRunning ? <><Square className="w-4 h-4 mr-1.5"/>Stop Agent</>
-          : <><Play className="w-4 h-4 mr-1.5"/>Start AI Agent — Paper Test</>}
+          : isRunning
+            ? <><Square className="w-4 h-4 mr-1.5"/>Stop Agent{isServerMode ? ' (Railway)' : ''}</>
+            : isServerMode
+              ? <><Play className="w-4 h-4 mr-1.5"/>Start Agent on Railway (24/7)</>
+              : <><Play className="w-4 h-4 mr-1.5"/>Start AI Agent — Paper Test</>}
       </Button>
-      {isRunning
+      {isServerMode
         ? <p className="text-[10px] text-center text-muted-foreground -mt-2">
-            Exits live on every tick · Signals live via WebSocket · EMA+RSI+MACD+Volume
-            {agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}
+            {railwayConnected
+              ? `Runs 24/7 on Railway server · stays active when browser is closed · polling every 5s`
+              : `Connecting to Railway server… set URL via the ⚡ button above`
+            }
           </p>
-        : <p className="text-[10px] text-center text-muted-foreground -mt-2">
-            Exits fire on every price tick · Signals live via WebSocket · EMA+RSI+MACD+Volume · no API key needed
-          </p>
+        : isRunning
+          ? <p className="text-[10px] text-center text-muted-foreground -mt-2">
+              ⚠️ Runs in browser tab — will stop when tab closes · set Railway URL above for 24/7
+              {agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}
+            </p>
+          : <p className="text-[10px] text-center text-muted-foreground -mt-2">
+              ⚠️ Browser mode — stops when tab closes · set Railway URL above to run 24/7
+            </p>
       }
 
       {/* ── Live coin signals ── */}
