@@ -1,5 +1,5 @@
 {
-  "version": "3.5.16",
-  "buildTime": "2026-05-02T22:00:00Z",
-  "commit": "fix-railway-railpack-python-detection"
+  "version": "3.5.17",
+  "buildTime": "2026-05-02T23:00:00Z",
+  "commit": "fix-sqlite-init-order-no-such-table-paper-state"
 }
