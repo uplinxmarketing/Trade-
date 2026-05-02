@@ -6,6 +6,7 @@ Runs as a daemon thread (non-blocking).
 
 import json
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ import uvicorn
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 import config
 import database
@@ -496,6 +498,55 @@ def api_agent_start():
 def api_agent_stop():
     _write_strategy_patch({"trading_active": False, "pause_reason": "Stopped via API"})
     return {"ok": True, "running": False}
+
+
+class ModeRequest(BaseModel):
+    mode: str           # "paper" or "live"
+    api_key: str = ""
+    api_secret: str = ""
+
+
+def _update_env_file(updates: dict):
+    env_path = ".env"
+    lines: list[str] = []
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            lines = f.readlines()
+    for key, value in updates.items():
+        found = False
+        for i, line in enumerate(lines):
+            if line.startswith(f"{key}="):
+                lines[i] = f"{key}={value}\n"
+                found = True
+                break
+        if not found:
+            lines.append(f"{key}={value}\n")
+    with open(env_path, "w") as f:
+        f.writelines(lines)
+
+
+@app.post("/api/mode")
+def api_set_mode(req: ModeRequest):
+    if req.mode not in ("paper", "live"):
+        return {"ok": False, "error": "mode must be paper or live"}
+
+    updates = {"MODE": req.mode}
+    if req.mode == "live":
+        if req.api_key:
+            updates["BINANCE_API_KEY"] = req.api_key
+        if req.api_secret:
+            updates["BINANCE_API_SECRET"] = req.api_secret
+
+    _update_env_file(updates)
+    # Stop trading before restart so no open orders are left dangling
+    _write_strategy_patch({"trading_active": False})
+
+    def _restart():
+        time.sleep(0.8)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=_restart, daemon=True).start()
+    return {"ok": True, "mode": req.mode, "restarting": True}
 
 
 def start_control_api():

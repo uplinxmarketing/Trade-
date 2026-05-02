@@ -1,5 +1,5 @@
 {
-  "version": "3.5.19",
-  "buildTime": "2026-05-02T23:30:00Z",
-  "commit": "set-railway-default-url"
+  "version": "3.5.20",
+  "buildTime": "2026-05-03T00:00:00Z",
+  "commit": "feat-live-mode-switcher-railway"
 }

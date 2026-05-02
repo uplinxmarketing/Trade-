@@ -170,6 +170,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [railwayConnected, setRailwayConnected] = useState(false);
   const [showUrlInput, setShowUrlInput] = useState(false);
   const [urlDraft, setUrlDraft] = useState('');
+  const [serverBotMode, setServerBotMode] = useState<'paper' | 'live'>('paper');
+  const [showLiveForm, setShowLiveForm] = useState(false);
+  const [apiKeyDraft, setApiKeyDraft] = useState('');
+  const [apiSecretDraft, setApiSecretDraft] = useState('');
+  const [applyingMode, setApplyingMode] = useState(false);
 
   const isRunningRef      = useRef(false);
   const exitProcessingRef = useRef(false);
@@ -201,6 +206,38 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (trimmed) toast.success('Railway URL saved — bot will run 24/7 on server');
     else toast.info('Railway URL cleared — running in browser');
   }, []);
+
+  const applyServerMode = useCallback(async (newMode: 'paper' | 'live') => {
+    if (newMode === 'live' && (!apiKeyDraft.trim() || !apiSecretDraft.trim())) {
+      toast.error('Enter Binance API key and secret first');
+      return;
+    }
+    setApplyingMode(true);
+    try {
+      const res = await fetch(`${railwayUrl}/api/mode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: newMode,
+          api_key: apiKeyDraft.trim(),
+          api_secret: apiSecretDraft.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error ?? 'Failed');
+      setServerBotMode(newMode);
+      setShowLiveForm(false);
+      setApiKeyDraft('');
+      setApiSecretDraft('');
+      toast.success(`Switched to ${newMode.toUpperCase()} mode — bot restarting…`, {
+        description: 'Takes ~5 seconds. Status will update automatically.',
+      });
+    } catch (e) {
+      toast.error(`Mode switch failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setApplyingMode(false);
+    }
+  }, [railwayUrl, apiKeyDraft, apiSecretDraft]);
 
   const addLog = useCallback((msg: string) => {
     const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -303,6 +340,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         setBalance(bal);
         balanceRef.current = bal;
         setRailwayConnected(true);
+        if (status.mode === 'live' || status.mode === 'paper') {
+          setServerBotMode(status.mode);
+        }
 
         const mappedPos: OpenPosition[] = (posData.positions ?? []).map((p: any) => ({
           symbol: p.symbol,
@@ -884,6 +924,63 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             <p className={`text-[10px] font-medium ${railwayConnected ? 'text-gain' : 'text-warn'}`}>
               {railwayConnected ? `✓ Connected — ${railwayUrl}` : `⟳ Connecting to ${railwayUrl}…`}
             </p>
+          )}
+
+          {/* ── Server trading mode switcher ── */}
+          {isServerMode && railwayConnected && (
+            <div className="border-t border-border pt-2 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-accent">Server Trading Mode</span>
+                <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${serverBotMode === 'live' ? 'bg-loss/20 text-loss' : 'bg-accent/20 text-accent'}`}>
+                  {serverBotMode === 'live' ? '⚡ LIVE — Real USDT' : 'PAPER TEST'}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-1 bg-muted/30 rounded-md p-0.5">
+                <button
+                  onClick={() => { setShowLiveForm(false); applyServerMode('paper'); }}
+                  disabled={applyingMode || serverBotMode === 'paper'}
+                  className={`py-1.5 rounded text-xs font-semibold transition-colors disabled:opacity-50
+                    ${serverBotMode === 'paper' ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                >
+                  <FlaskConical className="w-3 h-3 inline mr-1" />Paper Test
+                </button>
+                <button
+                  onClick={() => setShowLiveForm(v => !v)}
+                  disabled={applyingMode}
+                  className={`py-1.5 rounded text-xs font-semibold transition-colors disabled:opacity-50
+                    ${serverBotMode === 'live' ? 'bg-loss/80 text-white' : 'text-muted-foreground hover:text-foreground'}`}
+                >
+                  <Zap className="w-3 h-3 inline mr-1" />Live Trading
+                </button>
+              </div>
+
+              {showLiveForm && (
+                <div className="space-y-1.5 pt-1">
+                  <p className="text-[10px] text-loss font-medium">⚠️ Real USDT will be used. Double-check your keys.</p>
+                  <input
+                    type="password"
+                    value={apiKeyDraft}
+                    onChange={e => setApiKeyDraft(e.target.value)}
+                    placeholder="Binance API Key"
+                    className="w-full bg-muted/40 border border-border rounded px-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-loss/60"
+                  />
+                  <input
+                    type="password"
+                    value={apiSecretDraft}
+                    onChange={e => setApiSecretDraft(e.target.value)}
+                    placeholder="Binance API Secret"
+                    className="w-full bg-muted/40 border border-border rounded px-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-loss/60"
+                  />
+                  <button
+                    onClick={() => applyServerMode('live')}
+                    disabled={applyingMode || !apiKeyDraft.trim() || !apiSecretDraft.trim()}
+                    className="w-full py-1.5 rounded bg-loss/90 hover:bg-loss text-white text-xs font-semibold disabled:opacity-50"
+                  >
+                    {applyingMode ? '⟳ Applying…' : 'Apply & Restart Bot in LIVE Mode'}
+                  </button>
+                </div>
+              )}
+            </div>
           )}
         </div>
       )}
