@@ -209,7 +209,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const cycleTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownRef   = useRef<ReturnType<typeof setInterval> | null>(null);
   const stopLossRef    = useRef(1.5);
-  const onStateChangeRef = useRef(onStateChange);
+  const onStateChangeRef  = useRef(onStateChange);
+  // Refs so the init effect can restart the scheduler after page refresh
+  // without creating a circular dependency (scheduler defined later in file)
+  const runCycleRef    = useRef<(() => Promise<void>) | null>(null);
+  const scheduleNextRef = useRef<(() => void) | null>(null);
 
   useEffect(() => { isRunningRef.current = isRunning; },   [isRunning]);
   useEffect(() => { balanceRef.current   = balance; },     [balance]);
@@ -272,14 +276,22 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   }, []);
 
   useEffect(() => {
-    loadData();
+    loadData().then(() => {
+      // Restart the scheduler if the bot was running before the page refresh.
+      // runCycleRef and scheduleNextRef are populated by effects registered
+      // further down, which have all fired by the time this .then() resolves.
+      if (isRunningRef.current && scheduleNextRef.current) {
+        addLog('=== Resumed after page refresh — restarting cycle ===');
+        runCycleRef.current?.().then(() => scheduleNextRef.current?.());
+      }
+    });
     const ch = supabase.channel('ata-rt')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_trade_history' }, loadData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'paper_portfolio' }, loadData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_config' }, loadData)
       .subscribe();
     return () => { supabase.removeChannel(ch); };
-  }, [loadData]);
+  }, [loadData]); // eslint-disable-line
 
   // ── Exit checker on every WS price tick ─────────────────────────────────
   const pricesRef = useRef(prices);
@@ -346,7 +358,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         const fee = alloc * TAKER_FEE;
         const qty = (alloc - fee) / price;
 
-        await Promise.all([
+        const [tradeRes, portRes] = await Promise.all([
           supabase.from('bot_trade_history').insert({
             user_session: SESSION, symbol: sig.symbol,
             side: 'BUY', price, quantity: qty, pnl: null,
@@ -358,6 +370,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             updated_at: new Date().toISOString(),
           }, { onConflict: 'user_session,symbol' }),
         ]);
+        if (tradeRes.error) addLog(`[DB ERR] trade_history insert: ${tradeRes.error.message}`);
+        if (portRes.error)  addLog(`[DB ERR] paper_portfolio upsert: ${portRes.error.message}`);
 
         runBal -= alloc;
         newlyBought.push({ symbol: sig.symbol, quantity: qty, avg_entry_price: price });
@@ -399,6 +413,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     cycleTimerRef.current = setTimeout(() => runCycle().then(scheduleNext), AGENT_CYCLE_MS);
   }, [runCycle]);
 
+  // Keep refs in sync so the init effect can call these after page refresh
+  useEffect(() => { runCycleRef.current    = runCycle;    }, [runCycle]);
+  useEffect(() => { scheduleNextRef.current = scheduleNext; }, [scheduleNext]);
+
   // ── Start / Stop ─────────────────────────────────────────────────────────
   const toggleBot = async () => {
     if (mode === 'live' && !binanceConnected) { toast.error('Connect Binance API first'); onConnectBinance?.(); return; }
@@ -406,21 +424,25 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     try {
       if (!isRunning) {
         const startBal = getPaperCfg().startingBalance ?? 1000;
+        // Preserve existing balance if the bot was previously running (e.g. after a page refresh).
+        // Only reset to startBal on a genuine fresh start (no prior balance in DB).
+        const existingBal  = balanceRef.current  > 0 ? balanceRef.current  : startBal;
+        const existingInit = initialBalance       > 0 ? initialBalance      : startBal;
         await supabase.from('bot_config').upsert({
           user_session: SESSION,
           selected_coins: selectedCoins,
           mode, is_running: true,
-          current_balance: startBal,
-          initial_balance: startBal,
+          current_balance: existingBal,
+          initial_balance: existingInit,
           stop_loss_percent: 1.5,
           updated_at: new Date().toISOString(),
         }, { onConflict: 'user_session' });
         isRunningRef.current = true;
         setIsRunning(true);
-        setBalance(startBal); balanceRef.current = startBal;
-        setInitialBalance(startBal);
-        addLog(`=== Agent STARTED · ${startBal} USDT · ${mode.toUpperCase()} ===`);
-        toast.success(`AI Agent started — PAPER mode`, { description: `${startBal.toLocaleString()} USDT · ${selectedCoins.length} coins · every 30s` });
+        setBalance(existingBal); balanceRef.current = existingBal;
+        setInitialBalance(existingInit);
+        addLog(`=== Agent STARTED · ${existingBal.toFixed(2)} USDT · ${mode.toUpperCase()} ===`);
+        toast.success(`AI Agent started — PAPER mode`, { description: `${existingBal.toLocaleString()} USDT · ${selectedCoins.length} coins · every 30s` });
         runCycle().then(scheduleNext);
       } else {
         if (cycleTimerRef.current) clearTimeout(cycleTimerRef.current);
