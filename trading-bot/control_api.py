@@ -448,7 +448,7 @@ def api_wallet():
         total_usdt = sum(
             b["free"] for b in balances if b["asset"] == "USDT"
         )
-        return {"balances": balances, "total_usdt": total_usdt, "mode": "paper"}
+        return {"balances": balances, "total_usdt": total_usdt, "mode": get_mode()}
     except Exception as e:
         return {"balances": [], "total_usdt": 0.0, "mode": "paper", "error": str(e)}
 

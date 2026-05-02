@@ -22,22 +22,25 @@ def init_db():
         c = conn.cursor()
         c.executescript("""
             CREATE TABLE IF NOT EXISTS candles (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                coin        TEXT NOT NULL,
-                timeframe   TEXT NOT NULL,
-                open_time   INTEGER NOT NULL,
-                open        REAL,
-                high        REAL,
-                low         REAL,
-                close       REAL,
-                volume      REAL,
-                ma20        REAL,
-                rsi14       REAL,
-                bb_upper    REAL,
-                bb_lower    REAL,
-                bb_mid      REAL,
-                volume_ma20 REAL,
-                saved_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin         TEXT NOT NULL,
+                timeframe    TEXT NOT NULL,
+                open_time    INTEGER NOT NULL,
+                open         REAL,
+                high         REAL,
+                low          REAL,
+                close        REAL,
+                volume       REAL,
+                ma20         REAL,
+                rsi14        REAL,
+                bb_upper     REAL,
+                bb_lower     REAL,
+                bb_mid       REAL,
+                volume_ma20  REAL,
+                ma_position  TEXT,
+                bb_position  TEXT,
+                volume_trend TEXT,
+                saved_at     TEXT DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(coin, timeframe, open_time)
             );
 
@@ -97,13 +100,17 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS positions (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol      TEXT,
-                entry_price REAL,
-                quantity    REAL,
-                budget_usdt REAL,
-                timestamp   TEXT,
-                mode        TEXT
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol              TEXT,
+                entry_price         REAL,
+                quantity            REAL,
+                budget_usdt         REAL,
+                timestamp           TEXT,
+                mode                TEXT,
+                entry_rsi           REAL,
+                entry_ma_position   TEXT,
+                entry_bb_position   TEXT,
+                entry_volume_trend  TEXT
             );
 
             CREATE TABLE IF NOT EXISTS activity_log (
@@ -113,6 +120,24 @@ def init_db():
                 level     TEXT NOT NULL DEFAULT 'info'
             );
         """)
+        conn.commit()
+
+        # Schema migrations — ADD COLUMN is idempotent via try/except
+        # (SQLite has no IF NOT EXISTS for ALTER TABLE)
+        migrations = [
+            "ALTER TABLE candles ADD COLUMN ma_position TEXT",
+            "ALTER TABLE candles ADD COLUMN bb_position TEXT",
+            "ALTER TABLE candles ADD COLUMN volume_trend TEXT",
+            "ALTER TABLE positions ADD COLUMN entry_rsi REAL",
+            "ALTER TABLE positions ADD COLUMN entry_ma_position TEXT",
+            "ALTER TABLE positions ADD COLUMN entry_bb_position TEXT",
+            "ALTER TABLE positions ADD COLUMN entry_volume_trend TEXT",
+        ]
+        for sql in migrations:
+            try:
+                c.execute(sql)
+            except Exception:
+                pass  # column already exists
         conn.commit()
         conn.close()
     print("Database initialised.")
@@ -125,14 +150,18 @@ def save_candle(coin: str, timeframe: str, ohlcv: dict):
         c.execute("""
             INSERT INTO candles
                 (coin, timeframe, open_time, open, high, low, close, volume,
-                 ma20, rsi14, bb_upper, bb_lower, bb_mid, volume_ma20)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 ma20, rsi14, bb_upper, bb_lower, bb_mid, volume_ma20,
+                 ma_position, bb_position, volume_trend)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(coin, timeframe, open_time) DO UPDATE SET
                 open=excluded.open, high=excluded.high, low=excluded.low,
                 close=excluded.close, volume=excluded.volume,
                 ma20=excluded.ma20, rsi14=excluded.rsi14,
                 bb_upper=excluded.bb_upper, bb_lower=excluded.bb_lower,
-                bb_mid=excluded.bb_mid, volume_ma20=excluded.volume_ma20
+                bb_mid=excluded.bb_mid, volume_ma20=excluded.volume_ma20,
+                ma_position=excluded.ma_position,
+                bb_position=excluded.bb_position,
+                volume_trend=excluded.volume_trend
         """, (
             coin, timeframe,
             ohlcv.get("open_time", 0),
@@ -141,6 +170,7 @@ def save_candle(coin: str, timeframe: str, ohlcv: dict):
             ohlcv.get("ma20"), ohlcv.get("rsi14"),
             ohlcv.get("bb_upper"), ohlcv.get("bb_lower"), ohlcv.get("bb_mid"),
             ohlcv.get("volume_ma20"),
+            ohlcv.get("ma_position"), ohlcv.get("bb_position"), ohlcv.get("volume_trend"),
         ))
         conn.commit()
         conn.close()
@@ -314,10 +344,16 @@ def save_position(pos: dict):
     with _lock:
         conn = _conn()
         conn.execute("""
-            INSERT INTO positions (symbol, entry_price, quantity, budget_usdt, timestamp, mode)
-            VALUES (?,?,?,?,?,?)
-        """, (pos["symbol"], pos["entry_price"], pos["quantity"],
-              pos["budget_usdt"], pos["timestamp"], pos.get("mode", "paper")))
+            INSERT INTO positions
+                (symbol, entry_price, quantity, budget_usdt, timestamp, mode,
+                 entry_rsi, entry_ma_position, entry_bb_position, entry_volume_trend)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, (
+            pos["symbol"], pos["entry_price"], pos["quantity"],
+            pos["budget_usdt"], pos["timestamp"], pos.get("mode", "paper"),
+            pos.get("entry_rsi"), pos.get("entry_ma_position"),
+            pos.get("entry_bb_position"), pos.get("entry_volume_trend"),
+        ))
         conn.commit()
         row = conn.execute("SELECT last_insert_rowid() AS id").fetchone()
         conn.close()

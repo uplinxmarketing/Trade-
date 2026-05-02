@@ -354,12 +354,27 @@ async def signal_scanner(prices: dict):
         await asyncio.sleep(config.SCAN_INTERVAL_SEC)
 
 
+_KLINE_BASES = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+]
+
+
 async def _fetch_klines(session: aiohttp.ClientSession, sym: str) -> list:
-    """Fetch 50 1m klines from Binance REST — fully async, non-blocking."""
-    url = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval=1m&limit=50"
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+    """Try each Binance base URL to work around regional geo-blocks (HTTP 451)."""
+    last_exc: Exception = RuntimeError("No Binance bases configured")
+    for base in _KLINE_BASES:
+        url = f"{base}/api/v3/klines?symbol={sym}&interval=1m&limit=50"
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+        except Exception as e:
+            last_exc = e
+    raise last_exc
 
 
 async def _run_signal_scan(prices: dict):

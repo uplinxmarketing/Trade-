@@ -47,10 +47,9 @@ function getAllocation(runBal: number, symbol: string): number {
   }
 }
 
-// RSI thresholds — match config.py: RSI_BUY_MIN=40, RSI_BUY_MAX=65
-// RSI 65 passes (<=), RSI 66 fails (>)
-const RSI_BUY_MIN = 40;
-const RSI_BUY_MAX = 65;
+// RSI thresholds — match config.py: RSI_BUY_MIN=35, RSI_BUY_MAX=70
+const RSI_BUY_MIN = 35;
+const RSI_BUY_MAX = 70;
 
 // evaluateSignals: returns exactly {trend, rsi, macd, volume} — all booleans.
 // This is the single authoritative source of truth for signal evaluation.
@@ -71,7 +70,7 @@ function evaluateSignals(closes: number[], volumes: number[]): {
 
   return {
     trend:  ema9 > ema21,
-    // RSI_BUY_MIN <= rsi <= RSI_BUY_MAX (both constants — RSI 65 passes, 66 fails)
+    // RSI_BUY_MIN <= rsi <= RSI_BUY_MAX — matches config.py
     rsi:    rsiVal >= RSI_BUY_MIN && rsiVal <= RSI_BUY_MAX,
     macd:   macd.histogram > 0,
     volume: volRat > 1.05 || recentVol > prevVol,
