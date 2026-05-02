@@ -39,8 +39,12 @@ _cooldowns: dict = {}  # symbol -> unix timestamp when cooldown expires
 
 # ── Balance guard + budget helpers ───────────────────────────────────────────
 
-def can_execute_buy(coin_cfg: dict, positions: list, client) -> tuple[bool, str]:
-    """Final pre-buy safety guard. Fetches live account balance to verify funds."""
+def can_execute_buy(coin_cfg: dict, client) -> tuple[bool, str]:
+    """
+    Final pre-buy safety guard.
+    Reads the shared _positions list directly (never a copy) so that every
+    position appended since bot start is visible here.
+    """
     budget = coin_cfg.get("budget_usdt", config.BUDGET_FIXED_USDT)
     try:
         account = client.get_account()
@@ -53,12 +57,18 @@ def can_execute_buy(coin_cfg: dict, positions: list, client) -> tuple[bool, str]
         return False, f"Insufficient USDT: have {usdt_free:.2f}, need {budget * 1.002:.2f}"
 
     sym = coin_cfg["symbol"]
-    open_this_coin = [p for p in positions if p["symbol"] == sym]
     max_concurrent = int(coin_cfg.get("max_concurrent", 1))
+
+    # Read the single shared mutable list — never a copy — so appends from
+    # earlier in the same scan loop are always visible here.
+    with _positions_lock:
+        open_this_coin = [p for p in _positions if p["symbol"] == sym]
+        total_open     = len(_positions)
+
     if len(open_this_coin) >= max_concurrent:
         return False, f"Max concurrent for {sym} reached ({max_concurrent})"
 
-    if len(positions) >= config.MAX_OPEN_POSITIONS:
+    if total_open >= config.MAX_OPEN_POSITIONS:
         return False, "Global max positions reached"
 
     return True, ""
@@ -187,6 +197,45 @@ def _derive_bb_pos(price: float, candle: dict) -> Optional[str]:
     return "mid_zone"
 
 
+# ── Signal evaluation (Bug 2/3: extracted function, explicit 4-key dict) ─────
+
+def evaluate_signals(closes: list, volumes: list) -> dict:
+    """
+    Evaluate all four technical signals on the last COMPLETED candle (index -2).
+    Returns exactly {"trend": bool, "rsi": bool, "macd": bool, "volume": bool}.
+    RSI bounds are config.RSI_BUY_MIN and config.RSI_BUY_MAX — never hardcoded.
+    """
+    ema9        = indicators.calc_ema(closes, 9)
+    ema21       = indicators.calc_ema(closes, 21)
+    rsi_vals    = indicators.calc_rsi(closes, 14)
+    _, _, histo = indicators.calc_macd(closes)
+    vol_ma      = indicators.calc_volume_ma(volumes, 20)
+
+    trend = bool(
+        ema9[-2]  is not None
+        and ema21[-2] is not None
+        and ema9[-2] > ema21[-2]
+    )
+    # RSI_BUY_MIN <= rsi <= RSI_BUY_MAX — both constants from config, never hardcoded
+    rsi = bool(
+        rsi_vals[-2] is not None
+        and config.RSI_BUY_MIN <= rsi_vals[-2] <= config.RSI_BUY_MAX
+    )
+    macd = bool(
+        histo[-2] is not None
+        and histo[-3] is not None
+        and histo[-2] > 0
+        and histo[-2] > histo[-3]
+    )
+    volume = bool(
+        volumes[-2] is not None
+        and vol_ma[-2] is not None
+        and volumes[-2] > vol_ma[-2] * config.VOLUME_RATIO_MIN
+    )
+
+    return {"trend": trend, "rsi": rsi, "macd": macd, "volume": volume}
+
+
 # ── Shared sell execution (used by both realtime_monitor and signal_scanner) ──
 
 def _execute_sell(pos: dict, price: float, reason: str):
@@ -250,10 +299,12 @@ def _execute_sell(pos: dict, price: float, reason: str):
     with _positions_lock:
         _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
 
-    profit_sign = "+" if net_profit >= 0 else ""
+    usdt_received = gross - sell_fee
+    pnl_sign      = "+" if net_profit >= 0 else ""
     print(
-        f"[TradeEngine] SOLD ({reason}) {sym} @ ${fill_price:.4f} "
-        f"| net {profit_sign}${net_profit:.4f} | held {duration}s"
+        f"[{sell_ts}] SELL {sym} @ {fill_price:.4f} USDT "
+        f"· {usdt_received:.4f} USDT · P&L: {pnl_sign}{net_profit:.4f} USDT"
+        f"  ({reason}, held {duration}s)"
     )
 
 
@@ -261,8 +312,9 @@ def _execute_sell(pos: dict, price: float, reason: str):
 
 def realtime_monitor(prices: Dict[str, float]):
     """
-    Synchronous. Called on every WebSocket trade tick.
-    Handles take-profit and stop-loss exits only — no new buys.
+    Synchronous. Called by data_collector on EVERY WebSocket 'trade' event
+    (not only on candle close). This is the tick-level exit monitor —
+    handles take-profit and stop-loss only, no new buys.
     """
     with _positions_lock:
         snapshot = list(_positions)
@@ -365,40 +417,13 @@ async def _run_signal_scan(prices: dict):
                 print(f"[SignalScanner] {sym}: not enough candles ({len(closes)}) — skipping.")
                 continue
 
-            ema9      = indicators.calc_ema(closes, 9)
-            ema21     = indicators.calc_ema(closes, 21)
-            rsi       = indicators.calc_rsi(closes, 14)
-            _, _, histogram = indicators.calc_macd(closes)
-            vol_ma    = indicators.calc_volume_ma(volumes, 20)
+            # evaluate_signals() returns exactly {"trend","rsi","macd","volume"}
+            signals       = evaluate_signals(closes, volumes)
+            bullish_count = sum(signals.values())   # all four keys included
 
-            # Use index -2 (last completed candle, not the still-open one)
-            trend_bullish = (
-                ema9[-2] is not None
-                and ema21[-2] is not None
-                and ema9[-2] > ema21[-2]
-            )
-            rsi_bullish = (
-                rsi[-2] is not None
-                and config.RSI_BUY_MIN <= rsi[-2] <= config.RSI_BUY_MAX
-            )
-            macd_bullish = (
-                histogram[-2] is not None
-                and histogram[-3] is not None
-                and histogram[-2] > 0
-                and histogram[-2] > histogram[-3]
-            )
-            vol_bullish = (
-                volumes[-2] is not None
-                and vol_ma[-2] is not None
-                and volumes[-2] > vol_ma[-2] * config.VOLUME_RATIO_MIN
-            )
-
-            bullish_count = sum([trend_bullish, rsi_bullish, macd_bullish, vol_bullish])
-
+            # Print full dict + count immediately before the buy decision
             print(
-                f"[SignalScanner] {sym} signals — "
-                f"trend={trend_bullish} rsi={rsi_bullish} "
-                f"macd={macd_bullish} vol={vol_bullish} "
+                f"[SignalScanner] {sym} signals={signals} "
                 f"→ {bullish_count}/4 bullish"
             )
 
@@ -425,11 +450,9 @@ async def _run_signal_scan(prices: dict):
         except Exception:
             pass
 
-        # Final pre-buy guard (live balance check + concurrent cap + global cap)
-        with _positions_lock:
-            snapshot_now = list(_positions)
+        # Final pre-buy guard — reads _positions directly, never a copy
         buy_cfg = {**coin_cfg, "symbol": sym, "budget_usdt": budget}
-        allowed, reason = can_execute_buy(buy_cfg, snapshot_now, client)
+        allowed, reason = can_execute_buy(buy_cfg, client)
         if not allowed:
             print(f"[SKIP] {sym}: {reason}")
             continue
