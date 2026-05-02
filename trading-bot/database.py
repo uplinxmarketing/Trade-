@@ -286,7 +286,12 @@ def save_paper_state(balances: dict):
 def load_paper_state() -> Optional[dict]:
     with _lock:
         conn = _conn()
-        row = conn.execute("SELECT balances FROM paper_state WHERE id=1").fetchone()
+        try:
+            row = conn.execute("SELECT balances FROM paper_state WHERE id=1").fetchone()
+        except sqlite3.OperationalError:
+            # Table doesn't exist yet — init_db() hasn't run. Return None safely.
+            conn.close()
+            return None
         conn.close()
     if row:
         try:

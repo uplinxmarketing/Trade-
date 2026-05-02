@@ -28,20 +28,17 @@ def _ensure_env():
 def main():
     _ensure_env()
 
+    # 1. Initialise database FIRST — before any other import that touches SQLite.
+    #    Importing data_collector triggers connection.py → PaperClient → load_paper_state(),
+    #    which will crash with "no such table" if init_db() hasn't run yet.
     import database
+    database.init_db()
+
     import data_collector
     import trade_engine
     import strategy_engine
     import control_api
     from connection import get_mode
-
-    mode = get_mode()
-    print(f"\n{'='*55}")
-    print(f"  Trading Bot  |  Mode: {mode.upper()}")
-    print(f"{'='*55}\n")
-
-    # 1. Initialise database
-    database.init_db()
 
     # 2. Write a default strategy.json immediately so trade_engine never waits
     if not os.path.exists("strategy.json"):
