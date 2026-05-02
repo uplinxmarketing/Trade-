@@ -448,7 +448,16 @@ async def _run_signal_scan(prices: dict):
                 continue
 
             # ── Execute buy ───────────────────────────────────────────────────────
-            price = prices.get(sym, closes[-1])
+            # Use the freshly-fetched kline close as the canonical price.
+            # The WebSocket dict may not have this symbol yet (slow connection
+            # or infrequent ticker), so always fall back to the kline close.
+            price = prices.get(sym) or closes[-1]
+
+            # Sync the price into PaperClient._prices so order_market_buy()
+            # doesn't raise "No price available" when WebSocket is still
+            # connecting.  For live/testnet the real Binance client ignores this
+            # (update_price is a no-op lambda).
+            client.update_price(sym, price)
 
             # Gather entry indicators from latest candle
             entry_rsi = entry_ma = entry_bb = entry_vol = None

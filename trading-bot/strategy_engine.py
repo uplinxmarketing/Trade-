@@ -214,7 +214,10 @@ def run_strategy_once():
 async def strategy_loop():
     """Runs strategy_once() every DECISION_INTERVAL_SEC."""
     while True:
-        run_strategy_once()
+        # run_strategy_once() may call the Anthropic API synchronously.
+        # Run it in a thread so it never blocks the asyncio event loop
+        # (which would starve the WebSocket and signal scanner).
+        await asyncio.to_thread(run_strategy_once)
         interval = config.DECISION_INTERVAL_SEC
         print(f"[StrategyEngine] Next review in {interval}s")
         await asyncio.sleep(interval)

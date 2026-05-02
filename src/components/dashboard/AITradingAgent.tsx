@@ -159,7 +159,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [editingInstr, setEditingInstr]   = useState(false);
   const [instrDraft, setInstrDraft]       = useState('');
   const [actLog, setActLog]       = useState<string[]>([]);
-  const [showLog, setShowLog]     = useState(false);
+  const [showLog, setShowLog]     = useState(true);
 
   // ── Railway server mode ──────────────────────────────────────────────────
   const RAILWAY_URL_KEY = 'railway_bot_url';
@@ -324,15 +324,17 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (!isServerMode) return;
     const poll = async () => {
       try {
-        const [statusRes, posRes, tradesRes] = await Promise.all([
+        const [statusRes, posRes, tradesRes, actRes] = await Promise.all([
           fetch(`${railwayUrl}/api/status`),
           fetch(`${railwayUrl}/api/positions`),
           fetch(`${railwayUrl}/api/trades`),
+          fetch(`${railwayUrl}/api/activity`),
         ]);
         if (!statusRes.ok) throw new Error('unreachable');
         const status     = await statusRes.json();
         const posData    = await posRes.json();
         const tradesData = await tradesRes.json();
+        const actData    = actRes.ok ? await actRes.json() : { entries: [] };
 
         setIsRunning(Boolean(status.running));
         isRunningRef.current = Boolean(status.running);
@@ -370,6 +372,17 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         setTrades(mapped);
         const walletTrades = mapped.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
         onStateChangeRef.current?.(mappedPos, bal, initBal > 0 ? initBal : undefined, walletTrades);
+
+        // Populate activity log from Railway's /api/activity endpoint
+        const entries: { timestamp: string; message: string; level: string }[] =
+          actData.entries ?? [];
+        setActLog(
+          entries.map(e => {
+            const ts = e.timestamp ? e.timestamp.slice(11, 19) : '';
+            const lvl = e.level === 'error' ? '[ERR]' : e.level === 'warn' ? '[WARN]' : '[INFO]';
+            return `${ts} ${lvl} ${e.message}`;
+          })
+        );
       } catch {
         setRailwayConnected(false);
       }
