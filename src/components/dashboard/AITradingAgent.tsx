@@ -188,6 +188,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const klineBufferRef    = useRef<Map<string, { closes: number[]; volumes: number[] }>>(new Map());
   const selectedCoinsRef  = useRef(selectedCoins);
   const connectKlineWsRef = useRef<() => void>(() => {});
+  const seedBuffersRef    = useRef<() => void>(() => {});
   const stopLossRef       = useRef(1.5);
   const onStateChangeRef  = useRef(onStateChange);
 
@@ -345,9 +346,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
         // If Railway bot just became active and browser WS isn't open yet,
         // seed the kline buffers so the 4-indicator coin tiles appear.
+        // Use refs to avoid TDZ: seedBuffers/connectKlineWs are declared later.
         if (nowRunning && !wasRunning && !klineWsRef.current) {
-          seedBuffers();
-          connectKlineWs();
+          seedBuffersRef.current();
+          connectKlineWsRef.current();
         }
         // If bot stopped remotely, clean up browser signal display
         if (!nowRunning && wasRunning) {
@@ -524,6 +526,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   }, [addLog, recomputeSignals]);
 
   useEffect(() => { connectKlineWsRef.current = connectKlineWs; }, [connectKlineWs]);
+  useEffect(() => { seedBuffersRef.current    = seedBuffers;    }, [seedBuffers]);
 
   // ── Buy executor — runs on every price tick using cached signals ──────────
   // No API calls here — just reads the signal cache and executes if conditions met.
@@ -715,8 +718,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           // Seed the browser-side kline buffers and open the WebSocket so the
           // 4-indicator coin tiles appear. executePendingBuys / executeExits are
           // guarded by isServerModeRef so the browser never double-executes trades.
-          seedBuffers();
-          connectKlineWs();
+          seedBuffersRef.current();
+          connectKlineWsRef.current();
           toast.success('Bot started on Railway server — runs 24/7');
         } else {
           // Clean up browser-side signal display on stop
@@ -768,8 +771,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         addLog(`=== Agent STARTED · ${useBal.toFixed(2)} USDT · ${mode.toUpperCase()} ===`);
         toast.success(`AI Agent started — PAPER mode`, { description: `${useBal.toLocaleString()} USDT · ${selectedCoins.length} coins · live signals` });
         // Seed kline buffers from REST once, then keep live via WebSocket
-        seedBuffers();
-        connectKlineWs();
+        seedBuffersRef.current();
+        connectKlineWsRef.current();
       } else {
         if (klineWsRef.current) { klineWsRef.current.close(); klineWsRef.current = null; }
         klineBufferRef.current.clear();

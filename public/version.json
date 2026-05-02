@@ -1,5 +1,5 @@
 {
-  "version": "3.5.27",
-  "buildTime": "2026-05-03T05:00:00Z",
-  "commit": "fix-coin-signal-tiles-missing-server-mode"
+  "version": "3.5.28",
+  "buildTime": "2026-05-03T06:00:00Z",
+  "commit": "fix-tdz-crash-seedbuffers-ref"
 }
