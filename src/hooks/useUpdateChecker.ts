@@ -43,19 +43,15 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
 
   const applyUpdate = useCallback(async () => {
     setUpdating(true);
-    const toastId = toast.loading('Pulling latest code from GitHub…');
+    const toastId = toast.loading('Applying update…');
     try {
       const resp = await fetch('/api/update', { method: 'POST' });
       const data = await resp.json();
 
       if (!data.success) {
-        // git not available or pull failed — tell user to restart start.bat
-        toast.error('Auto-update failed', {
-          id: toastId,
-          description: 'Close start.bat, then reopen it — it will download the latest code automatically.',
-          duration: 8000,
-        });
-        setUpdating(false);
+        // Local server returned failure — fall back to hard reload
+        toast.loading('Reloading with latest version…', { id: toastId });
+        setTimeout(() => window.location.reload(), 800);
         return;
       }
 
@@ -65,11 +61,7 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
       let attempts = 0;
       const poll = setInterval(async () => {
         attempts++;
-        if (attempts > 30) {
-          clearInterval(poll);
-          window.location.reload();
-          return;
-        }
+        if (attempts > 30) { clearInterval(poll); window.location.reload(); return; }
         try {
           const ping = await fetch('/api/ping', { cache: 'no-store' });
           if (ping.ok) {
@@ -80,13 +72,10 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
         } catch { /* server still restarting */ }
       }, 1000);
     } catch {
-      // /api/update not reachable at all — app not running via start.bat
-      toast.error('Update server not available', {
-        id: toastId,
-        description: 'Close and reopen start.bat to get the latest version.',
-        duration: 8000,
-      });
-      setUpdating(false);
+      // /api/update unreachable — running on Vercel or similar static host.
+      // New code is already deployed; a hard reload picks it up immediately.
+      toast.loading('Reloading with latest version…', { id: toastId });
+      setTimeout(() => window.location.reload(), 800);
     }
   }, []);
 

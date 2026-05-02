@@ -1,5 +1,5 @@
 {
-  "version": "3.5.21",
+  "version": "3.5.22",
   "buildTime": "2026-05-03T00:00:00Z",
-  "commit": "fix-bot-not-trading-numbers-mismatch"
+  "commit": "fix-update-on-vercel-hard-reload"
 }
