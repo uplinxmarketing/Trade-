@@ -1,5 +1,5 @@
 {
-  "version": "3.5.18",
-  "buildTime": "2026-05-02T23:00:00Z",
-  "commit": "feat-railway-server-mode-24-7-trading"
+  "version": "3.5.19",
+  "buildTime": "2026-05-02T23:30:00Z",
+  "commit": "set-railway-default-url"
 }
