@@ -176,6 +176,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [apiSecretDraft, setApiSecretDraft] = useState('');
   const [applyingMode, setApplyingMode] = useState(false);
 
+  const isServerMode = railwayUrl.trim().length > 0;
+
   const isRunningRef      = useRef(false);
   const isServerModeRef   = useRef(false);
   const exitProcessingRef = useRef(false);
@@ -198,8 +200,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   useEffect(() => { selectedCoinsRef.current = selectedCoins; },  [selectedCoins]);
   useEffect(() => { localStorage.setItem(INSTRUCTIONS_KEY, instructions); }, [instructions]);
   useEffect(() => { onStateChangeRef.current = onStateChange; }, [onStateChange]);
-
-  const isServerMode = railwayUrl.trim().length > 0;
 
   const saveRailwayUrl = useCallback((url: string) => {
     const trimmed = url.trim().replace(/\/$/, '');
