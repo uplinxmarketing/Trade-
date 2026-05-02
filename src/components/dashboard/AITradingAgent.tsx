@@ -217,16 +217,39 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       supabase.from('paper_portfolio').select('*').eq('user_session', SESSION).gt('quantity', 0),
       supabase.from('bot_config').select('*').eq('user_session', SESSION).maybeSingle(),
     ]);
-    if (trdRes.data)  setTrades(trdRes.data as TradeRow[]);
+
+    if (trdRes.data) {
+      const trades = trdRes.data as TradeRow[];
+      setTrades(trades);
+      // On page load (actLog is empty), reconstruct activity log from persisted trades
+      setActLog(prev => {
+        if (prev.length > 0) return prev;
+        return trades.slice(0, 30).map(t => {
+          const ts = new Date(t.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          if (t.side === 'BUY') return `[${ts}]   BUY  ${t.symbol} @ ${Number(t.price).toFixed(4)} USDT`;
+          const pnlStr = t.pnl != null ? ` · P&L: ${t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(4)} USDT` : '';
+          return `[${ts}] SELL ${t.symbol} @ ${Number(t.price).toFixed(4)} USDT${pnlStr}`;
+        });
+      });
+    }
+
     if (posRes.data)  setPositions(posRes.data as OpenPosition[]);
+
+    // Use same fallback chain as wallet: current_balance → initial_balance → localStorage startingBalance
+    const startBal = getPaperCfg().startingBalance ?? 1000;
     if (cfgRes.data) {
-      const bal = Number(cfgRes.data.current_balance);
-      setBalance(bal); balanceRef.current = bal;
-      setInitialBalance(Number(cfgRes.data.initial_balance ?? 0));
+      const bal     = Number(cfgRes.data.current_balance);
+      const initBal = Number(cfgRes.data.initial_balance ?? 0);
+      const display = bal > 0 ? bal : initBal > 0 ? initBal : startBal;
+      setBalance(display); balanceRef.current = display;
+      setInitialBalance(initBal > 0 ? initBal : startBal);
       stopLossRef.current = Number(cfgRes.data.stop_loss_percent ?? 1.5);
       const running = Boolean(cfgRes.data.is_running);
       isRunningRef.current = running;
       setIsRunning(running);
+    } else {
+      setBalance(startBal); balanceRef.current = startBal;
+      setInitialBalance(startBal);
     }
   }, []);
 

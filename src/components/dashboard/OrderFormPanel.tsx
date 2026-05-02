@@ -42,7 +42,7 @@ export default function OrderFormPanel({ activeCoin, prices, binanceConnected }:
   const [amtMode, setAmtMode]         = useState<AmtMode>('usdt');
   const [marginType, setMarginType]   = useState<MarginType>('isolated');
   const [leverage, setLeverage]       = useState(5);
-  const [balance, setBalance]         = useState(10000);
+  const [balance, setBalance]         = useState(0);
   const [amount, setAmount]           = useState('');
   const [limitPrice, setLimitPrice]   = useState('');
   const [stopPrice, setStopPrice]     = useState('');
@@ -54,11 +54,20 @@ export default function OrderFormPanel({ activeCoin, prices, binanceConnected }:
   const ticker   = activeCoin.replace('USDT', '');
 
   useEffect(() => {
-    supabase.from('bot_config').select('current_balance').eq('user_session', 'default').single()
-      .then(({ data }) => { if (data) setBalance(Number(data.current_balance)); });
+    const readBal = (val: unknown) => {
+      const n = Number(val ?? 0);
+      // Fall back to localStorage startingBalance when DB value is 0
+      if (n > 0) { setBalance(n); return; }
+      try {
+        const cfg = JSON.parse(localStorage.getItem('paper_wallet_config') ?? '{}');
+        setBalance(cfg.startingBalance ?? 1000);
+      } catch { setBalance(1000); }
+    };
+    supabase.from('bot_config').select('current_balance').eq('user_session', 'default').maybeSingle()
+      .then(({ data }) => readBal(data?.current_balance));
     const ch = supabase.channel('ofp-bal')
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'bot_config' }, (p) => {
-        if (p.new?.current_balance) setBalance(Number(p.new.current_balance));
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_config' }, (p) => {
+        readBal(p.new?.current_balance);
       }).subscribe();
     return () => { supabase.removeChannel(ch); };
   }, []);

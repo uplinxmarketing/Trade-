@@ -96,7 +96,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
   const [loading, setLoading]           = useState(false);
   const [resetting, setResetting]       = useState(false);
   const [lastUpdated, setLastUpdated]   = useState('');
-  const [showBudget, setShowBudget]     = useState(false);
+  const [showBudget, setShowBudget]     = useState(true);
 
   // ── Budget config (localStorage) ────────────────────────────────────────────
   const [walletCfg, setWalletCfg] = useState<WalletCfg>(DEFAULT_CFG);
@@ -117,7 +117,13 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
   }, []);
 
   // ── Paper / test mode ────────────────────────────────────────────────────────
+  // No dependency on walletCfg state — reads localStorage directly so the callback
+  // stays stable and the Supabase realtime subscription is never recreated on cfg changes.
   const loadPaper = useCallback(async () => {
+    const localStartBal = (() => {
+      try { return JSON.parse(localStorage.getItem(PAPER_CFG_KEY) ?? '{}').startingBalance ?? 1000; }
+      catch { return 1000; }
+    })();
     const [cfgRes, posRes, tradeRes] = await Promise.all([
       supabase.from('bot_config').select('current_balance,initial_balance,selected_coins').eq('user_session','default').maybeSingle(),
       supabase.from('paper_portfolio').select('*').eq('user_session','default').gt('quantity',0),
@@ -126,12 +132,11 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
     if (cfgRes.data) {
       const bal = Number(cfgRes.data.current_balance);
       const initBal = Number(cfgRes.data.initial_balance);
-      const localStartBal = walletCfg.startingBalance;
       setUsdtFree(bal > 0 ? bal : initBal > 0 ? initBal : localStartBal);
       setInitialBalance(initBal > 0 ? initBal : localStartBal);
     } else {
-      setUsdtFree(walletCfg.startingBalance);
-      setInitialBalance(walletCfg.startingBalance);
+      setUsdtFree(localStartBal);
+      setInitialBalance(localStartBal);
     }
     if (posRes.data) setPositions(posRes.data as Position[]);
     if (tradeRes.data) {
@@ -146,7 +151,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
       setTotalFees(Math.round(fees*10000)/10000);
     }
     setLastUpdated(new Date().toLocaleTimeString());
-  }, [walletCfg.startingBalance]);
+  }, []);
 
   // ── Live mode ────────────────────────────────────────────────────────────────
   const loadLive = useCallback(async () => {
