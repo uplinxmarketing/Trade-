@@ -89,8 +89,8 @@ call :logline "npm v%NPM_VER% OK"
 if not exist ".env" (
     call :logline "Creating .env file with Supabase credentials..."
     (
-        echo VITE_SUPABASE_URL=https://hkwirofdkgdamqnlcjqf.supabase.co
-        echo VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_6p26q62HNaU7pqv9k9jb_w_8S0ixNrP
+        echo VITE_SUPABASE_URL=https://vrmnmedrwsddxovqcuns.supabase.co
+        echo VITE_SUPABASE_PUBLISHABLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZybW5tZWRyd3NkZHhvdnFjdW5zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3MjYwNTIsImV4cCI6MjA5MzMwMjA1Mn0.sV_iJu0CYQwQ9aQGWgFfusqH92QhPKgThOWrCmKKXJo
     ) > .env
     call :logline ".env created OK"
 ) else (

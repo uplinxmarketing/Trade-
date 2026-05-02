@@ -1,5 +1,5 @@
 {
-  "version": "3.5.9",
-  "buildTime": "2026-05-03T01:00:00Z",
-  "commit": "e1a7c6d"
+  "version": "3.5.10",
+  "buildTime": "2026-05-02T12:00:00Z",
+  "commit": "deploy-new-supabase"
 }
