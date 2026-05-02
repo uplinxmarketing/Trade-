@@ -177,6 +177,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [applyingMode, setApplyingMode] = useState(false);
 
   const isRunningRef      = useRef(false);
+  const isServerModeRef   = useRef(false);
   const exitProcessingRef = useRef(false);
   const buyProcessingRef  = useRef(false);
   const pendingSellsRef   = useRef<Set<string>>(new Set());
@@ -191,6 +192,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const onStateChangeRef  = useRef(onStateChange);
 
   useEffect(() => { isRunningRef.current     = isRunning; },      [isRunning]);
+  useEffect(() => { isServerModeRef.current  = isServerMode; },   [isServerMode]);
   useEffect(() => { positionsRef.current     = positions; },      [positions]);
   useEffect(() => { selectedCoinsRef.current = selectedCoins; },  [selectedCoins]);
   useEffect(() => { localStorage.setItem(INSTRUCTIONS_KEY, instructions); }, [instructions]);
@@ -336,8 +338,25 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         const tradesData = await tradesRes.json();
         const actData    = actRes.ok ? await actRes.json() : { entries: [] };
 
-        setIsRunning(Boolean(status.running));
-        isRunningRef.current = Boolean(status.running);
+        const wasRunning = isRunningRef.current;
+        const nowRunning = Boolean(status.running);
+        setIsRunning(nowRunning);
+        isRunningRef.current = nowRunning;
+
+        // If Railway bot just became active and browser WS isn't open yet,
+        // seed the kline buffers so the 4-indicator coin tiles appear.
+        if (nowRunning && !wasRunning && !klineWsRef.current) {
+          seedBuffers();
+          connectKlineWs();
+        }
+        // If bot stopped remotely, clean up browser signal display
+        if (!nowRunning && wasRunning) {
+          if (klineWsRef.current) { klineWsRef.current.close(); klineWsRef.current = null; }
+          klineBufferRef.current.clear();
+          signalCacheRef.current = [];
+          setCoinSignals([]);
+        }
+
         const bal     = Number(status.balance_usdt ?? 0);
         const initBal = Number(status.initial_balance ?? 0);
         setBalance(bal);
@@ -420,7 +439,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       const volSma = calcSMA(volumes, 20);
       const curVol = volumes[volumes.length - 1] ?? 0;
       const volRat = volSma > 0 ? curVol / volSma : 1;
-      const isBuy  = score >= 3;
+      const isBuy  = score >= 2;   // match Railway's MIN_SIGNALS_TO_BUY = 2
       const isHold = rsi >= 72 || rsi < 24;
       const parts  = [sigs.trend ? 'EMA↑' : 'EMA↓', `RSI ${rsi.toFixed(0)}`, sigs.macd ? 'MACD+' : 'MACD-'];
       if (sigs.volume) parts.push(`Vol ${volRat.toFixed(1)}×`);
@@ -510,6 +529,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // No API calls here — just reads the signal cache and executes if conditions met.
   const executePendingBuys = useCallback(async () => {
     if (!isRunningRef.current) return;
+    if (isServerModeRef.current) return;  // Railway handles all trades in server mode
     const signals = signalCacheRef.current;
     const buySigs = signals.filter(s => s.signal === 'BUY');
     if (!buySigs.length) return;
@@ -585,6 +605,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // Reads positionsRef + pricesRef in-memory only; DB writes are fire-and-forget.
   const executeExits = useCallback(async () => {
     if (!isRunningRef.current) return;
+    if (isServerModeRef.current) return;  // Railway handles all sells in server mode
     const currentPositions = positionsRef.current;
     if (!currentPositions.length) return;
 
@@ -678,7 +699,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
   // ── Start / Stop ─────────────────────────────────────────────────────────
   const toggleBot = async () => {
-    // Server mode: delegate to Railway, don't run in browser
+    // Server mode: delegate to Railway, then start browser-side signal display
     if (isServerMode) {
       setLoading(true);
       try {
@@ -686,11 +707,25 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         const res = await fetch(`${railwayUrl}/api/agent/${endpoint}`, { method: 'POST' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        setIsRunning(Boolean(data.running));
-        isRunningRef.current = Boolean(data.running);
-        toast[data.running ? 'success' : 'info'](
-          data.running ? 'Bot started on Railway server — runs 24/7' : 'Bot stopped on Railway server'
-        );
+        const nowRunning = Boolean(data.running);
+        setIsRunning(nowRunning);
+        isRunningRef.current = nowRunning;
+
+        if (nowRunning) {
+          // Seed the browser-side kline buffers and open the WebSocket so the
+          // 4-indicator coin tiles appear. executePendingBuys / executeExits are
+          // guarded by isServerModeRef so the browser never double-executes trades.
+          seedBuffers();
+          connectKlineWs();
+          toast.success('Bot started on Railway server — runs 24/7');
+        } else {
+          // Clean up browser-side signal display on stop
+          if (klineWsRef.current) { klineWsRef.current.close(); klineWsRef.current = null; }
+          klineBufferRef.current.clear();
+          signalCacheRef.current = [];
+          setCoinSignals([]);
+          toast.info('Bot stopped on Railway server');
+        }
       } catch (e) {
         toast.error(`Railway unreachable: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
@@ -1173,8 +1208,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       <div key={label} className={`flex-1 rounded-full text-center py-0.5 text-[8px] font-bold ${on?'bg-gain/20 text-gain':'bg-loss/10 text-loss/50'}`} title={label}>{label}</div>
                     ))}
                   </div>
-                  {/* Force buy/sell */}
-                  {!held ? (
+                  {/* Force buy/sell — only available in browser mode */}
+                  {isServerMode ? (
+                    held
+                      ? <div className="text-[10px] text-center text-accent font-semibold">Server holding ✓</div>
+                      : sig.signal === 'BUY'
+                        ? <div className="text-[10px] text-center text-gain font-semibold animate-pulse">⚡ Railway will buy</div>
+                        : <div className="text-[10px] text-center text-muted-foreground">Watching…</div>
+                  ) : !held ? (
                     <button onClick={() => forceBuy(sig.symbol)} disabled={!!forcingBuy||sig.signal==='error'}
                       className="w-full text-[10px] py-1 rounded bg-gain/10 hover:bg-gain/20 text-gain font-semibold disabled:opacity-40 flex items-center justify-center gap-1">
                       <ShoppingCart className="w-2.5 h-2.5" />{forcingBuy===sig.symbol?'…':'Force BUY'}
