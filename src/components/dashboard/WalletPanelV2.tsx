@@ -154,6 +154,8 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
   }, []);
 
   // ── Live mode ────────────────────────────────────────────────────────────────
+  // Intentionally NOT in the subscription effect below — prices changes every WS tick
+  // and would destroy/recreate the paper subscription on every tick if combined.
   const loadLive = useCallback(async () => {
     if (!binanceConnected) return;
     setLoading(true);
@@ -182,20 +184,23 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
     } finally { setLoading(false); }
   }, [binanceConnected, prices]);
 
+  // Paper subscription + polling — stable, never torn down by price changes
   useEffect(() => {
-    if (mode === 'test' || !binanceConnected) {
-      loadPaper();
-      const ch = supabase.channel('walletv2')
-        .on('postgres_changes',{event:'*',schema:'public',table:'bot_config'},loadPaper)
-        .on('postgres_changes',{event:'*',schema:'public',table:'paper_portfolio'},loadPaper)
-        .on('postgres_changes',{event:'*',schema:'public',table:'bot_trade_history'},loadPaper)
-        .subscribe();
-      const poll = setInterval(loadPaper, 2000);
-      return () => { supabase.removeChannel(ch); clearInterval(poll); };
-    } else {
-      loadLive();
-    }
-  }, [mode, binanceConnected, loadPaper, loadLive]);
+    if (mode === 'live' && binanceConnected) return;
+    loadPaper();
+    const ch = supabase.channel('walletv2')
+      .on('postgres_changes',{event:'*',schema:'public',table:'bot_config'},loadPaper)
+      .on('postgres_changes',{event:'*',schema:'public',table:'paper_portfolio'},loadPaper)
+      .on('postgres_changes',{event:'*',schema:'public',table:'bot_trade_history'},loadPaper)
+      .subscribe();
+    const poll = setInterval(loadPaper, 2000);
+    return () => { supabase.removeChannel(ch); clearInterval(poll); };
+  }, [mode, binanceConnected, loadPaper]);
+
+  // Live mode — re-run only when connection state changes (not on every price tick)
+  useEffect(() => {
+    if (mode === 'live' && binanceConnected) loadLive();
+  }, [mode, binanceConnected]); // eslint-disable-line
 
   const isPaper = mode === 'test' || !binanceConnected;
 
