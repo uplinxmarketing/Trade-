@@ -118,10 +118,13 @@ export async function updateSignals(
 
 // ── Check open positions — runs on every price tick (~1 s) ───────────────────
 // Exits as soon as the fee-correct PnL turns positive — no minimum hold time.
+// onSell is called for each closed position so callers can log the trade.
 export async function checkExits(
   prices: LivePrices,
   sb: SupabaseClient,
   stopLossPct = 1.5,
+  _minProfitPct = 0,          // reserved: absorbed from AIBotPanel call signature
+  onSell?: (d: { symbol: string; price: number; usdtReceived: number; pnl: number }) => void,
 ): Promise<number> {
   const { data: holdings } = await sb
     .from('paper_portfolio').select('*').eq('user_session', 'default').gt('quantity', 0);
@@ -166,6 +169,7 @@ export async function checkExits(
         .eq('user_session', 'default').eq('symbol', h.symbol);
       balance += sellProceeds;
       executed++;
+      onSell?.({ symbol: h.symbol, price, usdtReceived: sellProceeds, pnl });
     }
   }
 

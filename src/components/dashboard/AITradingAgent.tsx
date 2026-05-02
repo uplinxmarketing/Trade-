@@ -19,6 +19,37 @@ const MAX_POSITIONS = 3;
 const ALLOC_PCT     = 0.25;   // 25% of balance per trade
 const MIN_USDT      = 11;
 
+// RSI thresholds — match config.py: RSI_BUY_MIN=40, RSI_BUY_MAX=65
+// RSI 65 passes (<=), RSI 66 fails (>)
+const RSI_BUY_MIN = 40;
+const RSI_BUY_MAX = 65;
+
+// evaluateSignals: returns exactly {trend, rsi, macd, volume} — all booleans.
+// This is the single authoritative source of truth for signal evaluation.
+// bullish_count = Object.values(signals).filter(Boolean).length — all 4 keys included.
+// BUY fires only if bullish_count >= 3.
+function evaluateSignals(closes: number[], volumes: number[]): {
+  trend: boolean; rsi: boolean; macd: boolean; volume: boolean;
+} {
+  const ema9   = calcEMA(closes, 9);
+  const ema21  = calcEMA(closes, 21);
+  const rsiVal = calcRSI(closes, 14);
+  const macd   = calcMACD(closes);
+  const volSma = calcSMA(volumes, 20);
+  const curVol = volumes[volumes.length - 1] ?? 0;
+  const volRat = volSma > 0 ? curVol / volSma : 1;
+  const recentVol = volumes.slice(-10).reduce((a, b) => a + b, 0);
+  const prevVol   = volumes.slice(-20, -10).reduce((a, b) => a + b, 0);
+
+  return {
+    trend:  ema9 > ema21,
+    // RSI_BUY_MIN <= rsi <= RSI_BUY_MAX (both constants — RSI 65 passes, 66 fails)
+    rsi:    rsiVal >= RSI_BUY_MIN && rsiVal <= RSI_BUY_MAX,
+    macd:   macd.histogram > 0,
+    volume: volRat > 1.05 || recentVol > prevVol,
+  };
+}
+
 interface CoinSignal {
   symbol: string;
   price: number;
@@ -50,45 +81,27 @@ async function analyseCoin(sym: string): Promise<CoinSignal> {
     const volumes = klines.map((k: any[]) => parseFloat(k[5]));
     const price   = closes[closes.length - 1];
 
-    const ema9   = calcEMA(closes, 9);
-    const ema21  = calcEMA(closes, 21);
-    const rsi    = calcRSI(closes, 14);
-    const macd   = calcMACD(closes);
+    // Delegate to evaluateSignals — single source of truth for all 4 signals
+    const sigs  = evaluateSignals(closes, volumes);
+    const score = Object.values(sigs).filter(Boolean).length; // all 4 keys counted
+    const rsi   = calcRSI(closes, 14);
     const volSma = calcSMA(volumes, 20);
     const curVol = volumes[volumes.length - 1] ?? 0;
     const volRat = volSma > 0 ? curVol / volSma : 1;
-    const bb     = calcBollingerBands(closes);
 
-    const recentVol = volumes.slice(-10).reduce((a, b) => a + b, 0);
-    const prevVol   = volumes.slice(-20, -10).reduce((a, b) => a + b, 0);
-    const volTrend  = recentVol > prevVol;
-
-    const emaBullish = ema9 > ema21;
-    const rsiOk      = rsi >= 28 && rsi < 70;
-    const macdPos    = macd.histogram > 0;
-    const volUp      = volRat > 1.05 || volTrend;
-    const nearLow    = bb.position < 0.40;
-
-    let score = 0;
-    if (emaBullish) score++;
-    if (rsiOk)      score++;
-    if (macdPos)    score++;
-    if (volUp)      score++;
-
-    // BUY: 3/4 signals, or EMA+RSI+near-BB-low (relaxed entry for learning)
-    const isBuy  = score >= 3 || (emaBullish && rsiOk && nearLow);
-    const isHold = rsi >= 72 || rsi < 24;   // only block extreme RSI
+    // BUY only if bullish_count >= 3 — no bypass conditions
+    const isBuy  = score >= 3;
+    const isHold = rsi >= 72 || rsi < 24;
 
     const parts: string[] = [];
-    parts.push(emaBullish ? 'EMA↑' : 'EMA↓');
+    parts.push(sigs.trend ? 'EMA↑' : 'EMA↓');
     parts.push(`RSI ${rsi.toFixed(0)}`);
-    parts.push(macdPos ? 'MACD+' : 'MACD-');
-    if (volUp) parts.push(`Vol ${volRat.toFixed(1)}×`);
-    if (nearLow) parts.push('BB-low');
+    parts.push(sigs.macd ? 'MACD+' : 'MACD-');
+    if (sigs.volume) parts.push(`Vol ${volRat.toFixed(1)}×`);
 
     return {
       symbol: sym, price, rsi,
-      emaBullish, rsiOk, macdPos, volUp,
+      emaBullish: sigs.trend, rsiOk: sigs.rsi, macdPos: sigs.macd, volUp: sigs.volume,
       signal: isHold ? 'HOLD' : isBuy ? 'BUY' : 'HOLD',
       reason: parts.join(' · '),
     };
@@ -219,7 +232,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (!isRunning || processingRef.current) return;
     if (!Object.keys(prices).length) return;
     processingRef.current = true;
-    checkExits(prices, supabase, stopLossRef.current)
+    checkExits(prices, supabase, stopLossRef.current, 0, ({ symbol, price, usdtReceived, pnl }) => {
+      addLog(`SELL ${symbol} @ ${price.toFixed(4)} USDT · ${usdtReceived.toFixed(4)} USDT · P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDT`);
+    })
       .then(n => { if (n > 0) { loadData(); toast.success(`Closed ${n} position(s)`, { duration: 2500 }); } })
       .catch(() => {})
       .finally(() => { processingRef.current = false; });
@@ -248,43 +263,43 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       const buySigs  = signals.filter(s => s.signal === 'BUY');
       const holdSigs = signals.filter(s => s.signal === 'HOLD');
       addLog(`Signals: ${buySigs.length} BUY · ${holdSigs.length} HOLD · ${signals.filter(s=>s.signal==='error').length} err`);
-      signals.forEach(s => addLog(`  ${s.symbol.replace('USDT','').padEnd(6)} ${s.signal.padEnd(5)} ${s.reason}`));
+      signals.forEach(s => {
+        const count = [s.emaBullish, s.rsiOk, s.macdPos, s.volUp].filter(Boolean).length;
+        addLog(`[SIGNALS] ${s.symbol}: trend=${s.emaBullish} rsi=${s.rsiOk} macd=${s.macdPos} vol=${s.volUp} count=${count}/4`);
+      });
 
-      // — Execute BUYs —
-      const openSlots = MAX_POSITIONS - heldSet.size;
-      if (openSlots > 0 && runBal >= MIN_USDT) {
-        for (const sig of buySigs.slice(0, openSlots)) {
-          if (heldSet.has(sig.symbol)) continue;
-          const wsPrice = parseFloat(pricesRef.current[sig.symbol]?.price || '0');
-          const price   = wsPrice > 0 ? wsPrice : sig.price;
-          if (!price) continue;
+      // — Execute BUYs — dynamic heldSet check so every iteration sees the latest count
+      for (const sig of buySigs) {
+        if (heldSet.size >= MAX_POSITIONS) { addLog(`  Max ${MAX_POSITIONS} positions held — exits handled by price ticker`); break; }
+        if (runBal < MIN_USDT) break;
+        if (heldSet.has(sig.symbol)) continue;
+        const wsPrice = parseFloat(pricesRef.current[sig.symbol]?.price || '0');
+        const price   = wsPrice > 0 ? wsPrice : sig.price;
+        if (!price) continue;
 
-          const alloc = Math.min(runBal * ALLOC_PCT, runBal);
-          if (alloc < MIN_USDT) { addLog(`  SKIP ${sig.symbol} — alloc ${alloc.toFixed(2)} USDT too low`); continue; }
+        const alloc = Math.min(runBal * ALLOC_PCT, runBal);
+        if (alloc < MIN_USDT) { addLog(`  SKIP ${sig.symbol} — alloc ${alloc.toFixed(2)} USDT too low`); continue; }
 
-          const fee = alloc * TAKER_FEE;
-          const qty = (alloc - fee) / price;
+        const fee = alloc * TAKER_FEE;
+        const qty = (alloc - fee) / price;
 
-          await Promise.all([
-            supabase.from('bot_trade_history').insert({
-              user_session: SESSION, symbol: sig.symbol,
-              side: 'BUY', price, quantity: qty, pnl: null,
-              reason: `[AI Paper] ${sig.reason} · ${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`,
-            }),
-            supabase.from('paper_portfolio').upsert({
-              user_session: SESSION, symbol: sig.symbol,
-              quantity: qty, avg_entry_price: price,
-              updated_at: new Date().toISOString(),
-            }, { onConflict: 'user_session,symbol' }),
-          ]);
+        await Promise.all([
+          supabase.from('bot_trade_history').insert({
+            user_session: SESSION, symbol: sig.symbol,
+            side: 'BUY', price, quantity: qty, pnl: null,
+            reason: `[AI Paper] ${sig.reason} · ${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`,
+          }),
+          supabase.from('paper_portfolio').upsert({
+            user_session: SESSION, symbol: sig.symbol,
+            quantity: qty, avg_entry_price: price,
+            updated_at: new Date().toISOString(),
+          }, { onConflict: 'user_session,symbol' }),
+        ]);
 
-          runBal -= alloc;
-          heldSet.add(sig.symbol);
-          addLog(`  BUY  ${sig.symbol} @ ${price.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT`);
-          toast.info(`AI Paper BUY: ${sig.symbol.replace('USDT','')}`, { description: `${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`, duration: 3000 });
-        }
-      } else if (openSlots <= 0) {
-        addLog(`  Max ${MAX_POSITIONS} positions held — exits handled by price ticker`);
+        runBal -= alloc;
+        heldSet.add(sig.symbol);
+        addLog(`  BUY  ${sig.symbol} @ ${price.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT`);
+        toast.info(`AI Paper BUY: ${sig.symbol.replace('USDT','')}`, { description: `${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`, duration: 3000 });
       }
 
       await supabase.from('bot_config').update({
