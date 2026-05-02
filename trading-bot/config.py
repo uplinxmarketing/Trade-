@@ -23,7 +23,7 @@ CLAUDE_MAX_TOKENS       = 400
 STRATEGY_FILE           = "strategy.json"
 
 # ── Two-speed architecture constants ─────────────────────────────────────────
-SCAN_INTERVAL_SEC    = 20      # signal scanner frequency
+SCAN_INTERVAL_SEC    = 60      # REST backup cache refresh (buys fire in realtime via WebSocket)
 STOP_LOSS_PCT        = 0.015   # 1.5%
 COOLDOWN_AFTER_LOSS  = 180     # 3 min cooldown after stop-loss
 MIN_SIGNALS_TO_BUY   = 2       # out of 4 signals must be bullish

@@ -53,8 +53,11 @@ def main():
     # 5. Download candle history (skipped if already loaded)
     data_collector.download_history()
 
-    # 6. Register trade engine as the price callback
+    # 6. Register trade engine callbacks
+    #    price callback  → real-time exits AND buy-cache checks on every tick
+    #    kline callback  → update signal cache on every 1-minute candle close
     data_collector.register_price_callback(trade_engine.realtime_monitor)
+    data_collector.register_kline_callback(trade_engine.update_coin_signals)
 
     print("\n[Main] All systems ready. Starting live feeds…\n")
 

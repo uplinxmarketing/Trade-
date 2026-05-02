@@ -1,12 +1,17 @@
 """
-Trade execution engine — two-speed architecture.
+Trade execution engine — unified real-time architecture.
 
-Process 1 (realtime_monitor):  Called on every WebSocket trade tick.
-                                 Only handles stop-loss / take-profit exits.
+realtime_monitor:  Called on every WebSocket trade tick (~100 ms).
+                   Handles both stop-loss/take-profit exits AND buy entry.
+                   Buys read from an in-memory signal cache (no I/O per tick).
 
-Process 2 (signal_scanner):    Async coroutine, runs every SCAN_INTERVAL_SEC.
-                                 Reads fresh 1m klines, evaluates 4 signals,
-                                 and opens new positions when enough are bullish.
+signal_scanner:    Async coroutine, runs every SCAN_INTERVAL_SEC (60 s).
+                   Only refreshes the signal cache from REST / DB.
+                   Does NOT execute trades — buy execution is in realtime_monitor.
+
+update_coin_signals: Called by data_collector on every 1-minute kline close
+                   (WebSocket-driven). Keeps the signal cache fresh between
+                   REST refreshes.
 """
 
 import asyncio
@@ -26,7 +31,7 @@ import indicators
 import learning
 from connection import client, get_mode
 
-_positions: List[dict] = []       # {id, symbol, entry_price, quantity, budget_usdt, timestamp, entry_rsi, entry_ma_position, entry_bb_position, entry_volume_trend}
+_positions: List[dict] = []
 _positions_lock = threading.Lock()
 
 _strategy_mtime: float = 0.0
@@ -36,6 +41,12 @@ _fee_rate = config.FEE_RATE_BNB if config.BNB_FEE_MODE else config.FEE_RATE_STAN
 _breakeven_mult = 1.0 + _fee_rate + _fee_rate   # 1.0015 with BNB, 1.002 without
 
 _cooldowns: dict = {}  # symbol -> unix timestamp when cooldown expires
+
+# ── Real-time signal cache — updated on every kline close ────────────────────
+# Maps symbol → {"signals": dict, "score": int, "price": float}
+_signal_cache: Dict[str, dict] = {}
+_signal_cache_lock = threading.Lock()
+_last_buy_check: float = 0.0   # throttle: don't call get_account() on every tick
 
 
 # ── Balance guard + budget helpers ───────────────────────────────────────────
@@ -237,6 +248,28 @@ def evaluate_signals(closes: list, volumes: list) -> dict:
     return {"trend": trend, "rsi": rsi, "macd": macd, "volume": volume}
 
 
+def update_coin_signals(symbol: str, closes: list, volumes: list):
+    """
+    Update the in-memory signal cache for one coin.
+    Called by data_collector on every 1-minute kline close (WebSocket-driven)
+    and by signal_scanner every SCAN_INTERVAL_SEC as a REST-backup.
+    Requires at least 27 candles; silently skips if fewer.
+    """
+    if len(closes) < 27:
+        return
+    try:
+        signals = evaluate_signals(closes, volumes)
+        score   = sum(signals.values())
+        with _signal_cache_lock:
+            _signal_cache[symbol] = {
+                "signals": signals,
+                "score":   score,
+                "price":   closes[-1],
+            }
+    except Exception as e:
+        print(f"[TradeEngine] Signal cache error {symbol}: {e}")
+
+
 # ── Shared sell execution (used by both realtime_monitor and signal_scanner) ──
 
 def _execute_sell(pos: dict, price: float, reason: str):
@@ -309,13 +342,149 @@ def _execute_sell(pos: dict, price: float, reason: str):
     )
 
 
+# ── Real-time buy check from signal cache (called from realtime_monitor) ──────
+
+def _check_buys_from_cache(prices: Dict[str, float]):
+    """
+    Real-time buy executor. Reads the pre-computed signal cache — zero I/O per
+    call except when a buy is actually about to fire. Throttled to at most once
+    every 3 s to avoid hammering get_account() on every WebSocket tick.
+    """
+    global _last_buy_check
+
+    # Fast pre-check: any coin signalling BUY? (no lock needed for scalar read)
+    with _signal_cache_lock:
+        any_ready = any(v["score"] >= config.MIN_SIGNALS_TO_BUY for v in _signal_cache.values())
+    if not any_ready:
+        return
+
+    # Throttle: don't call get_account() faster than every 3 s
+    now = time.time()
+    if now - _last_buy_check < 3.0:
+        return
+    _last_buy_check = now
+
+    strategy = _load_strategy()
+    if not strategy.get("trading_active", True):
+        return
+
+    approved = {
+        c["symbol"]: c
+        for c in strategy.get("approved_coins", [])
+        if c.get("approved")
+    }
+    global_max = strategy.get("global_max_positions", config.MAX_OPEN_POSITIONS)
+
+    with _positions_lock:
+        if len(_positions) >= global_max:
+            return
+
+    usdt_balance = _get_usdt_balance()
+    ts_now = datetime.utcnow().isoformat()
+    mode   = get_mode()
+
+    with _signal_cache_lock:
+        cache_snapshot = dict(_signal_cache)
+
+    for sym, cached in cache_snapshot.items():
+        if sym not in approved:
+            continue
+        if cached["score"] < config.MIN_SIGNALS_TO_BUY:
+            continue
+        if _in_cooldown(sym):
+            continue
+
+        with _positions_lock:
+            already_held = any(p["symbol"] == sym for p in _positions)
+            global_open  = len(_positions)
+
+        if already_held or global_open >= global_max:
+            continue
+
+        budget = get_budget_for_coin(sym, usdt_balance)
+        if budget <= 0:
+            continue
+
+        price = prices.get(sym) or cached["price"]
+        if not price:
+            continue
+
+        client.update_price(sym, price)
+
+        buy_cfg = {**approved[sym], "symbol": sym, "budget_usdt": budget}
+        allowed, reason = can_execute_buy(buy_cfg, client)
+        if not allowed:
+            database.log_activity(f"{sym}: buy skipped — {reason}", "info")
+            continue
+
+        try:
+            result = client.order_market_buy(symbol=sym, quoteOrderQty=budget)
+        except Exception as e:
+            print(f"[RealtimeBuy] BUY failed {sym}: {e}")
+            database.log_activity(f"{sym}: BUY failed — {e}", "error")
+            continue
+
+        fill       = result.get("fills", [{}])[0]
+        fill_price = float(fill.get("price", price))
+        qty        = float(result.get("executedQty", 0))
+        if qty <= 0:
+            continue
+
+        # Gather entry indicators from latest DB candle
+        entry_rsi = entry_ma = entry_bb = entry_vol = None
+        try:
+            candles = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=1)
+            if candles:
+                last      = candles[-1]
+                entry_rsi = last.get("rsi14")
+                entry_ma  = last.get("ma_position") or _derive_ma_pos(fill_price, last.get("ma20"))
+                entry_bb  = last.get("bb_position") or _derive_bb_pos(fill_price, last)
+                entry_vol = last.get("volume_trend")
+        except Exception:
+            pass
+
+        pos_record = {
+            "symbol":             sym,
+            "entry_price":        fill_price,
+            "quantity":           qty,
+            "budget_usdt":        budget,
+            "timestamp":          ts_now,
+            "mode":               mode,
+            "entry_rsi":          entry_rsi,
+            "entry_ma_position":  entry_ma,
+            "entry_bb_position":  entry_bb,
+            "entry_volume_trend": entry_vol,
+        }
+        pos_id = database.save_position(pos_record)
+        pos_record["id"] = pos_id
+
+        with _positions_lock:
+            _positions.append(pos_record)
+
+        usdt_balance -= budget + budget * _fee_rate
+        global_open  += 1
+
+        score     = cached["score"]
+        breakeven = fill_price * _breakeven_mult
+        msg = (
+            f"BOUGHT {sym} @ ${fill_price:.4f} "
+            f"| qty={qty:.6f} | BEP=${breakeven:.4f} "
+            f"| signals={score}/4"
+        )
+        print(f"[RealtimeBuy] {msg}")
+        database.log_activity(msg, "info")
+
+        if global_open >= global_max:
+            break
+
+
 # ── Process 1: realtime monitor (called on every WebSocket tick) ──────────────
 
 def realtime_monitor(prices: Dict[str, float]):
     """
-    Synchronous. Called by data_collector on EVERY WebSocket 'trade' event
-    (not only on candle close). This is the tick-level exit monitor —
-    handles take-profit and stop-loss only, no new buys.
+    Synchronous. Called by data_collector on EVERY WebSocket 'trade' event.
+    Handles both exits (take-profit / stop-loss) and entries (via signal cache).
+    Both are purely in-memory — no kline fetches on the hot path.
     """
     with _positions_lock:
         snapshot = list(_positions)
@@ -336,20 +505,23 @@ def realtime_monitor(prices: Dict[str, float]):
             _execute_sell(pos, price, "stop-loss")
             _set_cooldown(sym)
 
+    # Real-time buy check — throttled, reads from signal cache only
+    _check_buys_from_cache(prices)
+
 
 # ── Process 2: signal scanner (async, runs every SCAN_INTERVAL_SEC) ──────────
 
 async def signal_scanner(prices: dict):
     """
-    Async coroutine. Loops forever with asyncio.sleep(SCAN_INTERVAL_SEC).
-    Fetches fresh 1m klines, evaluates 4 technical signals, and opens
-    new positions when MIN_SIGNALS_TO_BUY or more are bullish.
+    Async coroutine — runs every SCAN_INTERVAL_SEC (60 s).
+    Only refreshes the signal cache from REST / DB.
+    Actual buy execution happens in realtime_monitor via _check_buys_from_cache.
     """
     while True:
         try:
-            await _run_signal_scan(prices)
+            await _refresh_signal_cache()
         except Exception as e:
-            print(f"[SignalScanner] Unexpected error in scan loop: {e}")
+            print(f"[SignalScanner] Unexpected error: {e}")
 
         await asyncio.sleep(config.SCAN_INTERVAL_SEC)
 
@@ -377,174 +549,51 @@ async def _fetch_klines(session: aiohttp.ClientSession, sym: str) -> list:
     raise last_exc
 
 
-async def _run_signal_scan(prices: dict):
+async def _refresh_signal_cache():
+    """
+    Refresh the in-memory signal cache from REST klines (or DB fallback).
+    Called every SCAN_INTERVAL_SEC as a backup to WebSocket-driven updates.
+    Never executes trades — buy execution is in realtime_monitor.
+    """
     strategy = _load_strategy()
     if not strategy:
         return
-    if not strategy.get("trading_active", True):
-        database.log_activity("Signal scan skipped — trading_active=false", "info")
-        return
 
-    approved_coins = {
-        c["symbol"]: c
+    approved_coins = [
+        c["symbol"]
         for c in strategy.get("approved_coins", [])
         if c.get("approved")
-    }
-    global_max = strategy.get("global_max_positions", config.MAX_OPEN_POSITIONS)
-    mode       = get_mode()
-    now        = datetime.utcnow().isoformat()
-
-    with _positions_lock:
-        global_open = len(_positions)
-
-    if global_open >= global_max:
-        database.log_activity(f"Signal scan skipped — {global_open}/{global_max} positions full", "info")
+    ]
+    if not approved_coins:
         return
 
-    usdt_balance = _get_usdt_balance()
-
-    # Show warmup progress: how many coins have ≥27 DB candles ready
     db_ready = sum(
         1 for s in approved_coins
         if len(database.get_candles(s, config.CANDLE_TIMEFRAME, limit=27)) >= 27
     )
     database.log_activity(
-        f"Scan started — {len(approved_coins)} coins, {global_open}/{global_max} positions, "
-        f"USDT={usdt_balance:.2f} | candles ready: {db_ready}/{len(approved_coins)}",
+        f"Signal refresh — {len(approved_coins)} coins | candles ready: {db_ready}/{len(approved_coins)}",
         "info",
     )
 
+    updated = 0
     async with aiohttp.ClientSession() as session:
-        for sym, coin_cfg in approved_coins.items():
-            # Gate checks
-            if _in_cooldown(sym):
-                continue
-
-            with _positions_lock:
-                already_held = any(p["symbol"] == sym for p in _positions)
-            if already_held:
-                continue
-
-            with _positions_lock:
-                global_open = len(_positions)
-            if global_open >= global_max:
-                break
-
-            budget = get_budget_for_coin(sym, usdt_balance)
-            if budget <= 0:
-                continue
-
-            # Fetch klines — try Binance REST first; when REST is geo-blocked
-            # (HTTP 451 on Railway US servers) fall back to candles the WebSocket
-            # has already saved to the DB.  On cold start the DB is empty and
-            # fills at 1 candle/minute per coin; signals fire once ≥27 candles exist.
+        for sym in approved_coins:
             closes = volumes = None
             try:
-                raw_klines = await _fetch_klines(session, sym)
-                closes  = [float(k[4]) for k in raw_klines]
-                volumes = [float(k[5]) for k in raw_klines]
+                raw = await _fetch_klines(session, sym)
+                closes  = [float(k[4]) for k in raw]
+                volumes = [float(k[5]) for k in raw]
             except Exception:
                 db_rows = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=50)
                 if len(db_rows) >= 27:
                     closes  = [float(c["close"])  for c in db_rows]
                     volumes = [float(c["volume"]) for c in db_rows]
 
-            if closes is None or len(closes) < 27:
-                continue  # REST blocked and not enough WebSocket candles yet
+            if closes and len(closes) >= 27:
+                update_coin_signals(sym, closes, volumes)
+                updated += 1
 
-            try:
-                # evaluate_signals() returns exactly {"trend","rsi","macd","volume"}
-                signals       = evaluate_signals(closes, volumes)
-                bullish_count = sum(signals.values())
-
-                print(
-                    f"[SignalScanner] {sym} signals={signals} "
-                    f"→ {bullish_count}/4 bullish"
-                )
-                database.log_activity(
-                    f"{sym}: {bullish_count}/4 signals bullish {signals}", "info"
-                )
-
-                if bullish_count < config.MIN_SIGNALS_TO_BUY:
-                    continue
-
-            except Exception as e:
-                print(f"[SignalScanner] {sym}: indicator error — {e}")
-                continue
-
-            # ── Execute buy ───────────────────────────────────────────────────────
-            # Use the freshly-fetched kline close as the canonical price.
-            # The WebSocket dict may not have this symbol yet (slow connection
-            # or infrequent ticker), so always fall back to the kline close.
-            price = prices.get(sym) or closes[-1]
-
-            # Sync the price into PaperClient._prices so order_market_buy()
-            # doesn't raise "No price available" when WebSocket is still
-            # connecting.  For live/testnet the real Binance client ignores this
-            # (update_price is a no-op lambda).
-            client.update_price(sym, price)
-
-            # Gather entry indicators from latest candle
-            entry_rsi = entry_ma = entry_bb = entry_vol = None
-            try:
-                candles = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=1)
-                if candles:
-                    last = candles[-1]
-                    entry_rsi = last.get("rsi14")
-                    entry_ma  = last.get("ma_position") or _derive_ma_pos(price, last.get("ma20"))
-                    entry_bb  = last.get("bb_position") or _derive_bb_pos(price, last)
-                    entry_vol = last.get("volume_trend")
-            except Exception:
-                pass
-
-            # Final pre-buy guard — reads _positions directly, never a copy
-            buy_cfg = {**coin_cfg, "symbol": sym, "budget_usdt": budget}
-            allowed, reason = can_execute_buy(buy_cfg, client)
-            if not allowed:
-                print(f"[SKIP] {sym}: {reason}")
-                database.log_activity(f"{sym}: buy skipped — {reason}", "info")
-                continue
-
-            try:
-                result = client.order_market_buy(symbol=sym, quoteOrderQty=budget)
-            except Exception as e:
-                print(f"[SignalScanner] BUY failed {sym}: {e}")
-                database.log_activity(f"{sym}: BUY failed — {e}", "error")
-                continue
-
-            fill = result.get("fills", [{}])[0]
-            fill_price = float(fill.get("price", price))
-            qty        = float(result.get("executedQty", 0))
-
-            if qty <= 0:
-                continue
-
-            pos_record = {
-                "symbol":              sym,
-                "entry_price":         fill_price,
-                "quantity":            qty,
-                "budget_usdt":         budget,
-                "timestamp":           now,
-                "mode":                mode,
-                "entry_rsi":           entry_rsi,
-                "entry_ma_position":   entry_ma,
-                "entry_bb_position":   entry_bb,
-                "entry_volume_trend":  entry_vol,
-            }
-            pos_id = database.save_position(pos_record)
-            pos_record["id"] = pos_id
-
-            with _positions_lock:
-                _positions.append(pos_record)
-
-            usdt_balance -= budget + budget * _fee_rate
-            global_open  += 1
-
-            breakeven = fill_price * _breakeven_mult
-            msg = (
-                f"BOUGHT {sym} @ ${fill_price:.4f} "
-                f"| qty={qty:.6f} | BEP=${breakeven:.4f} "
-                f"| signals={bullish_count}/4"
-            )
-            print(f"[SignalScanner] {msg}")
-            database.log_activity(msg, "info")
+    with _signal_cache_lock:
+        ready = sum(1 for v in _signal_cache.values() if v["score"] >= config.MIN_SIGNALS_TO_BUY)
+    print(f"[SignalScanner] Cache refreshed {updated}/{len(approved_coins)} coins — {ready} signalling BUY")

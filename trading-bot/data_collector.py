@@ -18,13 +18,20 @@ from connection import client
 # Shared live prices dict — imported by trade_engine and strategy_engine
 prices: Dict[str, float] = {}
 
-# Callback registered by main.py to avoid circular import
+# Callbacks registered by main.py to avoid circular imports
 _price_callback: Optional[Callable[[Dict[str, float]], None]] = None
+_kline_callback: Optional[Callable[[str, list, list], None]]  = None
 
 
 def register_price_callback(cb: Callable[[Dict[str, float]], None]):
     global _price_callback
     _price_callback = cb
+
+
+def register_kline_callback(cb: Callable[[str, list, list], None]):
+    """Wire kline-close events into trade_engine.update_coin_signals."""
+    global _kline_callback
+    _kline_callback = cb
 
 
 # ── REST historical download ─────────────────────────────────────────────────
@@ -179,6 +186,13 @@ async def start_websocket():
                                     new_row["low"], new_row["close"], new_row["volume"]
                                 ]]
                                 _compute_and_save(sym, all_raw)
+
+                                # Notify trade_engine so the signal cache is updated
+                                # immediately on kline close — enables real-time buys.
+                                if _kline_callback and len(all_raw) >= 27:
+                                    closes  = [float(r[4]) for r in all_raw]
+                                    volumes = [float(r[5]) for r in all_raw]
+                                    _kline_callback(sym, closes, volumes)
 
                     except Exception as e:
                         print(f"[DataCollector] Message error: {e}")
