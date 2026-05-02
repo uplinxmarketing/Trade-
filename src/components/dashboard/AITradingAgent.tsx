@@ -80,65 +80,24 @@ interface CoinSignal {
   reason: string;
 }
 
-// Fetch one coin sequentially — avoids Binance rate-limit on parallel bulk requests.
-// Uses klines only (no depth endpoint) to halve the request count.
-async function analyseCoin(sym: string): Promise<CoinSignal> {
+// Fetch raw 60-candle buffer for one coin — called once on agent start to seed the WebSocket buffer.
+async function fetchKlineBuffer(sym: string): Promise<{ closes: number[]; volumes: number[] } | null> {
   const ctrl = new AbortController();
   const timeout = setTimeout(() => ctrl.abort(), 8000);
   try {
-    const res = await fetch(
-      `${BIN}/klines?symbol=${sym}&interval=1m&limit=60`,
-      { signal: ctrl.signal }
-    );
+    const res = await fetch(`${BIN}/klines?symbol=${sym}&interval=1m&limit=60`, { signal: ctrl.signal });
     clearTimeout(timeout);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const klines = await res.json();
     if (!Array.isArray(klines) || klines.length < 30) throw new Error('insufficient data');
-
-    const closes  = klines.map((k: any[]) => parseFloat(k[4]));
-    const volumes = klines.map((k: any[]) => parseFloat(k[5]));
-    const price   = closes[closes.length - 1];
-
-    // Delegate to evaluateSignals — single source of truth for all 4 signals
-    const sigs  = evaluateSignals(closes, volumes);
-    const score = Object.values(sigs).filter(Boolean).length; // all 4 keys counted
-    const rsi   = calcRSI(closes, 14);
-    const volSma = calcSMA(volumes, 20);
-    const curVol = volumes[volumes.length - 1] ?? 0;
-    const volRat = volSma > 0 ? curVol / volSma : 1;
-
-    // BUY only if bullish_count >= 3 — no bypass conditions
-    const isBuy  = score >= 3;
-    const isHold = rsi >= 72 || rsi < 24;
-
-    const parts: string[] = [];
-    parts.push(sigs.trend ? 'EMA↑' : 'EMA↓');
-    parts.push(`RSI ${rsi.toFixed(0)}`);
-    parts.push(sigs.macd ? 'MACD+' : 'MACD-');
-    if (sigs.volume) parts.push(`Vol ${volRat.toFixed(1)}×`);
-
     return {
-      symbol: sym, price, rsi,
-      emaBullish: sigs.trend, rsiOk: sigs.rsi, macdPos: sigs.macd, volUp: sigs.volume,
-      signal: isHold ? 'HOLD' : isBuy ? 'BUY' : 'HOLD',
-      reason: parts.join(' · '),
+      closes:  klines.map((k: any[]) => parseFloat(k[4])),
+      volumes: klines.map((k: any[]) => parseFloat(k[5])),
     };
-  } catch (e: any) {
+  } catch {
     clearTimeout(timeout);
-    return { symbol: sym, price: 0, rsi: 50, emaBullish: false, rsiOk: false, macdPos: false, volUp: false, signal: 'error', reason: e.message ?? 'Fetch failed' };
+    return null;
   }
-}
-
-// Sequential fetch with 300 ms gap to stay well inside Binance rate limits.
-async function analyseAll(symbols: string[]): Promise<CoinSignal[]> {
-  const results: CoinSignal[] = [];
-  for (const sym of symbols) {
-    results.push(await analyseCoin(sym));
-    if (symbols.indexOf(sym) < symbols.length - 1) {
-      await new Promise(r => setTimeout(r, 300));
-    }
-  }
-  return results;
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -167,9 +126,8 @@ interface AITradingAgentProps {
   onStateChange?: (positions: {symbol:string;quantity:number;avg_entry_price:number}[], balance: number) => void;
 }
 
-const INSTRUCTIONS_KEY    = 'ai_agent_instructions';
-const SIGNAL_REFRESH_MS   = 5_000; // refresh klines & signals every 5s
-const BEP_MULT            = 1 / Math.pow(1 - TAKER_FEE, 2);
+const INSTRUCTIONS_KEY = 'ai_agent_instructions';
+const BEP_MULT         = 1 / Math.pow(1 - TAKER_FEE, 2);
 
 // ── Component ────────────────────────────────────────────────────────────────
 const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onStateChange }: AITradingAgentProps) => {
@@ -192,20 +150,24 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [actLog, setActLog]       = useState<string[]>([]);
   const [showLog, setShowLog]     = useState(false);
 
-  const isRunningRef    = useRef(false);
+  const isRunningRef      = useRef(false);
   const exitProcessingRef = useRef(false);
   const buyProcessingRef  = useRef(false);
   const pendingSellsRef   = useRef<Set<string>>(new Set());
-  const balanceRef      = useRef(balance);
-  const positionsRef    = useRef(positions);
-  const signalCacheRef  = useRef<CoinSignal[]>([]);
-  const signalRefreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const stopLossRef     = useRef(1.5);
-  const onStateChangeRef = useRef(onStateChange);
+  const balanceRef        = useRef(balance);
+  const positionsRef      = useRef(positions);
+  const signalCacheRef    = useRef<CoinSignal[]>([]);
+  const klineWsRef        = useRef<WebSocket | null>(null);
+  const klineBufferRef    = useRef<Map<string, { closes: number[]; volumes: number[] }>>(new Map());
+  const selectedCoinsRef  = useRef(selectedCoins);
+  const connectKlineWsRef = useRef<() => void>(() => {});
+  const stopLossRef       = useRef(1.5);
+  const onStateChangeRef  = useRef(onStateChange);
 
-  useEffect(() => { isRunningRef.current = isRunning; },   [isRunning]);
-  useEffect(() => { balanceRef.current   = balance; },     [balance]);
-  useEffect(() => { positionsRef.current = positions; },   [positions]);
+  useEffect(() => { isRunningRef.current     = isRunning; },      [isRunning]);
+  useEffect(() => { balanceRef.current       = balance; },        [balance]);
+  useEffect(() => { positionsRef.current     = positions; },      [positions]);
+  useEffect(() => { selectedCoinsRef.current = selectedCoins; },  [selectedCoins]);
   useEffect(() => { localStorage.setItem(INSTRUCTIONS_KEY, instructions); }, [instructions]);
   useEffect(() => { onStateChangeRef.current = onStateChange; }, [onStateChange]);
 
@@ -270,37 +232,116 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       .on('postgres_changes', { event: '*', schema: 'public', table: 'paper_portfolio' }, loadData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_config' }, loadData)
       .subscribe();
-    return () => { supabase.removeChannel(ch); };
+    return () => { supabase.removeChannel(ch); if (klineWsRef.current) { klineWsRef.current.close(); klineWsRef.current = null; } };
   }, [loadData]);
 
   // ── Price refs ───────────────────────────────────────────────────────────
   const pricesRef = useRef(prices);
   useEffect(() => { pricesRef.current = prices; }, [prices]);
 
-  // ── Signal refresh (every SIGNAL_REFRESH_MS) ─────────────────────────────
-  // Fetches klines from Binance and updates the signal cache.
-  // Kept on a timer (not every tick) to stay within Binance rate limits.
-  const refreshSignals = useCallback(async () => {
+  // ── Pure signal recomputation from in-memory kline buffers — zero network calls ──
+  const recomputeSignals = useCallback(() => {
+    const coins = selectedCoinsRef.current;
+    const results: CoinSignal[] = [];
+    for (const sym of coins) {
+      const buf = klineBufferRef.current.get(sym);
+      if (!buf || buf.closes.length < 30) {
+        results.push({ symbol: sym, price: 0, rsi: 50, emaBullish: false, rsiOk: false, macdPos: false, volUp: false, signal: 'loading', reason: 'loading' });
+        continue;
+      }
+      const { closes, volumes } = buf;
+      const price  = closes[closes.length - 1];
+      const sigs   = evaluateSignals(closes, volumes);
+      const score  = Object.values(sigs).filter(Boolean).length;
+      const rsi    = calcRSI(closes, 14);
+      const volSma = calcSMA(volumes, 20);
+      const curVol = volumes[volumes.length - 1] ?? 0;
+      const volRat = volSma > 0 ? curVol / volSma : 1;
+      const isBuy  = score >= 3;
+      const isHold = rsi >= 72 || rsi < 24;
+      const parts  = [sigs.trend ? 'EMA↑' : 'EMA↓', `RSI ${rsi.toFixed(0)}`, sigs.macd ? 'MACD+' : 'MACD-'];
+      if (sigs.volume) parts.push(`Vol ${volRat.toFixed(1)}×`);
+      results.push({
+        symbol: sym, price, rsi,
+        emaBullish: sigs.trend, rsiOk: sigs.rsi, macdPos: sigs.macd, volUp: sigs.volume,
+        signal: isHold ? 'HOLD' : isBuy ? 'BUY' : 'HOLD',
+        reason: parts.join(' · '),
+      });
+    }
+    signalCacheRef.current = results;
+    setCoinSignals(results);
+  }, []);
+
+  // ── Seed kline buffers from REST — one REST call per coin, runs once on start ──
+  const seedBuffers = useCallback(async () => {
     if (!isRunningRef.current) return;
     setScanning(true);
-    setAgentStatus('Scanning market…');
+    setAgentStatus('Seeding market data…');
+    const coins = selectedCoinsRef.current;
     try {
-      const signals = await analyseAll(selectedCoins);
-      signalCacheRef.current = signals;
-      setCoinSignals(signals);
-      const buySigs = signals.filter(s => s.signal === 'BUY');
-      addLog(`Signals: ${buySigs.length} BUY · ${signals.filter(s=>s.signal==='HOLD').length} HOLD · ${signals.filter(s=>s.signal==='error').length} err`);
-      signals.forEach(s => {
-        const count = [s.emaBullish, s.rsiOk, s.macdPos, s.volUp].filter(Boolean).length;
-        addLog(`[SIGNALS] ${s.symbol}: trend=${s.emaBullish} rsi=${s.rsiOk} macd=${s.macdPos} vol=${s.volUp} count=${count}/4`);
-      });
-      setAgentStatus(`Done · ${new Date().toLocaleTimeString()}`);
+      for (let i = 0; i < coins.length; i++) {
+        const sym = coins[i];
+        const buf = await fetchKlineBuffer(sym);
+        if (buf) {
+          klineBufferRef.current.set(sym, buf);
+          recomputeSignals();
+        } else {
+          addLog(`[WARN] Could not seed ${sym}`);
+        }
+        if (i < coins.length - 1) await new Promise(r => setTimeout(r, 200));
+      }
+      const buySigs = signalCacheRef.current.filter(s => s.signal === 'BUY');
+      addLog(`Seed done: ${buySigs.length} BUY · ${signalCacheRef.current.filter(s => s.signal === 'HOLD').length} HOLD`);
+      setAgentStatus('Live');
     } catch (e: any) {
-      addLog(`Signal refresh error: ${e.message}`);
+      addLog(`Seed error: ${e.message}`);
     } finally {
       setScanning(false);
     }
-  }, [selectedCoins, addLog]);
+  }, [addLog, recomputeSignals]);
+
+  // ── Binance kline WebSocket — keeps buffers live after initial seed ──
+  const connectKlineWs = useCallback(() => {
+    if (klineWsRef.current) { klineWsRef.current.close(); klineWsRef.current = null; }
+    const coins = selectedCoinsRef.current;
+    const streams = coins.map(s => `${s.toLowerCase()}@kline_1m`).join('/');
+    const ws = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${streams}`);
+
+    ws.onmessage = (event: MessageEvent) => {
+      try {
+        const msg = JSON.parse(event.data as string);
+        const k = msg.data?.k;
+        if (!k) return;
+        const sym: string = k.s;
+        const close = parseFloat(k.c);
+        const vol   = parseFloat(k.v);
+        const buf   = klineBufferRef.current.get(sym);
+        if (!buf) return;
+        if (k.x) {
+          buf.closes  = [...buf.closes.slice(-59),  close];
+          buf.volumes = [...buf.volumes.slice(-59), vol];
+        } else {
+          buf.closes  = [...buf.closes.slice(0, -1),  close];
+          buf.volumes = [...buf.volumes.slice(0, -1), vol];
+        }
+        klineBufferRef.current.set(sym, buf);
+        recomputeSignals();
+      } catch { /* malformed frame */ }
+    };
+
+    ws.onerror = () => { addLog('[WS] Kline stream error'); };
+    ws.onclose = () => {
+      klineWsRef.current = null;
+      if (isRunningRef.current) {
+        addLog('[WS] Kline stream closed — reconnecting in 3s');
+        setTimeout(() => connectKlineWsRef.current(), 3000);
+      }
+    };
+
+    klineWsRef.current = ws;
+  }, [addLog, recomputeSignals]);
+
+  useEffect(() => { connectKlineWsRef.current = connectKlineWs; }, [connectKlineWs]);
 
   // ── Buy executor — runs on every price tick using cached signals ──────────
   // No API calls here — just reads the signal cache and executes if conditions met.
@@ -458,8 +499,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     }
   }, [prices]); // eslint-disable-line
 
-  // ── Manual "Now" button — refresh signals immediately ────────────────────
-  const runCycle = useCallback(() => refreshSignals(), [refreshSignals]);
+  // ── Manual "Now" button — re-seed buffers + reconnect WebSocket ─────────
+  const runCycle = useCallback(() => { seedBuffers(); connectKlineWs(); }, [seedBuffers, connectKlineWs]);
 
   // ── Start / Stop ─────────────────────────────────────────────────────────
   const toggleBot = async () => {
@@ -483,11 +524,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         setInitialBalance(startBal);
         addLog(`=== Agent STARTED · ${startBal} USDT · ${mode.toUpperCase()} ===`);
         toast.success(`AI Agent started — PAPER mode`, { description: `${startBal.toLocaleString()} USDT · ${selectedCoins.length} coins · live signals` });
-        // Immediate first signal fetch, then refresh on interval
-        refreshSignals();
-        signalRefreshRef.current = setInterval(refreshSignals, SIGNAL_REFRESH_MS);
+        // Seed kline buffers from REST once, then keep live via WebSocket
+        seedBuffers();
+        connectKlineWs();
       } else {
-        if (signalRefreshRef.current) clearInterval(signalRefreshRef.current);
+        if (klineWsRef.current) { klineWsRef.current.close(); klineWsRef.current = null; }
+        klineBufferRef.current.clear();
         signalCacheRef.current = [];
         await supabase.from('bot_config').update({ is_running: false, updated_at: new Date().toISOString() }).eq('user_session', SESSION);
         isRunningRef.current = false;
@@ -556,7 +598,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // ── Reset ────────────────────────────────────────────────────────────────
   const resetBot = async () => {
     if (!confirm('Reset all paper trades and restore budget?')) return;
-    if (signalRefreshRef.current) clearInterval(signalRefreshRef.current);
+    if (klineWsRef.current) { klineWsRef.current.close(); klineWsRef.current = null; }
+    klineBufferRef.current.clear();
     signalCacheRef.current = [];
     isRunningRef.current = false;
     const startBal = getPaperCfg().startingBalance ?? 1000;
@@ -694,11 +737,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       </Button>
       {isRunning
         ? <p className="text-[10px] text-center text-muted-foreground -mt-2">
-            Exits live on every tick · Signals refresh every 5s · EMA+RSI+MACD+Volume
+            Exits live on every tick · Signals live via WebSocket · EMA+RSI+MACD+Volume
             {agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}
           </p>
         : <p className="text-[10px] text-center text-muted-foreground -mt-2">
-            Exits fire on every price tick · Buy signals refresh every 5s · EMA+RSI+MACD+Volume · no API key needed
+            Exits fire on every price tick · Signals live via WebSocket · EMA+RSI+MACD+Volume · no API key needed
           </p>
       }
 
