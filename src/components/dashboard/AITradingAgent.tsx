@@ -208,7 +208,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       });
     }
 
-    if (posRes.data)  setPositions(posRes.data as OpenPosition[]);
+    if (posRes.data) {
+      const fetched = posRes.data as OpenPosition[];
+      setPositions(fetched);
+      positionsRef.current = fetched;   // sync ref directly — no render-cycle delay
+    }
 
     // Use same fallback chain as wallet: current_balance → initial_balance → localStorage startingBalance
     const startBal = getPaperCfg().startingBalance ?? 1000;
@@ -372,9 +376,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     const heldSet = new Set(currentPositions.map(p => p.symbol));
     let runBal = balanceRef.current;
 
+    // Scale max open positions with how many coins the bot is watching
+    // so adding more coins actually allows the bot to hold more positions.
+    const maxPos = Math.max(MAX_POSITIONS, Math.floor(selectedCoinsRef.current.length / 3));
+
     const newlyBought: OpenPosition[] = [];
     for (const sig of buySigs) {
-      if (heldSet.size >= MAX_POSITIONS) break;
+      if (heldSet.size >= maxPos) break;
       if (runBal < MIN_USDT) break;
       if (heldSet.has(sig.symbol)) continue;
 
@@ -668,8 +676,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         is_running: false, updated_at: new Date().toISOString(),
       }).eq('user_session', SESSION),
     ]);
-    setTrades([]); setPositions([]); setBalance(startBal); balanceRef.current = startBal; setInitialBalance(startBal);
-    setIsRunning(false); setActLog([]);
+    positionsRef.current = [];
+    balanceRef.current = startBal;
+    pendingSellsRef.current.clear();
+    buyProcessingRef.current = false;
+    exitProcessingRef.current = false;
+    setTrades([]); setPositions([]); setBalance(startBal); setInitialBalance(startBal);
+    setIsRunning(false); setCoinSignals([]); setActLog([]);
+    onStateChangeRef.current?.([], startBal);
     toast.success(`Reset · ${startBal.toLocaleString()} USDT restored`);
   };
 

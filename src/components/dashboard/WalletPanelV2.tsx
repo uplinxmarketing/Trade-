@@ -55,6 +55,7 @@ interface Props {
   selectedCoins?: string[];
   agentPositions?: { symbol: string; quantity: number; avg_entry_price: number }[];
   agentBalance?: number;
+  onReset?: () => void;
 }
 
 function CoinIcon({ coin }: { coin: string }) {
@@ -88,7 +89,7 @@ function PnlPill({ pnl, pct }: { pnl: number; pct: number }) {
   );
 }
 
-const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPositions, agentBalance }: Props) => {
+const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPositions, agentBalance, onReset }: Props) => {
   const [usdtFree, setUsdtFree]         = useState(0);
   const [initialBalance, setInitialBalance] = useState(0);
   const [positions, setPositions]       = useState<Position[]>([]);
@@ -229,11 +230,14 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
           updated_at: new Date().toISOString(),
         }).eq('user_session', 'default'),
       ]);
+      // Clear local wallet state immediately
       setPositions([]);
       setUsdtFree(walletCfg.startingBalance);
       setInitialBalance(walletCfg.startingBalance);
       setSessionGain(0);
       setTotalFees(0);
+      // Notify parent so agent clears its in-memory positions/balance too
+      onReset?.();
       toast.success(`Paper wallet reset · ${walletCfg.startingBalance.toLocaleString()} USDT`);
     } finally { setResetting(false); }
   };

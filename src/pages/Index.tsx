@@ -115,6 +115,7 @@ const Index = () => {
               selectedCoins={selectedCoins}
               agentPositions={agentPositions}
               agentBalance={agentBalance}
+              onReset={() => { setAgentPositions([]); setAgentBalance(0); }}
             />
 
             {/* AI Trading Bot */}
