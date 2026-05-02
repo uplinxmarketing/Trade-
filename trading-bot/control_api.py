@@ -1,14 +1,17 @@
 """
-FastAPI control server — port 8000.
-Serves REST endpoints + a live HTML dashboard for paper mode.
-Runs as a daemon thread (non-blocking).
+FastAPI control server — binds to $PORT on the main thread so Railway's
+health-check can reach it immediately.  All trading-bot logic (DB init,
+history download, WebSocket feed, strategy loop) starts in the FastAPI
+lifespan as async background tasks — nothing blocks the HTTP server.
 """
 
+import asyncio
 import json
 import os
 import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -22,7 +25,48 @@ import config
 import database
 from connection import get_mode
 
-app = FastAPI(title="Trading Bot Control API", version="1.0")
+
+# ── Lifespan: start the full trading bot after HTTP server is ready ───────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Runs once after uvicorn binds and is accepting connections.
+    Railway's health-check will already be passing by the time this executes.
+    """
+    import data_collector
+    import trade_engine
+    import strategy_engine
+
+    # 1. DB (already done in main.py before uvicorn starts, but idempotent)
+    database.init_db()
+
+    # 2. Regenerate strategy.json
+    strategy_engine.write_default_strategy()
+
+    # 3. Restore open positions
+    trade_engine.load_positions_from_db()
+
+    # 4. History download runs in a thread so it doesn't block the event loop
+    #    (makes ~30 synchronous HTTP requests with time.sleep between them)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, data_collector.download_history)
+
+    # 5. Register callbacks
+    data_collector.register_price_callback(trade_engine.realtime_monitor)
+    data_collector.register_kline_callback(trade_engine.update_coin_signals)
+
+    # 6. Launch WebSocket feed + strategy loop + signal scanner as async tasks
+    asyncio.create_task(data_collector.start_websocket())
+    asyncio.create_task(strategy_engine.strategy_loop())
+    asyncio.create_task(trade_engine.signal_scanner(data_collector.prices))
+
+    print("[ControlAPI] All trading tasks started.")
+    yield
+    # Shutdown — daemon threads and tasks stop with the process
+
+
+app = FastAPI(title="Trading Bot Control API", version="1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -645,10 +689,7 @@ def api_set_mode(req: ModeRequest):
 
 
 def start_control_api():
+    """Block the main thread on uvicorn — all bot logic starts via lifespan."""
     port = int(os.getenv("PORT", 8000))
-    t = threading.Thread(
-        target=lambda: uvicorn.run(app, host="0.0.0.0", port=port, log_level="error"),
-        daemon=True,
-    )
-    t.start()
-    print(f"[ControlAPI] Dashboard running at http://0.0.0.0:{port}")
+    print(f"[ControlAPI] Binding to 0.0.0.0:{port}")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
