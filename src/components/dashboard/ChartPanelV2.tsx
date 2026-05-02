@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useBinanceKlines } from '@/hooks/useBinanceKlines';
 import { TAKER_FEE } from '@/lib/trading-engine';
 import { supabase } from '@/integrations/supabase/client';
@@ -8,10 +8,11 @@ import type { LivePrices } from '@/lib/trading-engine';
 const BREAK_EVEN_MULT = 1 / Math.pow(1 - TAKER_FEE, 2);
 
 const TF = [
-  { key: '1m', label: '1m' }, { key: '3m', label: '3m' },
-  { key: '5m', label: '5m' }, { key: '15m', label: '15m' },
-  { key: '1h', label: '1h' }, { key: '4h', label: '4h' },
-  { key: '1d', label: '1d' }, { key: '1w', label: '1w' },
+  { key: 'live', label: 'LIVE' }, { key: '30s', label: '30s' },
+  { key: '1m', label: '1m' },    { key: '3m', label: '3m' },
+  { key: '5m', label: '5m' },    { key: '15m', label: '15m' },
+  { key: '1h', label: '1h' },    { key: '4h', label: '4h' },
+  { key: '1d', label: '1d' },    { key: '1w', label: '1w' },
 ];
 
 type ChartType = 'candles' | 'line' | 'area';
@@ -28,23 +29,77 @@ function fmtP(p: number) {
 }
 
 export default function ChartPanelV2({ activeCoin, prices }: Props) {
-  const [interval, setInterval] = useState('15m');
+  const [interval, setIntervalState] = useState('15m');
   const [chartType, setChartType] = useState<ChartType>('candles');
   const [overlays, setOverlays] = useState<Overlays>({ ma: true, bb: false, entry: true, breakeven: true, volume: true });
   const [entryPrice, setEntryPrice] = useState(0);
   const canvasRef   = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  // Tick buffer for LIVE and 30s synthetic modes
+  const tickBufferRef = useRef<{ ts: number; price: number }[]>([]);
+  const [liveTick, setLiveTick] = useState(0); // increment to force re-render in live modes
+
   const binanceSymbol = activeCoin.replace('/', '').replace(' ', '');
   const { klines: rawKlines, loading } = useBinanceKlines(binanceSymbol, interval);
-
-  // Merge live price into last candle
   const livePrice = parseFloat(prices[activeCoin]?.price ?? '0');
-  const klines = rawKlines.length > 0 && livePrice > 0
-    ? rawKlines.map((k, i) => i === rawKlines.length - 1
-        ? { ...k, close: livePrice, high: Math.max(k.high, livePrice), low: Math.min(k.low, livePrice) }
-        : k)
-    : rawKlines;
+
+  // Reset tick buffer when coin changes
+  useEffect(() => { tickBufferRef.current = []; }, [activeCoin]);
+
+  // Push each new price tick into the buffer; only re-render when in live/30s mode
+  useEffect(() => {
+    if (livePrice <= 0) return;
+    const now = Date.now();
+    const buf = tickBufferRef.current;
+    // Skip duplicate consecutive prices
+    if (buf.length > 0 && buf[buf.length - 1].price === livePrice) return;
+    tickBufferRef.current = [...buf.filter(t => now - t.ts < 10 * 60 * 1000), { ts: now, price: livePrice }].slice(-1200);
+    if (interval === 'live' || interval === '30s') setLiveTick(t => t + 1);
+  }, [livePrice, interval]);
+
+  // Synthetic klines derived from tick buffer (LIVE = every tick, 30s = bucketed candles)
+  const tickKlines = useMemo(() => {
+    const buf = tickBufferRef.current;
+    if (interval === 'live') {
+      return buf.map(t => ({
+        time: new Date(t.ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }),
+        open: t.price, high: t.price, low: t.price, close: t.price, volume: 0,
+      }));
+    }
+    if (interval === '30s') {
+      if (buf.length === 0) return [];
+      const buckets = new Map<number, { open: number; high: number; low: number; close: number }>();
+      for (const t of buf) {
+        const b30 = Math.floor(t.ts / 30000) * 30000;
+        const bk = buckets.get(b30);
+        if (!bk) buckets.set(b30, { open: t.price, high: t.price, low: t.price, close: t.price });
+        else { bk.high = Math.max(bk.high, t.price); bk.low = Math.min(bk.low, t.price); bk.close = t.price; }
+      }
+      return Array.from(buckets.entries()).sort((a, b) => a[0] - b[0]).map(([ts, bk]) => ({
+        time: new Date(ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }),
+        open: bk.open, high: bk.high, low: bk.low, close: bk.close, volume: 0,
+      }));
+    }
+    return [];
+  }, [interval, liveTick]); // liveTick forces recompute on each new tick
+
+  const isTickMode = interval === 'live' || interval === '30s';
+
+  // Merge live price into last candle (kline modes only)
+  const klines = isTickMode ? tickKlines
+    : rawKlines.length > 0 && livePrice > 0
+      ? rawKlines.map((k, i) => i === rawKlines.length - 1
+          ? { ...k, close: livePrice, high: Math.max(k.high, livePrice), low: Math.min(k.low, livePrice) }
+          : k)
+      : rawKlines;
+
+  const setInterval = (tf: string) => {
+    setIntervalState(tf);
+    // Auto-switch chart type for tick modes
+    if (tf === 'live') setChartType('area');
+    else if (tf === '30s') setChartType('candles');
+  };
 
   const breakEven = entryPrice > 0 ? entryPrice * BREAK_EVEN_MULT : 0;
 
@@ -292,9 +347,10 @@ export default function ChartPanelV2({ activeCoin, prices }: Props) {
         {/* Timeframes */}
         {TF.map(tf => (
           <button key={tf.key} onClick={() => setInterval(tf.key)}
-            className={`shrink-0 px-2 py-0.5 text-[10px] rounded transition-colors ${
+            className={`shrink-0 px-2 py-0.5 text-[10px] rounded transition-colors flex items-center gap-1 ${
               interval === tf.key ? 'bg-secondary text-foreground font-semibold' : 'text-muted-foreground hover:text-foreground hover:bg-secondary/50'
-            }`}>
+            } ${tf.key === 'live' ? 'text-gain' : ''}`}>
+            {tf.key === 'live' && <span className={`w-1.5 h-1.5 rounded-full bg-gain shrink-0 ${interval === 'live' ? 'animate-pulse' : 'opacity-50'}`} />}
             {tf.label}
           </button>
         ))}
@@ -332,9 +388,14 @@ export default function ChartPanelV2({ activeCoin, prices }: Props) {
 
       {/* Canvas */}
       <div ref={containerRef} className="flex-1 relative min-h-0">
-        {loading && klines.length === 0 && (
+        {loading && !isTickMode && klines.length === 0 && (
           <div className="absolute inset-0 flex items-center justify-center z-10">
             <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+          </div>
+        )}
+        {isTickMode && klines.length === 0 && (
+          <div className="absolute inset-0 flex items-center justify-center z-10">
+            <span className="text-[11px] text-muted-foreground animate-pulse">Waiting for price ticks…</span>
           </div>
         )}
         <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
