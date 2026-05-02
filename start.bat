@@ -15,7 +15,7 @@ echo TradeBot AI — Session %TIMESTAMP% > "%LOG_FILE%"
 
 echo.
 echo   ============================================
-echo       TradeBot AI v2.5.0
+echo       TradeBot AI v3.5.0
 echo   ============================================
 echo.
 call :logline "Log file: %LOG_FILE%"
@@ -103,7 +103,7 @@ if not exist ".env" (
 :: or missing. Only requires Node.js (found above) and PowerShell (built-in).
 call :logline "Checking for updates..."
 set "TMPUPD=%TEMP%\tb_updater_%RANDOM%.js"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "(New-Object Net.WebClient).DownloadFile('https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/scripts/update.js','%TMPUPD%')" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $ts=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); Invoke-WebRequest -Uri ('https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/scripts/update.js?t='+$ts) -OutFile '%TMPUPD%' -UseBasicParsing -Headers @{'Cache-Control'='no-cache';'Pragma'='no-cache'} } catch { exit 1 }" >nul 2>&1
 if exist "%TMPUPD%" (
     call :logline "Updater downloaded — running..."
     node "%TMPUPD%" >> "%LOG_FILE%" 2>&1

@@ -121,9 +121,17 @@ async function main() {
   let localVersion = { commit: '', version: '0.0.0' };
   try { localVersion = JSON.parse(fs.readFileSync(localVersionPath, 'utf8')); } catch { /* first run */ }
 
-  if (remoteVersion.commit === localVersion.commit) {
+  // 3. Check for force-update sentinel — bypasses version comparison
+  const sentinelPath = path.join(APP_DIR, '.force-update');
+  const forceUpdate = fs.existsSync(sentinelPath);
+
+  if (!forceUpdate && remoteVersion.commit === localVersion.commit) {
     log('Already up to date (v' + localVersion.version + ').');
     return;
+  }
+
+  if (forceUpdate) {
+    log('Force-update sentinel detected — applying update regardless of version.');
   }
 
   log('Update available: v' + localVersion.version + ' → v' + remoteVersion.version);
@@ -165,6 +173,8 @@ async function main() {
     }
 
     log('Successfully updated to v' + remoteVersion.version + '!');
+    // Remove force-update sentinel now that update succeeded
+    try { fs.unlinkSync(sentinelPath); } catch { /* may not exist */ }
   } finally {
     // 7. Clean up temp files regardless of success/failure
     try { fs.unlinkSync(zipPath); } catch { /* already gone */ }
