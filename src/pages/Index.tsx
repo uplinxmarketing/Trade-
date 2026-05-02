@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import TopBar from '@/components/dashboard/TopBar';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import AITradingAgent from '@/components/dashboard/AITradingAgent';
+import BudgetPanel from '@/components/dashboard/BudgetPanel';
 import BinanceConnect from '@/components/dashboard/BinanceConnect';
 import NotificationCenter from '@/components/dashboard/NotificationCenter';
 import CoinSelectorPanel from '@/components/dashboard/CoinSelectorPanel';
@@ -106,6 +107,9 @@ const Index = () => {
               binanceConnected={binanceConnected}
               onConnectBinance={() => setShowBinanceConnect(true)}
             />
+
+            {/* Bot budget configuration */}
+            <BudgetPanel watchedCoins={selectedCoins} />
 
             {/* Coin selection (for bot) */}
             <div className="trading-card p-3">

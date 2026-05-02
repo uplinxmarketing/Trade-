@@ -29,3 +29,16 @@ MIN_SIGNALS_TO_BUY   = 3       # out of 4 signals must be bullish
 RSI_BUY_MIN          = 40
 RSI_BUY_MAX          = 65
 VOLUME_RATIO_MIN     = 1.5
+
+# ── Budget allocation settings ────────────────────────────────────────────────
+BUDGET_MODE           = "fixed"   # fixed | percent | capped | per_coin
+BUDGET_FIXED_USDT     = 100.0
+BUDGET_PCT_OF_FREE    = 10.0      # % of free USDT per trade
+BUDGET_TOTAL_CAP_USDT = 500.0     # max total USDT deployed by bot at once
+BUDGET_PER_COIN = {
+    "BTCUSDT":  200.0,
+    "ETHUSDT":  150.0,
+    "SOLUSDT":  100.0,
+    "BNBUSDT":  100.0,
+    "DOGEUSDT": 50.0,
+}

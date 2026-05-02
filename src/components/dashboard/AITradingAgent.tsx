@@ -260,7 +260,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           if (!price) continue;
 
           const alloc = Math.min(runBal * ALLOC_PCT, runBal);
-          if (alloc < MIN_USDT) { addLog(`  SKIP ${sig.symbol} — alloc $${alloc.toFixed(2)} too low`); continue; }
+          if (alloc < MIN_USDT) { addLog(`  SKIP ${sig.symbol} — alloc ${alloc.toFixed(2)} USDT too low`); continue; }
 
           const fee = alloc * TAKER_FEE;
           const qty = (alloc - fee) / price;
@@ -269,7 +269,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             supabase.from('bot_trade_history').insert({
               user_session: SESSION, symbol: sig.symbol,
               side: 'BUY', price, quantity: qty, pnl: null,
-              reason: `[AI Paper] ${sig.reason} · $${alloc.toFixed(2)} @ $${price.toFixed(4)}`,
+              reason: `[AI Paper] ${sig.reason} · ${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`,
             }),
             supabase.from('paper_portfolio').upsert({
               user_session: SESSION, symbol: sig.symbol,
@@ -280,8 +280,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
           runBal -= alloc;
           heldSet.add(sig.symbol);
-          addLog(`  BUY  ${sig.symbol} @ $${price.toFixed(4)} · $${alloc.toFixed(2)}`);
-          toast.info(`AI Paper BUY: ${sig.symbol.replace('USDT','')}`, { description: `$${alloc.toFixed(2)} @ $${price.toFixed(4)}`, duration: 3000 });
+          addLog(`  BUY  ${sig.symbol} @ ${price.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT`);
+          toast.info(`AI Paper BUY: ${sig.symbol.replace('USDT','')}`, { description: `${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`, duration: 3000 });
         }
       } else if (openSlots <= 0) {
         addLog(`  Max ${MAX_POSITIONS} positions held — exits handled by price ticker`);
@@ -333,8 +333,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         isRunningRef.current = true;
         setIsRunning(true);
         setBalance(totalBudget); balanceRef.current = totalBudget;
-        addLog(`=== Agent STARTED · $${totalBudget} · ${mode.toUpperCase()} ===`);
-        toast.success(`AI Agent started — PAPER mode`, { description: `$${totalBudget.toLocaleString()} · ${selectedCoins.length} coins · every 30s` });
+        addLog(`=== Agent STARTED · ${totalBudget} USDT · ${mode.toUpperCase()} ===`);
+        toast.success(`AI Agent started — PAPER mode`, { description: `${totalBudget.toLocaleString()} USDT · ${selectedCoins.length} coins · every 30s` });
         runCycle().then(scheduleNext);
       } else {
         if (cycleTimerRef.current) clearTimeout(cycleTimerRef.current);
@@ -356,7 +356,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     try {
       const bal   = balanceRef.current;
       const alloc = Math.min(bal * ALLOC_PCT, bal);
-      if (alloc < MIN_USDT) { toast.error(`Balance too low ($${bal.toFixed(2)})`); return; }
+      if (alloc < MIN_USDT) { toast.error(`Balance too low (${bal.toFixed(2)} USDT)`); return; }
       const fee = alloc * TAKER_FEE;
       const qty = (alloc - fee) / wsPrice;
       const newBal = bal - alloc;
@@ -364,7 +364,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         supabase.from('bot_trade_history').insert({
           user_session: SESSION, symbol: sym, side: 'BUY',
           price: wsPrice, quantity: qty, pnl: null,
-          reason: `[Force BUY] manual test · $${alloc.toFixed(2)} @ $${wsPrice.toFixed(4)}`,
+          reason: `[Force BUY] manual test · ${alloc.toFixed(2)} USDT @ ${wsPrice.toFixed(4)} USDT`,
         }),
         supabase.from('paper_portfolio').upsert({
           user_session: SESSION, symbol: sym, quantity: qty, avg_entry_price: wsPrice,
@@ -372,8 +372,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         }, { onConflict: 'user_session,symbol' }),
         supabase.from('bot_config').update({ current_balance: newBal }).eq('user_session', SESSION),
       ]);
-      addLog(`FORCE BUY ${sym} @ $${wsPrice.toFixed(4)} · $${alloc.toFixed(2)}`);
-      toast.success(`Force BUY: ${sym.replace('USDT','')} @ $${wsPrice.toFixed(4)}`);
+      addLog(`FORCE BUY ${sym} @ ${wsPrice.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT`);
+      toast.success(`Force BUY: ${sym.replace('USDT','')} @ ${wsPrice.toFixed(4)} USDT`);
       await loadData();
     } finally { setForcingBuy(null); }
   }, [addLog, loadData]);
@@ -392,13 +392,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         supabase.from('bot_trade_history').insert({
           user_session: SESSION, symbol: pos.symbol, side: 'SELL',
           price: wsPrice, quantity: pos.quantity, pnl,
-          reason: `[Force SELL] manual · @ $${wsPrice.toFixed(4)} · pnl ${pnl>=0?'+':''}$${pnl.toFixed(4)}`,
+          reason: `[Force SELL] manual · @ ${wsPrice.toFixed(4)} USDT · pnl ${pnl>=0?'+':''}${pnl.toFixed(4)} USDT`,
         }),
         supabase.from('paper_portfolio').delete().eq('user_session', SESSION).eq('symbol', pos.symbol),
         supabase.from('bot_config').update({ current_balance: newBal }).eq('user_session', SESSION),
       ]);
-      addLog(`FORCE SELL ${pos.symbol} @ $${wsPrice.toFixed(4)} · P&L ${pnl>=0?'+':''}$${pnl.toFixed(4)}`);
-      toast[pnl >= 0 ? 'success' : 'error'](`Force SELL: ${pos.symbol.replace('USDT','')} ${pnl>=0?'+':''}$${pnl.toFixed(4)}`);
+      addLog(`FORCE SELL ${pos.symbol} @ ${wsPrice.toFixed(4)} USDT · P&L ${pnl>=0?'+':''}${pnl.toFixed(4)} USDT`);
+      toast[pnl >= 0 ? 'success' : 'error'](`Force SELL: ${pos.symbol.replace('USDT','')} ${pnl>=0?'+':''}${pnl.toFixed(4)} USDT`);
       await loadData();
     } finally { setForcingSell(null); }
   }, [addLog, loadData]);
@@ -419,7 +419,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     ]);
     setTrades([]); setPositions([]); setBalance(totalBudget);
     setIsRunning(false); setCycleCountdown(0); setActLog([]);
-    toast.success(`Reset · $${totalBudget.toLocaleString()} USDT restored`);
+    toast.success(`Reset · ${totalBudget.toLocaleString()} USDT restored`);
   };
 
   // ── Computed stats ───────────────────────────────────────────────────────
@@ -499,7 +499,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             {PRESET_BUDGETS.map(p => (
               <button key={p} onClick={() => { if (!isRunning) setTotalBudget(p); }} disabled={isRunning}
                 className={`text-[10px] px-2 py-1 rounded font-mono transition-colors disabled:opacity-50 ${totalBudget===p?'bg-accent text-accent-foreground':'bg-muted/50 text-muted-foreground hover:text-foreground'}`}>
-                ${p.toLocaleString()}
+                {p.toLocaleString()} USDT
               </button>
             ))}
             <button onClick={() => { setBudgetDraft(String(totalBudget)); setEditingBudget(true); }} disabled={isRunning}
@@ -538,8 +538,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       {/* ── Stats ── */}
       <div className="grid grid-cols-4 gap-1.5">
         {[
-          { label: 'Balance', value: `$${balance.toFixed(2)}`, color: '' },
-          { label: 'Net P&L', value: `${totalPnl>=0?'+':''}$${Math.abs(totalPnl).toFixed(2)}`, color: pnlColor },
+          { label: 'Balance', value: `${balance.toFixed(2)} USDT`, color: '' },
+          { label: 'Net P&L', value: `${totalPnl>=0?'+':''}${Math.abs(totalPnl).toFixed(2)} USDT`, color: pnlColor },
           { label: 'Return', value: `${totalPnl>=0?'+':''}${pnlPct}%`, color: pnlColor },
           { label: 'Win Rate', value: sellTrades.length ? `${winRate}%` : '—', color: winRate>=50?'text-gain':sellTrades.length?'text-loss':'' },
         ].map(s => (
@@ -586,7 +586,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       {sig.signal==='loading'?'…':sig.signal}
                     </span>
                   </div>
-                  <div className="text-xs font-mono">{wsP > 1 ? `$${wsP.toLocaleString('en-US',{maximumFractionDigits:2})}` : `$${wsP.toFixed(5)}`}</div>
+                  <div className="text-xs font-mono">{wsP > 1 ? `${wsP.toLocaleString('en-US',{maximumFractionDigits:2})} USDT` : `${wsP.toFixed(5)} USDT`}</div>
                   {/* 4 signal dots */}
                   <div className="flex gap-0.5">
                     {([['EMA',sig.emaBullish],['RSI',sig.rsiOk],['MACD',sig.macdPos],['Vol',sig.volUp]] as [string,boolean][]).map(([label,on])=>(
@@ -634,7 +634,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       <span className={`text-xs font-mono font-bold ${pct>=0?'text-gain':'text-loss'}`}>{pct>=0?'+':''}{pct.toFixed(3)}%</span>
                     </div>
                     <div className="flex items-center gap-2">
-                      <span className={`font-mono text-xs font-bold ${uPnl>=0?'text-gain':'text-loss'}`}>{uPnl>=0?'+':''}${uPnl.toFixed(4)}</span>
+                      <span className={`font-mono text-xs font-bold ${uPnl>=0?'text-gain':'text-loss'}`}>{uPnl>=0?'+':''}{uPnl.toFixed(4)} USDT</span>
                       <button onClick={() => forceSell(pos)} disabled={!!forcingSell}
                         className="text-[10px] px-2 py-1 rounded bg-loss/10 hover:bg-loss/20 text-loss font-semibold disabled:opacity-40 flex items-center gap-1">
                         <Banknote className="w-2.5 h-2.5"/>{forcingSell===pos.symbol?'…':'Sell'}
@@ -642,7 +642,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                     </div>
                   </div>
                   <div className="text-[10px] text-muted-foreground font-mono">
-                    Entry ${pos.avg_entry_price.toFixed(4)} · BEP ${bep.toFixed(4)} · Now ${live.toFixed(4)}
+                    Entry {pos.avg_entry_price.toFixed(4)} USDT · BEP {bep.toFixed(4)} USDT · Now {live.toFixed(4)} USDT
                   </div>
                   <div className="space-y-1">
                     <div className="flex justify-between text-[9px]">
@@ -670,7 +670,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           {sellTrades.length > 0 && (
             <div className="flex items-center gap-3 text-[10px] font-mono">
               <span className="text-muted-foreground">{wins}W/{sellTrades.length-wins}L</span>
-              <span className={pnlColor}>{totalPnl>=0?'+':''}${totalPnl.toFixed(4)}</span>
+              <span className={pnlColor}>{totalPnl>=0?'+':''}{totalPnl.toFixed(4)} USDT</span>
             </div>
           )}
         </div>
@@ -691,10 +691,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                     {isBuy?<TrendingUp className="w-3 h-3 text-accent shrink-0"/>:win?<TrendingUp className="w-3 h-3 text-gain shrink-0"/>:<TrendingDown className="w-3 h-3 text-loss shrink-0"/>}
                     <span className={`text-[9px] font-bold px-1 py-0.5 rounded shrink-0 ${isBuy?'bg-accent/20 text-accent':win?'bg-gain/20 text-gain':'bg-loss/20 text-loss'}`}>{t.side}</span>
                     <span className="font-mono font-semibold shrink-0">{t.symbol.replace('USDT','')}</span>
-                    <span className="text-muted-foreground font-mono text-[10px] truncate">${Number(t.price).toLocaleString('en-US',{maximumFractionDigits:4})}</span>
+                    <span className="text-muted-foreground font-mono text-[10px] truncate">{Number(t.price).toLocaleString('en-US',{maximumFractionDigits:4})} USDT</span>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
-                    {t.pnl!==null && <span className={`font-mono font-bold text-[10px] ${t.pnl>=0?'text-gain':'text-loss'}`}>{t.pnl>=0?'+':''}${t.pnl.toFixed(4)}</span>}
+                    {t.pnl!==null && <span className={`font-mono font-bold text-[10px] ${t.pnl>=0?'text-gain':'text-loss'}`}>{t.pnl>=0?'+':''}{t.pnl.toFixed(4)} USDT</span>}
                     <span className="text-muted-foreground text-[9px] font-mono">{new Date(t.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>
                   </div>
                 </div>

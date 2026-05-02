@@ -14,12 +14,19 @@ from typing import Optional
 import uvicorn
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 import config
 import database
 from connection import get_mode
 
 app = FastAPI(title="Trading Bot Control API", version="1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -145,6 +152,31 @@ def set_budget(amount: float):
     with open(config.STRATEGY_FILE, "w") as f:
         json.dump(s, f, indent=2)
     return {"ok": True, "new_budget": amount}
+
+
+@app.get("/config")
+def get_config():
+    strategy = _load_strategy()
+    return {
+        "budget_mode":           strategy.get("budget_mode",           config.BUDGET_MODE),
+        "budget_fixed_usdt":     strategy.get("budget_fixed_usdt",     config.BUDGET_FIXED_USDT),
+        "budget_pct_of_free":    strategy.get("budget_pct_of_free",    config.BUDGET_PCT_OF_FREE),
+        "budget_total_cap_usdt": strategy.get("budget_total_cap_usdt", config.BUDGET_TOTAL_CAP_USDT),
+        "budget_per_coin":       strategy.get("budget_per_coin",       config.BUDGET_PER_COIN),
+    }
+
+
+@app.post("/config")
+def update_config(body: dict):
+    allowed_keys = {
+        "budget_mode", "budget_fixed_usdt", "budget_pct_of_free",
+        "budget_total_cap_usdt", "budget_per_coin",
+    }
+    patch = {k: v for k, v in body.items() if k in allowed_keys}
+    if not patch:
+        return {"error": "No valid config keys provided"}
+    _write_strategy_patch(patch)
+    return {"ok": True, "updated": list(patch.keys()), "config": patch}
 
 
 @app.post("/mode/{mode}")

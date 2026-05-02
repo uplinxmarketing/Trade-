@@ -37,6 +37,60 @@ _breakeven_mult = 1.0 + _fee_rate + _fee_rate   # 1.0015 with BNB, 1.002 without
 _cooldowns: dict = {}  # symbol -> unix timestamp when cooldown expires
 
 
+# ── Balance guard + budget helpers ───────────────────────────────────────────
+
+def can_execute_buy(coin_cfg: dict, positions: list, client) -> tuple[bool, str]:
+    """Final pre-buy safety guard. Fetches live account balance to verify funds."""
+    budget = coin_cfg.get("budget_usdt", config.BUDGET_FIXED_USDT)
+    try:
+        account = client.get_account()
+        balances = {b["asset"]: float(b["free"]) for b in account["balances"]}
+        usdt_free = balances.get("USDT", 0.0)
+    except Exception as e:
+        return False, f"Cannot fetch account: {e}"
+
+    if usdt_free < budget * 1.002:
+        return False, f"Insufficient USDT: have {usdt_free:.2f}, need {budget * 1.002:.2f}"
+
+    sym = coin_cfg["symbol"]
+    open_this_coin = [p for p in positions if p["symbol"] == sym]
+    max_concurrent = int(coin_cfg.get("max_concurrent", 1))
+    if len(open_this_coin) >= max_concurrent:
+        return False, f"Max concurrent for {sym} reached ({max_concurrent})"
+
+    if len(positions) >= config.MAX_OPEN_POSITIONS:
+        return False, "Global max positions reached"
+
+    return True, ""
+
+
+def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
+    """Return trade size in USDT based on BUDGET_MODE (config defaults or strategy.json overrides)."""
+    strategy = _load_strategy()
+    mode = strategy.get("budget_mode", config.BUDGET_MODE)
+
+    if mode == "fixed":
+        return float(strategy.get("budget_fixed_usdt", config.BUDGET_FIXED_USDT))
+
+    elif mode == "percent":
+        pct = float(strategy.get("budget_pct_of_free", config.BUDGET_PCT_OF_FREE))
+        return round(free_usdt * (pct / 100), 2)
+
+    elif mode == "capped":
+        cap = float(strategy.get("budget_total_cap_usdt", config.BUDGET_TOTAL_CAP_USDT))
+        with _positions_lock:
+            total_in_positions = sum(p["budget_usdt"] for p in _positions)
+        remaining_cap = cap - total_in_positions
+        per_trade = cap / config.MAX_OPEN_POSITIONS
+        return min(per_trade, max(0.0, remaining_cap))
+
+    elif mode == "per_coin":
+        per_coin = strategy.get("budget_per_coin", config.BUDGET_PER_COIN)
+        return float(per_coin.get(symbol, config.BUDGET_FIXED_USDT))
+
+    return config.BUDGET_FIXED_USDT
+
+
 # ── Cooldown helpers ──────────────────────────────────────────────────────────
 
 def _set_cooldown(symbol: str):
@@ -287,8 +341,8 @@ async def _run_signal_scan(prices: dict):
         if global_open >= global_max:
             break
 
-        budget = float(coin_cfg.get("budget_usdt", config.BUDGET_PER_TRADE_USDT))
-        if usdt_balance < budget:
+        budget = get_budget_for_coin(sym, usdt_balance)
+        if budget <= 0:
             continue
 
         # Fetch 1m klines via REST
@@ -370,6 +424,15 @@ async def _run_signal_scan(prices: dict):
                 entry_vol = last.get("volume_trend")
         except Exception:
             pass
+
+        # Final pre-buy guard (live balance check + concurrent cap + global cap)
+        with _positions_lock:
+            snapshot_now = list(_positions)
+        buy_cfg = {**coin_cfg, "symbol": sym, "budget_usdt": budget}
+        allowed, reason = can_execute_buy(buy_cfg, snapshot_now, client)
+        if not allowed:
+            print(f"[SKIP] {sym}: {reason}")
+            continue
 
         try:
             result = client.order_market_buy(symbol=sym, quoteOrderQty=budget)

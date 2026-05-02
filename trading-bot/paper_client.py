@@ -46,7 +46,10 @@ class PaperClient:
 
     def _set_balance(self, asset: str, amount: float):
         with self._lock:
-            self._balances[asset] = max(0.0, amount)
+            if amount <= 0:
+                self._balances.pop(asset, None)
+            else:
+                self._balances[asset] = amount
         database.save_paper_state(dict(self._balances))
 
     # ── Account ─────────────────────────────────────────────────────────────
