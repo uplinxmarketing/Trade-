@@ -105,6 +105,13 @@ def init_db():
                 timestamp   TEXT,
                 mode        TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+                message   TEXT NOT NULL,
+                level     TEXT NOT NULL DEFAULT 'info'
+            );
         """)
         conn.commit()
         conn.close()
@@ -334,3 +341,46 @@ def candles_table_empty() -> bool:
         row = conn.execute("SELECT COUNT(*) AS cnt FROM candles").fetchone()
         conn.close()
     return row["cnt"] == 0
+
+
+def log_activity(message: str, level: str = "info"):
+    with _lock:
+        conn = _conn()
+        conn.execute(
+            "INSERT INTO activity_log (message, level) VALUES (?, ?)",
+            (message, level),
+        )
+        conn.commit()
+        conn.close()
+
+
+def get_activity_log(limit: int = 100) -> List[dict]:
+    with _lock:
+        conn = _conn()
+        rows = conn.execute(
+            "SELECT timestamp, message, level FROM activity_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        conn.close()
+    return [{"timestamp": r["timestamp"], "message": r["message"], "level": r["level"]} for r in rows]
+
+
+def get_trades_today_count() -> int:
+    with _lock:
+        conn = _conn()
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM trades WHERE date(timestamp_sell) = date('now')"
+        ).fetchone()
+        conn.close()
+    return row["cnt"] if row else 0
+
+
+def get_win_rate_overall() -> float:
+    with _lock:
+        conn = _conn()
+        total = conn.execute("SELECT COUNT(*) AS cnt FROM trades WHERE exit_price IS NOT NULL").fetchone()
+        wins  = conn.execute("SELECT COUNT(*) AS cnt FROM trades WHERE profitable = 1").fetchone()
+        conn.close()
+    if not total or total["cnt"] == 0:
+        return 0.0
+    return round(wins["cnt"] / total["cnt"], 3)

@@ -458,10 +458,50 @@ def dashboard():
 
 # ── Start as daemon thread ────────────────────────────────────────────────────
 
+@app.get("/api/status")
+def api_status():
+    strategy = _load_strategy()
+    return {
+        "running":       strategy.get("trading_active", False),
+        "mode":          get_mode(),
+        "balance_usdt":  round(_get_usdt_balance(), 2),
+        "open_positions": len(_get_positions()),
+        "trades_today":  database.get_trades_today_count(),
+        "win_rate":      database.get_win_rate_overall(),
+    }
+
+
+@app.get("/api/positions")
+def api_positions():
+    return {"positions": _get_positions()}
+
+
+@app.get("/api/trades")
+def api_trades():
+    return {"trades": database.get_recent_trades(limit=100)}
+
+
+@app.get("/api/activity")
+def api_activity():
+    return {"entries": database.get_activity_log(limit=100)}
+
+
+@app.post("/api/agent/start")
+def api_agent_start():
+    _write_strategy_patch({"trading_active": True, "pause_reason": None})
+    return {"ok": True, "running": True}
+
+
+@app.post("/api/agent/stop")
+def api_agent_stop():
+    _write_strategy_patch({"trading_active": False, "pause_reason": "Stopped via API"})
+    return {"ok": True, "running": False}
+
+
 def start_control_api():
-    t = threading.Thread(
-        target=lambda: uvicorn.run(app, host="0.0.0.0", port=8000, log_level="error"),
-        daemon=True,
-    )
+    port = int(os.environ.get("PORT", 8000))
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+    t = threading.Thread(target=server.run, daemon=True)
     t.start()
-    print("[ControlAPI] Dashboard running at http://localhost:8000")
+    print(f"[ControlAPI] Dashboard running on port {port}")
