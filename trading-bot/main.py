@@ -29,8 +29,8 @@ def main():
     _ensure_env()
 
     # 1. Initialise database FIRST — before any other import that touches SQLite.
-    #    `import data_collector` triggers connection.py → PaperClient.__init__()
-    #    → database.load_paper_state(), which crashes if tables don't exist yet.
+    #    Importing data_collector triggers connection.py → PaperClient → load_paper_state(),
+    #    which will crash with "no such table" if init_db() hasn't run yet.
     import database
     database.init_db()
 
@@ -40,8 +40,8 @@ def main():
     import control_api
     from connection import get_mode
 
-    # 2. Always regenerate strategy.json so config.py changes (coin list, thresholds)
-    #    take effect on every restart. trading_active state is preserved internally.
+    # 2. Always regenerate strategy.json so config.py changes take effect.
+    #    trading_active defaults to True (always active after restart).
     strategy_engine.write_default_strategy()
 
     # 3. Restore open positions from DB (crash recovery)
@@ -53,7 +53,7 @@ def main():
     # 5. Download candle history (skipped if already loaded)
     data_collector.download_history()
 
-    # 6. Register trade engine callbacks
+    # 6. Register callbacks
     #    price callback  → real-time exits AND buy-cache checks on every tick
     #    kline callback  → update signal cache on every 1-minute candle close
     data_collector.register_price_callback(trade_engine.realtime_monitor)

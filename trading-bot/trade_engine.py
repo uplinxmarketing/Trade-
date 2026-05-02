@@ -23,8 +23,6 @@ import threading
 from datetime import datetime
 from typing import Dict, List, Optional
 
-import aiohttp
-
 import config
 import database
 import indicators
@@ -38,15 +36,14 @@ _strategy_mtime: float = 0.0
 _strategy_cache: dict = {}
 
 _fee_rate = config.FEE_RATE_BNB if config.BNB_FEE_MODE else config.FEE_RATE_STANDARD
-_breakeven_mult = 1.0 + _fee_rate + _fee_rate   # 1.0015 with BNB, 1.002 without
+_breakeven_mult = 1.0 + _fee_rate + _fee_rate
 
-_cooldowns: dict = {}  # symbol -> unix timestamp when cooldown expires
+_cooldowns: dict = {}
 
 # ── Real-time signal cache — updated on every kline close ────────────────────
-# Maps symbol → {"signals": dict, "score": int, "price": float}
 _signal_cache: Dict[str, dict] = {}
 _signal_cache_lock = threading.Lock()
-_last_buy_check: float = 0.0   # throttle: don't call get_account() on every tick
+_last_buy_check: float = 0.0
 
 
 # ── Balance guard + budget helpers ───────────────────────────────────────────
@@ -233,28 +230,28 @@ def evaluate_signals(closes: list, volumes: list) -> dict:
         rsi_vals[-2] is not None
         and config.RSI_BUY_MIN <= rsi_vals[-2] <= config.RSI_BUY_MAX
     )
+    # MACD: histogram positive (matches frontend).
+    # Previously required histo[-2] > histo[-3] (rising), which silently blocked
+    # buys whenever histogram was positive but flattening.
     macd = bool(
         histo[-2] is not None
-        and histo[-3] is not None
         and histo[-2] > 0
-        and histo[-2] > histo[-3]
     )
+    # Volume: ratio check OR recent-period increase (matches frontend dual condition).
+    recent_vol = sum(volumes[-10:]) if len(volumes) >= 10 else 0
+    prev_vol   = sum(volumes[-20:-10]) if len(volumes) >= 20 else 0
     volume = bool(
-        volumes[-2] is not None
-        and vol_ma[-2] is not None
-        and volumes[-2] > vol_ma[-2] * config.VOLUME_RATIO_MIN
+        (volumes[-2] is not None
+         and vol_ma[-2] is not None
+         and volumes[-2] > vol_ma[-2] * config.VOLUME_RATIO_MIN)
+        or (recent_vol > 0 and prev_vol > 0 and recent_vol > prev_vol)
     )
 
     return {"trend": trend, "rsi": rsi, "macd": macd, "volume": volume}
 
 
 def update_coin_signals(symbol: str, closes: list, volumes: list):
-    """
-    Update the in-memory signal cache for one coin.
-    Called by data_collector on every 1-minute kline close (WebSocket-driven)
-    and by signal_scanner every SCAN_INTERVAL_SEC as a REST-backup.
-    Requires at least 27 candles; silently skips if fewer.
-    """
+    """Update the signal cache on every kline close (WebSocket-driven)."""
     if len(closes) < 27:
         return
     try:
@@ -360,6 +357,16 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     if not any_ready:
         if cache_size == 0:
             database.log_activity("Buy check: signal cache empty — waiting for first scan", "info")
+        else:
+            # Log scores so the user can see why no coin qualified
+            with _signal_cache_lock:
+                scores = {s: v["score"] for s, v in _signal_cache.items()}
+            top = sorted(scores.items(), key=lambda x: -x[1])[:5]
+            summary = " | ".join(f"{s}={sc}" for s, sc in top)
+            database.log_activity(
+                f"Buy check: cache={cache_size} coins, none at score≥{config.MIN_SIGNALS_TO_BUY} "
+                f"(top5: {summary})", "info"
+            )
         return
 
     # Throttle: don't call get_account() faster than every 3 s
@@ -370,6 +377,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
     strategy = _load_strategy()
     if not strategy.get("trading_active", True):
+        database.log_activity("Buy check: trading_active=False — bot is paused", "warn")
         return
 
     approved = {
@@ -377,18 +385,33 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         for c in strategy.get("approved_coins", [])
         if c.get("approved")
     }
+    if not approved:
+        database.log_activity("Buy check: no approved coins in strategy.json", "warn")
+        return
+
     global_max = strategy.get("global_max_positions", config.MAX_OPEN_POSITIONS)
 
     with _positions_lock:
-        if len(_positions) >= global_max:
-            return
+        open_count = len(_positions)
+    if open_count >= global_max:
+        database.log_activity(
+            f"Buy check: at max positions ({open_count}/{global_max})", "info"
+        )
+        return
 
     usdt_balance = _get_usdt_balance()
     ts_now = datetime.utcnow().isoformat()
     mode   = get_mode()
 
+    # Log a readable snapshot so the activity log always shows what's happening
     with _signal_cache_lock:
         cache_snapshot = dict(_signal_cache)
+    ready_syms = [s for s, v in cache_snapshot.items() if v["score"] >= config.MIN_SIGNALS_TO_BUY and s in approved]
+    database.log_activity(
+        f"Buy scan: USDT={usdt_balance:.2f} | {len(ready_syms)} coin(s) ready: "
+        + (", ".join(f"{s}(score={cache_snapshot[s]['score']})" for s in ready_syms[:6]) or "none"),
+        "info"
+    )
 
     for sym, cached in cache_snapshot.items():
         if sym not in approved:
@@ -396,21 +419,26 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         if cached["score"] < config.MIN_SIGNALS_TO_BUY:
             continue
         if _in_cooldown(sym):
+            database.log_activity(f"{sym}: buy skipped — in cooldown", "info")
             continue
 
         with _positions_lock:
             already_held = any(p["symbol"] == sym for p in _positions)
             global_open  = len(_positions)
 
-        if already_held or global_open >= global_max:
+        if already_held:
             continue
+        if global_open >= global_max:
+            break
 
         budget = get_budget_for_coin(sym, usdt_balance)
         if budget <= 0:
+            database.log_activity(f"{sym}: buy skipped — budget=0 (mode={mode}, usdt={usdt_balance:.2f})", "warn")
             continue
 
         price = prices.get(sym) or cached["price"]
         if not price:
+            database.log_activity(f"{sym}: buy skipped — no price available", "warn")
             continue
 
         client.update_price(sym, price)
@@ -487,8 +515,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 def realtime_monitor(prices: Dict[str, float]):
     """
     Synchronous. Called by data_collector on EVERY WebSocket 'trade' event.
-    Handles both exits (take-profit / stop-loss) and entries (via signal cache).
-    Both are purely in-memory — no kline fetches on the hot path.
+    Handles both stop-loss/take-profit exits AND buy entry (via signal cache).
     """
     with _positions_lock:
         snapshot = list(_positions)
@@ -509,11 +536,11 @@ def realtime_monitor(prices: Dict[str, float]):
             _execute_sell(pos, price, "stop-loss")
             _set_cooldown(sym)
 
-    # Real-time buy check — throttled, reads from signal cache only
+    # Real-time buy check — reads signal cache, zero network I/O
     _check_buys_from_cache(prices)
 
 
-# ── Process 2: signal scanner (async, runs every SCAN_INTERVAL_SEC) ──────────
+# ── Process 2: signal scanner (async, refreshes cache every SCAN_INTERVAL_SEC) ─
 
 async def signal_scanner(prices: dict):
     """
@@ -539,8 +566,9 @@ _KLINE_BASES = [
 ]
 
 
-async def _fetch_klines(session: aiohttp.ClientSession, sym: str) -> list:
+async def _fetch_klines(session, sym: str) -> list:
     """Try each Binance base URL to work around regional geo-blocks (HTTP 451)."""
+    import aiohttp
     last_exc: Exception = RuntimeError("No Binance bases configured")
     for base in _KLINE_BASES:
         url = f"{base}/api/v3/klines?symbol={sym}&interval=1m&limit=50"
@@ -555,10 +583,11 @@ async def _fetch_klines(session: aiohttp.ClientSession, sym: str) -> list:
 
 async def _refresh_signal_cache():
     """
-    Refresh the in-memory signal cache. Processes all coins CONCURRENTLY (asyncio.gather)
-    so 30 coins take max(individual) time instead of sum — ~3 s instead of 3+ min.
-    Never executes trades — buy execution is in realtime_monitor.
+    Refresh the in-memory signal cache concurrently (asyncio.gather).
+    Falls back to DB candles if REST is geo-blocked.
+    Never executes trades.
     """
+    import aiohttp
     strategy = _load_strategy()
     if not strategy:
         return
@@ -571,14 +600,13 @@ async def _refresh_signal_cache():
     if not approved_coins:
         return
 
-    async def _refresh_one(session: aiohttp.ClientSession, sym: str) -> bool:
+    async def _refresh_one(session, sym: str) -> bool:
         closes = volumes = None
         try:
-            raw    = await _fetch_klines(session, sym)
+            raw     = await _fetch_klines(session, sym)
             closes  = [float(k[4]) for k in raw]
             volumes = [float(k[5]) for k in raw]
         except Exception:
-            # REST failed (geo-block / timeout) — fall back to DB candles
             db_rows = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=50)
             if len(db_rows) >= 27:
                 closes  = [float(c["close"])  for c in db_rows]
@@ -597,12 +625,9 @@ async def _refresh_signal_cache():
 
     updated = sum(1 for r in results if r is True)
     with _signal_cache_lock:
-        buy_sigs   = [(sym, v["score"]) for sym, v in _signal_cache.items() if v["score"] >= config.MIN_SIGNALS_TO_BUY]
-        total_cached = len(_signal_cache)
-
-    ready_str = ", ".join(f"{s}({sc}/4)" for s, sc in buy_sigs[:8])
+        ready = sum(1 for v in _signal_cache.values() if v["score"] >= config.MIN_SIGNALS_TO_BUY)
     database.log_activity(
-        f"Signal cache refreshed: {updated}/{len(approved_coins)} coins updated | "
-        f"{len(buy_sigs)} BUY signals: {ready_str or 'none'}",
+        f"Signal cache refreshed: {updated}/{len(approved_coins)} coins updated, "
+        f"{ready} at score≥{config.MIN_SIGNALS_TO_BUY}",
         "info",
     )

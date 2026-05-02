@@ -36,8 +36,6 @@ def register_kline_callback(cb: Callable[[str, list, list], None]):
 
 # ── REST historical download ─────────────────────────────────────────────────
 
-# Binance has several base URLs. api.binance.com returns HTTP 451 (geo-block)
-# from Railway's US servers; the numbered subdomains are often not restricted.
 _BINANCE_BASES = [
     "https://api.binance.com",
     "https://api1.binance.com",
@@ -57,7 +55,7 @@ def _fetch_klines_rest(symbol: str, interval: str, limit: int = 500):
                 return json.loads(resp.read())
         except Exception as e:
             last_err = e
-    raise last_err  # all bases failed
+    raise last_err
 
 
 def _compute_and_save(symbol: str, raw_klines: list):
@@ -187,7 +185,7 @@ async def start_websocket():
                                 ]]
                                 _compute_and_save(sym, all_raw)
 
-                                # Notify trade_engine so the signal cache is updated
+                                # Notify trade_engine so signal cache is updated
                                 # immediately on kline close — enables real-time buys.
                                 if _kline_callback and len(all_raw) >= 27:
                                     closes  = [float(r[4]) for r in all_raw]

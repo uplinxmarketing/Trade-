@@ -16,7 +16,6 @@ import uvicorn
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
 import config
 import database
@@ -448,7 +447,7 @@ def api_wallet():
         total_usdt = sum(
             b["free"] for b in balances if b["asset"] == "USDT"
         )
-        return {"balances": balances, "total_usdt": total_usdt, "mode": get_mode()}
+        return {"balances": balances, "total_usdt": total_usdt, "mode": "paper"}
     except Exception as e:
         return {"balances": [], "total_usdt": 0.0, "mode": "paper", "error": str(e)}
 
@@ -575,6 +574,26 @@ def api_agent_stop():
     return {"ok": True, "running": False}
 
 
+@app.post("/api/force-sell/{symbol}")
+def api_force_sell(symbol: str):
+    """Immediately sell an open position by symbol (case-insensitive)."""
+    sym = symbol.upper()
+    try:
+        from trade_engine import get_open_positions, _execute_sell
+        from data_collector import prices as live_prices
+        pos_list = get_open_positions()
+        pos = next((p for p in pos_list if p["symbol"] == sym), None)
+        if pos is None:
+            return {"ok": False, "error": f"No open position for {sym}"}
+        price = live_prices.get(sym, 0) or pos.get("entry_price", 0)
+        if not price:
+            return {"ok": False, "error": f"No live price for {sym}"}
+        _execute_sell(pos, price, "force-sell")
+        return {"ok": True, "symbol": sym, "price": price}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 class ModeRequest(BaseModel):
     mode: str           # "paper" or "live"
     api_key: str = ""
@@ -625,9 +644,9 @@ def api_set_mode(req: ModeRequest):
 
 
 def start_control_api():
-    port = int(os.environ.get("PORT", 8000))
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
-    server = uvicorn.Server(config)
-    t = threading.Thread(target=server.run, daemon=True)
+    t = threading.Thread(
+        target=lambda: uvicorn.run(app, host="0.0.0.0", port=8000, log_level="error"),
+        daemon=True,
+    )
     t.start()
-    print(f"[ControlAPI] Dashboard running on port {port}")
+    print("[ControlAPI] Dashboard running at http://localhost:8000")

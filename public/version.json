@@ -1,5 +1,5 @@
 {
-  "version": "3.5.32",
-  "buildTime": "2026-05-03T06:00:00Z",
-  "commit": "fix-tdz-crash-seedbuffers-ref"
+  "version": "3.5.33",
+  "buildTime": "2026-05-03T07:00:00Z",
+  "commit": "fix-trades-positions-panel-forcesell"
 }

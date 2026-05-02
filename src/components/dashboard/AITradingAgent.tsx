@@ -3,24 +3,14 @@ import {
   Play, Square, Brain, TrendingUp, TrendingDown, Zap,
   RotateCcw, ChevronDown, ChevronUp, FlaskConical,
   Pencil, Check, X, BookOpen, Activity,
-  ShoppingCart, Banknote, RefreshCw, Settings2, Plus, Minus,
+  ShoppingCart, Banknote, RefreshCw,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
-import { TAKER_FEE } from '@/lib/trading-engine';
+import { checkExits, TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
 import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcSMA } from '@/lib/indicators';
-import { API_BASE } from '@/config';
-
-// ── All coins available for the bot to trade ─────────────────────────────────
-const ALL_TRADABLE_COINS = [
-  'BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','DOGEUSDT','XRPUSDT',
-  'ADAUSDT','AVAXUSDT','DOTUSDT','LINKUSDT','MATICUSDT','UNIUSDT',
-  'LTCUSDT','ATOMUSDT','SHIBUSDT','ARBUSDT','OPUSDT','INJUSDT',
-  'FETUSDT','NEARUSDT','TRXUSDT','TONUSDT','APTUSDT','SUIUSDT',
-  'PEPEUSDT','WIFUSDT','BONKUSDT','JUPUSDT','RENDERUSDT','TIAUSDT',
-];
 
 // ── Simple 4-signal analyser (no API key, Binance public data only) ──────────
 const BIN = 'https://api.binance.com/api/v3';
@@ -47,9 +37,10 @@ function getAllocation(runBal: number, symbol: string): number {
   }
 }
 
-// RSI thresholds — match config.py: RSI_BUY_MIN=35, RSI_BUY_MAX=70
-const RSI_BUY_MIN = 35;
-const RSI_BUY_MAX = 70;
+// RSI thresholds — match config.py: RSI_BUY_MIN=40, RSI_BUY_MAX=65
+// RSI 65 passes (<=), RSI 66 fails (>)
+const RSI_BUY_MIN = 40;
+const RSI_BUY_MAX = 65;
 
 // evaluateSignals: returns exactly {trend, rsi, macd, volume} — all booleans.
 // This is the single authoritative source of truth for signal evaluation.
@@ -70,7 +61,7 @@ function evaluateSignals(closes: number[], volumes: number[]): {
 
   return {
     trend:  ema9 > ema21,
-    // RSI_BUY_MIN <= rsi <= RSI_BUY_MAX — matches config.py
+    // RSI_BUY_MIN <= rsi <= RSI_BUY_MAX (both constants — RSI 65 passes, 66 fails)
     rsi:    rsiVal >= RSI_BUY_MIN && rsiVal <= RSI_BUY_MAX,
     macd:   macd.histogram > 0,
     volume: volRat > 1.05 || recentVol > prevVol,
@@ -89,24 +80,65 @@ interface CoinSignal {
   reason: string;
 }
 
-// Fetch raw 60-candle buffer for one coin — called once on agent start to seed the WebSocket buffer.
-async function fetchKlineBuffer(sym: string): Promise<{ closes: number[]; volumes: number[] } | null> {
+// Fetch one coin sequentially — avoids Binance rate-limit on parallel bulk requests.
+// Uses klines only (no depth endpoint) to halve the request count.
+async function analyseCoin(sym: string): Promise<CoinSignal> {
   const ctrl = new AbortController();
   const timeout = setTimeout(() => ctrl.abort(), 8000);
   try {
-    const res = await fetch(`${BIN}/klines?symbol=${sym}&interval=1m&limit=60`, { signal: ctrl.signal });
+    const res = await fetch(
+      `${BIN}/klines?symbol=${sym}&interval=1m&limit=60`,
+      { signal: ctrl.signal }
+    );
     clearTimeout(timeout);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const klines = await res.json();
     if (!Array.isArray(klines) || klines.length < 30) throw new Error('insufficient data');
+
+    const closes  = klines.map((k: any[]) => parseFloat(k[4]));
+    const volumes = klines.map((k: any[]) => parseFloat(k[5]));
+    const price   = closes[closes.length - 1];
+
+    // Delegate to evaluateSignals — single source of truth for all 4 signals
+    const sigs  = evaluateSignals(closes, volumes);
+    const score = Object.values(sigs).filter(Boolean).length; // all 4 keys counted
+    const rsi   = calcRSI(closes, 14);
+    const volSma = calcSMA(volumes, 20);
+    const curVol = volumes[volumes.length - 1] ?? 0;
+    const volRat = volSma > 0 ? curVol / volSma : 1;
+
+    // BUY only if bullish_count >= 3 — no bypass conditions
+    const isBuy  = score >= 3;
+    const isHold = rsi >= 72 || rsi < 24;
+
+    const parts: string[] = [];
+    parts.push(sigs.trend ? 'EMA↑' : 'EMA↓');
+    parts.push(`RSI ${rsi.toFixed(0)}`);
+    parts.push(sigs.macd ? 'MACD+' : 'MACD-');
+    if (sigs.volume) parts.push(`Vol ${volRat.toFixed(1)}×`);
+
     return {
-      closes:  klines.map((k: any[]) => parseFloat(k[4])),
-      volumes: klines.map((k: any[]) => parseFloat(k[5])),
+      symbol: sym, price, rsi,
+      emaBullish: sigs.trend, rsiOk: sigs.rsi, macdPos: sigs.macd, volUp: sigs.volume,
+      signal: isHold ? 'HOLD' : isBuy ? 'BUY' : 'HOLD',
+      reason: parts.join(' · '),
     };
-  } catch {
+  } catch (e: any) {
     clearTimeout(timeout);
-    return null;
+    return { symbol: sym, price: 0, rsi: 50, emaBullish: false, rsiOk: false, macdPos: false, volUp: false, signal: 'error', reason: e.message ?? 'Fetch failed' };
   }
+}
+
+// Sequential fetch with 300 ms gap to stay well inside Binance rate limits.
+async function analyseAll(symbols: string[]): Promise<CoinSignal[]> {
+  const results: CoinSignal[] = [];
+  for (const sym of symbols) {
+    results.push(await analyseCoin(sym));
+    if (symbols.indexOf(sym) < symbols.length - 1) {
+      await new Promise(r => setTimeout(r, 300));
+    }
+  }
+  return results;
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -132,15 +164,15 @@ interface AITradingAgentProps {
   prices: LivePrices;
   binanceConnected?: boolean;
   onConnectBinance?: () => void;
-  onStateChange?: (positions: {symbol:string;quantity:number;avg_entry_price:number}[], balance: number, initialBalance?: number, trades?: {side:'BUY'|'SELL';pnl:number|null;quantity:number;price:number}[]) => void;
-  onCoinsChange?: (coins: string[]) => void;
+  onStateChange?: (positions: {symbol:string;quantity:number;avg_entry_price:number}[], balance: number) => void;
 }
 
 const INSTRUCTIONS_KEY = 'ai_agent_instructions';
+const AGENT_CYCLE_MS   = 30_000;
 const BEP_MULT         = 1 / Math.pow(1 - TAKER_FEE, 2);
 
 // ── Component ────────────────────────────────────────────────────────────────
-const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onStateChange, onCoinsChange }: AITradingAgentProps) => {
+const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onStateChange }: AITradingAgentProps) => {
   const [mode, setMode]           = useState<'test' | 'live'>('test');
   const [isRunning, setIsRunning] = useState(false);
   const [loading, setLoading]     = useState(false);
@@ -149,6 +181,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [positions, setPositions] = useState<OpenPosition[]>([]);
   const [trades, setTrades]       = useState<TradeRow[]>([]);
   const [coinSignals, setCoinSignals] = useState<CoinSignal[]>([]);
+  const [cycleCountdown, setCycleCountdown] = useState(0);
   const [agentStatus, setAgentStatus]       = useState('');
   const [scanning, setScanning]   = useState(false);
   const [showAll, setShowAll]     = useState(false);
@@ -158,88 +191,22 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [editingInstr, setEditingInstr]   = useState(false);
   const [instrDraft, setInstrDraft]       = useState('');
   const [actLog, setActLog]       = useState<string[]>([]);
-  const [showLog, setShowLog]     = useState(true);
+  const [showLog, setShowLog]     = useState(false);
 
-  // ── Railway server mode ──────────────────────────────────────────────────
-  const RAILWAY_URL_KEY = 'railway_bot_url';
-  const [railwayUrl, setRailwayUrl] = useState<string>(() => {
-    if (API_BASE) return API_BASE;
-    return localStorage.getItem(RAILWAY_URL_KEY) ?? '';
-  });
-  const [railwayConnected, setRailwayConnected] = useState(false);
-  const [showUrlInput, setShowUrlInput] = useState(false);
-  const [urlDraft, setUrlDraft] = useState('');
-  const [serverBotMode, setServerBotMode] = useState<'paper' | 'live'>('paper');
-  const [showLiveForm, setShowLiveForm] = useState(false);
-  const [apiKeyDraft, setApiKeyDraft] = useState('');
-  const [apiSecretDraft, setApiSecretDraft] = useState('');
-  const [applyingMode, setApplyingMode] = useState(false);
+  const isRunningRef   = useRef(false);
+  const processingRef  = useRef(false);
+  const balanceRef     = useRef(balance);
+  const positionsRef   = useRef(positions);
+  const cycleTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const countdownRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const stopLossRef    = useRef(1.5);
+  const onStateChangeRef = useRef(onStateChange);
 
-  const isServerMode = railwayUrl.trim().length > 0;
-
-  const isRunningRef      = useRef(false);
-  const isServerModeRef   = useRef(false);
-  const exitProcessingRef = useRef(false);
-  const buyProcessingRef  = useRef(false);
-  const pendingSellsRef   = useRef<Set<string>>(new Set());
-  const balanceRef        = useRef(balance);
-  const positionsRef      = useRef(positions);
-  const signalCacheRef    = useRef<CoinSignal[]>([]);
-  const klineWsRef        = useRef<WebSocket | null>(null);
-  const klineBufferRef    = useRef<Map<string, { closes: number[]; volumes: number[] }>>(new Map());
-  const selectedCoinsRef  = useRef(selectedCoins);
-  const connectKlineWsRef = useRef<() => void>(() => {});
-  const seedBuffersRef    = useRef<() => void>(() => {});
-  const stopLossRef       = useRef(1.5);
-  const onStateChangeRef  = useRef(onStateChange);
-
-  useEffect(() => { isRunningRef.current     = isRunning; },      [isRunning]);
-  useEffect(() => { isServerModeRef.current  = isServerMode; },   [isServerMode]);
-  useEffect(() => { positionsRef.current     = positions; },      [positions]);
-  useEffect(() => { selectedCoinsRef.current = selectedCoins; },  [selectedCoins]);
+  useEffect(() => { isRunningRef.current = isRunning; },   [isRunning]);
+  useEffect(() => { balanceRef.current   = balance; },     [balance]);
+  useEffect(() => { positionsRef.current = positions; },   [positions]);
   useEffect(() => { localStorage.setItem(INSTRUCTIONS_KEY, instructions); }, [instructions]);
   useEffect(() => { onStateChangeRef.current = onStateChange; }, [onStateChange]);
-
-  const saveRailwayUrl = useCallback((url: string) => {
-    const trimmed = url.trim().replace(/\/$/, '');
-    setRailwayUrl(trimmed);
-    localStorage.setItem(RAILWAY_URL_KEY, trimmed);
-    setShowUrlInput(false);
-    if (trimmed) toast.success('Railway URL saved — bot will run 24/7 on server');
-    else toast.info('Railway URL cleared — running in browser');
-  }, []);
-
-  const applyServerMode = useCallback(async (newMode: 'paper' | 'live') => {
-    if (newMode === 'live' && (!apiKeyDraft.trim() || !apiSecretDraft.trim())) {
-      toast.error('Enter Binance API key and secret first');
-      return;
-    }
-    setApplyingMode(true);
-    try {
-      const res = await fetch(`${railwayUrl}/api/mode`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          mode: newMode,
-          api_key: apiKeyDraft.trim(),
-          api_secret: apiSecretDraft.trim(),
-        }),
-      });
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error ?? 'Failed');
-      setServerBotMode(newMode);
-      setShowLiveForm(false);
-      setApiKeyDraft('');
-      setApiSecretDraft('');
-      toast.success(`Switched to ${newMode.toUpperCase()} mode — bot restarting…`, {
-        description: 'Takes ~5 seconds. Status will update automatically.',
-      });
-    } catch (e) {
-      toast.error(`Mode switch failed: ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setApplyingMode(false);
-    }
-  }, [railwayUrl, apiKeyDraft, apiSecretDraft]);
 
   const addLog = useCallback((msg: string) => {
     const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -269,11 +236,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       });
     }
 
-    if (posRes.data) {
-      const fetched = posRes.data as OpenPosition[];
-      setPositions(fetched);
-      positionsRef.current = fetched;   // sync ref directly — no render-cycle delay
-    }
+    if (posRes.data)  setPositions(posRes.data as OpenPosition[]);
 
     // Use same fallback chain as wallet: current_balance → initial_balance → localStorage startingBalance
     const startBal = getPaperCfg().startingBalance ?? 1000;
@@ -282,22 +245,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       const bal     = Number(cfgRes.data.current_balance);
       const initBal = Number(cfgRes.data.initial_balance ?? 0);
       display = bal > 0 ? bal : initBal > 0 ? initBal : startBal;
-      setBalance(display);
-      // Only sync balanceRef from DB when no buy/sell cycle is active.
-      // During active cycles the ref is authoritative and loadData must not overwrite it.
-      if (!buyProcessingRef.current && !exitProcessingRef.current) {
-        balanceRef.current = display;
-      }
+      setBalance(display); balanceRef.current = display;
       setInitialBalance(initBal > 0 ? initBal : startBal);
       stopLossRef.current = Number(cfgRes.data.stop_loss_percent ?? 1.5);
       const running = Boolean(cfgRes.data.is_running);
       isRunningRef.current = running;
       setIsRunning(running);
     } else {
-      setBalance(startBal);
-      if (!buyProcessingRef.current && !exitProcessingRef.current) {
-        balanceRef.current = startBal;
-      }
+      setBalance(startBal); balanceRef.current = startBal;
       setInitialBalance(startBal);
     }
 
@@ -314,471 +269,156 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       .on('postgres_changes', { event: '*', schema: 'public', table: 'paper_portfolio' }, loadData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_config' }, loadData)
       .subscribe();
-    return () => { supabase.removeChannel(ch); if (klineWsRef.current) { klineWsRef.current.close(); klineWsRef.current = null; } };
+    return () => { supabase.removeChannel(ch); };
   }, [loadData]);
 
-  // ── Price refs ───────────────────────────────────────────────────────────
+  // ── Exit checker on every WS price tick ─────────────────────────────────
   const pricesRef = useRef(prices);
   useEffect(() => { pricesRef.current = prices; }, [prices]);
 
-  // ── Poll Railway when in server mode ────────────────────────────────────��
   useEffect(() => {
-    if (!isServerMode) return;
-    const poll = async () => {
-      try {
-        const [statusRes, posRes, tradesRes, actRes] = await Promise.all([
-          fetch(`${railwayUrl}/api/status`),
-          fetch(`${railwayUrl}/api/positions`),
-          fetch(`${railwayUrl}/api/trades`),
-          fetch(`${railwayUrl}/api/activity`),
-        ]);
-        if (!statusRes.ok) throw new Error('unreachable');
-        const status     = await statusRes.json();
-        const posData    = await posRes.json();
-        const tradesData = await tradesRes.json();
-        const actData    = actRes.ok ? await actRes.json() : { entries: [] };
+    if (!isRunning || processingRef.current) return;
+    if (!Object.keys(prices).length) return;
+    processingRef.current = true;
+    checkExits(prices, supabase, stopLossRef.current, 0, ({ symbol, price, usdtReceived, pnl }) => {
+      addLog(`SELL ${symbol} @ ${price.toFixed(4)} USDT · ${usdtReceived.toFixed(4)} USDT · P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDT`);
+    })
+      .then(n => { if (n > 0) { loadData(); toast.success(`Closed ${n} position(s)`, { duration: 2500 }); } })
+      .catch(() => {})
+      .finally(() => { processingRef.current = false; });
+  }, [prices]); // eslint-disable-line
 
-        const wasRunning = isRunningRef.current;
-        const nowRunning = Boolean(status.running);
-        setIsRunning(nowRunning);
-        isRunningRef.current = nowRunning;
-
-        // If Railway bot just became active and browser WS isn't open yet,
-        // seed the kline buffers so the 4-indicator coin tiles appear.
-        // Use refs to avoid TDZ: seedBuffers/connectKlineWs are declared later.
-        if (nowRunning && !wasRunning && !klineWsRef.current) {
-          seedBuffersRef.current();
-          connectKlineWsRef.current();
-        }
-        // If bot stopped remotely, clean up browser signal display
-        if (!nowRunning && wasRunning) {
-          if (klineWsRef.current) { klineWsRef.current.close(); klineWsRef.current = null; }
-          klineBufferRef.current.clear();
-          signalCacheRef.current = [];
-          setCoinSignals([]);
-        }
-
-        const bal     = Number(status.balance_usdt ?? 0);
-        const initBal = Number(status.initial_balance ?? 0);
-        setBalance(bal);
-        balanceRef.current = bal;
-        if (initBal > 0) setInitialBalance(initBal);
-        setRailwayConnected(true);
-        if (status.mode === 'live' || status.mode === 'paper') {
-          setServerBotMode(status.mode);
-        }
-
-        const mappedPos: OpenPosition[] = (posData.positions ?? []).map((p: any) => ({
-          symbol: p.symbol,
-          quantity: Number(p.quantity),
-          avg_entry_price: Number(p.entry_price),
-        }));
-        setPositions(mappedPos);
-        positionsRef.current = mappedPos;
-
-        // Map Railway trade records → TradeRow (sells only for history)
-        const mapped = (tradesData.trades ?? []).map((t: any): TradeRow => ({
-          id: String(t.id),
-          created_at: t.timestamp_sell ?? t.timestamp_buy ?? new Date().toISOString(),
-          symbol: t.coin,
-          side: t.exit_price != null ? 'SELL' : 'BUY',
-          price: Number(t.exit_price ?? t.entry_price),
-          quantity: Number(t.quantity),
-          pnl: t.net_profit != null ? Number(t.net_profit) : null,
-          reason: t.exit_price != null
-            ? (Number(t.net_profit) >= 0 ? 'take-profit' : 'stop-loss')
-            : null,
-        }));
-        setTrades(mapped);
-        const walletTrades = mapped.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
-        onStateChangeRef.current?.(mappedPos, bal, initBal > 0 ? initBal : undefined, walletTrades);
-
-        // Populate activity log from Railway's /api/activity endpoint
-        const entries: { timestamp: string; message: string; level: string }[] =
-          actData.entries ?? [];
-        setActLog(
-          entries.map(e => {
-            const ts = e.timestamp ? e.timestamp.slice(11, 19) : '';
-            const lvl = e.level === 'error' ? '[ERR]' : e.level === 'warn' ? '[WARN]' : '[INFO]';
-            return `${ts} ${lvl} ${e.message}`;
-          })
-        );
-      } catch {
-        setRailwayConnected(false);
-      }
-    };
-    poll();
-    const id = setInterval(poll, 5000);
-    return () => clearInterval(id);
-  }, [railwayUrl, isServerMode]); // eslint-disable-line
-
-  // ── Push coin selection to Railway when in server mode ───────────────────
-  useEffect(() => {
-    if (!isServerMode || !railwayConnected || !selectedCoins.length) return;
-    fetch(`${railwayUrl}/api/coins`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ coins: selectedCoins }),
-    }).catch(() => {});
-  }, [selectedCoins, isServerMode, railwayConnected, railwayUrl]); // eslint-disable-line
-
-  // ── Pure signal recomputation from in-memory kline buffers — zero network calls ──
-  const recomputeSignals = useCallback(() => {
-    const coins = selectedCoinsRef.current;
-    const results: CoinSignal[] = [];
-    for (const sym of coins) {
-      const buf = klineBufferRef.current.get(sym);
-      if (!buf || buf.closes.length < 30) {
-        results.push({ symbol: sym, price: 0, rsi: 50, emaBullish: false, rsiOk: false, macdPos: false, volUp: false, signal: 'loading', reason: 'loading' });
-        continue;
-      }
-      const { closes, volumes } = buf;
-      const price  = closes[closes.length - 1];
-      const sigs   = evaluateSignals(closes, volumes);
-      const score  = Object.values(sigs).filter(Boolean).length;
-      const rsi    = calcRSI(closes, 14);
-      const volSma = calcSMA(volumes, 20);
-      const curVol = volumes[volumes.length - 1] ?? 0;
-      const volRat = volSma > 0 ? curVol / volSma : 1;
-      const isBuy  = score >= 2;   // match Railway's MIN_SIGNALS_TO_BUY = 2
-      const isHold = rsi >= 72 || rsi < 24;
-      const parts  = [sigs.trend ? 'EMA↑' : 'EMA↓', `RSI ${rsi.toFixed(0)}`, sigs.macd ? 'MACD+' : 'MACD-'];
-      if (sigs.volume) parts.push(`Vol ${volRat.toFixed(1)}×`);
-      results.push({
-        symbol: sym, price, rsi,
-        emaBullish: sigs.trend, rsiOk: sigs.rsi, macdPos: sigs.macd, volUp: sigs.volume,
-        signal: isHold ? 'HOLD' : isBuy ? 'BUY' : 'HOLD',
-        reason: parts.join(' · '),
-      });
-    }
-    signalCacheRef.current = results;
-    setCoinSignals(results);
-  }, []);
-
-  // ── Seed kline buffers from REST — one REST call per coin, runs once on start ──
-  const seedBuffers = useCallback(async () => {
+  // ── Core cycle ───────────────────────────────────────────────────────────
+  const runCycle = useCallback(async () => {
     if (!isRunningRef.current) return;
     setScanning(true);
-    setAgentStatus('Seeding market data…');
-    const coins = selectedCoinsRef.current;
+    setAgentStatus('Scanning market…');
+    addLog('── Cycle started');
+
     try {
-      for (let i = 0; i < coins.length; i++) {
-        const sym = coins[i];
-        const buf = await fetchKlineBuffer(sym);
-        if (buf) {
-          klineBufferRef.current.set(sym, buf);
-          recomputeSignals();
-        } else {
-          addLog(`[WARN] Could not seed ${sym}`);
+      const [posRes, cfgRes] = await Promise.all([
+        supabase.from('paper_portfolio').select('*').eq('user_session', SESSION).gt('quantity', 0),
+        supabase.from('bot_config').select('current_balance').eq('user_session', SESSION).maybeSingle(),
+      ]);
+      const currentPositions: OpenPosition[] = (posRes.data ?? []) as OpenPosition[];
+      let runBal = Number(cfgRes.data?.current_balance ?? balanceRef.current);
+      const heldSet = new Set(currentPositions.map(p => p.symbol));
+
+      // — Analyse all coins using simple 4-signal method —
+      const signals = await analyseAll(selectedCoins);
+      setCoinSignals(signals);
+
+      const buySigs  = signals.filter(s => s.signal === 'BUY');
+      const holdSigs = signals.filter(s => s.signal === 'HOLD');
+      addLog(`Signals: ${buySigs.length} BUY · ${holdSigs.length} HOLD · ${signals.filter(s=>s.signal==='error').length} err`);
+      signals.forEach(s => {
+        const count = [s.emaBullish, s.rsiOk, s.macdPos, s.volUp].filter(Boolean).length;
+        addLog(`[SIGNALS] ${s.symbol}: trend=${s.emaBullish} rsi=${s.rsiOk} macd=${s.macdPos} vol=${s.volUp} count=${count}/4`);
+      });
+
+      // — Execute BUYs — dynamic heldSet check so every iteration sees the latest count
+      const newlyBought: OpenPosition[] = [];
+      for (const sig of buySigs) {
+        if (heldSet.size >= MAX_POSITIONS) { addLog(`  Max ${MAX_POSITIONS} positions held — exits handled by price ticker`); break; }
+        if (runBal < MIN_USDT) break;
+        if (heldSet.has(sig.symbol)) continue;
+        const wsPrice = parseFloat(pricesRef.current[sig.symbol]?.price || '0');
+        const price   = wsPrice > 0 ? wsPrice : sig.price;
+        if (!price) continue;
+
+        const alloc  = getAllocation(runBal, sig.symbol);
+        const needed = alloc * 1.002;
+        if (runBal < needed) {
+          addLog(`[SKIP] ${sig.symbol}: Insufficient USDT — have ${runBal.toFixed(2)}, need ${needed.toFixed(2)}`);
+          continue;
         }
-        if (i < coins.length - 1) await new Promise(r => setTimeout(r, 200));
+        if (alloc < MIN_USDT) { addLog(`  SKIP ${sig.symbol} — alloc ${alloc.toFixed(2)} USDT too low`); continue; }
+
+        const fee = alloc * TAKER_FEE;
+        const qty = (alloc - fee) / price;
+
+        await Promise.all([
+          supabase.from('bot_trade_history').insert({
+            user_session: SESSION, symbol: sig.symbol,
+            side: 'BUY', price, quantity: qty, pnl: null,
+            reason: `[AI Paper] ${sig.reason} · ${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`,
+          }),
+          supabase.from('paper_portfolio').upsert({
+            user_session: SESSION, symbol: sig.symbol,
+            quantity: qty, avg_entry_price: price,
+            updated_at: new Date().toISOString(),
+          }, { onConflict: 'user_session,symbol' }),
+        ]);
+
+        runBal -= alloc;
+        newlyBought.push({ symbol: sig.symbol, quantity: qty, avg_entry_price: price });
+        heldSet.add(sig.symbol);
+        addLog(`  BUY  ${sig.symbol} @ ${price.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT`);
+        toast.info(`AI Paper BUY: ${sig.symbol.replace('USDT','')}`, { description: `${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`, duration: 3000 });
       }
-      const buySigs = signalCacheRef.current.filter(s => s.signal === 'BUY');
-      addLog(`Seed done: ${buySigs.length} BUY · ${signalCacheRef.current.filter(s => s.signal === 'HOLD').length} HOLD`);
-      setAgentStatus('Live');
+
+      await supabase.from('bot_config').update({
+        current_balance: Math.round(runBal * 10000) / 10000,
+        updated_at: new Date().toISOString(),
+      }).eq('user_session', SESSION);
+
+      // Optimistic wallet update — no need to wait for loadData
+      if (newlyBought.length > 0) {
+        onStateChangeRef.current?.([...currentPositions, ...newlyBought], runBal);
+      }
+
+      setAgentStatus(`Done · ${new Date().toLocaleTimeString()}`);
+      await loadData();
     } catch (e: any) {
-      addLog(`Seed error: ${e.message}`);
+      addLog(`ERROR: ${e.message}`);
+      setAgentStatus(`Error: ${e.message?.slice(0, 50)}`);
     } finally {
       setScanning(false);
     }
-  }, [addLog, recomputeSignals]);
+  }, [selectedCoins, loadData, addLog]);
 
-  // ── Binance kline WebSocket — keeps buffers live after initial seed ──
-  const connectKlineWs = useCallback(() => {
-    if (klineWsRef.current) { klineWsRef.current.close(); klineWsRef.current = null; }
-    const coins = selectedCoinsRef.current;
-    const streams = coins.map(s => `${s.toLowerCase()}@kline_1m`).join('/');
-    const ws = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${streams}`);
+  // ── Scheduler ────────────────────────────────────────────────────────────
+  const scheduleNext = useCallback(() => {
+    if (cycleTimerRef.current)  clearTimeout(cycleTimerRef.current);
+    if (countdownRef.current)   clearInterval(countdownRef.current);
+    if (!isRunningRef.current)  return;
 
-    ws.onmessage = (event: MessageEvent) => {
-      try {
-        const msg = JSON.parse(event.data as string);
-        const k = msg.data?.k;
-        if (!k) return;
-        const sym: string = k.s;
-        const close = parseFloat(k.c);
-        const vol   = parseFloat(k.v);
-        const buf   = klineBufferRef.current.get(sym);
-        if (!buf) return;
-        if (k.x) {
-          buf.closes  = [...buf.closes.slice(-59),  close];
-          buf.volumes = [...buf.volumes.slice(-59), vol];
-        } else {
-          buf.closes  = [...buf.closes.slice(0, -1),  close];
-          buf.volumes = [...buf.volumes.slice(0, -1), vol];
-        }
-        klineBufferRef.current.set(sym, buf);
-        recomputeSignals();
-      } catch { /* malformed frame */ }
-    };
-
-    ws.onerror = () => { addLog('[WS] Kline stream error'); };
-    ws.onclose = () => {
-      klineWsRef.current = null;
-      if (isRunningRef.current) {
-        addLog('[WS] Kline stream closed — reconnecting in 3s');
-        setTimeout(() => connectKlineWsRef.current(), 3000);
-      }
-    };
-
-    klineWsRef.current = ws;
-  }, [addLog, recomputeSignals]);
-
-  useEffect(() => { connectKlineWsRef.current = connectKlineWs; }, [connectKlineWs]);
-  useEffect(() => { seedBuffersRef.current    = seedBuffers;    }, [seedBuffers]);
-
-  // ── Buy executor — runs on every price tick using cached signals ──────────
-  // No API calls here — just reads the signal cache and executes if conditions met.
-  const executePendingBuys = useCallback(async () => {
-    if (!isRunningRef.current) return;
-    if (isServerModeRef.current) return;  // Railway handles all trades in server mode
-    const signals = signalCacheRef.current;
-    const buySigs = signals.filter(s => s.signal === 'BUY');
-    if (!buySigs.length) return;
-
-    const currentPositions = positionsRef.current;
-    const heldSet = new Set(currentPositions.map(p => p.symbol));
-    let runBal = balanceRef.current;
-
-    // Scale max open positions with how many coins the bot is watching
-    // so adding more coins actually allows the bot to hold more positions.
-    const maxPos = Math.max(MAX_POSITIONS, Math.floor(selectedCoinsRef.current.length / 3));
-
-    const newlyBought: OpenPosition[] = [];
-    for (const sig of buySigs) {
-      if (heldSet.size >= maxPos) break;
-      if (runBal < MIN_USDT) break;
-      if (heldSet.has(sig.symbol)) continue;
-
-      const wsPrice = parseFloat(pricesRef.current[sig.symbol]?.price || '0');
-      const price   = wsPrice > 0 ? wsPrice : sig.price;
-      if (!price) continue;
-
-      const alloc  = getAllocation(runBal, sig.symbol);
-      const needed = alloc * 1.002;
-      if (runBal < needed) { addLog(`[SKIP] ${sig.symbol}: need ${needed.toFixed(2)} have ${runBal.toFixed(2)}`); continue; }
-      if (alloc < MIN_USDT) continue;
-
-      const fee       = alloc * TAKER_FEE;
-      const qty       = (alloc - fee) / price;
-      const newRunBal = Math.round((runBal - alloc) * 10000) / 10000;
-
-      // Write position AND deduct balance in the same round-trip so realtime
-      // subscribers always see a consistent state (no phantom USDT).
-      // Update balanceRef BEFORE the await so concurrent loadData calls
-      // triggered by the DB write cannot overwrite it with a stale value.
-      balanceRef.current = newRunBal;
-      setBalance(newRunBal);
-
-      await Promise.all([
-        supabase.from('bot_trade_history').insert({
-          user_session: SESSION, symbol: sig.symbol,
-          side: 'BUY', price, quantity: qty, pnl: null,
-          reason: `[AI Paper] ${sig.reason} · ${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`,
-        }),
-        supabase.from('paper_portfolio').upsert({
-          user_session: SESSION, symbol: sig.symbol,
-          quantity: qty, avg_entry_price: price,
-          updated_at: new Date().toISOString(),
-        }, { onConflict: 'user_session,symbol' }),
-        supabase.from('bot_config').update({
-          current_balance: newRunBal,
-          updated_at: new Date().toISOString(),
-        }).eq('user_session', SESSION),
-      ]);
-
-      runBal = newRunBal;
-      newlyBought.push({ symbol: sig.symbol, quantity: qty, avg_entry_price: price });
-      heldSet.add(sig.symbol);
-      addLog(`  BUY  ${sig.symbol} @ ${price.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT · bal ${runBal.toFixed(2)} USDT`);
-      toast.info(`AI Paper BUY: ${sig.symbol.replace('USDT','')}`, { description: `${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`, duration: 3000 });
-    }
-
-    if (newlyBought.length > 0) {
-      const updated = [...currentPositions, ...newlyBought];
-      setPositions(updated); positionsRef.current = updated;
-      // balanceRef.current already set per-buy above; sync UI state + parent
-      setBalance(runBal); balanceRef.current = runBal;
-      onStateChangeRef.current?.(updated, runBal);
-    }
-  }, [addLog]);
-
-  // ── Exit executor — pure computation, zero DB reads, fires on every tick ──
-  // Reads positionsRef + pricesRef in-memory only; DB writes are fire-and-forget.
-  const executeExits = useCallback(async () => {
-    if (!isRunningRef.current) return;
-    if (isServerModeRef.current) return;  // Railway handles all sells in server mode
-    const currentPositions = positionsRef.current;
-    if (!currentPositions.length) return;
-
-    type SellItem = { pos: OpenPosition; price: number; pnl: number; proceeds: number };
-    const toSell: SellItem[] = [];
-
-    for (const pos of currentPositions) {
-      if (pendingSellsRef.current.has(pos.symbol)) continue;
-      const wsPrice = parseFloat(pricesRef.current[pos.symbol]?.price || '0');
-      if (!wsPrice) continue;
-
-      const qty   = Number(pos.quantity);
-      const entry = Number(pos.avg_entry_price);
-      const bep   = entry * BEP_MULT;
-      const stopPrice = entry * (1 - stopLossRef.current / 100);
-
-      if (wsPrice < bep && wsPrice > stopPrice) continue;
-
-      const proceeds = qty * wsPrice * (1 - TAKER_FEE);
-      const cost     = qty * entry / (1 - TAKER_FEE);
-      const pnl      = Math.round((proceeds - cost) * 10000) / 10000;
-
-      pendingSellsRef.current.add(pos.symbol);
-      toSell.push({ pos, price: wsPrice, pnl, proceeds });
-    }
-
-    if (!toSell.length) return;
-
-    // Optimistic state update — happens before any DB round-trip
-    const soldSymbols = new Set(toSell.map(s => s.pos.symbol));
-    const remaining   = currentPositions.filter(p => !soldSymbols.has(p.symbol));
-    const totalProceeds = toSell.reduce((s, t) => s + t.proceeds, 0);
-    const newBal = Math.round((balanceRef.current + totalProceeds) * 10000) / 10000;
-
-    setPositions(remaining);  positionsRef.current = remaining;
-    setBalance(newBal);        balanceRef.current   = newBal;
-    onStateChangeRef.current?.(remaining, newBal);
-
-    for (const { pos, price, pnl } of toSell) {
-      addLog(`SELL ${pos.symbol} @ ${price.toFixed(4)} USDT · P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDT`);
-    }
-
-    // DB writes with error logging
-    await Promise.all([
-      ...toSell.map(async ({ pos, price, pnl }) => {
-        const [histRes, portRes] = await Promise.all([
-          supabase.from('bot_trade_history').insert({
-            user_session: SESSION, symbol: pos.symbol, side: 'SELL',
-            price, quantity: Number(pos.quantity), pnl,
-            reason: `[AI Paper] exit · @ ${price.toFixed(4)} USDT · pnl ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDT`,
-          }),
-          supabase.from('paper_portfolio').delete().eq('user_session', SESSION).eq('symbol', pos.symbol),
-        ]);
-        if (histRes.error) addLog(`[ERR] Sell history ${pos.symbol}: ${histRes.error.message}`);
-        if (portRes.error) addLog(`[ERR] Portfolio delete ${pos.symbol}: ${portRes.error.message}`);
-      }),
-      supabase.from('bot_config').update({ current_balance: newBal, updated_at: new Date().toISOString() })
-        .eq('user_session', SESSION)
-        .then(r => { if (r.error) addLog(`[ERR] Config update: ${r.error.message}`); }),
-    ]);
-
-    for (const { pos } of toSell) pendingSellsRef.current.delete(pos.symbol);
-
-    toast.success(`Closed ${toSell.length} position(s)`, { duration: 2500 });
-    await loadData();
-  }, [addLog, loadData]);
-
-  // ── Price tick: exits (real-time) + buy execution (uses cached signals) ───
-  useEffect(() => {
-    if (!isRunning || !Object.keys(prices).length) return;
-
-    // Exit check — zero DB reads, pure in-memory computation
-    if (!exitProcessingRef.current) {
-      exitProcessingRef.current = true;
-      executeExits()
-        .catch((e: unknown) => { addLog(`[ERR] Exit check: ${e instanceof Error ? e.message : String(e)}`); })
-        .finally(() => { exitProcessingRef.current = false; });
-    }
-
-    // Buy check — only if signal cache is populated and no concurrent buy running
-    if (!buyProcessingRef.current && signalCacheRef.current.length > 0) {
-      buyProcessingRef.current = true;
-      executePendingBuys()
-        .catch((e: unknown) => { addLog(`[ERR] Buy exec: ${e instanceof Error ? e.message : String(e)}`); })
-        .finally(() => { buyProcessingRef.current = false; });
-    }
-  }, [prices]); // eslint-disable-line
-
-  // ── Manual "Now" button — re-seed buffers + reconnect WebSocket ─────────
-  const runCycle = useCallback(() => { seedBuffers(); connectKlineWs(); }, [seedBuffers, connectKlineWs]);
+    setCycleCountdown(AGENT_CYCLE_MS / 1000);
+    countdownRef.current = setInterval(() => {
+      setCycleCountdown(p => { if (p <= 1) { clearInterval(countdownRef.current!); return 0; } return p - 1; });
+    }, 1000);
+    cycleTimerRef.current = setTimeout(() => runCycle().then(scheduleNext), AGENT_CYCLE_MS);
+  }, [runCycle]);
 
   // ── Start / Stop ─────────────────────────────────────────────────────────
   const toggleBot = async () => {
-    // Server mode: delegate to Railway, then start browser-side signal display
-    if (isServerMode) {
-      setLoading(true);
-      try {
-        const endpoint = isRunning ? 'stop' : 'start';
-        const res = await fetch(`${railwayUrl}/api/agent/${endpoint}`, { method: 'POST' });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        const nowRunning = Boolean(data.running);
-        setIsRunning(nowRunning);
-        isRunningRef.current = nowRunning;
-
-        if (nowRunning) {
-          // Seed the browser-side kline buffers and open the WebSocket so the
-          // 4-indicator coin tiles appear. executePendingBuys / executeExits are
-          // guarded by isServerModeRef so the browser never double-executes trades.
-          seedBuffersRef.current();
-          connectKlineWsRef.current();
-          toast.success('Bot started on Railway server — runs 24/7');
-        } else {
-          // Clean up browser-side signal display on stop
-          if (klineWsRef.current) { klineWsRef.current.close(); klineWsRef.current = null; }
-          klineBufferRef.current.clear();
-          signalCacheRef.current = [];
-          setCoinSignals([]);
-          toast.info('Bot stopped on Railway server');
-        }
-      } catch (e) {
-        toast.error(`Railway unreachable: ${e instanceof Error ? e.message : String(e)}`);
-      } finally {
-        setLoading(false);
-      }
-      return;
-    }
-
     if (mode === 'live' && !binanceConnected) { toast.error('Connect Binance API first'); onConnectBinance?.(); return; }
     setLoading(true);
     try {
       if (!isRunning) {
         const startBal = getPaperCfg().startingBalance ?? 1000;
-
-        // Read existing config — never reset current_balance on restart,
-        // only use startBal on first-ever launch (no existing config row).
-        const existing = await supabase.from('bot_config')
-          .select('current_balance, initial_balance')
-          .eq('user_session', SESSION)
-          .maybeSingle();
-        const existingBal     = Number(existing.data?.current_balance ?? 0);
-        const existingInitBal = Number(existing.data?.initial_balance ?? 0);
-        const useBal     = existingBal     > 0 ? existingBal     : startBal;
-        const useInitBal = existingInitBal > 0 ? existingInitBal : startBal;
-
         await supabase.from('bot_config').upsert({
           user_session: SESSION,
           selected_coins: selectedCoins,
           mode, is_running: true,
-          current_balance: useBal,
-          initial_balance: useInitBal,
+          current_balance: startBal,
+          initial_balance: startBal,
           stop_loss_percent: 1.5,
           updated_at: new Date().toISOString(),
         }, { onConflict: 'user_session' });
-
         isRunningRef.current = true;
         setIsRunning(true);
-        setBalance(useBal); balanceRef.current = useBal;
-        setInitialBalance(useInitBal);
-        addLog(`=== Agent STARTED · ${useBal.toFixed(2)} USDT · ${mode.toUpperCase()} ===`);
-        toast.success(`AI Agent started — PAPER mode`, { description: `${useBal.toLocaleString()} USDT · ${selectedCoins.length} coins · live signals` });
-        // Seed kline buffers from REST once, then keep live via WebSocket
-        seedBuffersRef.current();
-        connectKlineWsRef.current();
+        setBalance(startBal); balanceRef.current = startBal;
+        setInitialBalance(startBal);
+        addLog(`=== Agent STARTED · ${startBal} USDT · ${mode.toUpperCase()} ===`);
+        toast.success(`AI Agent started — PAPER mode`, { description: `${startBal.toLocaleString()} USDT · ${selectedCoins.length} coins · every 30s` });
+        runCycle().then(scheduleNext);
       } else {
-        if (klineWsRef.current) { klineWsRef.current.close(); klineWsRef.current = null; }
-        klineBufferRef.current.clear();
-        signalCacheRef.current = [];
+        if (cycleTimerRef.current) clearTimeout(cycleTimerRef.current);
+        if (countdownRef.current)  clearInterval(countdownRef.current);
         await supabase.from('bot_config').update({ is_running: false, updated_at: new Date().toISOString() }).eq('user_session', SESSION);
         isRunningRef.current = false;
-        setIsRunning(false);
+        setIsRunning(false); setCycleCountdown(0);
         addLog('=== Agent STOPPED ===');
         toast.info('AI Agent stopped');
       }
@@ -794,31 +434,21 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       const bal   = balanceRef.current;
       const alloc = getAllocation(bal, sym);
       if (alloc < MIN_USDT) { toast.error(`Balance too low (${bal.toFixed(2)} USDT)`); return; }
-      const fee    = alloc * TAKER_FEE;
-      const qty    = (alloc - fee) / wsPrice;
-      const newBal = Math.round((bal - alloc) * 10000) / 10000;
-
-      // Optimistic update before DB writes so wallet reflects instantly
-      balanceRef.current = newBal;
-      setBalance(newBal);
-      const newPos: OpenPosition = { symbol: sym, quantity: qty, avg_entry_price: wsPrice };
-      const updatedPositions = [...positionsRef.current.filter(p => p.symbol !== sym), newPos];
-      setPositions(updatedPositions); positionsRef.current = updatedPositions;
-      onStateChangeRef.current?.(updatedPositions, newBal);
-
-      const [histRes] = await Promise.all([
+      const fee = alloc * TAKER_FEE;
+      const qty = (alloc - fee) / wsPrice;
+      const newBal = bal - alloc;
+      await Promise.all([
         supabase.from('bot_trade_history').insert({
           user_session: SESSION, symbol: sym, side: 'BUY',
           price: wsPrice, quantity: qty, pnl: null,
-          reason: `[Force BUY] manual · ${alloc.toFixed(2)} USDT @ ${wsPrice.toFixed(4)} USDT`,
+          reason: `[Force BUY] manual test · ${alloc.toFixed(2)} USDT @ ${wsPrice.toFixed(4)} USDT`,
         }),
         supabase.from('paper_portfolio').upsert({
           user_session: SESSION, symbol: sym, quantity: qty, avg_entry_price: wsPrice,
           updated_at: new Date().toISOString(),
         }, { onConflict: 'user_session,symbol' }),
-        supabase.from('bot_config').update({ current_balance: newBal, updated_at: new Date().toISOString() }).eq('user_session', SESSION),
+        supabase.from('bot_config').update({ current_balance: newBal }).eq('user_session', SESSION),
       ]);
-      if (histRes.error) addLog(`[ERR] Force buy DB: ${histRes.error.message}`);
       addLog(`FORCE BUY ${sym} @ ${wsPrice.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT`);
       toast.success(`Force BUY: ${sym.replace('USDT','')} @ ${wsPrice.toFixed(4)} USDT`);
       await loadData();
@@ -827,56 +457,55 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
   // ── Force SELL ───────────────────────────────────────────────────────────
   const forceSell = useCallback(async (pos: OpenPosition) => {
-    const wsPrice = parseFloat(pricesRef.current[pos.symbol]?.price || '0');
-    if (!wsPrice) { toast.error('No live price yet'); return; }
     if (pendingSellsRef.current.has(pos.symbol)) return;
     pendingSellsRef.current.add(pos.symbol);
     setForcingSell(pos.symbol);
+
+    // Server mode: delegate to Railway's force-sell endpoint
+    if (isServerModeRef.current) {
+      try {
+        const res = await fetch(`${railwayUrl}/api/force-sell/${pos.symbol}`, { method: 'POST' });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error ?? 'Force sell failed');
+        addLog(`FORCE SELL ${pos.symbol} via Railway @ ${Number(data.price).toFixed(4)} USDT`);
+        toast.success(`Force SELL sent: ${pos.symbol.replace('USDT','')}`);
+      } catch (e) {
+        toast.error(`Force sell failed: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setForcingSell(null);
+        pendingSellsRef.current.delete(pos.symbol);
+      }
+      return;
+    }
+
+    const wsPrice = parseFloat(pricesRef.current[pos.symbol]?.price || '0');
+    if (!wsPrice) { toast.error('No live price yet'); setForcingSell(null); pendingSellsRef.current.delete(pos.symbol); return; }
     try {
-      const proceeds = Number(pos.quantity) * wsPrice * (1 - TAKER_FEE);
-      const cost     = Number(pos.quantity) * Number(pos.avg_entry_price) / (1 - TAKER_FEE);
+      const proceeds = pos.quantity * wsPrice * (1 - TAKER_FEE);
+      const cost     = pos.quantity * pos.avg_entry_price / (1 - TAKER_FEE);
       const pnl      = Math.round((proceeds - cost) * 10000) / 10000;
-      const newBal   = Math.round((balanceRef.current + proceeds) * 10000) / 10000;
-
-      // Optimistic update before DB writes so wallet reflects instantly
-      const remaining = positionsRef.current.filter(p => p.symbol !== pos.symbol);
-      setPositions(remaining); positionsRef.current = remaining;
-      setBalance(newBal); balanceRef.current = newBal;
-      onStateChangeRef.current?.(remaining, newBal);
-
-      const [histRes] = await Promise.all([
+      const newBal   = balanceRef.current + proceeds;
+      await Promise.all([
         supabase.from('bot_trade_history').insert({
           user_session: SESSION, symbol: pos.symbol, side: 'SELL',
-          price: wsPrice, quantity: Number(pos.quantity), pnl,
+          price: wsPrice, quantity: pos.quantity, pnl,
           reason: `[Force SELL] manual · @ ${wsPrice.toFixed(4)} USDT · pnl ${pnl>=0?'+':''}${pnl.toFixed(4)} USDT`,
         }),
         supabase.from('paper_portfolio').delete().eq('user_session', SESSION).eq('symbol', pos.symbol),
-        supabase.from('bot_config').update({ current_balance: newBal, updated_at: new Date().toISOString() }).eq('user_session', SESSION),
+        supabase.from('bot_config').update({ current_balance: newBal }).eq('user_session', SESSION),
       ]);
-      if (histRes.error) addLog(`[ERR] Force sell DB: ${histRes.error.message}`);
       addLog(`FORCE SELL ${pos.symbol} @ ${wsPrice.toFixed(4)} USDT · P&L ${pnl>=0?'+':''}${pnl.toFixed(4)} USDT`);
       toast[pnl >= 0 ? 'success' : 'error'](`Force SELL: ${pos.symbol.replace('USDT','')} ${pnl>=0?'+':''}${pnl.toFixed(4)} USDT`);
       await loadData();
     } finally { setForcingSell(null); pendingSellsRef.current.delete(pos.symbol); }
-  }, [addLog, loadData]);
+  }, [addLog, loadData, railwayUrl]);
 
   // ── Reset ────────────────────────────────────────────────────────────────
   const resetBot = async () => {
     if (!confirm('Reset all paper trades and restore budget?')) return;
-    if (klineWsRef.current) { klineWsRef.current.close(); klineWsRef.current = null; }
-    klineBufferRef.current.clear();
-    signalCacheRef.current = [];
+    if (cycleTimerRef.current) clearTimeout(cycleTimerRef.current);
+    if (countdownRef.current)  clearInterval(countdownRef.current);
     isRunningRef.current = false;
-
-    // In server mode, reset the Railway SQLite wallet first
-    if (isServerMode) {
-      const res = await fetch(`${railwayUrl}/api/reset`, { method: 'POST' }).catch(() => null);
-      if (!res?.ok) {
-        toast.error('Server reset failed — check Railway logs');
-        return;
-      }
-    }
-
     const startBal = getPaperCfg().startingBalance ?? 1000;
     await Promise.all([
       supabase.from('bot_trade_history').delete().eq('user_session', SESSION),
@@ -886,35 +515,18 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         is_running: false, updated_at: new Date().toISOString(),
       }).eq('user_session', SESSION),
     ]);
-    positionsRef.current = [];
-    balanceRef.current = startBal;
-    pendingSellsRef.current.clear();
-    buyProcessingRef.current = false;
-    exitProcessingRef.current = false;
     setTrades([]); setPositions([]); setBalance(startBal); setInitialBalance(startBal);
-    setIsRunning(false); setCoinSignals([]); setActLog([]);
-    onStateChangeRef.current?.([], startBal);
+    setIsRunning(false); setCycleCountdown(0); setActLog([]);
     toast.success(`Reset · ${startBal.toLocaleString()} USDT restored`);
   };
 
   // ── Computed stats ───────────────────────────────────────────────────────
-  const sellTrades    = trades.filter(t => t.side === 'SELL' && t.pnl !== null);
-  const wins          = sellTrades.filter(t => (t.pnl ?? 0) > 0).length;
-  const realizedPnl   = sellTrades.reduce((s, t) => s + (t.pnl ?? 0), 0);
-  const winRate       = sellTrades.length ? Math.round((wins / sellTrades.length) * 100) : 0;
-
-  // Unrealized P&L from open positions (updates every price tick)
-  const unrealizedPnl = positions.reduce((s, pos) => {
-    const livePrice = parseFloat(pricesRef.current[pos.symbol]?.price || '0');
-    if (!livePrice) return s;
-    const qty = Number(pos.quantity);
-    const entry = Number(pos.avg_entry_price);
-    return s + (qty * livePrice * (1 - TAKER_FEE)) - (qty * entry / (1 - TAKER_FEE));
-  }, 0);
-
-  const totalPnl  = realizedPnl + unrealizedPnl;
-  const pnlColor  = totalPnl >= 0 ? 'text-gain' : 'text-loss';
-  const pnlPct    = initialBalance > 0 ? ((totalPnl / initialBalance) * 100).toFixed(2) : '0.00';
+  const sellTrades  = trades.filter(t => t.side === 'SELL' && t.pnl !== null);
+  const wins        = sellTrades.filter(t => (t.pnl ?? 0) > 0).length;
+  const totalPnl    = sellTrades.reduce((s, t) => s + (t.pnl ?? 0), 0);
+  const winRate     = sellTrades.length ? Math.round((wins / sellTrades.length) * 100) : 0;
+  const pnlColor    = totalPnl >= 0 ? 'text-gain' : 'text-loss';
+  const pnlPct      = initialBalance > 0 ? ((totalPnl / initialBalance) * 100).toFixed(2) : '0.00';
   const displayedTrades = showAll ? trades : trades.slice(0, 12);
 
   return (
@@ -929,138 +541,27 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${mode === 'live' ? 'bg-loss/20 text-loss' : 'bg-accent/20 text-accent'}`}>
             {mode === 'live' ? 'LIVE' : 'PAPER TEST'}
           </span>
-          {isServerMode
-            ? <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${railwayConnected ? 'bg-gain/20 text-gain' : 'bg-warn/20 text-warn'}`}>
-                {railwayConnected ? '⚡ SERVER 24/7' : '⚡ SERVER …'}
-              </span>
-            : <span className="text-[9px] px-1.5 py-0.5 rounded bg-muted/50 text-muted-foreground">BROWSER</span>
-          }
-          {!isServerMode && scanning
+          {scanning
             ? <span className="text-[9px] text-accent font-mono flex items-center gap-1"><RefreshCw className="w-2.5 h-2.5 animate-spin" />Checking signals…</span>
-            : !isServerMode && isRunning
+            : isRunning && cycleCountdown > 0
               ? <span className="text-[9px] text-muted-foreground font-mono flex items-center gap-1.5">
-                  <span className="text-gain">●</span>live
+                  <span className="text-gain">●</span>exits live
+                  <span className="opacity-40">·</span>buy scan in {cycleCountdown}s
                 </span>
               : null
           }
         </div>
         <div className="flex items-center gap-1.5">
-          {isRunning && !isServerMode && (
+          {isRunning && (
             <Button size="sm" variant="outline" className="h-6 text-[10px] px-2" onClick={() => runCycle()} disabled={scanning}>
               <Zap className="w-3 h-3 mr-0.5" />Now
             </Button>
           )}
-          <button
-            onClick={() => { setUrlDraft(railwayUrl); setShowUrlInput(v => !v); }}
-            className={`p-1.5 rounded hover:bg-muted/40 ${isServerMode ? 'text-gain' : 'text-muted-foreground hover:text-foreground'}`}
-            title="Set Railway server URL for 24/7 trading"
-          >
-            <Activity className="w-3.5 h-3.5" />
-          </button>
           <button onClick={resetBot} className="p-1.5 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground" title="Reset">
             <RotateCcw className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
-
-      {/* ── Railway URL settings ── */}
-      {showUrlInput && (
-        <div className="bg-muted/20 border border-gain/30 rounded-md px-3 py-2.5 space-y-2">
-          <div className="flex items-center gap-1.5">
-            <Activity className="w-3.5 h-3.5 text-gain" />
-            <span className="text-xs font-semibold text-gain">Railway Server URL</span>
-          </div>
-          <p className="text-[10px] text-muted-foreground leading-relaxed">
-            Paste your Railway app URL to run the bot 24/7 on a server. Leave empty to run in browser (stops when tab closes).
-          </p>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={urlDraft}
-              onChange={e => setUrlDraft(e.target.value)}
-              placeholder="https://your-app.railway.app"
-              className="flex-1 bg-muted/40 border border-border rounded px-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-gain/60"
-            />
-            <button
-              onClick={() => saveRailwayUrl(urlDraft)}
-              className="px-3 py-1.5 rounded bg-gain/90 hover:bg-gain text-background text-xs font-semibold"
-            >
-              Save
-            </button>
-            {railwayUrl && (
-              <button
-                onClick={() => saveRailwayUrl('')}
-                className="px-2 py-1.5 rounded bg-muted hover:bg-muted/60 text-muted-foreground text-xs"
-                title="Clear Railway URL"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            )}
-          </div>
-          {isServerMode && (
-            <p className={`text-[10px] font-medium ${railwayConnected ? 'text-gain' : 'text-warn'}`}>
-              {railwayConnected ? `✓ Connected — ${railwayUrl}` : `⟳ Connecting to ${railwayUrl}…`}
-            </p>
-          )}
-
-          {/* ── Server trading mode switcher ── */}
-          {isServerMode && railwayConnected && (
-            <div className="border-t border-border pt-2 space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-accent">Server Trading Mode</span>
-                <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${serverBotMode === 'live' ? 'bg-loss/20 text-loss' : 'bg-accent/20 text-accent'}`}>
-                  {serverBotMode === 'live' ? '⚡ LIVE — Real USDT' : 'PAPER TEST'}
-                </span>
-              </div>
-              <div className="grid grid-cols-2 gap-1 bg-muted/30 rounded-md p-0.5">
-                <button
-                  onClick={() => { setShowLiveForm(false); applyServerMode('paper'); }}
-                  disabled={applyingMode || serverBotMode === 'paper'}
-                  className={`py-1.5 rounded text-xs font-semibold transition-colors disabled:opacity-50
-                    ${serverBotMode === 'paper' ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:text-foreground'}`}
-                >
-                  <FlaskConical className="w-3 h-3 inline mr-1" />Paper Test
-                </button>
-                <button
-                  onClick={() => setShowLiveForm(v => !v)}
-                  disabled={applyingMode}
-                  className={`py-1.5 rounded text-xs font-semibold transition-colors disabled:opacity-50
-                    ${serverBotMode === 'live' ? 'bg-loss/80 text-white' : 'text-muted-foreground hover:text-foreground'}`}
-                >
-                  <Zap className="w-3 h-3 inline mr-1" />Live Trading
-                </button>
-              </div>
-
-              {showLiveForm && (
-                <div className="space-y-1.5 pt-1">
-                  <p className="text-[10px] text-loss font-medium">⚠️ Real USDT will be used. Double-check your keys.</p>
-                  <input
-                    type="password"
-                    value={apiKeyDraft}
-                    onChange={e => setApiKeyDraft(e.target.value)}
-                    placeholder="Binance API Key"
-                    className="w-full bg-muted/40 border border-border rounded px-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-loss/60"
-                  />
-                  <input
-                    type="password"
-                    value={apiSecretDraft}
-                    onChange={e => setApiSecretDraft(e.target.value)}
-                    placeholder="Binance API Secret"
-                    className="w-full bg-muted/40 border border-border rounded px-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-loss/60"
-                  />
-                  <button
-                    onClick={() => applyServerMode('live')}
-                    disabled={applyingMode || !apiKeyDraft.trim() || !apiSecretDraft.trim()}
-                    className="w-full py-1.5 rounded bg-loss/90 hover:bg-loss text-white text-xs font-semibold disabled:opacity-50"
-                  >
-                    {applyingMode ? '⟳ Applying…' : 'Apply & Restart Bot in LIVE Mode'}
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      )}
 
       {/* ── Mode toggle ── */}
       <div className="grid grid-cols-2 gap-1 bg-muted/30 rounded-md p-0.5">
@@ -1071,53 +572,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             {m === 'test' ? <><FlaskConical className="w-3.5 h-3.5" />TEST · Paper</> : <><Zap className="w-3.5 h-3.5" />LIVE · Real{!binanceConnected && <span className="text-[9px] px-1 bg-warn/20 text-warn rounded ml-1">API needed</span>}</>}
           </button>
         ))}
-      </div>
-
-      {/* ── Coin picker ── */}
-      <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-2">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-1.5">
-            <Settings2 className="w-3.5 h-3.5 text-accent" />
-            <span className="text-xs font-semibold text-accent">Coins to Trade</span>
-            <span className="text-[10px] text-muted-foreground">({selectedCoins.length} active)</span>
-          </div>
-          {isRunning
-            ? <span className="text-[9px] text-muted-foreground">stop bot to edit</span>
-            : <span className="text-[9px] text-muted-foreground">tap coin to add/remove</span>
-          }
-        </div>
-        <div className="flex flex-wrap gap-1">
-          {ALL_TRADABLE_COINS.map(coin => {
-            const ticker = coin.replace('USDT', '');
-            const active = selectedCoins.includes(coin);
-            return (
-              <button
-                key={coin}
-                disabled={isRunning || (!active && !onCoinsChange)}
-                onClick={() => {
-                  if (!onCoinsChange || isRunning) return;
-                  const next = active
-                    ? selectedCoins.filter(c => c !== coin)
-                    : [...selectedCoins, coin];
-                  if (next.length === 0) { toast.error('Keep at least 1 coin'); return; }
-                  onCoinsChange(next);
-                }}
-                title={active ? `Remove ${ticker}` : `Add ${ticker}`}
-                className={`flex items-center gap-0.5 text-[10px] px-2 py-0.5 rounded-full font-semibold transition-colors
-                  ${active
-                    ? 'bg-accent text-accent-foreground hover:bg-accent/80'
-                    : 'bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground'
-                  } disabled:opacity-50 disabled:cursor-not-allowed`}
-              >
-                {active
-                  ? <Minus className="w-2 h-2" />
-                  : <Plus className="w-2 h-2" />
-                }
-                {ticker}
-              </button>
-            );
-          })}
-        </div>
       </div>
 
       {mode === 'live' && (
@@ -1157,9 +611,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       <div className="grid grid-cols-4 gap-1.5">
         {[
           { label: 'Balance', value: `${balance.toFixed(2)} USDT`, color: '' },
-          { label: positions.length ? 'Open P&L' : 'Realized P&L', value: `${(positions.length ? unrealizedPnl : realizedPnl) >= 0 ? '+' : ''}${Math.abs(positions.length ? unrealizedPnl : realizedPnl).toFixed(2)} USDT`, color: (positions.length ? unrealizedPnl : realizedPnl) >= 0 ? 'text-gain' : 'text-loss' },
-          { label: 'Total Return', value: `${totalPnl>=0?'+':''}${pnlPct}%`, color: pnlColor },
-          { label: 'Win Rate', value: sellTrades.length ? `${winRate}% (${wins}W/${sellTrades.length-wins}L)` : '—', color: winRate>=50?'text-gain':sellTrades.length?'text-loss':'' },
+          { label: 'Net P&L', value: `${totalPnl>=0?'+':''}${Math.abs(totalPnl).toFixed(2)} USDT`, color: pnlColor },
+          { label: 'Return', value: `${totalPnl>=0?'+':''}${pnlPct}%`, color: pnlColor },
+          { label: 'Win Rate', value: sellTrades.length ? `${winRate}%` : '—', color: winRate>=50?'text-gain':sellTrades.length?'text-loss':'' },
         ].map(s => (
           <div key={s.label} className="bg-muted/20 rounded-md p-2 text-center">
             <div className="text-[9px] uppercase tracking-widest text-muted-foreground">{s.label}</div>
@@ -1169,30 +623,20 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       </div>
 
       {/* ── Start / Stop ── */}
-      <Button onClick={toggleBot} disabled={loading || (!isServerMode && !selectedCoins.length)}
+      <Button onClick={toggleBot} disabled={loading||!selectedCoins.length}
         className={`w-full font-semibold py-5 ${isRunning?'bg-loss/90 hover:bg-loss text-white':'bg-gain/90 hover:bg-gain text-background'}`}>
         {loading ? <span className="animate-spin mr-1.5">⟳</span>
-          : isRunning
-            ? <><Square className="w-4 h-4 mr-1.5"/>Stop Agent{isServerMode ? ' (Railway)' : ''}</>
-            : isServerMode
-              ? <><Play className="w-4 h-4 mr-1.5"/>Start Agent on Railway (24/7)</>
-              : <><Play className="w-4 h-4 mr-1.5"/>Start AI Agent — Paper Test</>}
+          : isRunning ? <><Square className="w-4 h-4 mr-1.5"/>Stop Agent</>
+          : <><Play className="w-4 h-4 mr-1.5"/>Start AI Agent — Paper Test</>}
       </Button>
-      {isServerMode
+      {isRunning
         ? <p className="text-[10px] text-center text-muted-foreground -mt-2">
-            {railwayConnected
-              ? `Runs 24/7 on Railway server · stays active when browser is closed · polling every 5s`
-              : `Connecting to Railway server… set URL via the ⚡ button above`
-            }
+            Every 30s: fetches live candles → checks EMA / RSI / MACD / Volume → buys or holds
+            {agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}
           </p>
-        : isRunning
-          ? <p className="text-[10px] text-center text-muted-foreground -mt-2">
-              ⚠️ Runs in browser tab — will stop when tab closes · set Railway URL above for 24/7
-              {agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}
-            </p>
-          : <p className="text-[10px] text-center text-muted-foreground -mt-2">
-              ⚠️ Browser mode — stops when tab closes · set Railway URL above to run 24/7
-            </p>
+        : <p className="text-[10px] text-center text-muted-foreground -mt-2">
+            Sells on every price tick · Buys checked every 30s · EMA+RSI+MACD+Volume signals · no API key needed
+          </p>
       }
 
       {/* ── Live coin signals ── */}
@@ -1220,14 +664,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       <div key={label} className={`flex-1 rounded-full text-center py-0.5 text-[8px] font-bold ${on?'bg-gain/20 text-gain':'bg-loss/10 text-loss/50'}`} title={label}>{label}</div>
                     ))}
                   </div>
-                  {/* Force buy/sell — only available in browser mode */}
-                  {isServerMode ? (
-                    held
-                      ? <div className="text-[10px] text-center text-accent font-semibold">Server holding ✓</div>
-                      : sig.signal === 'BUY'
-                        ? <div className="text-[10px] text-center text-gain font-semibold animate-pulse">⚡ Railway will buy</div>
-                        : <div className="text-[10px] text-center text-muted-foreground">Watching…</div>
-                  ) : !held ? (
+                  {/* Force buy/sell */}
+                  {!held ? (
                     <button onClick={() => forceBuy(sig.symbol)} disabled={!!forcingBuy||sig.signal==='error'}
                       className="w-full text-[10px] py-1 rounded bg-gain/10 hover:bg-gain/20 text-gain font-semibold disabled:opacity-40 flex items-center justify-center gap-1">
                       <ShoppingCart className="w-2.5 h-2.5" />{forcingBuy===sig.symbol?'…':'Force BUY'}
@@ -1242,12 +680,25 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         </div>
       )}
 
-      {/* ── Open positions ── */}
-      {positions.length > 0 && (
-        <div>
-          <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2 flex items-center gap-1.5">
-            <Zap className="w-3 h-3 text-warn"/>Open Positions ({positions.length})
+      {/* ── Open positions ── always visible so the user can see status */}
+      <div>
+        <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2 flex items-center justify-between">
+          <div className="flex items-center gap-1.5">
+            <Zap className="w-3 h-3 text-warn"/>
+            Open Positions
+            <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${positions.length>0?'bg-warn/20 text-warn':'bg-muted/40 text-muted-foreground'}`}>
+              {positions.length}
+            </span>
           </div>
+          {isServerMode && positions.length > 0 && (
+            <span className="text-[9px] text-muted-foreground">live from Railway</span>
+          )}
+        </div>
+        {positions.length === 0 ? (
+          <div className="text-xs text-muted-foreground text-center py-5 border border-dashed border-border rounded-lg">
+            {isRunning ? '⏳ No open positions — bot will buy when signals align' : '▶ Start the agent to begin trading'}
+          </div>
+        ) : (
           <div className="space-y-1.5">
             {positions.map(pos => {
               const live  = parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.avg_entry_price;
@@ -1258,6 +709,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               const bep   = pos.avg_entry_price * BEP_MULT;
               const prof  = live >= bep;
               const bepProgress = Math.min(100, Math.max(0, ((live-pos.avg_entry_price)/(bep-pos.avg_entry_price))*100));
+              const qty   = Number(pos.quantity);
+              const budget = pos.avg_entry_price * qty;
               return (
                 <div key={pos.symbol} className="bg-muted/20 border border-border/50 rounded-lg px-3 py-2.5 space-y-2">
                   <div className="flex items-center justify-between">
@@ -1274,24 +727,27 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       </button>
                     </div>
                   </div>
-                  <div className="text-[10px] text-muted-foreground font-mono">
-                    Entry {pos.avg_entry_price.toFixed(4)} USDT · BEP {bep.toFixed(4)} USDT · Now {live.toFixed(4)} USDT
+                  <div className="grid grid-cols-2 gap-x-4 text-[10px] text-muted-foreground font-mono">
+                    <span>Entry <span className="text-foreground">{pos.avg_entry_price.toFixed(4)}</span></span>
+                    <span>BEP <span className="text-accent">{bep.toFixed(4)}</span></span>
+                    <span>Now <span className={prof?'text-gain':'text-foreground'}>{live.toFixed(4)}</span></span>
+                    <span>Qty <span className="text-foreground">{qty.toFixed(6)}</span> · <span className="text-foreground">{budget.toFixed(2)} USDT</span></span>
                   </div>
                   <div className="space-y-1">
                     <div className="flex justify-between text-[9px]">
                       <span className="text-muted-foreground">Break-even progress</span>
-                      <span className={prof?'text-gain font-bold':'text-warn'}>{prof?'✓ Profitable':bepProgress.toFixed(0)+'%'}</span>
+                      <span className={prof?'text-gain font-bold':'text-warn'}>{prof?'✓ Profitable':bepProgress.toFixed(0)+'% to BEP'}</span>
                     </div>
                     <div className="h-1.5 bg-muted/40 rounded-full overflow-hidden">
-                      <div className={`h-full rounded-full transition-all ${prof?'bg-gain':'bg-warn'}`} style={{width:`${bepProgress}%`}}/>
+                      <div className={`h-full rounded-full transition-all ${prof?'bg-gain':'bg-warn'}`} style={{width:`${Math.max(2, bepProgress)}%`}}/>
                     </div>
                   </div>
                 </div>
               );
             })}
           </div>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* ── Trade history ── */}
       <div>
@@ -1301,9 +757,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             Trade History ({trades.length})
           </div>
           {sellTrades.length > 0 && (
-            <span className={`text-[10px] font-mono ${realizedPnl>=0?'text-gain':'text-loss'}`}>
-              {realizedPnl>=0?'+':''}{realizedPnl.toFixed(4)} USDT realized
-            </span>
+            <div className="flex items-center gap-3 text-[10px] font-mono">
+              <span className="text-muted-foreground">{wins}W/{sellTrades.length-wins}L</span>
+              <span className={pnlColor}>{totalPnl>=0?'+':''}{totalPnl.toFixed(4)} USDT</span>
+            </div>
           )}
         </div>
         {!trades.length ? (

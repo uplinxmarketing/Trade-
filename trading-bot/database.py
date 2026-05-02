@@ -3,7 +3,7 @@
 import sqlite3
 import threading
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
 
 DB_PATH = "bot.db"
@@ -100,54 +100,54 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS positions (
-                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol              TEXT,
-                entry_price         REAL,
-                quantity            REAL,
-                budget_usdt         REAL,
-                timestamp           TEXT,
-                mode                TEXT,
-                entry_rsi           REAL,
-                entry_ma_position   TEXT,
-                entry_bb_position   TEXT,
-                entry_volume_trend  TEXT
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol             TEXT,
+                entry_price        REAL,
+                quantity           REAL,
+                budget_usdt        REAL,
+                timestamp          TEXT,
+                mode               TEXT,
+                entry_rsi          REAL,
+                entry_ma_position  TEXT,
+                entry_bb_position  TEXT,
+                entry_volume_trend TEXT
             );
 
             CREATE TABLE IF NOT EXISTS activity_log (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
                 message   TEXT NOT NULL,
-                level     TEXT NOT NULL DEFAULT 'info'
+                level     TEXT NOT NULL DEFAULT 'info',
+                timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        conn.commit()
 
-        # Schema migrations — ADD COLUMN is idempotent via try/except
-        # (SQLite has no IF NOT EXISTS for ALTER TABLE)
+        # ── Schema migrations for existing databases ─────────────────────────
         migrations = [
-            "ALTER TABLE candles ADD COLUMN ma_position TEXT",
-            "ALTER TABLE candles ADD COLUMN bb_position TEXT",
-            "ALTER TABLE candles ADD COLUMN volume_trend TEXT",
-            "ALTER TABLE positions ADD COLUMN entry_rsi REAL",
-            "ALTER TABLE positions ADD COLUMN entry_ma_position TEXT",
-            "ALTER TABLE positions ADD COLUMN entry_bb_position TEXT",
+            "ALTER TABLE candles   ADD COLUMN ma_position  TEXT",
+            "ALTER TABLE candles   ADD COLUMN bb_position  TEXT",
+            "ALTER TABLE candles   ADD COLUMN volume_trend TEXT",
+            "ALTER TABLE positions ADD COLUMN entry_rsi          REAL",
+            "ALTER TABLE positions ADD COLUMN entry_ma_position  TEXT",
+            "ALTER TABLE positions ADD COLUMN entry_bb_position  TEXT",
             "ALTER TABLE positions ADD COLUMN entry_volume_trend TEXT",
         ]
         for sql in migrations:
             try:
                 c.execute(sql)
             except Exception:
-                pass  # column already exists
+                pass  # column already exists — SQLite has no IF NOT EXISTS for ALTER
+
         conn.commit()
         conn.close()
     print("Database initialised.")
 
 
+# ── Candles ───────────────────────────────────────────────────────────────────
+
 def save_candle(coin: str, timeframe: str, ohlcv: dict):
     with _lock:
         conn = _conn()
-        c = conn.cursor()
-        c.execute("""
+        conn.execute("""
             INSERT INTO candles
                 (coin, timeframe, open_time, open, high, low, close, volume,
                  ma20, rsi14, bb_upper, bb_lower, bb_mid, volume_ma20,
@@ -170,7 +170,8 @@ def save_candle(coin: str, timeframe: str, ohlcv: dict):
             ohlcv.get("ma20"), ohlcv.get("rsi14"),
             ohlcv.get("bb_upper"), ohlcv.get("bb_lower"), ohlcv.get("bb_mid"),
             ohlcv.get("volume_ma20"),
-            ohlcv.get("ma_position"), ohlcv.get("bb_position"), ohlcv.get("volume_trend"),
+            ohlcv.get("ma_position"), ohlcv.get("bb_position"),
+            ohlcv.get("volume_trend"),
         ))
         conn.commit()
         conn.close()
@@ -179,8 +180,7 @@ def save_candle(coin: str, timeframe: str, ohlcv: dict):
 def get_candles(coin: str, timeframe: str, limit: int = 50) -> List[dict]:
     with _lock:
         conn = _conn()
-        c = conn.cursor()
-        rows = c.execute("""
+        rows = conn.execute("""
             SELECT * FROM candles
             WHERE coin=? AND timeframe=?
             ORDER BY open_time DESC LIMIT ?
@@ -189,11 +189,20 @@ def get_candles(coin: str, timeframe: str, limit: int = 50) -> List[dict]:
     return [dict(r) for r in reversed(rows)]
 
 
+def candles_table_empty() -> bool:
+    with _lock:
+        conn = _conn()
+        row = conn.execute("SELECT COUNT(*) AS cnt FROM candles").fetchone()
+        conn.close()
+    return row["cnt"] == 0
+
+
+# ── Trades ────────────────────────────────────────────────────────────────────
+
 def log_trade(trade: dict):
     with _lock:
         conn = _conn()
-        c = conn.cursor()
-        c.execute("""
+        conn.execute("""
             INSERT INTO trades
                 (coin, mode, entry_price, exit_price, quantity, budget_usdt,
                  buy_fee, sell_fee, net_profit, profitable, duration_seconds,
@@ -225,6 +234,18 @@ def get_recent_trades(limit: int = 20) -> List[dict]:
     return [dict(r) for r in rows]
 
 
+def get_trades_today_count() -> int:
+    today = datetime.now(timezone.utc).date().isoformat()
+    with _lock:
+        conn = _conn()
+        row = conn.execute("""
+            SELECT COUNT(*) AS cnt FROM trades
+            WHERE timestamp_sell LIKE ?
+        """, (f"{today}%",)).fetchone()
+        conn.close()
+    return row["cnt"] if row else 0
+
+
 def get_win_rate_per_coin() -> Dict[str, float]:
     with _lock:
         conn = _conn()
@@ -250,97 +271,9 @@ def get_avg_duration_per_coin() -> Dict[str, float]:
     return {r["coin"]: round(r["avg_dur"], 1) for r in rows}
 
 
-def upsert_pattern(p: dict):
-    with _lock:
-        conn = _conn()
-        existing = conn.execute(
-            "SELECT * FROM patterns WHERE pattern_key=?", (p["pattern_key"],)
-        ).fetchone()
-        if existing:
-            old_count = existing["occurrence_count"]
-            new_count = old_count + 1
-            profitable = 1 if p.get("outcome_profitable") else 0
-            new_conf = (existing["confidence_score"] * old_count + profitable) / new_count
-            new_profit = ((existing["avg_profit_pct"] or 0) * old_count + (p.get("avg_profit_pct") or 0)) / new_count
-            conn.execute("""
-                UPDATE patterns SET
-                    occurrence_count=?, confidence_score=?, avg_profit_pct=?,
-                    outcome_profitable=?, last_seen=CURRENT_TIMESTAMP
-                WHERE pattern_key=?
-            """, (new_count, new_conf, new_profit, profitable, p["pattern_key"]))
-        else:
-            conn.execute("""
-                INSERT INTO patterns
-                    (coin, pattern_key, rsi_range, bb_position, volume_trend,
-                     ma_position, outcome_profitable, avg_profit_pct, confidence_score)
-                VALUES (?,?,?,?,?,?,?,?,?)
-            """, (
-                p.get("coin"), p["pattern_key"], p.get("rsi_range"),
-                p.get("bb_position"), p.get("volume_trend"), p.get("ma_position"),
-                int(p.get("outcome_profitable", 0)), p.get("avg_profit_pct", 0),
-                1.0 if p.get("outcome_profitable") else 0.0,
-            ))
-        conn.commit()
-        conn.close()
+# ── Positions ─────────────────────────────────────────────────────────────────
 
-
-def get_patterns(min_occurrences: int = 3) -> List[dict]:
-    with _lock:
-        conn = _conn()
-        rows = conn.execute("""
-            SELECT * FROM patterns
-            WHERE occurrence_count >= ?
-            ORDER BY confidence_score DESC
-        """, (min_occurrences,)).fetchall()
-        conn.close()
-    return [dict(r) for r in rows]
-
-
-def log_decision(d: dict):
-    with _lock:
-        conn = _conn()
-        conn.execute("""
-            INSERT INTO decisions (action, coin, confidence, reason, pattern_observed)
-            VALUES (?,?,?,?,?)
-        """, (d.get("action"), d.get("coin"), d.get("confidence"),
-              d.get("reason"), d.get("pattern_observed")))
-        conn.commit()
-        conn.close()
-
-
-def save_paper_state(balances: dict):
-    with _lock:
-        conn = _conn()
-        conn.execute("""
-            INSERT INTO paper_state (id, balances, updated_at)
-            VALUES (1, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(id) DO UPDATE SET balances=excluded.balances, updated_at=excluded.updated_at
-        """, (json.dumps(balances),))
-        conn.commit()
-        conn.close()
-
-
-def load_paper_state() -> Optional[dict]:
-    with _lock:
-        conn = _conn()
-        try:
-            row = conn.execute("SELECT balances FROM paper_state WHERE id=1").fetchone()
-        except sqlite3.OperationalError:
-            # Table doesn't exist yet — init_db() hasn't run. Return None safely.
-            conn.close()
-            return None
-        conn.close()
-    if row:
-        try:
-            return json.loads(row["balances"])
-        except Exception:
-            return None
-    return None
-
-
-# --- Position persistence ---
-
-def save_position(pos: dict):
+def save_position(pos: dict) -> Optional[int]:
     with _lock:
         conn = _conn()
         conn.execute("""
@@ -376,21 +309,72 @@ def load_positions() -> List[dict]:
     return [dict(r) for r in rows]
 
 
-def candles_table_empty() -> bool:
+# ── Paper state ───────────────────────────────────────────────────────────────
+
+def save_paper_state(balances: dict):
     with _lock:
         conn = _conn()
-        row = conn.execute("SELECT COUNT(*) AS cnt FROM candles").fetchone()
+        conn.execute("""
+            INSERT INTO paper_state (id, balances, updated_at)
+            VALUES (1, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                balances=excluded.balances, updated_at=excluded.updated_at
+        """, (json.dumps(balances),))
+        conn.commit()
         conn.close()
-    return row["cnt"] == 0
 
+
+def load_paper_state() -> Optional[dict]:
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute("SELECT balances FROM paper_state WHERE id=1").fetchone()
+        except sqlite3.OperationalError:
+            conn.close()
+            return None
+        conn.close()
+    if row:
+        try:
+            return json.loads(row["balances"])
+        except Exception:
+            return None
+    return None
+
+
+def reset_paper_wallet(starting_usdt: float):
+    """Wipe all trades, positions, and activity log. Restore starting USDT balance."""
+    with _lock:
+        conn = _conn()
+        conn.execute("DELETE FROM trades")
+        conn.execute("DELETE FROM positions")
+        conn.execute("DELETE FROM activity_log")
+        conn.execute("""
+            INSERT INTO paper_state (id, balances, updated_at)
+            VALUES (1, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                balances=excluded.balances, updated_at=excluded.updated_at
+        """, (json.dumps({"USDT": starting_usdt}),))
+        conn.commit()
+        conn.close()
+
+
+# ── Activity log ──────────────────────────────────────────────────────────────
 
 def log_activity(message: str, level: str = "info"):
+    ts = datetime.now(timezone.utc).isoformat()
     with _lock:
         conn = _conn()
-        conn.execute(
-            "INSERT INTO activity_log (message, level) VALUES (?, ?)",
-            (message, level),
-        )
+        conn.execute("""
+            INSERT INTO activity_log (message, level, timestamp)
+            VALUES (?, ?, ?)
+        """, (message, level, ts))
+        # Keep only the last 500 entries so the table never bloats
+        conn.execute("""
+            DELETE FROM activity_log
+            WHERE id NOT IN (
+                SELECT id FROM activity_log ORDER BY id DESC LIMIT 500
+            )
+        """)
         conn.commit()
         conn.close()
 
@@ -398,46 +382,75 @@ def log_activity(message: str, level: str = "info"):
 def get_activity_log(limit: int = 100) -> List[dict]:
     with _lock:
         conn = _conn()
-        rows = conn.execute(
-            "SELECT timestamp, message, level FROM activity_log ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        rows = conn.execute("""
+            SELECT id, message, level, timestamp
+            FROM activity_log
+            ORDER BY id DESC LIMIT ?
+        """, (limit,)).fetchall()
         conn.close()
-    return [{"timestamp": r["timestamp"], "message": r["message"], "level": r["level"]} for r in rows]
+    return [dict(r) for r in rows]
 
 
-def get_trades_today_count() -> int:
+# ── Patterns ──────────────────────────────────────────────────────────────────
+
+def upsert_pattern(p: dict):
     with _lock:
         conn = _conn()
-        row = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM trades WHERE date(timestamp_sell) = date('now')"
+        existing = conn.execute(
+            "SELECT * FROM patterns WHERE pattern_key=?", (p["pattern_key"],)
         ).fetchone()
-        conn.close()
-    return row["cnt"] if row else 0
-
-
-def reset_paper_wallet(starting_usdt: float):
-    """Wipe all trades, positions, activity log and reset paper balance."""
-    with _lock:
-        conn = _conn()
-        conn.execute("DELETE FROM trades")
-        conn.execute("DELETE FROM positions")
-        conn.execute("DELETE FROM activity_log")
-        conn.execute(
-            "INSERT INTO paper_state (id, balances, updated_at) VALUES (1, ?, CURRENT_TIMESTAMP) "
-            "ON CONFLICT(id) DO UPDATE SET balances=excluded.balances, updated_at=excluded.updated_at",
-            (json.dumps({"USDT": starting_usdt}),),
-        )
+        if existing:
+            old_count = existing["occurrence_count"]
+            new_count = old_count + 1
+            profitable = 1 if p.get("outcome_profitable") else 0
+            new_conf = (existing["confidence_score"] * old_count + profitable) / new_count
+            new_profit = (
+                ((existing["avg_profit_pct"] or 0) * old_count + (p.get("avg_profit_pct") or 0))
+                / new_count
+            )
+            conn.execute("""
+                UPDATE patterns SET
+                    occurrence_count=?, confidence_score=?, avg_profit_pct=?,
+                    outcome_profitable=?, last_seen=CURRENT_TIMESTAMP
+                WHERE pattern_key=?
+            """, (new_count, new_conf, new_profit, profitable, p["pattern_key"]))
+        else:
+            conn.execute("""
+                INSERT INTO patterns
+                    (coin, pattern_key, rsi_range, bb_position, volume_trend,
+                     ma_position, outcome_profitable, avg_profit_pct, confidence_score)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (
+                p.get("coin"), p["pattern_key"], p.get("rsi_range"),
+                p.get("bb_position"), p.get("volume_trend"), p.get("ma_position"),
+                int(p.get("outcome_profitable", 0)), p.get("avg_profit_pct", 0),
+                1.0 if p.get("outcome_profitable") else 0.0,
+            ))
         conn.commit()
         conn.close()
 
 
-def get_win_rate_overall() -> float:
+def get_patterns(min_occurrences: int = 3) -> List[dict]:
     with _lock:
         conn = _conn()
-        total = conn.execute("SELECT COUNT(*) AS cnt FROM trades WHERE exit_price IS NOT NULL").fetchone()
-        wins  = conn.execute("SELECT COUNT(*) AS cnt FROM trades WHERE profitable = 1").fetchone()
+        rows = conn.execute("""
+            SELECT * FROM patterns
+            WHERE occurrence_count >= ?
+            ORDER BY confidence_score DESC
+        """, (min_occurrences,)).fetchall()
         conn.close()
-    if not total or total["cnt"] == 0:
-        return 0.0
-    return round(wins["cnt"] / total["cnt"], 3)
+    return [dict(r) for r in rows]
+
+
+# ── Decisions ─────────────────────────────────────────────────────────────────
+
+def log_decision(d: dict):
+    with _lock:
+        conn = _conn()
+        conn.execute("""
+            INSERT INTO decisions (action, coin, confidence, reason, pattern_observed)
+            VALUES (?,?,?,?,?)
+        """, (d.get("action"), d.get("coin"), d.get("confidence"),
+              d.get("reason"), d.get("pattern_observed")))
+        conn.commit()
+        conn.close()
