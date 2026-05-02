@@ -86,19 +86,19 @@ class PaperClient:
         price = self._get_price(symbol)
         fee   = quoteOrderQty * self._fee_rate
         total_cost = quoteOrderQty + fee
-        usdt_bal   = self._get_balance("USDT")
+        coin  = symbol[:-4]  # strip USDT suffix
+        qty   = math.floor((quoteOrderQty / price) * 1e8) / 1e8  # floor to 8 dp
 
-        if usdt_bal < total_cost:
-            raise ValueError(
-                f"Insufficient paper USDT balance: need {total_cost:.4f}, have {usdt_bal:.4f}"
-            )
-
-        # Derive coin from symbol (strip USDT suffix)
-        coin = symbol.replace("USDT", "").replace("BTC", "") if not symbol.endswith("USDT") else symbol[:-4]
-        qty  = math.floor((quoteOrderQty / price) * 1e8) / 1e8  # floor to 8 dp
-
-        self._set_balance("USDT", usdt_bal - total_cost)
-        self._set_balance(coin, self._get_balance(coin) + qty)
+        with self._lock:
+            usdt_bal = self._balances.get("USDT", 0.0)
+            if usdt_bal < total_cost:
+                raise ValueError(
+                    f"Insufficient paper USDT balance: need {total_cost:.4f}, have {usdt_bal:.4f}"
+                )
+            self._balances["USDT"] = usdt_bal - total_cost
+            self._balances[coin]   = self._balances.get(coin, 0.0) + qty
+            snapshot = dict(self._balances)
+        database.save_paper_state(snapshot)
 
         order_id = str(uuid.uuid4())[:12].replace("-", "")
         now_ms   = int(time.time() * 1000)

@@ -433,6 +433,24 @@ setInterval(refresh, 5000);  // auto-refresh every 5s
 """
 
 
+@app.get("/api/wallet")
+def api_wallet():
+    try:
+        from connection import client
+        acc = client.get_account()
+        balances = [
+            {"asset": b["asset"], "free": float(b["free"]), "locked": float(b["locked"])}
+            for b in acc["balances"]
+            if float(b["free"]) + float(b["locked"]) > 0
+        ]
+        total_usdt = sum(
+            b["free"] for b in balances if b["asset"] == "USDT"
+        )
+        return {"balances": balances, "total_usdt": total_usdt, "mode": "paper"}
+    except Exception as e:
+        return {"balances": [], "total_usdt": 0.0, "mode": "paper", "error": str(e)}
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     return HTMLResponse(DASHBOARD_HTML)

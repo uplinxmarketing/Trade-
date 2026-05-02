@@ -596,7 +596,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             {agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}
           </p>
         : <p className="text-[10px] text-center text-muted-foreground -mt-2">
-            Analyses {selectedCoins.length} coins every 30s · EMA+RSI+MACD+Volume signals · no API key needed
+            Sells on every price tick · Buys checked every 30s · EMA+RSI+MACD+Volume signals · no API key needed
           </p>
       }
 

@@ -190,7 +190,8 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
         .on('postgres_changes',{event:'*',schema:'public',table:'paper_portfolio'},loadPaper)
         .on('postgres_changes',{event:'*',schema:'public',table:'bot_trade_history'},loadPaper)
         .subscribe();
-      return () => { supabase.removeChannel(ch); };
+      const poll = setInterval(loadPaper, 2000);
+      return () => { supabase.removeChannel(ch); clearInterval(poll); };
     } else {
       loadLive();
     }
@@ -261,7 +262,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
       <div className="px-4 pt-3 pb-2 border-b border-border/50 flex items-end justify-between gap-4">
         <div>
           <div className="text-[10px] text-muted-foreground uppercase tracking-widest mb-0.5">Total spot balance</div>
-          <div className="text-2xl font-bold font-mono tabular-nums">
+          <div id="wallet-total" className="text-2xl font-bold font-mono tabular-nums">
             {(isPaper ? totalPortfolio : liveTotal).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}
             <span className="text-sm text-muted-foreground ml-1 font-normal">USDT</span>
           </div>
@@ -295,7 +296,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
 
       {/* ── Paper mode rows ── */}
       {isPaper && (
-        <div className="divide-y divide-border/30">
+        <div id="wallet-tbody" className="divide-y divide-border/30">
           {positionRows.map(({ coin, pos, livePrice, currentValue, costBasis, pnl, pct }) => (
             <div key={pos.symbol} className="grid grid-cols-[auto_1fr_auto_auto_auto] gap-x-4 items-center px-4 py-2.5 hover:bg-muted/10 transition-colors">
               <div className="flex items-center gap-2">
