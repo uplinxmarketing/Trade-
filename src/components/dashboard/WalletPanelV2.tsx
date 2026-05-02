@@ -53,6 +53,8 @@ interface Props {
   prices: LivePrices;
   mode: 'test' | 'live';
   selectedCoins?: string[];
+  agentPositions?: { symbol: string; quantity: number; avg_entry_price: number }[];
+  agentBalance?: number;
 }
 
 function CoinIcon({ coin }: { coin: string }) {
@@ -86,7 +88,7 @@ function PnlPill({ pnl, pct }: { pnl: number; pct: number }) {
   );
 }
 
-const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props) => {
+const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPositions, agentBalance }: Props) => {
   const [usdtFree, setUsdtFree]         = useState(0);
   const [initialBalance, setInitialBalance] = useState(0);
   const [positions, setPositions]       = useState<Position[]>([]);
@@ -204,6 +206,14 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
 
   const isPaper = mode === 'test' || !binanceConnected;
 
+  // ── Use agent-provided state when available (instant sync after trades) ──────
+  const effectivePositions = (agentPositions !== undefined && agentBalance !== undefined && agentBalance > 0)
+    ? agentPositions
+    : positions;
+  const effectiveUsdtFree = (agentBalance !== undefined && agentBalance > 0)
+    ? agentBalance
+    : usdtFree;
+
   // ── Reset paper wallet ───────────────────────────────────────────────────────
   const resetWallet = async () => {
     if (!confirm(`Reset paper wallet to ${walletCfg.startingBalance.toLocaleString()} USDT and clear all positions?`)) return;
@@ -229,7 +239,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
   };
 
   // ── Compute portfolio totals (paper mode) ────────────────────────────────────
-  const positionRows = positions.map(pos => {
+  const positionRows = effectivePositions.map(pos => {
     const coin = pos.symbol.replace('USDT','');
     const livePrice = parseFloat(prices[pos.symbol]?.price||'0') || pos.avg_entry_price;
     const currentValue = pos.quantity * livePrice;
@@ -241,7 +251,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
   });
 
   const paperPositionTotal = positionRows.reduce((s,r)=>s+r.currentValue, 0);
-  const totalPortfolio     = usdtFree + paperPositionTotal;
+  const totalPortfolio     = effectiveUsdtFree + paperPositionTotal;
   const sessionGainPct     = initialBalance > 0 ? ((totalPortfolio-initialBalance)/initialBalance)*100 : 0;
 
   // ── Live mode totals ─────────────────────────────────────────────────────────
@@ -334,8 +344,8 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
             </div>
             <div className="font-mono text-xs tabular-nums text-muted-foreground">—</div>
             <div className="font-mono text-xs tabular-nums text-right">
-              <div>{usdtFree.toFixed(2)} USDT</div>
-              <div className="text-[9px] text-muted-foreground">≈ ${usdtFree.toFixed(2)} USD</div>
+              <div>{effectiveUsdtFree.toFixed(2)} USDT</div>
+              <div className="text-[9px] text-muted-foreground">≈ ${effectiveUsdtFree.toFixed(2)} USD</div>
             </div>
             <div className="font-mono text-xs tabular-nums text-right text-muted-foreground">—</div>
             <div className="rounded px-2 py-1 bg-muted/20 border border-border text-right min-w-[80px]">
@@ -343,7 +353,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
             </div>
           </div>
 
-          {positionRows.length === 0 && usdtFree === 0 && (
+          {positionRows.length === 0 && effectiveUsdtFree === 0 && (
             <div className="px-4 py-6 text-center text-xs text-muted-foreground">
               No positions — start the AI agent to begin paper trading
             </div>
@@ -499,7 +509,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins }: Props)
                       <span className="text-sm font-mono font-bold w-10 text-right">{walletCfg.budgetPct}%</span>
                     </div>
                     <div className="text-[9px] text-muted-foreground">
-                      At {usdtFree.toFixed(0)} USDT free → <span className="text-accent font-mono">{(usdtFree * walletCfg.budgetPct / 100).toFixed(2)} USDT</span> per trade
+                      At {effectiveUsdtFree.toFixed(0)} USDT free → <span className="text-accent font-mono">{(effectiveUsdtFree * walletCfg.budgetPct / 100).toFixed(2)} USDT</span> per trade
                     </div>
                   </div>
                 )}

@@ -164,6 +164,7 @@ interface AITradingAgentProps {
   prices: LivePrices;
   binanceConnected?: boolean;
   onConnectBinance?: () => void;
+  onStateChange?: (positions: {symbol:string;quantity:number;avg_entry_price:number}[], balance: number) => void;
 }
 
 const INSTRUCTIONS_KEY = 'ai_agent_instructions';
@@ -171,7 +172,7 @@ const AGENT_CYCLE_MS   = 30_000;
 const BEP_MULT         = 1 / Math.pow(1 - TAKER_FEE, 2);
 
 // ── Component ────────────────────────────────────────────────────────────────
-const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance }: AITradingAgentProps) => {
+const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onStateChange }: AITradingAgentProps) => {
   const [mode, setMode]           = useState<'test' | 'live'>('test');
   const [isRunning, setIsRunning] = useState(false);
   const [loading, setLoading]     = useState(false);
@@ -199,11 +200,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const cycleTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownRef   = useRef<ReturnType<typeof setInterval> | null>(null);
   const stopLossRef    = useRef(1.5);
+  const onStateChangeRef = useRef(onStateChange);
 
   useEffect(() => { isRunningRef.current = isRunning; },   [isRunning]);
   useEffect(() => { balanceRef.current   = balance; },     [balance]);
   useEffect(() => { positionsRef.current = positions; },   [positions]);
   useEffect(() => { localStorage.setItem(INSTRUCTIONS_KEY, instructions); }, [instructions]);
+  useEffect(() => { onStateChangeRef.current = onStateChange; }, [onStateChange]);
 
   const addLog = useCallback((msg: string) => {
     const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -237,10 +240,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
     // Use same fallback chain as wallet: current_balance → initial_balance → localStorage startingBalance
     const startBal = getPaperCfg().startingBalance ?? 1000;
+    let display = startBal;
     if (cfgRes.data) {
       const bal     = Number(cfgRes.data.current_balance);
       const initBal = Number(cfgRes.data.initial_balance ?? 0);
-      const display = bal > 0 ? bal : initBal > 0 ? initBal : startBal;
+      display = bal > 0 ? bal : initBal > 0 ? initBal : startBal;
       setBalance(display); balanceRef.current = display;
       setInitialBalance(initBal > 0 ? initBal : startBal);
       stopLossRef.current = Number(cfgRes.data.stop_loss_percent ?? 1.5);
@@ -250,6 +254,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     } else {
       setBalance(startBal); balanceRef.current = startBal;
       setInitialBalance(startBal);
+    }
+
+    // Notify parent with fresh state for instant wallet sync
+    if (posRes.data) {
+      onStateChangeRef.current?.(posRes.data as OpenPosition[], display);
     }
   }, []);
 
@@ -308,6 +317,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       });
 
       // — Execute BUYs — dynamic heldSet check so every iteration sees the latest count
+      const newlyBought: OpenPosition[] = [];
       for (const sig of buySigs) {
         if (heldSet.size >= MAX_POSITIONS) { addLog(`  Max ${MAX_POSITIONS} positions held — exits handled by price ticker`); break; }
         if (runBal < MIN_USDT) break;
@@ -341,6 +351,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         ]);
 
         runBal -= alloc;
+        newlyBought.push({ symbol: sig.symbol, quantity: qty, avg_entry_price: price });
         heldSet.add(sig.symbol);
         addLog(`  BUY  ${sig.symbol} @ ${price.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT`);
         toast.info(`AI Paper BUY: ${sig.symbol.replace('USDT','')}`, { description: `${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`, duration: 3000 });
@@ -350,6 +361,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         current_balance: Math.round(runBal * 10000) / 10000,
         updated_at: new Date().toISOString(),
       }).eq('user_session', SESSION);
+
+      // Optimistic wallet update — no need to wait for loadData
+      if (newlyBought.length > 0) {
+        onStateChangeRef.current?.([...currentPositions, ...newlyBought], runBal);
+      }
 
       setAgentStatus(`Done · ${new Date().toLocaleTimeString()}`);
       await loadData();
@@ -508,7 +524,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           {scanning
             ? <span className="text-[9px] text-accent font-mono flex items-center gap-1"><RefreshCw className="w-2.5 h-2.5 animate-spin" />Checking signals…</span>
             : isRunning && cycleCountdown > 0
-              ? <span className="text-[9px] text-muted-foreground font-mono">next signal check in {cycleCountdown}s</span>
+              ? <span className="text-[9px] text-muted-foreground font-mono flex items-center gap-1.5">
+                  <span className="text-gain">●</span>exits live
+                  <span className="opacity-40">·</span>buy scan in {cycleCountdown}s
+                </span>
               : null
           }
         </div>

@@ -21,6 +21,8 @@ const Index = () => {
   const [activeCoin, setActiveCoin]        = useState('BTCUSDT');
   const [binanceConnected, setBinanceConnected] = useState(false);
   const [showBinanceConnect, setShowBinanceConnect] = useState(false);
+  const [agentPositions, setAgentPositions] = useState<{symbol:string;quantity:number;avg_entry_price:number}[]>([]);
+  const [agentBalance, setAgentBalance] = useState(0);
 
   const { prices, connected: wsConnected } = useBinanceWebSocket(selectedCoins);
 
@@ -111,6 +113,8 @@ const Index = () => {
               prices={prices}
               mode={binanceConnected ? 'live' : 'test'}
               selectedCoins={selectedCoins}
+              agentPositions={agentPositions}
+              agentBalance={agentBalance}
             />
 
             {/* AI Trading Bot */}
@@ -119,6 +123,7 @@ const Index = () => {
               prices={prices}
               binanceConnected={binanceConnected}
               onConnectBinance={() => setShowBinanceConnect(true)}
+              onStateChange={(pos, bal) => { setAgentPositions(pos); setAgentBalance(bal); }}
             />
 
             {/* Reports */}
