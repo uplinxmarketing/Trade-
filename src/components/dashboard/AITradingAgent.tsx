@@ -165,7 +165,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const onStateChangeRef  = useRef(onStateChange);
 
   useEffect(() => { isRunningRef.current     = isRunning; },      [isRunning]);
-  useEffect(() => { balanceRef.current       = balance; },        [balance]);
   useEffect(() => { positionsRef.current     = positions; },      [positions]);
   useEffect(() => { selectedCoinsRef.current = selectedCoins; },  [selectedCoins]);
   useEffect(() => { localStorage.setItem(INSTRUCTIONS_KEY, instructions); }, [instructions]);
@@ -208,14 +207,22 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       const bal     = Number(cfgRes.data.current_balance);
       const initBal = Number(cfgRes.data.initial_balance ?? 0);
       display = bal > 0 ? bal : initBal > 0 ? initBal : startBal;
-      setBalance(display); balanceRef.current = display;
+      setBalance(display);
+      // Only sync balanceRef from DB when no buy/sell cycle is active.
+      // During active cycles the ref is authoritative and loadData must not overwrite it.
+      if (!buyProcessingRef.current && !exitProcessingRef.current) {
+        balanceRef.current = display;
+      }
       setInitialBalance(initBal > 0 ? initBal : startBal);
       stopLossRef.current = Number(cfgRes.data.stop_loss_percent ?? 1.5);
       const running = Boolean(cfgRes.data.is_running);
       isRunningRef.current = running;
       setIsRunning(running);
     } else {
-      setBalance(startBal); balanceRef.current = startBal;
+      setBalance(startBal);
+      if (!buyProcessingRef.current && !exitProcessingRef.current) {
+        balanceRef.current = startBal;
+      }
       setInitialBalance(startBal);
     }
 
@@ -376,6 +383,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
       // Write position AND deduct balance in the same round-trip so realtime
       // subscribers always see a consistent state (no phantom USDT).
+      // Update balanceRef BEFORE the await so concurrent loadData calls
+      // triggered by the DB write cannot overwrite it with a stale value.
+      balanceRef.current = newRunBal;
+      setBalance(newRunBal);
+
       await Promise.all([
         supabase.from('bot_trade_history').insert({
           user_session: SESSION, symbol: sig.symbol,
@@ -403,11 +415,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (newlyBought.length > 0) {
       const updated = [...currentPositions, ...newlyBought];
       setPositions(updated); positionsRef.current = updated;
-      setBalance(runBal);    balanceRef.current   = runBal;
+      // balanceRef.current already set per-buy above; sync UI state + parent
+      setBalance(runBal); balanceRef.current = runBal;
       onStateChangeRef.current?.(updated, runBal);
-      await loadData();
     }
-  }, [addLog, loadData]);
+  }, [addLog]);
 
   // ── Exit executor — pure computation, zero DB reads, fires on every tick ──
   // Reads positionsRef + pricesRef in-memory only; DB writes are fire-and-forget.
@@ -624,7 +636,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         is_running: false, updated_at: new Date().toISOString(),
       }).eq('user_session', SESSION),
     ]);
-    setTrades([]); setPositions([]); setBalance(startBal); setInitialBalance(startBal);
+    setTrades([]); setPositions([]); setBalance(startBal); balanceRef.current = startBal; setInitialBalance(startBal);
     setIsRunning(false); setActLog([]);
     toast.success(`Reset · ${startBal.toLocaleString()} USDT restored`);
   };
