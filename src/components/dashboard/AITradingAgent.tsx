@@ -328,9 +328,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       if (runBal < needed) { addLog(`[SKIP] ${sig.symbol}: need ${needed.toFixed(2)} have ${runBal.toFixed(2)}`); continue; }
       if (alloc < MIN_USDT) continue;
 
-      const fee = alloc * TAKER_FEE;
-      const qty = (alloc - fee) / price;
+      const fee       = alloc * TAKER_FEE;
+      const qty       = (alloc - fee) / price;
+      const newRunBal = Math.round((runBal - alloc) * 10000) / 10000;
 
+      // Write position AND deduct balance in the same round-trip so realtime
+      // subscribers always see a consistent state (no phantom USDT).
       await Promise.all([
         supabase.from('bot_trade_history').insert({
           user_session: SESSION, symbol: sig.symbol,
@@ -342,21 +345,20 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           quantity: qty, avg_entry_price: price,
           updated_at: new Date().toISOString(),
         }, { onConflict: 'user_session,symbol' }),
+        supabase.from('bot_config').update({
+          current_balance: newRunBal,
+          updated_at: new Date().toISOString(),
+        }).eq('user_session', SESSION),
       ]);
 
-      runBal -= alloc;
+      runBal = newRunBal;
       newlyBought.push({ symbol: sig.symbol, quantity: qty, avg_entry_price: price });
       heldSet.add(sig.symbol);
-      addLog(`  BUY  ${sig.symbol} @ ${price.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT`);
+      addLog(`  BUY  ${sig.symbol} @ ${price.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT · bal ${runBal.toFixed(2)} USDT`);
       toast.info(`AI Paper BUY: ${sig.symbol.replace('USDT','')}`, { description: `${alloc.toFixed(2)} USDT @ ${price.toFixed(4)} USDT`, duration: 3000 });
     }
 
     if (newlyBought.length > 0) {
-      await supabase.from('bot_config').update({
-        current_balance: Math.round(runBal * 10000) / 10000,
-        updated_at: new Date().toISOString(),
-      }).eq('user_session', SESSION);
-
       const updated = [...currentPositions, ...newlyBought];
       setPositions(updated); positionsRef.current = updated;
       setBalance(runBal);    balanceRef.current   = runBal;
