@@ -40,9 +40,9 @@ def main():
     import control_api
     from connection import get_mode
 
-    # 2. Write a default strategy.json immediately so trade_engine never waits
-    if not os.path.exists("strategy.json"):
-        strategy_engine.write_default_strategy()
+    # 2. Always regenerate strategy.json so config.py changes take effect.
+    #    trading_active defaults to True (always active after restart).
+    strategy_engine.write_default_strategy()
 
     # 3. Restore open positions from DB (crash recovery)
     trade_engine.load_positions_from_db()
@@ -53,8 +53,11 @@ def main():
     # 5. Download candle history (skipped if already loaded)
     data_collector.download_history()
 
-    # 6. Register trade engine as the price callback
+    # 6. Register callbacks
+    #    price callback  → real-time exits AND buy-cache checks on every tick
+    #    kline callback  → update signal cache on every 1-minute candle close
     data_collector.register_price_callback(trade_engine.realtime_monitor)
+    data_collector.register_kline_callback(trade_engine.update_coin_signals)
 
     print("\n[Main] All systems ready. Starting live feeds…\n")
 

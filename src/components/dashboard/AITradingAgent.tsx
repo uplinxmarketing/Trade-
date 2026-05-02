@@ -457,9 +457,29 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
   // ── Force SELL ───────────────────────────────────────────────────────────
   const forceSell = useCallback(async (pos: OpenPosition) => {
-    const wsPrice = parseFloat(pricesRef.current[pos.symbol]?.price || '0');
-    if (!wsPrice) { toast.error('No live price yet'); return; }
+    if (pendingSellsRef.current.has(pos.symbol)) return;
+    pendingSellsRef.current.add(pos.symbol);
     setForcingSell(pos.symbol);
+
+    // Server mode: delegate to Railway's force-sell endpoint
+    if (isServerModeRef.current) {
+      try {
+        const res = await fetch(`${railwayUrl}/api/force-sell/${pos.symbol}`, { method: 'POST' });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error ?? 'Force sell failed');
+        addLog(`FORCE SELL ${pos.symbol} via Railway @ ${Number(data.price).toFixed(4)} USDT`);
+        toast.success(`Force SELL sent: ${pos.symbol.replace('USDT','')}`);
+      } catch (e) {
+        toast.error(`Force sell failed: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setForcingSell(null);
+        pendingSellsRef.current.delete(pos.symbol);
+      }
+      return;
+    }
+
+    const wsPrice = parseFloat(pricesRef.current[pos.symbol]?.price || '0');
+    if (!wsPrice) { toast.error('No live price yet'); setForcingSell(null); pendingSellsRef.current.delete(pos.symbol); return; }
     try {
       const proceeds = pos.quantity * wsPrice * (1 - TAKER_FEE);
       const cost     = pos.quantity * pos.avg_entry_price / (1 - TAKER_FEE);
@@ -477,8 +497,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       addLog(`FORCE SELL ${pos.symbol} @ ${wsPrice.toFixed(4)} USDT · P&L ${pnl>=0?'+':''}${pnl.toFixed(4)} USDT`);
       toast[pnl >= 0 ? 'success' : 'error'](`Force SELL: ${pos.symbol.replace('USDT','')} ${pnl>=0?'+':''}${pnl.toFixed(4)} USDT`);
       await loadData();
-    } finally { setForcingSell(null); }
-  }, [addLog, loadData]);
+    } finally { setForcingSell(null); pendingSellsRef.current.delete(pos.symbol); }
+  }, [addLog, loadData, railwayUrl]);
 
   // ── Reset ────────────────────────────────────────────────────────────────
   const resetBot = async () => {
@@ -660,12 +680,25 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         </div>
       )}
 
-      {/* ── Open positions ── */}
-      {positions.length > 0 && (
-        <div>
-          <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2 flex items-center gap-1.5">
-            <Zap className="w-3 h-3 text-warn"/>Open Positions ({positions.length})
+      {/* ── Open positions ── always visible so the user can see status */}
+      <div>
+        <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2 flex items-center justify-between">
+          <div className="flex items-center gap-1.5">
+            <Zap className="w-3 h-3 text-warn"/>
+            Open Positions
+            <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${positions.length>0?'bg-warn/20 text-warn':'bg-muted/40 text-muted-foreground'}`}>
+              {positions.length}
+            </span>
           </div>
+          {isServerMode && positions.length > 0 && (
+            <span className="text-[9px] text-muted-foreground">live from Railway</span>
+          )}
+        </div>
+        {positions.length === 0 ? (
+          <div className="text-xs text-muted-foreground text-center py-5 border border-dashed border-border rounded-lg">
+            {isRunning ? '⏳ No open positions — bot will buy when signals align' : '▶ Start the agent to begin trading'}
+          </div>
+        ) : (
           <div className="space-y-1.5">
             {positions.map(pos => {
               const live  = parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.avg_entry_price;
@@ -676,6 +709,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               const bep   = pos.avg_entry_price * BEP_MULT;
               const prof  = live >= bep;
               const bepProgress = Math.min(100, Math.max(0, ((live-pos.avg_entry_price)/(bep-pos.avg_entry_price))*100));
+              const qty   = Number(pos.quantity);
+              const budget = pos.avg_entry_price * qty;
               return (
                 <div key={pos.symbol} className="bg-muted/20 border border-border/50 rounded-lg px-3 py-2.5 space-y-2">
                   <div className="flex items-center justify-between">
@@ -692,24 +727,27 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       </button>
                     </div>
                   </div>
-                  <div className="text-[10px] text-muted-foreground font-mono">
-                    Entry {pos.avg_entry_price.toFixed(4)} USDT · BEP {bep.toFixed(4)} USDT · Now {live.toFixed(4)} USDT
+                  <div className="grid grid-cols-2 gap-x-4 text-[10px] text-muted-foreground font-mono">
+                    <span>Entry <span className="text-foreground">{pos.avg_entry_price.toFixed(4)}</span></span>
+                    <span>BEP <span className="text-accent">{bep.toFixed(4)}</span></span>
+                    <span>Now <span className={prof?'text-gain':'text-foreground'}>{live.toFixed(4)}</span></span>
+                    <span>Qty <span className="text-foreground">{qty.toFixed(6)}</span> · <span className="text-foreground">{budget.toFixed(2)} USDT</span></span>
                   </div>
                   <div className="space-y-1">
                     <div className="flex justify-between text-[9px]">
                       <span className="text-muted-foreground">Break-even progress</span>
-                      <span className={prof?'text-gain font-bold':'text-warn'}>{prof?'✓ Profitable':bepProgress.toFixed(0)+'%'}</span>
+                      <span className={prof?'text-gain font-bold':'text-warn'}>{prof?'✓ Profitable':bepProgress.toFixed(0)+'% to BEP'}</span>
                     </div>
                     <div className="h-1.5 bg-muted/40 rounded-full overflow-hidden">
-                      <div className={`h-full rounded-full transition-all ${prof?'bg-gain':'bg-warn'}`} style={{width:`${bepProgress}%`}}/>
+                      <div className={`h-full rounded-full transition-all ${prof?'bg-gain':'bg-warn'}`} style={{width:`${Math.max(2, bepProgress)}%`}}/>
                     </div>
                   </div>
                 </div>
               );
             })}
           </div>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* ── Trade history ── */}
       <div>

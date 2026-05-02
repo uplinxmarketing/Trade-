@@ -18,8 +18,9 @@ from connection import client
 # Shared live prices dict — imported by trade_engine and strategy_engine
 prices: Dict[str, float] = {}
 
-# Callback registered by main.py to avoid circular import
+# Callbacks registered by main.py to avoid circular imports
 _price_callback: Optional[Callable[[Dict[str, float]], None]] = None
+_kline_callback: Optional[Callable[[str, list, list], None]]  = None
 
 
 def register_price_callback(cb: Callable[[Dict[str, float]], None]):
@@ -27,15 +28,34 @@ def register_price_callback(cb: Callable[[Dict[str, float]], None]):
     _price_callback = cb
 
 
+def register_kline_callback(cb: Callable[[str, list, list], None]):
+    """Wire kline-close events into trade_engine.update_coin_signals."""
+    global _kline_callback
+    _kline_callback = cb
+
+
 # ── REST historical download ─────────────────────────────────────────────────
 
+_BINANCE_BASES = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+]
+
+
 def _fetch_klines_rest(symbol: str, interval: str, limit: int = 500):
-    url = (
-        f"https://api.binance.com/api/v3/klines"
-        f"?symbol={symbol}&interval={interval}&limit={limit}"
-    )
-    with urllib.request.urlopen(url, timeout=15) as resp:
-        return json.loads(resp.read())
+    """Try each Binance base URL in order; return first successful response."""
+    last_err = None
+    for base in _BINANCE_BASES:
+        url = f"{base}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        try:
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            last_err = e
+    raise last_err
 
 
 def _compute_and_save(symbol: str, raw_klines: list):
@@ -164,6 +184,13 @@ async def start_websocket():
                                     new_row["low"], new_row["close"], new_row["volume"]
                                 ]]
                                 _compute_and_save(sym, all_raw)
+
+                                # Notify trade_engine so signal cache is updated
+                                # immediately on kline close — enables real-time buys.
+                                if _kline_callback and len(all_raw) >= 27:
+                                    closes  = [float(r[4]) for r in all_raw]
+                                    volumes = [float(r[5]) for r in all_raw]
+                                    _kline_callback(sym, closes, volumes)
 
                     except Exception as e:
                         print(f"[DataCollector] Message error: {e}")

@@ -458,6 +458,190 @@ def dashboard():
 
 # ── Start as daemon thread ────────────────────────────────────────────────────
 
+@app.get("/api/status")
+def api_status():
+    strategy = _load_strategy()
+    trades   = database.get_recent_trades(limit=500)
+    sells    = [t for t in trades if t.get("exit_price") is not None]
+    wins     = sum(1 for t in sells if (t.get("net_profit") or 0) > 0)
+    realized = sum(t.get("net_profit") or 0 for t in sells)
+    initial  = float(strategy.get("initial_balance_usdt", 0))
+    balance  = round(_get_usdt_balance(), 2)
+    approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
+    return {
+        "running":          strategy.get("trading_active", False),
+        "mode":             get_mode(),
+        "balance_usdt":     balance,
+        "initial_balance":  initial,
+        "open_positions":   len(_get_positions()),
+        "trades_today":     database.get_trades_today_count(),
+        "win_rate":         round(wins / len(sells), 3) if sells else 0.0,
+        "wins":             wins,
+        "losses":           len(sells) - wins,
+        "total_trades":     len(sells),
+        "realized_pnl":     round(realized, 4),
+        "watched_coins":    approved or config.WATCHED_COINS,
+    }
+
+
+@app.get("/api/positions")
+def api_positions():
+    return {"positions": _get_positions()}
+
+
+@app.get("/api/trades")
+def api_trades():
+    return {"trades": database.get_recent_trades(limit=200)}
+
+
+class CoinsRequest(BaseModel):
+    coins: list[str]
+
+
+@app.post("/api/coins")
+def api_set_coins(req: CoinsRequest):
+    """Update the approved coin list in strategy.json without restarting."""
+    valid = [c.upper() for c in req.coins if c.upper().endswith("USDT")]
+    if not valid:
+        return {"ok": False, "error": "No valid USDT pairs provided"}
+    strategy = _load_strategy()
+    existing = {c["symbol"]: c for c in strategy.get("approved_coins", [])}
+    new_approved = []
+    for sym in valid:
+        cfg = existing.get(sym, {})
+        new_approved.append({
+            "symbol":         sym,
+            "approved":       True,
+            "budget_usdt":    cfg.get("budget_usdt", config.BUDGET_PER_TRADE_USDT),
+            "max_concurrent": cfg.get("max_concurrent", 2),
+            "confidence":     cfg.get("confidence", 0.5),
+            "reason":         cfg.get("reason", "Updated via dashboard"),
+        })
+    _write_strategy_patch({"approved_coins": new_approved})
+    return {"ok": True, "coins": valid}
+
+
+@app.get("/api/activity")
+def api_activity():
+    return {"entries": database.get_activity_log(limit=100)}
+
+
+@app.post("/api/reset")
+def api_reset():
+    """Reset paper wallet: wipe all trades/positions and restore starting USDT balance."""
+    starting_usdt = float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+    try:
+        # Reset in-memory PaperClient balance
+        from connection import client as _client
+        if hasattr(_client, "_balances"):
+            with _client._lock:
+                _client._balances = {"USDT": starting_usdt}
+            _client._prices.clear()
+
+        # Wipe DB trades + positions + activity log, set paper state
+        database.reset_paper_wallet(starting_usdt)
+
+        # Reload positions in trade engine (clears in-memory list)
+        from trade_engine import load_positions_from_db
+        load_positions_from_db()
+
+        # Reset initial_balance in strategy.json
+        s = _load_strategy()
+        s["initial_balance_usdt"] = starting_usdt
+        with open(config.STRATEGY_FILE, "w") as f:
+            json.dump(s, f, indent=2)
+
+        database.log_activity(f"Paper wallet reset — {starting_usdt:.2f} USDT", "info")
+        return {"ok": True, "balance_usdt": starting_usdt}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/agent/start")
+def api_agent_start():
+    import strategy_engine
+    # Refresh approved coins from config before starting so stale strategy.json
+    # never limits which coins are scanned.
+    strategy_engine.write_default_strategy()
+    _write_strategy_patch({"trading_active": True, "pause_reason": None})
+    return {"ok": True, "running": True}
+
+
+@app.post("/api/agent/stop")
+def api_agent_stop():
+    _write_strategy_patch({"trading_active": False, "pause_reason": "Stopped via API"})
+    return {"ok": True, "running": False}
+
+
+@app.post("/api/force-sell/{symbol}")
+def api_force_sell(symbol: str):
+    """Immediately sell an open position by symbol (case-insensitive)."""
+    sym = symbol.upper()
+    try:
+        from trade_engine import get_open_positions, _execute_sell
+        from data_collector import prices as live_prices
+        pos_list = get_open_positions()
+        pos = next((p for p in pos_list if p["symbol"] == sym), None)
+        if pos is None:
+            return {"ok": False, "error": f"No open position for {sym}"}
+        price = live_prices.get(sym, 0) or pos.get("entry_price", 0)
+        if not price:
+            return {"ok": False, "error": f"No live price for {sym}"}
+        _execute_sell(pos, price, "force-sell")
+        return {"ok": True, "symbol": sym, "price": price}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class ModeRequest(BaseModel):
+    mode: str           # "paper" or "live"
+    api_key: str = ""
+    api_secret: str = ""
+
+
+def _update_env_file(updates: dict):
+    env_path = ".env"
+    lines: list[str] = []
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            lines = f.readlines()
+    for key, value in updates.items():
+        found = False
+        for i, line in enumerate(lines):
+            if line.startswith(f"{key}="):
+                lines[i] = f"{key}={value}\n"
+                found = True
+                break
+        if not found:
+            lines.append(f"{key}={value}\n")
+    with open(env_path, "w") as f:
+        f.writelines(lines)
+
+
+@app.post("/api/mode")
+def api_set_mode(req: ModeRequest):
+    if req.mode not in ("paper", "live"):
+        return {"ok": False, "error": "mode must be paper or live"}
+
+    updates = {"MODE": req.mode}
+    if req.mode == "live":
+        if req.api_key:
+            updates["BINANCE_API_KEY"] = req.api_key
+        if req.api_secret:
+            updates["BINANCE_API_SECRET"] = req.api_secret
+
+    _update_env_file(updates)
+    # Stop trading before restart so no open orders are left dangling
+    _write_strategy_patch({"trading_active": False})
+
+    def _restart():
+        time.sleep(0.8)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=_restart, daemon=True).start()
+    return {"ok": True, "mode": req.mode, "restarting": True}
+
+
 def start_control_api():
     t = threading.Thread(
         target=lambda: uvicorn.run(app, host="0.0.0.0", port=8000, log_level="error"),
