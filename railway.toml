@@ -1,6 +1,5 @@
 [build]
-builder = "nixpacks"
+builder = "dockerfile"
 
 [deploy]
-startCommand = "python trading-bot/main.py"
 restartPolicyType = "always"

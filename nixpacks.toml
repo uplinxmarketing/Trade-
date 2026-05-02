@@ -1,8 +1,0 @@
-[phases.setup]
-nixPkgs = ["python311", "python311Packages.pip", "gcc"]
-
-[phases.install]
-cmds = ["pip install -r trading-bot/requirements.txt"]
-
-[start]
-cmd = "python trading-bot/main.py"
