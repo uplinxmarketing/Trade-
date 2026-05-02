@@ -124,6 +124,7 @@ const Index = () => {
               binanceConnected={binanceConnected}
               onConnectBinance={() => setShowBinanceConnect(true)}
               onStateChange={(pos, bal) => { setAgentPositions(pos); setAgentBalance(bal); }}
+              onCoinsChange={setSelectedCoins}
             />
 
             {/* Reports */}

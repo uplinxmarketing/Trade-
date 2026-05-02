@@ -3,7 +3,7 @@ import {
   Play, Square, Brain, TrendingUp, TrendingDown, Zap,
   RotateCcw, ChevronDown, ChevronUp, FlaskConical,
   Pencil, Check, X, BookOpen, Activity,
-  ShoppingCart, Banknote, RefreshCw,
+  ShoppingCart, Banknote, RefreshCw, Settings2, Plus, Minus,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { supabase } from '@/integrations/supabase/client';
@@ -11,6 +11,15 @@ import { toast } from 'sonner';
 import { TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
 import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcSMA } from '@/lib/indicators';
+
+// ── All coins available for the bot to trade ─────────────────────────────────
+const ALL_TRADABLE_COINS = [
+  'BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','DOGEUSDT','XRPUSDT',
+  'ADAUSDT','AVAXUSDT','DOTUSDT','LINKUSDT','MATICUSDT','UNIUSDT',
+  'LTCUSDT','ATOMUSDT','SHIBUSDT','ARBUSDT','OPUSDT','INJUSDT',
+  'FETUSDT','NEARUSDT','TRXUSDT','TONUSDT','APTUSDT','SUIUSDT',
+  'PEPEUSDT','WIFUSDT','BONKUSDT','JUPUSDT','RENDERUSDT','TIAUSDT',
+];
 
 // ── Simple 4-signal analyser (no API key, Binance public data only) ──────────
 const BIN = 'https://api.binance.com/api/v3';
@@ -124,13 +133,14 @@ interface AITradingAgentProps {
   binanceConnected?: boolean;
   onConnectBinance?: () => void;
   onStateChange?: (positions: {symbol:string;quantity:number;avg_entry_price:number}[], balance: number) => void;
+  onCoinsChange?: (coins: string[]) => void;
 }
 
 const INSTRUCTIONS_KEY = 'ai_agent_instructions';
 const BEP_MULT         = 1 / Math.pow(1 - TAKER_FEE, 2);
 
 // ── Component ────────────────────────────────────────────────────────────────
-const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onStateChange }: AITradingAgentProps) => {
+const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onStateChange, onCoinsChange }: AITradingAgentProps) => {
   const [mode, setMode]           = useState<'test' | 'live'>('test');
   const [isRunning, setIsRunning] = useState(false);
   const [loading, setLoading]     = useState(false);
@@ -467,21 +477,23 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       addLog(`SELL ${pos.symbol} @ ${price.toFixed(4)} USDT · P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDT`);
     }
 
-    // Non-blocking DB writes
-    const writes = toSell.map(({ pos, price, pnl }) =>
-      Promise.all([
-        supabase.from('bot_trade_history').insert({
-          user_session: SESSION, symbol: pos.symbol, side: 'SELL',
-          price, quantity: Number(pos.quantity), pnl,
-          reason: `[AI Paper] exit · @ ${price.toFixed(4)} USDT · pnl ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDT`,
-        }),
-        supabase.from('paper_portfolio').delete().eq('user_session', SESSION).eq('symbol', pos.symbol),
-      ])
-    );
-
+    // DB writes with error logging
     await Promise.all([
-      ...writes,
-      supabase.from('bot_config').update({ current_balance: newBal, updated_at: new Date().toISOString() }).eq('user_session', SESSION),
+      ...toSell.map(async ({ pos, price, pnl }) => {
+        const [histRes, portRes] = await Promise.all([
+          supabase.from('bot_trade_history').insert({
+            user_session: SESSION, symbol: pos.symbol, side: 'SELL',
+            price, quantity: Number(pos.quantity), pnl,
+            reason: `[AI Paper] exit · @ ${price.toFixed(4)} USDT · pnl ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDT`,
+          }),
+          supabase.from('paper_portfolio').delete().eq('user_session', SESSION).eq('symbol', pos.symbol),
+        ]);
+        if (histRes.error) addLog(`[ERR] Sell history ${pos.symbol}: ${histRes.error.message}`);
+        if (portRes.error) addLog(`[ERR] Portfolio delete ${pos.symbol}: ${portRes.error.message}`);
+      }),
+      supabase.from('bot_config').update({ current_balance: newBal, updated_at: new Date().toISOString() })
+        .eq('user_session', SESSION)
+        .then(r => { if (r.error) addLog(`[ERR] Config update: ${r.error.message}`); }),
     ]);
 
     for (const { pos } of toSell) pendingSellsRef.current.delete(pos.symbol);
@@ -574,21 +586,31 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       const bal   = balanceRef.current;
       const alloc = getAllocation(bal, sym);
       if (alloc < MIN_USDT) { toast.error(`Balance too low (${bal.toFixed(2)} USDT)`); return; }
-      const fee = alloc * TAKER_FEE;
-      const qty = (alloc - fee) / wsPrice;
-      const newBal = bal - alloc;
-      await Promise.all([
+      const fee    = alloc * TAKER_FEE;
+      const qty    = (alloc - fee) / wsPrice;
+      const newBal = Math.round((bal - alloc) * 10000) / 10000;
+
+      // Optimistic update before DB writes so wallet reflects instantly
+      balanceRef.current = newBal;
+      setBalance(newBal);
+      const newPos: OpenPosition = { symbol: sym, quantity: qty, avg_entry_price: wsPrice };
+      const updatedPositions = [...positionsRef.current.filter(p => p.symbol !== sym), newPos];
+      setPositions(updatedPositions); positionsRef.current = updatedPositions;
+      onStateChangeRef.current?.(updatedPositions, newBal);
+
+      const [histRes] = await Promise.all([
         supabase.from('bot_trade_history').insert({
           user_session: SESSION, symbol: sym, side: 'BUY',
           price: wsPrice, quantity: qty, pnl: null,
-          reason: `[Force BUY] manual test · ${alloc.toFixed(2)} USDT @ ${wsPrice.toFixed(4)} USDT`,
+          reason: `[Force BUY] manual · ${alloc.toFixed(2)} USDT @ ${wsPrice.toFixed(4)} USDT`,
         }),
         supabase.from('paper_portfolio').upsert({
           user_session: SESSION, symbol: sym, quantity: qty, avg_entry_price: wsPrice,
           updated_at: new Date().toISOString(),
         }, { onConflict: 'user_session,symbol' }),
-        supabase.from('bot_config').update({ current_balance: newBal }).eq('user_session', SESSION),
+        supabase.from('bot_config').update({ current_balance: newBal, updated_at: new Date().toISOString() }).eq('user_session', SESSION),
       ]);
+      if (histRes.error) addLog(`[ERR] Force buy DB: ${histRes.error.message}`);
       addLog(`FORCE BUY ${sym} @ ${wsPrice.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT`);
       toast.success(`Force BUY: ${sym.replace('USDT','')} @ ${wsPrice.toFixed(4)} USDT`);
       await loadData();
@@ -599,25 +621,35 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const forceSell = useCallback(async (pos: OpenPosition) => {
     const wsPrice = parseFloat(pricesRef.current[pos.symbol]?.price || '0');
     if (!wsPrice) { toast.error('No live price yet'); return; }
+    if (pendingSellsRef.current.has(pos.symbol)) return;
+    pendingSellsRef.current.add(pos.symbol);
     setForcingSell(pos.symbol);
     try {
-      const proceeds = pos.quantity * wsPrice * (1 - TAKER_FEE);
-      const cost     = pos.quantity * pos.avg_entry_price / (1 - TAKER_FEE);
+      const proceeds = Number(pos.quantity) * wsPrice * (1 - TAKER_FEE);
+      const cost     = Number(pos.quantity) * Number(pos.avg_entry_price) / (1 - TAKER_FEE);
       const pnl      = Math.round((proceeds - cost) * 10000) / 10000;
-      const newBal   = balanceRef.current + proceeds;
-      await Promise.all([
+      const newBal   = Math.round((balanceRef.current + proceeds) * 10000) / 10000;
+
+      // Optimistic update before DB writes so wallet reflects instantly
+      const remaining = positionsRef.current.filter(p => p.symbol !== pos.symbol);
+      setPositions(remaining); positionsRef.current = remaining;
+      setBalance(newBal); balanceRef.current = newBal;
+      onStateChangeRef.current?.(remaining, newBal);
+
+      const [histRes] = await Promise.all([
         supabase.from('bot_trade_history').insert({
           user_session: SESSION, symbol: pos.symbol, side: 'SELL',
-          price: wsPrice, quantity: pos.quantity, pnl,
+          price: wsPrice, quantity: Number(pos.quantity), pnl,
           reason: `[Force SELL] manual · @ ${wsPrice.toFixed(4)} USDT · pnl ${pnl>=0?'+':''}${pnl.toFixed(4)} USDT`,
         }),
         supabase.from('paper_portfolio').delete().eq('user_session', SESSION).eq('symbol', pos.symbol),
-        supabase.from('bot_config').update({ current_balance: newBal }).eq('user_session', SESSION),
+        supabase.from('bot_config').update({ current_balance: newBal, updated_at: new Date().toISOString() }).eq('user_session', SESSION),
       ]);
+      if (histRes.error) addLog(`[ERR] Force sell DB: ${histRes.error.message}`);
       addLog(`FORCE SELL ${pos.symbol} @ ${wsPrice.toFixed(4)} USDT · P&L ${pnl>=0?'+':''}${pnl.toFixed(4)} USDT`);
       toast[pnl >= 0 ? 'success' : 'error'](`Force SELL: ${pos.symbol.replace('USDT','')} ${pnl>=0?'+':''}${pnl.toFixed(4)} USDT`);
       await loadData();
-    } finally { setForcingSell(null); }
+    } finally { setForcingSell(null); pendingSellsRef.current.delete(pos.symbol); }
   }, [addLog, loadData]);
 
   // ── Reset ────────────────────────────────────────────────────────────────
@@ -703,6 +735,53 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             {m === 'test' ? <><FlaskConical className="w-3.5 h-3.5" />TEST · Paper</> : <><Zap className="w-3.5 h-3.5" />LIVE · Real{!binanceConnected && <span className="text-[9px] px-1 bg-warn/20 text-warn rounded ml-1">API needed</span>}</>}
           </button>
         ))}
+      </div>
+
+      {/* ── Coin picker ── */}
+      <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-2">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1.5">
+            <Settings2 className="w-3.5 h-3.5 text-accent" />
+            <span className="text-xs font-semibold text-accent">Coins to Trade</span>
+            <span className="text-[10px] text-muted-foreground">({selectedCoins.length} active)</span>
+          </div>
+          {isRunning
+            ? <span className="text-[9px] text-muted-foreground">stop bot to edit</span>
+            : <span className="text-[9px] text-muted-foreground">tap coin to add/remove</span>
+          }
+        </div>
+        <div className="flex flex-wrap gap-1">
+          {ALL_TRADABLE_COINS.map(coin => {
+            const ticker = coin.replace('USDT', '');
+            const active = selectedCoins.includes(coin);
+            return (
+              <button
+                key={coin}
+                disabled={isRunning || (!active && !onCoinsChange)}
+                onClick={() => {
+                  if (!onCoinsChange || isRunning) return;
+                  const next = active
+                    ? selectedCoins.filter(c => c !== coin)
+                    : [...selectedCoins, coin];
+                  if (next.length === 0) { toast.error('Keep at least 1 coin'); return; }
+                  onCoinsChange(next);
+                }}
+                title={active ? `Remove ${ticker}` : `Add ${ticker}`}
+                className={`flex items-center gap-0.5 text-[10px] px-2 py-0.5 rounded-full font-semibold transition-colors
+                  ${active
+                    ? 'bg-accent text-accent-foreground hover:bg-accent/80'
+                    : 'bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+              >
+                {active
+                  ? <Minus className="w-2 h-2" />
+                  : <Plus className="w-2 h-2" />
+                }
+                {ticker}
+              </button>
+            );
+          })}
+        </div>
       </div>
 
       {mode === 'live' && (

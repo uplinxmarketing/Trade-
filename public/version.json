@@ -1,5 +1,5 @@
 {
-  "version": "3.5.10",
-  "buildTime": "2026-05-02T12:00:00Z",
-  "commit": "deploy-new-supabase"
+  "version": "3.5.11",
+  "buildTime": "2026-05-02T14:00:00Z",
+  "commit": "fix-sell-history-force-buttons-coin-picker"
 }
