@@ -167,9 +167,10 @@ interface AITradingAgentProps {
   onStateChange?: (positions: {symbol:string;quantity:number;avg_entry_price:number}[], balance: number) => void;
 }
 
-const INSTRUCTIONS_KEY = 'ai_agent_instructions';
-const AGENT_CYCLE_MS   = 30_000;
-const BEP_MULT         = 1 / Math.pow(1 - TAKER_FEE, 2);
+const INSTRUCTIONS_KEY  = 'ai_agent_instructions';
+const RAILWAY_URL_KEY   = 'railway_bot_url';
+const AGENT_CYCLE_MS    = 30_000;
+const BEP_MULT          = 1 / Math.pow(1 - TAKER_FEE, 2);
 
 // ── Component ────────────────────────────────────────────────────────────────
 const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onStateChange }: AITradingAgentProps) => {
@@ -192,9 +193,17 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [instrDraft, setInstrDraft]       = useState('');
   const [actLog, setActLog]       = useState<string[]>([]);
   const [showLog, setShowLog]     = useState(false);
+  const [railwayUrl, setRailwayUrl] = useState(() => localStorage.getItem(RAILWAY_URL_KEY) ?? '');
+  const [showRailwayInput, setShowRailwayInput] = useState(false);
+  const [railwayDraft, setRailwayDraft] = useState('');
 
-  const isRunningRef   = useRef(false);
-  const processingRef  = useRef(false);
+  const isServerMode    = railwayUrl.trim().length > 0;
+  const isServerModeRef = useRef(isServerMode);
+  useEffect(() => { isServerModeRef.current = isServerMode; }, [isServerMode]);
+
+  const isRunningRef    = useRef(false);
+  const processingRef   = useRef(false);
+  const pendingSellsRef = useRef<Set<string>>(new Set());
   const balanceRef     = useRef(balance);
   const positionsRef   = useRef(positions);
   const cycleTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -579,6 +588,43 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           {binanceConnected ? '⚠️ LIVE MODE — real USDT will be used.' : <span>Binance API not connected. <button onClick={onConnectBinance} className="underline font-semibold">Connect now →</button></span>}
         </div>
       )}
+
+      {/* ── Railway bot URL ── */}
+      <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-1.5">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Activity className="w-3.5 h-3.5 text-accent" />
+            <span className="text-xs font-semibold text-accent">Railway Bot</span>
+            {isServerMode && <span className="text-[9px] px-1.5 py-0.5 rounded bg-gain/20 text-gain font-bold">CONNECTED</span>}
+          </div>
+          {!showRailwayInput ? (
+            <button onClick={() => { setRailwayDraft(railwayUrl); setShowRailwayInput(true); }}
+              className="text-[10px] text-muted-foreground hover:text-foreground flex items-center gap-1">
+              <Pencil className="w-3 h-3" />{isServerMode ? 'Edit URL' : 'Set URL'}
+            </button>
+          ) : (
+            <div className="flex gap-2">
+              <button onClick={() => {
+                const url = railwayDraft.trim().replace(/\/$/, '');
+                setRailwayUrl(url);
+                if (url) localStorage.setItem(RAILWAY_URL_KEY, url);
+                else localStorage.removeItem(RAILWAY_URL_KEY);
+                setShowRailwayInput(false);
+              }} className="text-[10px] text-gain flex items-center gap-0.5"><Check className="w-3 h-3" />Save</button>
+              <button onClick={() => setShowRailwayInput(false)} className="text-[10px] text-loss flex items-center gap-0.5"><X className="w-3 h-3" />Cancel</button>
+            </div>
+          )}
+        </div>
+        {showRailwayInput ? (
+          <input value={railwayDraft} onChange={e => setRailwayDraft(e.target.value)}
+            placeholder="https://your-bot.up.railway.app"
+            className="w-full text-xs bg-background border border-border rounded px-2 py-1.5 font-mono outline-none focus:border-accent" />
+        ) : (
+          <p className="text-[10px] text-muted-foreground">
+            {isServerMode ? railwayUrl : 'Not configured — force-sells run locally against Supabase paper wallet.'}
+          </p>
+        )}
+      </div>
 
       {/* ── Instructions ── */}
       <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-2">
