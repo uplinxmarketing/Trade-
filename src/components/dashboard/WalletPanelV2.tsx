@@ -4,6 +4,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
 import { toast } from 'sonner';
+import { API_BASE } from '@/config';
 
 const PAPER_CFG_KEY = 'paper_wallet_config';
 
@@ -117,6 +118,24 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     setWalletCfg(prev => {
       const next = { ...prev, ...updates };
       try { localStorage.setItem(PAPER_CFG_KEY, JSON.stringify(next)); } catch { /* */ }
+
+      // Sync budget changes to the Railway server so it uses the same values
+      if (API_BASE) {
+        const serverPatch: Record<string, unknown> = {};
+        if (updates.budgetMode)   serverPatch.budget_mode           = updates.budgetMode;
+        if (updates.budgetFixed)  serverPatch.budget_fixed_usdt     = updates.budgetFixed;
+        if (updates.budgetPct)    serverPatch.budget_pct_of_free    = updates.budgetPct;
+        if (updates.budgetCap)    serverPatch.budget_total_cap_usdt = updates.budgetCap;
+        if (updates.budgetPerCoin) serverPatch.budget_per_coin      = updates.budgetPerCoin;
+        if (Object.keys(serverPatch).length > 0) {
+          fetch(`${API_BASE}/config`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(serverPatch),
+          }).catch(() => {});
+        }
+      }
+
       return next;
     });
   }, []);
@@ -234,6 +253,16 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     if (!confirm(`Reset paper wallet to ${walletCfg.startingBalance.toLocaleString()} USDT and clear all positions?`)) return;
     setResetting(true);
     try {
+      // Reset server-side wallet (Railway SQLite) when running in server mode
+      if (API_BASE) {
+        const res = await fetch(`${API_BASE}/api/reset`, { method: 'POST' }).catch(() => null);
+        if (!res?.ok) {
+          toast.error('Server reset failed — check Railway logs');
+          return;
+        }
+      }
+
+      // Always reset Supabase (browser paper wallet)
       await Promise.all([
         supabase.from('paper_portfolio').delete().eq('user_session', 'default'),
         supabase.from('bot_trade_history').delete().eq('user_session', 'default'),
@@ -244,13 +273,12 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
           updated_at: new Date().toISOString(),
         }).eq('user_session', 'default'),
       ]);
-      // Clear local wallet state immediately
+
       setPositions([]);
       setUsdtFree(walletCfg.startingBalance);
       setInitialBalance(walletCfg.startingBalance);
       setSessionGain(0);
       setTotalFees(0);
-      // Notify parent so agent clears its in-memory positions/balance too
       onReset?.();
       toast.success(`Paper wallet reset · ${walletCfg.startingBalance.toLocaleString()} USDT`);
     } finally { setResetting(false); }

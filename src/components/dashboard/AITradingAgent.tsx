@@ -867,6 +867,16 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     klineBufferRef.current.clear();
     signalCacheRef.current = [];
     isRunningRef.current = false;
+
+    // In server mode, reset the Railway SQLite wallet first
+    if (isServerMode) {
+      const res = await fetch(`${railwayUrl}/api/reset`, { method: 'POST' }).catch(() => null);
+      if (!res?.ok) {
+        toast.error('Server reset failed — check Railway logs');
+        return;
+      }
+    }
+
     const startBal = getPaperCfg().startingBalance ?? 1000;
     await Promise.all([
       supabase.from('bot_trade_history').delete().eq('user_session', SESSION),

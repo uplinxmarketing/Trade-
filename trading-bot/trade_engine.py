@@ -355,7 +355,11 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # Fast pre-check: any coin signalling BUY? (no lock needed for scalar read)
     with _signal_cache_lock:
         any_ready = any(v["score"] >= config.MIN_SIGNALS_TO_BUY for v in _signal_cache.values())
+        cache_size = len(_signal_cache)
+
     if not any_ready:
+        if cache_size == 0:
+            database.log_activity("Buy check: signal cache empty — waiting for first scan", "info")
         return
 
     # Throttle: don't call get_account() faster than every 3 s
@@ -541,7 +545,7 @@ async def _fetch_klines(session: aiohttp.ClientSession, sym: str) -> list:
     for base in _KLINE_BASES:
         url = f"{base}/api/v3/klines?symbol={sym}&interval=1m&limit=50"
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
                 resp.raise_for_status()
                 return await resp.json()
         except Exception as e:
@@ -551,8 +555,8 @@ async def _fetch_klines(session: aiohttp.ClientSession, sym: str) -> list:
 
 async def _refresh_signal_cache():
     """
-    Refresh the in-memory signal cache from REST klines (or DB fallback).
-    Called every SCAN_INTERVAL_SEC as a backup to WebSocket-driven updates.
+    Refresh the in-memory signal cache. Processes all coins CONCURRENTLY (asyncio.gather)
+    so 30 coins take max(individual) time instead of sum — ~3 s instead of 3+ min.
     Never executes trades — buy execution is in realtime_monitor.
     """
     strategy = _load_strategy()
@@ -567,33 +571,38 @@ async def _refresh_signal_cache():
     if not approved_coins:
         return
 
-    db_ready = sum(
-        1 for s in approved_coins
-        if len(database.get_candles(s, config.CANDLE_TIMEFRAME, limit=27)) >= 27
-    )
+    async def _refresh_one(session: aiohttp.ClientSession, sym: str) -> bool:
+        closes = volumes = None
+        try:
+            raw    = await _fetch_klines(session, sym)
+            closes  = [float(k[4]) for k in raw]
+            volumes = [float(k[5]) for k in raw]
+        except Exception:
+            # REST failed (geo-block / timeout) — fall back to DB candles
+            db_rows = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=50)
+            if len(db_rows) >= 27:
+                closes  = [float(c["close"])  for c in db_rows]
+                volumes = [float(c["volume"]) for c in db_rows]
+
+        if closes and len(closes) >= 27:
+            update_coin_signals(sym, closes, volumes)
+            return True
+        return False
+
+    async with aiohttp.ClientSession() as session:
+        results = await asyncio.gather(
+            *[_refresh_one(session, sym) for sym in approved_coins],
+            return_exceptions=True,
+        )
+
+    updated = sum(1 for r in results if r is True)
+    with _signal_cache_lock:
+        buy_sigs   = [(sym, v["score"]) for sym, v in _signal_cache.items() if v["score"] >= config.MIN_SIGNALS_TO_BUY]
+        total_cached = len(_signal_cache)
+
+    ready_str = ", ".join(f"{s}({sc}/4)" for s, sc in buy_sigs[:8])
     database.log_activity(
-        f"Signal refresh — {len(approved_coins)} coins | candles ready: {db_ready}/{len(approved_coins)}",
+        f"Signal cache refreshed: {updated}/{len(approved_coins)} coins updated | "
+        f"{len(buy_sigs)} BUY signals: {ready_str or 'none'}",
         "info",
     )
-
-    updated = 0
-    async with aiohttp.ClientSession() as session:
-        for sym in approved_coins:
-            closes = volumes = None
-            try:
-                raw = await _fetch_klines(session, sym)
-                closes  = [float(k[4]) for k in raw]
-                volumes = [float(k[5]) for k in raw]
-            except Exception:
-                db_rows = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=50)
-                if len(db_rows) >= 27:
-                    closes  = [float(c["close"])  for c in db_rows]
-                    volumes = [float(c["volume"]) for c in db_rows]
-
-            if closes and len(closes) >= 27:
-                update_coin_signals(sym, closes, volumes)
-                updated += 1
-
-    with _signal_cache_lock:
-        ready = sum(1 for v in _signal_cache.values() if v["score"] >= config.MIN_SIGNALS_TO_BUY)
-    print(f"[SignalScanner] Cache refreshed {updated}/{len(approved_coins)} coins — {ready} signalling BUY")

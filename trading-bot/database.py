@@ -416,6 +416,22 @@ def get_trades_today_count() -> int:
     return row["cnt"] if row else 0
 
 
+def reset_paper_wallet(starting_usdt: float):
+    """Wipe all trades, positions, activity log and reset paper balance."""
+    with _lock:
+        conn = _conn()
+        conn.execute("DELETE FROM trades")
+        conn.execute("DELETE FROM positions")
+        conn.execute("DELETE FROM activity_log")
+        conn.execute(
+            "INSERT INTO paper_state (id, balances, updated_at) VALUES (1, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(id) DO UPDATE SET balances=excluded.balances, updated_at=excluded.updated_at",
+            (json.dumps({"USDT": starting_usdt}),),
+        )
+        conn.commit()
+        conn.close()
+
+
 def get_win_rate_overall() -> float:
     with _lock:
         conn = _conn()

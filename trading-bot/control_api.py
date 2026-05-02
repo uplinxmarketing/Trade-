@@ -528,6 +528,37 @@ def api_activity():
     return {"entries": database.get_activity_log(limit=100)}
 
 
+@app.post("/api/reset")
+def api_reset():
+    """Reset paper wallet: wipe all trades/positions and restore starting USDT balance."""
+    starting_usdt = float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+    try:
+        # Reset in-memory PaperClient balance
+        from connection import client as _client
+        if hasattr(_client, "_balances"):
+            with _client._lock:
+                _client._balances = {"USDT": starting_usdt}
+            _client._prices.clear()
+
+        # Wipe DB trades + positions + activity log, set paper state
+        database.reset_paper_wallet(starting_usdt)
+
+        # Reload positions in trade engine (clears in-memory list)
+        from trade_engine import load_positions_from_db
+        load_positions_from_db()
+
+        # Reset initial_balance in strategy.json
+        s = _load_strategy()
+        s["initial_balance_usdt"] = starting_usdt
+        with open(config.STRATEGY_FILE, "w") as f:
+            json.dump(s, f, indent=2)
+
+        database.log_activity(f"Paper wallet reset — {starting_usdt:.2f} USDT", "info")
+        return {"ok": True, "balance_usdt": starting_usdt}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/api/agent/start")
 def api_agent_start():
     import strategy_engine

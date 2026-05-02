@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Settings2, Zap, Percent, Lock, Layers } from 'lucide-react';
 import { toast } from 'sonner';
+import { API_BASE } from '@/config';
 
-const BOT_API = 'http://localhost:8000';
+const BOT_API = API_BASE;
 
 type BudgetMode = 'fixed' | 'percent' | 'capped' | 'per_coin';
 

@@ -1,5 +1,5 @@
 {
-  "version": "3.5.31",
+  "version": "3.5.32",
   "buildTime": "2026-05-03T06:00:00Z",
   "commit": "fix-tdz-crash-seedbuffers-ref"
 }
