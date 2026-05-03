@@ -513,9 +513,36 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       // ── Server mode: delegate to Railway ──
       if (isServerMode) {
         const endpoint = isRunning ? '/api/agent/stop' : '/api/agent/start';
-        const res  = await fetch(`${railwayUrl}${endpoint}`, { method: 'POST' });
-        const data = await res.json();
-        if (data.ok === false) throw new Error(data.error ?? 'Railway call failed');
+        let res: Response;
+        try {
+          res = await fetch(`${railwayUrl}${endpoint}`, { method: 'POST' });
+        } catch (networkErr: any) {
+          const msg = `Cannot reach Railway (${networkErr.message ?? 'network error'})`;
+          toast.error(msg);
+          addLog(`[Railway ERROR] ${msg}`);
+          return;
+        }
+        if (!res.ok) {
+          const msg = `Railway returned HTTP ${res.status}: ${res.statusText}`;
+          toast.error(msg);
+          addLog(`[Railway ERROR] ${msg}`);
+          return;
+        }
+        let data: any;
+        try {
+          data = await res.json();
+        } catch {
+          const msg = 'Railway response was not valid JSON';
+          toast.error(msg);
+          addLog(`[Railway ERROR] ${msg}`);
+          return;
+        }
+        if (data.ok === false) {
+          const msg = data.error ?? 'Railway call failed';
+          toast.error(`Railway: ${msg}`);
+          addLog(`[Railway ERROR] ${msg}`);
+          return;
+        }
         addLog(isRunning ? '=== Railway bot STOPPED ===' : '=== Railway bot STARTED ===');
         toast[isRunning ? 'info' : 'success'](isRunning ? 'Railway bot paused' : 'Railway bot started', {
           description: 'Runs 24/7 on Railway — this browser tab can be closed.',

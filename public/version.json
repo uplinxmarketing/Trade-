@@ -1,5 +1,5 @@
 {
-  "version": "3.5.34",
-  "buildTime": "2026-05-03T10:00:00Z",
-  "commit": "fix-vercel-railway-communication"
+  "version": "3.5.35",
+  "buildTime": "2026-05-03T11:00:00Z",
+  "commit": "fix-railway-start-button-silent-failure"
 }
