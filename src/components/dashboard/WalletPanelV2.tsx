@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { RefreshCw, Loader2, Wifi, FlaskConical, RotateCcw, Lock, Percent, Zap, Layers, ChevronDown, ChevronUp } from 'lucide-react';
+import { RefreshCw, Loader2, Wifi, FlaskConical, RotateCcw, Lock, Percent, Zap, Layers, ChevronDown, ChevronUp, Check } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
 import { TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
@@ -35,7 +35,7 @@ const DEFAULT_CFG: WalletCfg = {
   startingBalance: 1000,
   budgetMode: 'percent',
   budgetFixed: 100,
-  budgetPct: 25,
+  budgetPct: 5,
   budgetCap: 500,
   budgetPerCoin: { BTCUSDT: 200, ETHUSDT: 150, SOLUSDT: 100, BNBUSDT: 100, DOGEUSDT: 50 },
 };
@@ -106,38 +106,58 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
 
   // ── Budget config (localStorage) ────────────────────────────────────────────
   const [walletCfg, setWalletCfg] = useState<WalletCfg>(DEFAULT_CFG);
+  // draftCfg holds uncommitted budget value edits; synced to server only on Apply
+  const [draftCfg, setDraftCfg]   = useState<WalletCfg>(DEFAULT_CFG);
 
   useEffect(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(PAPER_CFG_KEY) ?? '{}');
-      setWalletCfg(c => ({ ...c, ...saved }));
+      const merged = { ...DEFAULT_CFG, ...saved };
+      setWalletCfg(merged);
+      setDraftCfg(merged);
     } catch { /* use defaults */ }
   }, []);
 
+  // saveCfg: immediate local commit (mode, startingBalance) — no server call
   const saveCfg = useCallback((updates: Partial<WalletCfg>) => {
     setWalletCfg(prev => {
       const next = { ...prev, ...updates };
       try { localStorage.setItem(PAPER_CFG_KEY, JSON.stringify(next)); } catch { /* */ }
-
-      // Sync budget changes to the Railway server so it uses the same values.
-      // API_BASE='' means same-origin — always sync regardless of API_BASE value.
-      const serverPatch: Record<string, unknown> = {};
-      if (updates.budgetMode)   serverPatch.budget_mode           = updates.budgetMode;
-      if (updates.budgetFixed)  serverPatch.budget_fixed_usdt     = updates.budgetFixed;
-      if (updates.budgetPct)    serverPatch.budget_pct_of_free    = updates.budgetPct;
-      if (updates.budgetCap)    serverPatch.budget_total_cap_usdt = updates.budgetCap;
-      if (updates.budgetPerCoin) serverPatch.budget_per_coin      = updates.budgetPerCoin;
-      if (Object.keys(serverPatch).length > 0) {
-        fetch(`${API_BASE}/config`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(serverPatch),
-        }).catch(() => {});
-      }
-
       return next;
     });
+    // Keep draft in sync for non-value fields
+    setDraftCfg(prev => ({ ...prev, ...updates }));
   }, []);
+
+  // commitDraft: apply pending draft budget values → walletCfg + localStorage + server
+  const commitDraft = useCallback(() => {
+    setWalletCfg(prev => {
+      const next = { ...prev, ...draftCfg };
+      try { localStorage.setItem(PAPER_CFG_KEY, JSON.stringify(next)); } catch { /* */ }
+      const patch = {
+        budget_mode:           next.budgetMode,
+        budget_fixed_usdt:     next.budgetFixed,
+        budget_pct_of_free:    next.budgetPct,
+        budget_total_cap_usdt: next.budgetCap,
+        budget_per_coin:       next.budgetPerCoin,
+      };
+      fetch(`${API_BASE}/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      }).then(r => r.json()).then(d => {
+        if (d.ok) toast.success('Budget settings applied to bot');
+        else toast.error('Server rejected settings: ' + (d.error ?? 'unknown'));
+      }).catch(() => toast.error('Bot unreachable — settings saved locally'));
+      return next;
+    });
+  }, [draftCfg]);
+
+  const hasPendingBudget =
+    draftCfg.budgetFixed   !== walletCfg.budgetFixed   ||
+    draftCfg.budgetPct     !== walletCfg.budgetPct     ||
+    draftCfg.budgetCap     !== walletCfg.budgetCap     ||
+    JSON.stringify(draftCfg.budgetPerCoin) !== JSON.stringify(walletCfg.budgetPerCoin);
 
   // ── Paper / test mode ────────────────────────────────────────────────────────
   // No dependency on walletCfg state — reads localStorage directly so the callback
@@ -515,7 +535,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                   {BUDGET_MODES.map(m => (
                     <button
                       key={m.key}
-                      onClick={() => saveCfg({ budgetMode: m.key })}
+                      onClick={() => { saveCfg({ budgetMode: m.key }); }}
                       className={`flex flex-col items-center gap-0.5 py-2 px-1 rounded text-[9px] font-semibold border transition-colors
                         ${walletCfg.budgetMode === m.key
                           ? 'bg-accent text-accent-foreground border-accent'
@@ -530,15 +550,15 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                 </div>
               </div>
 
-              {/* Mode-specific input */}
+              {/* Mode-specific input — edits go to draftCfg, committed via Apply */}
               <div className="bg-muted/20 rounded-md px-3 py-2.5 space-y-2">
                 {walletCfg.budgetMode === 'fixed' && (
                   <div className="flex items-center gap-3">
                     <span className="text-[10px] text-muted-foreground w-28">Amount per trade</span>
                     <input
                       type="number" min={10} step={10}
-                      value={walletCfg.budgetFixed}
-                      onChange={e => saveCfg({ budgetFixed: Math.max(10, Number(e.target.value)) })}
+                      value={draftCfg.budgetFixed}
+                      onChange={e => setDraftCfg(p => ({ ...p, budgetFixed: Math.max(10, Number(e.target.value)) }))}
                       className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-accent"
                     />
                     <span className="text-[10px] text-muted-foreground">USDT per trade</span>
@@ -550,14 +570,15 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                       <span className="text-[10px] text-muted-foreground w-28">% of free balance</span>
                       <input
                         type="range" min={1} max={50} step={1}
-                        value={walletCfg.budgetPct}
-                        onChange={e => saveCfg({ budgetPct: Number(e.target.value) })}
+                        value={draftCfg.budgetPct}
+                        onChange={e => setDraftCfg(p => ({ ...p, budgetPct: Number(e.target.value) }))}
                         className="flex-1 accent-accent"
                       />
-                      <span className="text-sm font-mono font-bold w-10 text-right">{walletCfg.budgetPct}%</span>
+                      <span className="text-sm font-mono font-bold w-10 text-right">{draftCfg.budgetPct}%</span>
                     </div>
                     <div className="text-[9px] text-muted-foreground">
-                      At {effectiveUsdtFree.toFixed(0)} USDT free → <span className="text-accent font-mono">{(effectiveUsdtFree * walletCfg.budgetPct / 100).toFixed(2)} USDT</span> per trade
+                      At {effectiveUsdtFree.toFixed(0)} USDT free → <span className="text-accent font-mono">{(effectiveUsdtFree * draftCfg.budgetPct / 100).toFixed(2)} USDT</span> per trade
+                      {hasPendingBudget && <span className="ml-2 text-warn">(pending — click Apply)</span>}
                     </div>
                   </div>
                 )}
@@ -566,11 +587,11 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                     <span className="text-[10px] text-muted-foreground w-28">Max total cap</span>
                     <input
                       type="number" min={50} step={50}
-                      value={walletCfg.budgetCap}
-                      onChange={e => saveCfg({ budgetCap: Math.max(50, Number(e.target.value)) })}
+                      value={draftCfg.budgetCap}
+                      onChange={e => setDraftCfg(p => ({ ...p, budgetCap: Math.max(50, Number(e.target.value)) }))}
                       className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-accent"
                     />
-                    <span className="text-[10px] text-muted-foreground">USDT (÷3 slots = {(walletCfg.budgetCap/3).toFixed(0)} USDT/trade)</span>
+                    <span className="text-[10px] text-muted-foreground">USDT (÷3 slots = {(draftCfg.budgetCap/3).toFixed(0)} USDT/trade)</span>
                   </div>
                 )}
                 {walletCfg.budgetMode === 'per_coin' && (
@@ -578,16 +599,17 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                     <div className="text-[9px] text-muted-foreground mb-1">USDT per coin</div>
                     {watchCoins.map(sym => {
                       const ticker = sym.replace('USDT', '');
-                      const val = walletCfg.budgetPerCoin[sym] ?? 100;
+                      const val = draftCfg.budgetPerCoin[sym] ?? 100;
                       return (
                         <div key={sym} className="flex items-center gap-2">
                           <span className="text-[10px] font-mono font-bold w-12">{ticker}</span>
                           <input
                             type="number" min={10} step={10}
                             value={val}
-                            onChange={e => saveCfg({
-                              budgetPerCoin: { ...walletCfg.budgetPerCoin, [sym]: Math.max(10, Number(e.target.value)) },
-                            })}
+                            onChange={e => setDraftCfg(p => ({
+                              ...p,
+                              budgetPerCoin: { ...p.budgetPerCoin, [sym]: Math.max(10, Number(e.target.value)) },
+                            }))}
                             className="w-20 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-accent"
                           />
                           <span className="text-[9px] text-muted-foreground">USDT</span>
@@ -596,6 +618,24 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                     })}
                   </div>
                 )}
+              </div>
+
+              {/* Apply button */}
+              <div className="flex items-center justify-between pt-1">
+                <span className="text-[9px] text-muted-foreground">
+                  {hasPendingBudget ? '● Unsaved changes' : '✓ Settings synced'}
+                </span>
+                <button
+                  onClick={commitDraft}
+                  className={`flex items-center gap-1.5 text-[10px] font-semibold px-3 py-1.5 rounded border transition-colors
+                    ${hasPendingBudget
+                      ? 'bg-accent text-accent-foreground border-accent hover:bg-accent/90'
+                      : 'bg-muted/30 text-muted-foreground border-border hover:border-accent/50'
+                    }`}
+                >
+                  <Check className="w-3 h-3" />
+                  Apply to Bot
+                </button>
               </div>
             </div>
           )}

@@ -1,5 +1,5 @@
 {
-  "version": "3.6.6",
+  "version": "3.8.0",
   "buildTime": "2026-05-03T18:00:00Z",
   "commit": "fix-update-button-hard-reload-and-auto-check"
 }
