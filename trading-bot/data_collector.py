@@ -133,12 +133,11 @@ def _build_ws_url(coins: list) -> str:
 async def _verify_symbols(coins: list) -> list:
     """Return only coins that Binance confirms exist as USDT pairs."""
     try:
-        loop = asyncio.get_event_loop()
         def _fetch():
             url = "https://api.binance.com/api/v3/exchangeInfo?permissions=SPOT"
-            with urllib.request.urlopen(url, timeout=10) as r:
+            with urllib.request.urlopen(url, timeout=15) as r:
                 return json.loads(r.read())
-        data = await loop.run_in_executor(None, _fetch)
+        data = await asyncio.to_thread(_fetch)
         valid = {s["symbol"] for s in data.get("symbols", []) if s["status"] == "TRADING"}
         ok    = [c for c in coins if c in valid]
         bad   = [c for c in coins if c not in valid]
@@ -146,7 +145,7 @@ async def _verify_symbols(coins: list) -> list:
             print(f"[DataCollector] Dropping invalid symbols: {bad}")
         return ok
     except Exception as e:
-        print(f"[DataCollector] Symbol verification failed ({e}) — using full list")
+        print(f"[DataCollector] Symbol verification failed ({e}) — using full coin list")
         return coins
 
 

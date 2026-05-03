@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { BarChart3, DollarSign, TrendingUp, Percent, Loader2, RefreshCw, Activity } from 'lucide-react';
+import { BarChart3, DollarSign, TrendingUp, Percent, Loader2, RefreshCw, Activity, Lock } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
 import { TAKER_FEE } from '@/lib/trading-engine';
 import { API_BASE } from '@/config';
@@ -15,7 +15,7 @@ interface Trade {
 interface BotStatus {
   running: boolean;
   balance_usdt: number;
-  initial_balance: number;
+  initial_balance: number;  // starting capital for % locked calculation
   realized_pnl: number;
   win_rate: number;
   wins: number;
@@ -142,9 +142,14 @@ const ReportDashboard = () => {
 
   const isActive = botStatus?.running ?? false;
 
+  // Locked profit = cumulative USDT from winning sells only (ignores losses)
+  const lockedProfit = pairTrades.filter(p => p.netPnl > 0).reduce((s, p) => s + p.netPnl, 0);
+  const initBal      = Number(botStatus?.initial_balance ?? 0);
+  const lockedPct    = initBal > 0 && lockedProfit > 0 ? (lockedProfit / initBal) * 100 : 0;
+
   const cards = [
     {
-      label: 'Total Profit',
+      label: 'Total P&L',
       value: `${totalProfit >= 0 ? '+' : ''}$${fmt(Math.abs(totalProfit))}`,
       sub: `${total} closed trade${total !== 1 ? 's' : ''}`,
       color: totalProfit > 0 ? 'text-gain' : totalProfit < 0 ? 'text-loss' : 'text-muted-foreground',
@@ -158,6 +163,14 @@ const ReportDashboard = () => {
       color: todayProfit > 0 ? 'text-gain' : todayProfit < 0 ? 'text-loss' : 'text-muted-foreground',
       bg: todayProfit > 0 ? 'bg-gain/10 border-gain/20' : 'bg-muted/20 border-border',
       Icon: TrendingUp,
+    },
+    {
+      label: 'Profit Locked',
+      value: lockedProfit > 0 ? `+$${fmt(lockedProfit)}` : (total > 0 ? '$0.00' : '—'),
+      sub: lockedPct > 0 ? `+${fmt(lockedPct, 2)}% of starting capital · ${wins} win${wins !== 1 ? 's' : ''}` : (total > 0 ? `${wins} winning trade${wins !== 1 ? 's' : ''}` : isActive ? 'Awaiting first win…' : 'No wins yet'),
+      color: lockedProfit > 0 ? 'text-gain' : 'text-muted-foreground',
+      bg: lockedProfit > 0 ? 'bg-gain/10 border-gain/20' : 'bg-muted/20 border-border',
+      Icon: Lock,
     },
     {
       label: 'Total Fees',
@@ -192,7 +205,7 @@ const ReportDashboard = () => {
 
       {/* Metric cards */}
       {hasData && (
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
           {cards.map(c => (
             <div key={c.label} className={`rounded-lg border p-3 ${c.bg}`}>
               <div className="flex items-center gap-1.5 mb-2">
