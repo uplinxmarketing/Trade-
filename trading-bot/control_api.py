@@ -128,6 +128,15 @@ def _get_positions():
         return []
 
 
+def _sell_monitor_alive() -> bool:
+    try:
+        import trade_engine as _te
+        hb = _te._sell_monitor_heartbeat
+        return hb > 0 and (time.time() - hb) < 5.0
+    except Exception:
+        return False
+
+
 def _get_usdt_balance() -> float:
     try:
         from connection import client, get_mode
@@ -546,6 +555,7 @@ def api_status():
         "watched_coins":    approved or config.WATCHED_COINS,
         "data_dir":         database._DATA_DIR,
         "db_path":          database.DB_PATH,
+        "sell_monitor_alive": _sell_monitor_alive(),
     }
 
 
@@ -770,6 +780,46 @@ def api_set_mode(req: ModeRequest):
 
     threading.Thread(target=_restart, daemon=True).start()
     return {"ok": True, "mode": req.mode, "restarting": True}
+
+
+@app.get("/api/sell-monitor")
+def api_sell_monitor():
+    """Diagnostic: sell monitor thread status + per-position threshold check."""
+    import trade_engine as _te
+    from data_collector import prices as live_prices
+
+    hb    = _te._sell_monitor_heartbeat
+    alive = hb > 0 and (time.time() - hb) < 5.0
+    age   = round(time.time() - hb, 1) if hb > 0 else None
+
+    positions = _get_positions()
+    checks = []
+    for p in positions:
+        sym   = p["symbol"]
+        entry = p.get("entry_price", 0)
+        price = live_prices.get(sym, 0)
+        tp    = entry * (1.0 + config.TAKE_PROFIT_PCT) if entry else 0
+        sl    = entry * (1.0 - config.STOP_LOSS_PCT)   if entry else 0
+        pct   = ((price - entry) / entry * 100) if entry else 0
+        checks.append({
+            "symbol":       sym,
+            "entry":        entry,
+            "current":      price,
+            "pct_from_entry": round(pct, 4),
+            "take_profit":  round(tp, 6),
+            "stop_loss":    round(sl, 6),
+            "tp_hit":       price >= tp if price and tp else False,
+            "sl_hit":       price <= sl if price and sl else False,
+        })
+
+    return {
+        "sell_monitor_alive": alive,
+        "heartbeat_age_sec":  age,
+        "take_profit_pct":    config.TAKE_PROFIT_PCT * 100,
+        "stop_loss_pct":      config.STOP_LOSS_PCT   * 100,
+        "open_positions":     len(checks),
+        "positions":          checks,
+    }
 
 
 @app.get("/api/ping")

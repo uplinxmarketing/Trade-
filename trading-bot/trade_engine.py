@@ -657,7 +657,9 @@ def realtime_monitor(prices: Dict[str, float]):
 
 # ── Sell monitor — daemon thread, independent of asyncio ─────────────────────
 
-_sell_diag_ts: float = 0.0
+_sell_diag_ts: float      = 0.0
+_sell_monitor_heartbeat: float = 0.0   # updated every loop — 0 means not started
+_sell_monitor_thread: Optional[threading.Thread] = None
 
 
 def _sell_monitor_loop():
@@ -669,12 +671,16 @@ def _sell_monitor_loop():
     the WebSocket, the signal scanner, or any other async task.
     """
     import data_collector as _dc
-    global _sell_diag_ts
+    global _sell_diag_ts, _sell_monitor_heartbeat
 
-    database.log_activity("Sell monitor thread started", "info")
+    try:
+        database.log_activity("Sell monitor thread started", "info")
+    except Exception:
+        pass
 
     while True:
         time.sleep(0.5)
+        _sell_monitor_heartbeat = time.time()   # heartbeat — proves loop is running
         try:
             with _positions_lock:
                 snap = list(_positions)
@@ -732,9 +738,22 @@ def _sell_monitor_loop():
 
 
 async def position_guardian():
-    """Thin async shim — starts the sell monitor daemon thread and exits."""
-    t = threading.Thread(target=_sell_monitor_loop, name="sell-monitor", daemon=True)
-    t.start()
+    """
+    Watchdog coroutine — starts the sell monitor thread and restarts it if
+    it ever dies (which should never happen, but belt-and-suspenders).
+    """
+    global _sell_monitor_thread
+    while True:
+        alive = (
+            _sell_monitor_thread is not None
+            and _sell_monitor_thread.is_alive()
+        )
+        if not alive:
+            _sell_monitor_thread = threading.Thread(
+                target=_sell_monitor_loop, name="sell-monitor", daemon=True
+            )
+            _sell_monitor_thread.start()
+        await asyncio.sleep(5.0)   # check every 5 s
 
 
 # ── Process 2: signal scanner (async, refreshes cache every SCAN_INTERVAL_SEC) ─
