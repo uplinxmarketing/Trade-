@@ -2,9 +2,6 @@ import { useState, useEffect, useCallback } from 'react';
 import { toast } from 'sonner';
 import { API_BASE } from '@/config';
 
-const REMOTE_VERSION_URL =
-  'https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/public/version.json';
-
 // Baked into the JS bundle at build time — frozen for the life of this run.
 const LOCAL_FINGERPRINT = `${__APP_COMMIT__}:${__APP_BUILD_TIME__}`;
 
@@ -18,7 +15,10 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
   const checkForUpdates = useCallback(async (): Promise<boolean> => {
     setChecking(true);
     try {
-      const resp = await fetch(`${REMOTE_VERSION_URL}?t=${Date.now()}`, { cache: 'no-store' });
+      // Fetch the version.json that the server is currently serving.
+      // After Railway redeploys, this file reflects the new build fingerprint
+      // while the browser still has the old JS bundle — mismatch = update available.
+      const resp = await fetch(`/version.json?t=${Date.now()}`, { cache: 'no-store' });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data: VersionInfo = await resp.json();
       const remote = `${data.commit}:${data.buildTime}`;
@@ -28,7 +28,7 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
       }
       return false;
     } catch {
-      throw new Error('Could not reach GitHub to check for updates');
+      throw new Error('Could not reach server to check for updates');
     } finally {
       setChecking(false);
     }

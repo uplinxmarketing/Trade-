@@ -771,6 +771,12 @@ def api_version():
     return {"version": "unknown"}
 
 
+@app.post("/api/update")
+def api_update():
+    """Railway deployments are handled automatically — the client just needs to reload."""
+    return {"success": False, "message": "Reload to pick up the latest build"}
+
+
 def start_control_api():
     """Block the main thread on uvicorn — all bot logic starts via lifespan."""
     import pathlib
