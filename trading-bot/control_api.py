@@ -711,6 +711,12 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
         with _positions_lock:
             _positions.append(pos)
 
+        try:
+            import supabase_sync
+            supabase_sync.sync_position_open(pos)
+        except Exception:
+            pass
+
         database.log_activity(f"Force buy: {sym} @ ${fill_price:.4f} | qty={qty:.6f} | budget={budget:.2f} USDT", "info")
         return {"ok": True, "symbol": sym, "price": fill_price, "quantity": qty, "budget": budget}
     except Exception as e:

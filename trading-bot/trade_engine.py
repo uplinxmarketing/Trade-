@@ -129,9 +129,31 @@ def _in_cooldown(symbol: str) -> bool:
 # ── DB / startup helpers ──────────────────────────────────────────────────────
 
 def load_positions_from_db():
-    """Called on startup — restores open positions from SQLite."""
+    """Called on startup — restores open positions from SQLite, or Supabase if SQLite is empty."""
     global _positions
     rows = database.load_positions()
+
+    if not rows:
+        # SQLite is empty (fresh Railway deploy) — try to restore from Supabase
+        try:
+            import supabase_sync
+            restored = supabase_sync.restore_from_supabase()
+            if restored.get("positions"):
+                for pos in restored["positions"]:
+                    pos_id = database.save_position(pos)
+                    pos["id"] = pos_id
+                rows = database.load_positions()
+                print(f"[TradeEngine] Restored {len(rows)} position(s) from Supabase.")
+            if restored.get("usdt_balance") is not None:
+                usdt = restored["usdt_balance"]
+                if hasattr(client, "_balances"):
+                    with client._lock:
+                        client._balances["USDT"] = usdt
+                    database.save_paper_state(dict(client._balances))
+                    print(f"[TradeEngine] Restored USDT balance from Supabase: {usdt:.2f}")
+        except Exception as e:
+            print(f"[TradeEngine] Supabase restore failed (non-fatal): {e}")
+
     with _positions_lock:
         _positions = list(rows)
     print(f"[TradeEngine] Loaded {len(_positions)} open position(s) from DB.")
@@ -406,6 +428,12 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     try:
         database.log_trade(trade_record)
         try:
+            import supabase_sync
+            supabase_sync.sync_trade(trade_record)
+            supabase_sync.sync_position_close(sym)
+        except Exception:
+            pass
+        try:
             learning.learn_from_trade(trade_record)
         except Exception as le:
             database.log_activity(f"learn_from_trade error ({sym}): {le}", "warn")
@@ -586,6 +614,13 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         with _positions_lock:
             _positions.append(pos_record)
+
+        try:
+            import supabase_sync
+            supabase_sync.sync_position_open(pos_record)
+            supabase_sync.sync_balance(usdt_balance - budget - budget * _fee_rate)
+        except Exception:
+            pass
 
         usdt_balance -= budget + budget * _fee_rate
 
