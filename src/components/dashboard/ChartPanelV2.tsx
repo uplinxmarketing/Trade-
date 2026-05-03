@@ -41,7 +41,7 @@ export default function ChartPanelV2({ activeCoin, prices }: Props) {
   const [liveTick, setLiveTick] = useState(0); // increment to force re-render in live modes
 
   const binanceSymbol = activeCoin.replace('/', '').replace(' ', '');
-  const { klines: rawKlines, loading } = useBinanceKlines(binanceSymbol, interval);
+  const { klines: rawKlines, loading, error } = useBinanceKlines(binanceSymbol, interval);
   const livePrice = parseFloat(prices[activeCoin]?.price ?? '0');
 
   // Reset tick buffer when coin changes
@@ -397,6 +397,13 @@ export default function ChartPanelV2({ activeCoin, prices }: Props) {
         {loading && !isTickMode && klines.length === 0 && (
           <div className="absolute inset-0 flex items-center justify-center z-10">
             <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+          </div>
+        )}
+        {error && !loading && klines.length === 0 && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center z-10 gap-2">
+            <span className="text-loss text-sm font-semibold">Symbol unavailable</span>
+            <span className="text-[11px] text-muted-foreground font-mono">{binanceSymbol}</span>
+            <span className="text-[10px] text-muted-foreground">{error}</span>
           </div>
         )}
         {isTickMode && klines.length === 0 && (

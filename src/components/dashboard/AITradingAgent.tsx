@@ -200,6 +200,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [editingInstr, setEditingInstr]   = useState(false);
   const [instrDraft, setInstrDraft]       = useState('');
   const [actLog, setActLog]       = useState<string[]>([]);
+  const [dataPersistent, setDataPersistent] = useState<boolean | null>(null);
   const [showLog, setShowLog]     = useState(true);
   // Unified deployment: frontend and API are served from the same Railway URL.
   // railwayUrl defaults to '' (same origin) so all /api/* calls are relative.
@@ -528,6 +529,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     setBalance(bal); balanceRef.current = bal;
     setInitialBalance(Number(s.initial_balance ?? bal));
     setAgentStatus(`Railway · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${new Date().toLocaleTimeString()}`);
+    if (s.data_persistent !== undefined) setDataPersistent(Boolean(s.data_persistent));
 
     const mapped: OpenPosition[] = (data.positions ?? []).map((pos: any) => ({
       symbol:          pos.symbol,
@@ -883,6 +885,21 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
   return (
     <div className="bg-card border border-border rounded-lg p-4 space-y-4">
+
+      {/* ── Data persistence warning ── */}
+      {dataPersistent === false && (
+        <div className="bg-loss/10 border border-loss/40 rounded-md px-3 py-2.5 space-y-1">
+          <div className="text-xs font-bold text-loss flex items-center gap-1.5">
+            ⚠️ Trade history will be lost on next Railway deploy
+          </div>
+          <p className="text-[10px] text-muted-foreground leading-relaxed">
+            The database is stored inside the container (no persistent volume).
+            Every redeploy wipes all trades, positions, and wallet history.
+            To fix: add a Railway Volume mounted at <code className="bg-muted px-1 rounded text-foreground">/data</code> and set{' '}
+            <code className="bg-muted px-1 rounded text-foreground">DATA_DIR=/data</code> in your Railway environment variables.
+          </p>
+        </div>
+      )}
 
       {/* ── Header ── */}
       <div className="flex items-center justify-between">

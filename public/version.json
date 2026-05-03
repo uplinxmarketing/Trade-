@@ -1,5 +1,5 @@
 {
-  "version": "4.0.1",
-  "buildTime": "2026-05-03T22:30:00.000Z",
-  "commit": "realtime-scan-10s"
+  "version": "4.0.2",
+  "buildTime": "2026-05-03T22:50:00.000Z",
+  "commit": "coin-validation-chart-fix-data-warning"
 }

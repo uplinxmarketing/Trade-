@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Star, Search } from 'lucide-react';
+import { Star, Search, AlertCircle } from 'lucide-react';
 import type { LivePrices } from '@/lib/trading-engine';
 
 const COIN_COLORS: Record<string, string> = {
@@ -16,14 +16,14 @@ const COIN_COLORS: Record<string, string> = {
   MANA:'#FF2D55', AXS: '#0055D5', GALA:'#FCCD05',  IMX: '#17B5CB',
   ALGO:'#000000', VET: '#15BDFF', FIL: '#0090FF',  ICP: '#29ABE2',
   HBAR:'#222222', RENDER:'#5A5AFF', DOGS:'#F7931A', NEIRO:'#FF69B4',
-  BRETT:'#627EEA', '1000SATS':'#F7931A',
+  BRETT:'#627EEA', '1000SATS':'#F7931A', TIA: '#9D5CFF',
 };
 
 const ALL_USDT_COINS = [
   // Large-caps
   'BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT',
   'ADAUSDT','AVAXUSDT','DOGEUSDT','DOTUSDT','LINKUSDT',
-  'POLUSDT', 'UNIUSDT', 'LTCUSDT', 'ATOMUSDT','TRXUSDT',
+  'POLUSDT','UNIUSDT','LTCUSDT','ATOMUSDT','TRXUSDT',
   // Mid-caps / L2
   'ARBUSDT','OPUSDT','INJUSDT','FETUSDT','NEARUSDT',
   'TONUSDT','APTUSDT','SUIUSDT','SHIBUSDT','RENDERUSDT',
@@ -45,6 +45,32 @@ interface Props {
 }
 
 const FAV_KEY = 'coin_favorites';
+// Cache valid symbols for 10 minutes to avoid hammering exchange info
+let _validCache: Set<string> | null = null;
+let _validCacheTs = 0;
+
+async function fetchValidSymbols(): Promise<Set<string>> {
+  if (_validCache && Date.now() - _validCacheTs < 10 * 60 * 1000) return _validCache;
+  const bases = ['https://data-api.binance.vision', 'https://api.binance.com'];
+  for (const base of bases) {
+    try {
+      const resp = await fetch(`${base}/api/v3/exchangeInfo?permissions=SPOT`, {
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!resp.ok) continue;
+      const data = await resp.json();
+      const valid = new Set<string>(
+        (data.symbols as any[])
+          .filter(s => s.status === 'TRADING' && s.quoteAsset === 'USDT')
+          .map(s => s.symbol as string)
+      );
+      _validCache = valid;
+      _validCacheTs = Date.now();
+      return valid;
+    } catch { /* try next base */ }
+  }
+  return new Set(); // empty = unknown, show all
+}
 
 function CoinRow({
   symbol, price, changePct, isActive, isFav, onSelect, onFav,
@@ -54,8 +80,8 @@ function CoinRow({
   onSelect: () => void; onFav: () => void;
 }) {
   const ticker = symbol.replace('USDT', '');
-  const color = COIN_COLORS[ticker] ?? '#6b7280';
-  const up = changePct >= 0;
+  const color  = COIN_COLORS[ticker] ?? '#6b7280';
+  const up     = changePct >= 0;
   const priceStr = price > 0
     ? price >= 1000 ? price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
     : price >= 1   ? price.toFixed(4)
@@ -98,22 +124,50 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
   const [favorites, setFavorites] = useState<Set<string>>(() => {
     try { return new Set(JSON.parse(localStorage.getItem(FAV_KEY) ?? '[]')); } catch { return new Set(); }
   });
-  const [extraPrices, setExtraPrices] = useState<Record<string, { price: number; changePct: number }>>({});
+  const [extraPrices, setExtraPrices]   = useState<Record<string, { price: number; changePct: number }>>({});
+  // null = still loading, empty Set = fetch failed (show all), non-empty = validated
+  const [validSymbols, setValidSymbols] = useState<Set<string> | null>(null);
 
-  // Fetch 24hr ticker for coins not in websocket
+  // Fetch valid Binance spot symbols once on mount
   useEffect(() => {
-    const missing = ALL_USDT_COINS.filter(c => !prices[c]);
+    fetchValidSymbols().then(setValidSymbols);
+  }, []);
+
+  // All coins merged and filtered to only those Binance actually trades
+  const allCoins = useMemo(() => {
+    const set = new Set([...ALL_USDT_COINS, ...selectedCoins]);
+    const all = [...set];
+    if (!validSymbols || validSymbols.size === 0) return all; // unknown — show all
+    return all.filter(c => validSymbols.has(c));
+  }, [selectedCoins, validSymbols]);
+
+  // Fetch 24hr ticker only for validated coins not already in the WebSocket feed
+  useEffect(() => {
+    const missing = allCoins.filter(c => !prices[c]);
     if (missing.length === 0) return;
+    // Batch endpoint — only include coins that passed validation so no 400 errors
     const symbols = JSON.stringify(missing);
-    fetch(`https://api.binance.com/api/v3/ticker/24hr?symbols=${encodeURIComponent(symbols)}`)
-      .then(r => r.json())
-      .then((data: { symbol: string; lastPrice: string; priceChangePercent: string }[]) => {
-        const map: Record<string, { price: number; changePct: number }> = {};
-        data.forEach(d => { map[d.symbol] = { price: parseFloat(d.lastPrice), changePct: parseFloat(d.priceChangePercent) }; });
-        setExtraPrices(map);
-      })
-      .catch(() => {});
-  }, [prices]);
+    const bases = ['https://data-api.binance.vision', 'https://api.binance.com'];
+    const tryFetch = async () => {
+      for (const base of bases) {
+        try {
+          const r = await fetch(
+            `${base}/api/v3/ticker/24hr?symbols=${encodeURIComponent(symbols)}`,
+            { signal: AbortSignal.timeout(8000) }
+          );
+          if (!r.ok) continue;
+          const data: { symbol: string; lastPrice: string; priceChangePercent: string }[] = await r.json();
+          const map: Record<string, { price: number; changePct: number }> = {};
+          data.forEach(d => {
+            map[d.symbol] = { price: parseFloat(d.lastPrice), changePct: parseFloat(d.priceChangePercent) };
+          });
+          setExtraPrices(map);
+          return;
+        } catch { /* try next base */ }
+      }
+    };
+    tryFetch();
+  }, [allCoins, prices]);
 
   const toggleFav = (coin: string) => {
     setFavorites(prev => {
@@ -123,11 +177,6 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
       return next;
     });
   };
-
-  const allCoins = useMemo(() => {
-    const set = new Set([...ALL_USDT_COINS, ...selectedCoins]);
-    return [...set];
-  }, [selectedCoins]);
 
   const getPrice = (sym: string) => {
     const lp = prices[sym];
@@ -177,10 +226,17 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
         <span className="w-12 text-right">24H %</span>
       </div>
 
+      {/* Validation indicator */}
+      {validSymbols === null && (
+        <div className="px-3 py-1 text-[9px] text-muted-foreground flex items-center gap-1 animate-pulse border-b border-border/30">
+          <AlertCircle className="w-2.5 h-2.5" />Validating pairs…
+        </div>
+      )}
+
       {/* Coin list */}
       <div className="flex-1 overflow-y-auto scrollbar-thin">
         {filtered.length === 0 ? (
-          <div className="p-4 text-center text-xs text-muted-foreground">No pairs found</div>
+          <div className="p-4 text-center text-xs text-muted-foreground">No valid pairs found</div>
         ) : (
           filtered.map(coin => {
             const { price, changePct } = getPrice(coin);
@@ -196,9 +252,11 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
         )}
       </div>
 
-      {/* Footer hint */}
+      {/* Footer */}
       <div className="px-3 py-1.5 border-t border-border/50 text-[9px] text-muted-foreground leading-relaxed">
-        Green pill = up 24h · Red = down · Highlighted = active pair · Prices live via WebSocket
+        {validSymbols && validSymbols.size > 0
+          ? `${filtered.length} valid pairs · prices live via WebSocket`
+          : 'Prices live via WebSocket'}
       </div>
     </div>
   );
