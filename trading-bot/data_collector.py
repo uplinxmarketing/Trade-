@@ -122,12 +122,32 @@ def download_history():
 
 # ── Live WebSocket ───────────────────────────────────────────────────────────
 
-def _build_ws_url() -> str:
+def _build_ws_url(coins: list) -> str:
     streams = "/".join(
         f"{coin.lower()}@trade/{coin.lower()}@kline_{config.CANDLE_TIMEFRAME}"
-        for coin in config.WATCHED_COINS
+        for coin in coins
     )
     return f"wss://stream.binance.com:9443/stream?streams={streams}"
+
+
+async def _verify_symbols(coins: list) -> list:
+    """Return only coins that Binance confirms exist as USDT pairs."""
+    try:
+        loop = asyncio.get_event_loop()
+        def _fetch():
+            url = "https://api.binance.com/api/v3/exchangeInfo?permissions=SPOT"
+            with urllib.request.urlopen(url, timeout=10) as r:
+                return json.loads(r.read())
+        data = await loop.run_in_executor(None, _fetch)
+        valid = {s["symbol"] for s in data.get("symbols", []) if s["status"] == "TRADING"}
+        ok    = [c for c in coins if c in valid]
+        bad   = [c for c in coins if c not in valid]
+        if bad:
+            print(f"[DataCollector] Dropping invalid symbols: {bad}")
+        return ok
+    except Exception as e:
+        print(f"[DataCollector] Symbol verification failed ({e}) — using full list")
+        return coins
 
 
 async def start_websocket():
@@ -139,9 +159,12 @@ async def start_websocket():
     import websockets
     backoff = 2
 
+    # Verify symbols once on startup so invalid coins don't break the connection
+    active_coins = await _verify_symbols(config.WATCHED_COINS)
+
     while True:
-        url = _build_ws_url()
-        print(f"[DataCollector] Connecting WebSocket…")
+        url = _build_ws_url(active_coins)
+        print(f"[DataCollector] Connecting WebSocket ({len(active_coins)} coins)…")
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=30) as ws:
                 backoff = 2  # reset on successful connect
@@ -199,9 +222,9 @@ async def start_websocket():
             print(f"[DataCollector] WebSocket disconnected: {e}")
             print(f"[DataCollector] Reconnecting in {backoff}s…")
 
-            # Fill gap: re-fetch last 10 candles via REST
+            # Fill gap: re-fetch last 10 candles via REST for active coins only
             try:
-                for coin in config.WATCHED_COINS:
+                for coin in active_coins:
                     raw = _fetch_klines_rest(coin, config.CANDLE_TIMEFRAME, limit=10)
                     _compute_and_save(coin, raw)
             except Exception:

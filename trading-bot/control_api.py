@@ -756,6 +756,40 @@ def api_ping():
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
 
 
+@app.get("/api/all")
+def api_all():
+    """Single endpoint returning status + positions + trades + activity.
+    Reduces frontend from 4 concurrent fetches to 1, cutting Railway load 4×."""
+    strategy = _load_strategy()
+    trades   = database.get_recent_trades(limit=500)
+    sells    = [t for t in trades if t.get("exit_price") is not None]
+    wins     = sum(1 for t in sells if (t.get("net_profit") or 0) > 0)
+    realized = sum(t.get("net_profit") or 0 for t in sells)
+    initial  = float(strategy.get("initial_balance_usdt", 0))
+    balance  = round(_get_usdt_balance(), 2)
+    approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
+    return {
+        "status": {
+            "running":         strategy.get("trading_active", False),
+            "mode":            get_mode(),
+            "balance_usdt":    balance,
+            "paper_balance":   balance,
+            "initial_balance": initial or balance,
+            "open_positions":  len(_get_positions()),
+            "trades_today":    database.get_trades_today_count(),
+            "win_rate":        round(wins / len(sells), 3) if sells else 0.0,
+            "wins":            wins,
+            "losses":          len(sells) - wins,
+            "total_trades":    len(sells),
+            "realized_pnl":    round(realized, 4),
+            "watched_coins":   approved or config.WATCHED_COINS,
+        },
+        "positions": _get_positions(),
+        "trades":    database.get_recent_trades(limit=200),
+        "activity":  database.get_activity_log(limit=100),
+    }
+
+
 class ChatRequest(BaseModel):
     messages: list[dict]
     apiKey: str

@@ -489,85 +489,84 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const serverPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const pollRailway = useCallback(async () => {
-    // railwayUrl='' means same-origin — always poll in unified Railway deployment
-    try {
+    // Single /api/all request (status + positions + trades + activity in one round trip)
+    // Retry once with a 2s delay if the first attempt fails.
+    const attempt = async () => {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 8000);
-      const [sRes, pRes, tRes, aRes] = await Promise.all([
-        fetch(`${railwayUrl}/api/status`,    { signal: ctrl.signal }),
-        fetch(`${railwayUrl}/api/positions`, { signal: ctrl.signal }),
-        fetch(`${railwayUrl}/api/trades`,    { signal: ctrl.signal }),
-        fetch(`${railwayUrl}/api/activity`,  { signal: ctrl.signal }),
-      ]);
-      clearTimeout(timer);
-
-      if (sRes.ok) {
-        const s = await sRes.json();
-        const running = Boolean(s.running);
-        isRunningRef.current = running;
-        setIsRunning(running);
-        const bal = Number(s.balance_usdt ?? 0);
-        setBalance(bal); balanceRef.current = bal;
-        setInitialBalance(Number(s.initial_balance ?? bal));
-        setAgentStatus(`Railway · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${new Date().toLocaleTimeString()}`);
+      const timer = setTimeout(() => ctrl.abort(), 10_000);
+      try {
+        const res = await fetch(`${railwayUrl}/api/all`, { signal: ctrl.signal, cache: 'no-store' });
+        clearTimeout(timer);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return await res.json();
+      } catch (e) {
+        clearTimeout(timer);
+        throw e;
       }
+    };
 
-      if (pRes.ok) {
-        const p = await pRes.json();
-        const mapped: OpenPosition[] = (p.positions ?? []).map((pos: any) => ({
-          symbol:          pos.symbol,
-          quantity:        Number(pos.quantity),
-          avg_entry_price: Number(pos.entry_price ?? pos.avg_entry_price ?? 0),
-        }));
-        setPositions(mapped);
-        positionsRef.current = mapped;
+    let data: any;
+    try {
+      data = await attempt();
+    } catch {
+      // one retry after 2 s
+      await new Promise(r => setTimeout(r, 2000));
+      try { data = await attempt(); }
+      catch (e: any) {
+        if (e.name !== 'AbortError') addLog(`[Railway] poll failed: ${e.message}`);
+        return;
       }
-
-      let tradePayload: {side:'BUY'|'SELL'; pnl:number|null; quantity:number; price:number}[] = [];
-      if (tRes.ok) {
-        const t = await tRes.json();
-        const railwayTrades: TradeRow[] = [];
-        for (const tr of (t.trades ?? [])) {
-          if (tr.entry_price && tr.timestamp_buy) {
-            railwayTrades.push({
-              id: `rw-buy-${tr.id}`, created_at: tr.timestamp_buy,
-              symbol: tr.coin, side: 'BUY' as const,
-              price: Number(tr.entry_price), quantity: Number(tr.quantity),
-              pnl: null, reason: null,
-            });
-          }
-          if (tr.exit_price && tr.timestamp_sell) {
-            railwayTrades.push({
-              id: `rw-sell-${tr.id}`, created_at: tr.timestamp_sell,
-              symbol: tr.coin, side: 'SELL' as const,
-              price: Number(tr.exit_price), quantity: Number(tr.quantity),
-              pnl: Number(tr.net_profit ?? 0), reason: null,
-            });
-          }
-        }
-        const sorted = railwayTrades.sort((a, b) =>
-          new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-        if (sorted.length > 0) setTrades(sorted);
-        tradePayload = sorted.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
-      }
-
-      // Always sync parent wallet after every poll (positions + balance are always fresh here)
-      onStateChangeRef.current?.(positionsRef.current, balanceRef.current, initialBalance, tradePayload);
-
-      // Activity log from Python bot's SQLite activity_log table
-      if (aRes.ok) {
-        const a = await aRes.json();
-        const entries: string[] = (a.entries ?? []).map((e: any) => {
-          const ts = new Date(e.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-          const icon = e.level === 'warn' ? '⚠ ' : e.level === 'error' ? '✕ ' : '';
-          return `[${ts}] ${icon}${e.message}`;
-        });
-        // Always update — even empty clears stale entries
-        setActLog(entries.length > 0 ? entries : ['[Bot] Waiting for first activity...']);
-      }
-    } catch (e: any) {
-      if (e.name !== 'AbortError') addLog(`[Railway] poll failed: ${e.message}`);
     }
+
+    const s = data.status ?? {};
+    const running = Boolean(s.running);
+    isRunningRef.current = running;
+    setIsRunning(running);
+    const bal = Number(s.balance_usdt ?? 0);
+    setBalance(bal); balanceRef.current = bal;
+    setInitialBalance(Number(s.initial_balance ?? bal));
+    setAgentStatus(`Railway · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${new Date().toLocaleTimeString()}`);
+
+    const mapped: OpenPosition[] = (data.positions ?? []).map((pos: any) => ({
+      symbol:          pos.symbol,
+      quantity:        Number(pos.quantity),
+      avg_entry_price: Number(pos.entry_price ?? pos.avg_entry_price ?? 0),
+    }));
+    setPositions(mapped);
+    positionsRef.current = mapped;
+
+    const railwayTrades: TradeRow[] = [];
+    for (const tr of (data.trades ?? [])) {
+      if (tr.entry_price && tr.timestamp_buy) {
+        railwayTrades.push({
+          id: `rw-buy-${tr.id}`, created_at: tr.timestamp_buy,
+          symbol: tr.coin, side: 'BUY' as const,
+          price: Number(tr.entry_price), quantity: Number(tr.quantity),
+          pnl: null, reason: null,
+        });
+      }
+      if (tr.exit_price && tr.timestamp_sell) {
+        railwayTrades.push({
+          id: `rw-sell-${tr.id}`, created_at: tr.timestamp_sell,
+          symbol: tr.coin, side: 'SELL' as const,
+          price: Number(tr.exit_price), quantity: Number(tr.quantity),
+          pnl: Number(tr.net_profit ?? 0), reason: null,
+        });
+      }
+    }
+    const sorted = railwayTrades.sort((a, b) =>
+      new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    if (sorted.length > 0) setTrades(sorted);
+    const tradePayload = sorted.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
+
+    onStateChangeRef.current?.(positionsRef.current, balanceRef.current, initialBalance, tradePayload);
+
+    const entries: string[] = (data.activity ?? []).map((e: any) => {
+      const ts = new Date(e.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const icon = e.level === 'warn' ? '⚠ ' : e.level === 'error' ? '✕ ' : '';
+      return `[${ts}] ${icon}${e.message}`;
+    });
+    setActLog(entries.length > 0 ? entries : ['[Bot] Waiting for first activity...']);
   }, [railwayUrl, addLog]);
 
   // Start/stop the polling interval whenever server mode changes
