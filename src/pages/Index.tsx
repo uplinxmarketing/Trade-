@@ -40,6 +40,25 @@ const Index = () => {
     try { localStorage.setItem(COINS_KEY, JSON.stringify(selectedCoins)); }
     catch { /* storage quota */ }
   }, [selectedCoins]);
+
+  // If localStorage was empty (new browser / cleared), try Supabase railway_bot session
+  useEffect(() => {
+    const saved = localStorage.getItem(COINS_KEY);
+    if (saved) return; // localStorage already has data — no need to fetch
+    (async () => {
+      try {
+        const { data } = await supabase
+          .from('bot_config')
+          .select('selected_coins')
+          .eq('user_session', 'railway_bot')
+          .maybeSingle();
+        const coins = data?.selected_coins;
+        if (Array.isArray(coins) && coins.length > 0) {
+          setSelectedCoins(coins as string[]);
+        }
+      } catch { /* non-fatal */ }
+    })();
+  }, []);
   const [activeCoin, setActiveCoin]        = useState('BTCUSDT');
   const [binanceConnected, setBinanceConnected] = useState(false);
   const [showBinanceConnect, setShowBinanceConnect] = useState(false);

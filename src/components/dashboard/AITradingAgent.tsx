@@ -561,24 +561,27 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         });
       }
     }
-    let sorted = railwayTrades.sort((a, b) =>
-      new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    // Always merge Supabase history so trades survive Railway redeploys.
+    // Bot writes to Supabase with user_session='railway_bot' on every trade.
+    // Deduplicate by created_at+symbol+side (Railway IDs differ from Supabase UUIDs).
+    try {
+      const { data: sbTrades } = await supabase
+        .from('bot_trade_history')
+        .select('*')
+        .eq('user_session', 'railway_bot')
+        .order('created_at', { ascending: false })
+        .limit(200);
+      if (sbTrades && sbTrades.length > 0) {
+        const rwKeys = new Set(railwayTrades.map(t => `${t.created_at}|${t.symbol}|${t.side}`));
+        const deduped = (sbTrades as TradeRow[]).filter(
+          t => !rwKeys.has(`${t.created_at}|${t.symbol}|${t.side}`)
+        );
+        railwayTrades.push(...deduped);
+      }
+    } catch { /* Supabase unavailable — Railway-only data shown */ }
 
-    // Railway SQLite was wiped on redeploy (empty trades) — fall back to Supabase.
-    // The Python bot writes trades with user_session='railway_bot' so they survive deploys.
-    if (sorted.length === 0) {
-      try {
-        const { data: sbTrades } = await supabase
-          .from('bot_trade_history')
-          .select('*')
-          .eq('user_session', 'railway_bot')
-          .order('created_at', { ascending: false })
-          .limit(100);
-        if (sbTrades && sbTrades.length > 0) {
-          sorted = sbTrades as TradeRow[];
-        }
-      } catch { /* Supabase fallback failed — show empty list */ }
-    }
+    const sorted = railwayTrades.sort((a, b) =>
+      new Date(b.created_at).getTime() - new Date(a.created_at).getTime()).slice(0, 200);
 
     if (sorted.length > 0) setTrades(sorted);
     const tradePayload = sorted.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));

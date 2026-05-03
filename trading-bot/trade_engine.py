@@ -167,6 +167,31 @@ def load_positions_from_db():
                         snapshot = dict(client._balances)
                     database.save_paper_state(snapshot)
                     print(f"[TradeEngine] Restored USDT balance from Supabase: {usdt:.2f}")
+            # Restore selected coins — write them back to strategy.json
+            coins = restored.get("selected_coins")
+            if coins and isinstance(coins, list) and len(coins) > 0:
+                try:
+                    if os.path.exists(config.STRATEGY_FILE):
+                        with open(config.STRATEGY_FILE) as f:
+                            strat = json.load(f)
+                        existing = {c["symbol"]: c for c in strat.get("approved_coins", [])}
+                        strat["approved_coins"] = [
+                            {
+                                "symbol":         sym,
+                                "approved":       True,
+                                "budget_usdt":    existing.get(sym, {}).get("budget_usdt", config.BUDGET_PER_TRADE_USDT),
+                                "max_concurrent": existing.get(sym, {}).get("max_concurrent", 3),
+                                "confidence":     existing.get(sym, {}).get("confidence", 0.5),
+                                "reason":         "Restored from Supabase",
+                            }
+                            for sym in coins
+                        ]
+                        strat["updated_at"] = datetime.now(timezone.utc).isoformat()
+                        with open(config.STRATEGY_FILE, "w") as f:
+                            json.dump(strat, f, indent=2)
+                        print(f"[TradeEngine] Restored {len(coins)} coins from Supabase to strategy.json.")
+                except Exception as ce:
+                    print(f"[TradeEngine] Coin restore to strategy.json failed: {ce}")
         except Exception as e:
             print(f"[TradeEngine] Supabase restore failed (non-fatal): {e}")
 
