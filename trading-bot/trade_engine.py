@@ -20,7 +20,7 @@ import os
 import time
 import math
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import config
@@ -724,6 +724,23 @@ def _sell_monitor_loop():
                         continue
 
                 entry = pos["entry_price"]
+
+                # Time-based exit: sell any position held longer than MAX_HOLD_SECONDS
+                # regardless of P&L — prevents positions from being stuck forever when
+                # the market never reaches the take-profit threshold.
+                try:
+                    ts = pos.get("timestamp", "")
+                    if ts:
+                        open_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        age_sec = (datetime.now(timezone.utc) - open_dt).total_seconds()
+                        if age_sec >= config.MAX_HOLD_SECONDS:
+                            _execute_sell(pos, price, f"max-hold-{int(age_sec // 60)}min")
+                            if price <= entry * (1.0 - config.STOP_LOSS_PCT):
+                                _set_cooldown(sym)
+                            continue
+                except Exception:
+                    pass
+
                 if price >= entry * (1.0 + config.TAKE_PROFIT_PCT):
                     _execute_sell(pos, price, "take-profit")
                 elif price <= entry * (1.0 - config.STOP_LOSS_PCT):

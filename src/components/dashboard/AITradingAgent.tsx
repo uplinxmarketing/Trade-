@@ -146,6 +146,8 @@ interface OpenPosition {
   symbol: string;
   quantity: number;
   avg_entry_price: number;
+  hold_time_sec?: number;
+  max_hold_sec?: number;
 }
 
 interface TradeRow {
@@ -531,6 +533,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       symbol:          pos.symbol,
       quantity:        Number(pos.quantity),
       avg_entry_price: Number(pos.entry_price ?? pos.avg_entry_price ?? 0),
+      hold_time_sec:   Number(pos.hold_time_sec ?? 0),
+      max_hold_sec:    Number(pos.max_hold_sec ?? 1800),
     }));
     setPositions(mapped);
     positionsRef.current = mapped;
@@ -1083,13 +1087,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       {isRunning
         ? <p className="text-[10px] text-center text-muted-foreground -mt-2">
             {isServerMode
-              ? <>Railway bot running 24/7 · closes browser safe · polling every 30s{agentStatus && <> · <span className="text-gain font-mono">{agentStatus}</span></>}</>
-              : <>Every 30s: fetches live candles → checks EMA / RSI / MACD / Volume → buys or holds{agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}</>}
+              ? <>Railway bot running 24/7 · real-time prices · sells in &lt;1s · UI syncs every 5s{agentStatus && <> · <span className="text-gain font-mono">{agentStatus}</span></>}</>
+              : <>Every 10s: fetches live candles → checks EMA / RSI / MACD / Volume → buys or holds{agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}</>}
           </p>
         : <p className="text-[10px] text-center text-muted-foreground -mt-2">
             {isServerMode
               ? 'Railway bot handles all trading 24/7 — no browser required'
-              : 'Sells on every price tick · Buys checked every 30s · EMA+RSI+MACD+Volume signals · no API key needed'}
+              : 'Sells on every price tick · Buys checked every 10s · EMA+RSI+MACD+Volume signals · no API key needed'}
           </p>
       }
 
@@ -1186,6 +1190,23 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                     <span>BEP <span className="text-accent">{bep.toFixed(4)}</span></span>
                     <span>Now <span className={prof?'text-gain':'text-foreground'}>{live.toFixed(4)}</span></span>
                     <span>Qty <span className="text-foreground">{qty.toFixed(6)}</span> · <span className="text-foreground">{budget.toFixed(2)} USDT</span></span>
+                    {pos.hold_time_sec != null && pos.max_hold_sec != null && (() => {
+                      const holdMin = Math.floor(pos.hold_time_sec! / 60);
+                      const maxMin  = Math.floor(pos.max_hold_sec! / 60);
+                      const pctHeld = Math.min(100, (pos.hold_time_sec! / pos.max_hold_sec!) * 100);
+                      const nearMax = pctHeld >= 80;
+                      return (
+                        <span className={`col-span-2 flex items-center gap-1.5 ${nearMax ? 'text-warn' : ''}`}>
+                          Held <span className={nearMax ? 'text-warn font-bold' : 'text-foreground'}>{holdMin}m</span>
+                          <span className="opacity-40">/</span>
+                          <span>{maxMin}m max · auto-exit</span>
+                          <span className="flex-1 h-1 bg-muted/40 rounded-full overflow-hidden" style={{display:'inline-block',minWidth:'30px'}}>
+                            <span className={`h-full rounded-full block ${nearMax ? 'bg-warn' : 'bg-muted-foreground/30'}`} style={{width:`${pctHeld}%`}}/>
+                          </span>
+                          {nearMax && <span className="text-warn font-bold animate-pulse">⏱</span>}
+                        </span>
+                      );
+                    })()}
                   </div>
                   <div className="space-y-1">
                     <div className="flex justify-between text-[9px]">
