@@ -381,15 +381,23 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         if now_ns - _last_no_signal_log >= 60.0:
             _last_no_signal_log = now_ns
             if cache_size == 0:
-                database.log_activity("Buy check: signal cache empty — waiting for first scan", "info")
+                import data_collector as _diag_dc
+                n_ticks   = sum(1 for v in _diag_dc.price_ticks.values()   if len(v) >= _diag_dc._MIN_TICKS)
+                n_samples = sum(1 for v in _diag_dc.price_samples.values() if len(v) >= _diag_dc._MIN_SAMPLES)
+                n_ws      = sum(1 for v in _diag_dc.ws_candles.values()    if len(v) >= _diag_dc._MIN_CANDLES)
+                database.log_activity(
+                    f"Signal cache empty — data sources: ticks={n_ticks}, samples={n_samples}, ws_candles={n_ws}", "info"
+                )
             else:
                 with _signal_cache_lock:
-                    scores = {s: v["score"] for s, v in _signal_cache.items()}
-                top = sorted(scores.items(), key=lambda x: -x[1])[:5]
-                summary = " | ".join(f"{s}={sc}" for s, sc in top)
+                    snap = dict(_signal_cache)
+                top = sorted(snap.items(), key=lambda x: -x[1]["score"])[:5]
+                detail = " | ".join(
+                    f"{s}:score={v['score']} RSI={v['signals'].get('rsi',False)} trend={v['signals'].get('trend',False)}"
+                    for s, v in top
+                )
                 database.log_activity(
-                    f"Buy check: {cache_size} coins cached, none at score≥{config.MIN_SIGNALS_TO_BUY} "
-                    f"(top5: {summary})", "info"
+                    f"Buy check: {cache_size} coins, none at score≥{config.MIN_SIGNALS_TO_BUY} — top5: {detail}", "info"
                 )
         return
 
@@ -539,19 +547,25 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
 def _inline_refresh_from_ticks(sym: str, price: float):
     """
-    Recompute signals for sym using the latest price_ticks — no I/O, pure math.
-    Called from realtime_monitor every _TICK_REFRESH_SEC per coin so the signal
-    cache reflects the current price, not the last candle close.
+    Recompute signals for sym using the best available price series — no I/O.
+    Preference order: time-sampled prices (quality RSI) → raw ticks (last resort).
     """
     import data_collector as _dc
-    ticks = list(_dc.price_ticks.get(sym, []))
-    if not ticks:
-        return
-    ticks[-1] = price          # replace stale last tick with the freshest price
-    if len(ticks) < _dc._MIN_TICKS:
-        return
-    vols = [1.0] * len(ticks)  # uniform volume — volume signal won't fire, RSI/EMA/MACD do
-    update_coin_signals(sym, ticks, vols)
+
+    # Prefer 30-second sampled prices — spans real time, gives meaningful RSI
+    closes = list(_dc.price_samples.get(sym, []))
+    if len(closes) >= _dc._MIN_SAMPLES:
+        closes = closes[:]   # copy
+        closes[-1] = price   # inject latest price
+    else:
+        # Fall back to raw ticks (available in seconds but RSI less reliable)
+        closes = list(_dc.price_ticks.get(sym, []))
+        if len(closes) < _dc._MIN_TICKS:
+            return
+        closes[-1] = price
+
+    vols = [1.0] * len(closes)
+    update_coin_signals(sym, closes, vols)
 
 
 # ── Process 1: realtime monitor (called on every WebSocket tick) ──────────────
@@ -653,6 +667,8 @@ async def signal_scanner(prices: dict):
 
 
 _KLINE_BASES = [
+    # Binance public CDN — served via Cloudflare, often accessible when api.binance.com is blocked
+    "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
@@ -724,10 +740,16 @@ async def _refresh_signal_cache():
                 closes  = [float(r[4]) for r in buf]
                 volumes = [float(r[5]) for r in buf]
 
-        # 4. Fall back to trade-price tick buffer — available within seconds of
-        #    WebSocket connect, no candle-close wait required.
-        #    Volumes are uniform (no trade-volume in @trade events) so volume
-        #    signal won't fire, but RSI / EMA / MACD all produce valid values.
+        # 4. Time-sampled price buffer (one price per 30 s) — meaningful RSI after 8 min.
+        #    Much better than raw ticks because prices span real time, not one second.
+        if not closes or len(closes) < MIN:
+            samples = list(_dc.price_samples.get(sym, []))
+            if len(samples) >= _dc._MIN_SAMPLES:
+                closes  = samples
+                volumes = [1.0] * len(samples)
+
+        # 5. Raw price-tick buffer — available in seconds but RSI quality is poor.
+        #    Used only as last resort (first 8 minutes of uptime).
         if not closes or len(closes) < MIN:
             ticks = list(_dc.price_ticks.get(sym, []))
             if len(ticks) >= _dc._MIN_TICKS:

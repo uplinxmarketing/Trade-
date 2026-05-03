@@ -28,12 +28,20 @@ _WS_CANDLE_MAX = 60   # candles to keep per coin
 _MIN_CANDLES   = 16   # minimum candles needed for at least RSI signal to work
 
 # Rolling price-tick buffer — filled by every WebSocket @trade event.
-# Trade events arrive within seconds of connecting (no candle-close wait).
-# Once 20+ ticks accumulate (~seconds), RSI/EMA/MACD all fire.
-# Used as 4th fallback when REST, DB candles, and WS candles are all empty.
+# Used as immediate fallback (available in seconds) but RSI quality is poor
+# because all ticks come from the same second (prices nearly identical → RSI≈50).
 price_ticks: Dict[str, deque] = {}
 _TICK_MAX  = 50
-_MIN_TICKS = 20
+_MIN_TICKS = 15
+
+# Time-sampled price buffer — one close price recorded per 30 seconds.
+# After 8 minutes: 16 samples → RSI(14) computes on meaningful price variation.
+# This is the primary signal source when Binance REST is geo-blocked.
+price_samples: Dict[str, list] = {}       # one price per _SAMPLE_INTERVAL
+_price_sample_ts: Dict[str, float] = {}   # last sample time per coin
+_SAMPLE_INTERVAL = 30.0   # seconds between samples
+_SAMPLE_MAX      = 120    # keep 60 minutes of samples (120 × 30s)
+_MIN_SAMPLES     = 16     # 8 minutes needed before RSI fires
 
 # Callbacks registered by main.py to avoid circular imports
 _price_callback: Optional[Callable[[Dict[str, float]], None]] = None
@@ -54,6 +62,8 @@ def register_kline_callback(cb: Callable[[str, list, list], None]):
 # ── REST historical download ─────────────────────────────────────────────────
 
 _BINANCE_BASES = [
+    # Cloudflare CDN — often not geo-blocked even when api.binance.com is
+    "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
@@ -196,8 +206,17 @@ async def start_websocket():
                             symbol = data["s"]
                             price  = float(data["p"])
                             prices[symbol] = price
+                            # Raw ticks (fast, but too uniform for quality RSI)
                             ticks = price_ticks.setdefault(symbol, deque(maxlen=_TICK_MAX))
                             ticks.append(price)
+                            # Time-sampled prices (one per 30s → quality RSI after 8 min)
+                            now_ts = time.time()
+                            if now_ts - _price_sample_ts.get(symbol, 0) >= _SAMPLE_INTERVAL:
+                                _price_sample_ts[symbol] = now_ts
+                                buf = price_samples.setdefault(symbol, [])
+                                buf.append(price)
+                                if len(buf) > _SAMPLE_MAX:
+                                    buf.pop(0)
                             client.update_price(symbol, price)
                             if _price_callback:
                                 _price_callback(dict(prices))

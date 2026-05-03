@@ -47,8 +47,8 @@ SCAN_INTERVAL_SEC    = 30      # REST backup cache refresh (buys fire in realtim
 STOP_LOSS_PCT        = 0.015   # 1.5%
 COOLDOWN_AFTER_LOSS  = 180     # 3 min cooldown after stop-loss
 MIN_SIGNALS_TO_BUY   = 1       # at least 1 of 4 signals must be bullish
-RSI_BUY_MIN          = 30
-RSI_BUY_MAX          = 70      # wider RSI window for more trade opportunities
+RSI_BUY_MIN          = 20
+RSI_BUY_MAX          = 80      # wide window — scalping works across most RSI zones
 VOLUME_RATIO_MIN     = 1.1     # volume must be 1.1× the 20-candle average
 TAKE_PROFIT_PCT      = 0.002   # sell at +0.2% — just above the 0.15% fee breakeven
 
