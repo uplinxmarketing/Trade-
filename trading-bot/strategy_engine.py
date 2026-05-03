@@ -95,7 +95,6 @@ def write_default_strategy():
             }
             for coin in config.WATCHED_COINS
         ],
-        "global_max_positions": config.MAX_OPEN_POSITIONS,
         "next_review_seconds":  config.DECISION_INTERVAL_SEC,
     }
     with open(config.STRATEGY_FILE, "w") as f:
@@ -135,7 +134,7 @@ It holds losing positions without selling until they recover.
 
 === CURRENT STATE ===
 USDT available:   {usdt_balance}
-Open positions:   {len(open_positions)} of {config.MAX_OPEN_POSITIONS} max
+Open positions:   {len(open_positions)} (no cap — only limited by USDT balance)
 Open details:     {json.dumps(open_positions, indent=2)}
 
 === DECISION RULES ===
@@ -164,7 +163,6 @@ Respond ONLY with valid JSON matching this exact schema (no text outside JSON):
       "reason": "one sentence"
     }}
   ],
-  "global_max_positions": {config.MAX_OPEN_POSITIONS},
   "next_review_seconds": {config.DECISION_INTERVAL_SEC}
 }}"""
 

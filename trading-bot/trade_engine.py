@@ -81,13 +81,9 @@ def can_execute_buy(coin_cfg: dict, client) -> tuple[bool, str]:
     # earlier in the same scan loop are always visible here.
     with _positions_lock:
         open_this_coin = [p for p in _positions if p["symbol"] == sym]
-        total_open     = len(_positions)
 
     if len(open_this_coin) >= max_concurrent:
         return False, f"Max concurrent for {sym} reached ({max_concurrent})"
-
-    if total_open >= config.MAX_OPEN_POSITIONS:
-        return False, "Global max positions reached"
 
     return True, ""
 
@@ -485,16 +481,6 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         database.log_activity("Buy check: no approved coins in strategy.json", "warn")
         return
 
-    global_max = strategy.get("global_max_positions", config.MAX_OPEN_POSITIONS)
-
-    with _positions_lock:
-        open_count = len(_positions)
-    if open_count >= global_max:
-        database.log_activity(
-            f"Buy check: at max positions ({open_count}/{global_max})", "info"
-        )
-        return
-
     from datetime import timezone as _tz
     usdt_balance = _get_usdt_balance()
     ts_now = datetime.now(_tz.utc).isoformat()
@@ -521,12 +507,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         with _positions_lock:
             already_held = any(p["symbol"] == sym for p in _positions)
-            global_open  = len(_positions)
 
         if already_held:
             continue
-        if global_open >= global_max:
-            break
 
         budget = get_budget_for_coin(sym, usdt_balance)
         if budget <= 0:
@@ -591,7 +574,6 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _positions.append(pos_record)
 
         usdt_balance -= budget + budget * _fee_rate
-        global_open  += 1
 
         score     = cached["score"]
         breakeven = fill_price * _breakeven_mult
@@ -602,9 +584,6 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         )
         print(f"[RealtimeBuy] {msg}")
         database.log_activity(msg, "info")
-
-        if global_open >= global_max:
-            break
 
 
 # ── Inline tick-driven signal refresh ────────────────────────────────────────

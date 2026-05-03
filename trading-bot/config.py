@@ -17,7 +17,7 @@ WATCHED_COINS = [
 ]
 
 BUDGET_PER_TRADE_USDT   = 100.0
-MAX_OPEN_POSITIONS      = 20
+MAX_OPEN_POSITIONS      = 9999   # no hard cap — USDT balance is the only limit
 DECISION_INTERVAL_SEC   = 600       # Claude strategy runs every 10 minutes
 MIN_CLAUDE_CONFIDENCE   = 0.65
 RSI_OVERBOUGHT          = 75
