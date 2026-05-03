@@ -433,6 +433,26 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   useEffect(() => { runCycleRef.current    = runCycle;    }, [runCycle]);
   useEffect(() => { scheduleNextRef.current = scheduleNext; }, [scheduleNext]);
 
+  // ── Coin signal scanner (server mode) ────────────────────────────────────
+  // In server mode runCycle() never runs, so we scan independently for display.
+  // Trading decisions are still made server-side by the Python bot.
+  useEffect(() => {
+    if (!selectedCoins.length) return;
+    let cancelled = false;
+    const scan = async () => {
+      if (cancelled) return;
+      setScanning(true);
+      try {
+        const signals = await analyseAll(selectedCoins);
+        if (!cancelled) setCoinSignals(signals);
+      } catch { /* ignore network errors */ }
+      finally { if (!cancelled) setScanning(false); }
+    };
+    scan();
+    const id = setInterval(scan, AGENT_CYCLE_MS);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [selectedCoins]); // eslint-disable-line
+
   // ── Railway server-mode poller ─────────────────────────────────────────────
   // When a Railway URL is configured the JS trading loop is disabled.
   // Instead we poll the Railway bot's REST API every 30 s and mirror its state
@@ -508,6 +528,33 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     serverPollRef.current = setInterval(pollRailway, 30_000);
     return () => { if (serverPollRef.current) { clearInterval(serverPollRef.current); serverPollRef.current = null; } };
   }, [isServerMode, pollRailway]);
+
+  // ── Mode change (paper ↔ live) ───────────────────────────────────────────
+  const handleModeChange = useCallback(async (newMode: 'test' | 'live') => {
+    if (isRunning) return;
+    if (isServerMode) {
+      if (newMode === 'live') {
+        toast.info(
+          'To enable Live trading on Railway, add MODE=live and BINANCE_API_KEY / BINANCE_API_SECRET to your Railway service environment variables, then redeploy.',
+          { duration: 8000 }
+        );
+        setMode('live');
+      } else {
+        try {
+          const res = await fetch(`${railwayUrl}/api/mode`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: 'paper' }),
+          });
+          const data = await res.json();
+          if (data.ok) { setMode('test'); toast.info('Railway bot set to Paper mode'); }
+          else toast.error(data.warning ?? 'Mode switch failed');
+        } catch { toast.error('Could not reach Railway to switch mode'); }
+      }
+    } else {
+      if (newMode === 'live' && !binanceConnected) { toast.error('Connect Binance API first'); onConnectBinance?.(); return; }
+      setMode(newMode);
+    }
+  }, [isRunning, isServerMode, railwayUrl, binanceConnected, onConnectBinance]);
 
   // ── Start / Stop ─────────────────────────────────────────────────────────
   const toggleBot = async () => {
@@ -750,22 +797,26 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         </div>
       </div>
 
-      {/* ── Mode toggle — hidden in server mode (Railway controls its own mode) ── */}
-      {!isServerMode && (
-        <div className="grid grid-cols-2 gap-1 bg-muted/30 rounded-md p-0.5">
-          {(['test', 'live'] as const).map(m => (
-            <button key={m} onClick={() => { if (!isRunning) setMode(m); }} disabled={isRunning}
-              className={`flex items-center justify-center gap-1.5 py-2 rounded text-xs font-semibold transition-colors disabled:opacity-60
-                ${mode === m ? (m === 'live' ? 'bg-loss/80 text-white' : 'bg-accent text-accent-foreground') : 'text-muted-foreground hover:text-foreground'}`}>
-              {m === 'test' ? <><FlaskConical className="w-3.5 h-3.5" />TEST · Paper</> : <><Zap className="w-3.5 h-3.5" />LIVE · Real{!binanceConnected && <span className="text-[9px] px-1 bg-warn/20 text-warn rounded ml-1">API needed</span>}</>}
-            </button>
-          ))}
-        </div>
-      )}
+      {/* ── Mode toggle ── */}
+      <div className="grid grid-cols-2 gap-1 bg-muted/30 rounded-md p-0.5">
+        {(['test', 'live'] as const).map(m => (
+          <button key={m} onClick={() => handleModeChange(m)} disabled={isRunning}
+            className={`flex items-center justify-center gap-1.5 py-2 rounded text-xs font-semibold transition-colors disabled:opacity-60
+              ${mode === m ? (m === 'live' ? 'bg-loss/80 text-white' : 'bg-accent text-accent-foreground') : 'text-muted-foreground hover:text-foreground'}`}>
+            {m === 'test'
+              ? <><FlaskConical className="w-3.5 h-3.5" />TEST · Paper</>
+              : <><Zap className="w-3.5 h-3.5" />LIVE · Real{!isServerMode && !binanceConnected && <span className="text-[9px] px-1 bg-warn/20 text-warn rounded ml-1">API needed</span>}</>}
+          </button>
+        ))}
+      </div>
 
-      {!isServerMode && mode === 'live' && (
-        <div className={`rounded-md px-3 py-2 text-xs ${binanceConnected ? 'bg-loss/10 border border-loss/30 text-loss' : 'bg-warn/10 border border-warn/30 text-warn'}`}>
-          {binanceConnected ? '⚠️ LIVE MODE — real USDT will be used.' : <span>Binance API not connected. <button onClick={onConnectBinance} className="underline font-semibold">Connect now →</button></span>}
+      {mode === 'live' && (
+        <div className={`rounded-md px-3 py-2 text-xs ${isServerMode ? 'bg-warn/10 border border-warn/30 text-warn' : binanceConnected ? 'bg-loss/10 border border-loss/30 text-loss' : 'bg-warn/10 border border-warn/30 text-warn'}`}>
+          {isServerMode
+            ? 'Live mode: set MODE=live + BINANCE_API_KEY + BINANCE_API_SECRET in Railway env vars, then redeploy.'
+            : binanceConnected
+              ? '⚠️ LIVE MODE — real USDT will be used.'
+              : <span>Binance API not connected. <button onClick={onConnectBinance} className="underline font-semibold">Connect now →</button></span>}
         </div>
       )}
 
