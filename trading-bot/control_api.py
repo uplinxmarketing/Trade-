@@ -711,6 +711,12 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
         with _positions_lock:
             _positions.append(pos)
 
+        try:
+            import supabase_sync
+            supabase_sync.sync_position_open(pos)
+        except Exception:
+            pass
+
         database.log_activity(f"Force buy: {sym} @ ${fill_price:.4f} | qty={qty:.6f} | budget={budget:.2f} USDT", "info")
         return {"ok": True, "symbol": sym, "price": fill_price, "quantity": qty, "budget": budget}
     except Exception as e:
@@ -805,14 +811,17 @@ def api_sell_monitor():
     alive = hb > 0 and (time.time() - hb) < 5.0
     age   = round(time.time() - hb, 1) if hb > 0 else None
 
+    fee_rate = config.FEE_RATE_BNB if config.BNB_FEE_MODE else config.FEE_RATE_STANDARD
+    bep_mult = 1.0 + fee_rate * 2  # price ratio at which sell is profitable after fees
+
     positions = _get_positions()
     checks = []
     for p in positions:
         sym      = p["symbol"]
         entry    = p.get("entry_price", 0)
         price    = live_prices.get(sym, 0)
-        tp       = entry * (1.0 + config.TAKE_PROFIT_PCT) if entry else 0
-        sl       = entry * (1.0 - config.STOP_LOSS_PCT)   if entry else 0
+        bep      = entry * bep_mult if entry else 0
+        sl       = entry * (1.0 - config.STOP_LOSS_PCT) if entry else 0
         pct      = ((price - entry) / entry * 100) if entry else 0
         hold_sec = p.get("hold_time_sec", 0)
         max_hold = config.MAX_HOLD_SECONDS
@@ -821,9 +830,9 @@ def api_sell_monitor():
             "entry":            entry,
             "current":          price,
             "pct_from_entry":   round(pct, 4),
-            "take_profit":      round(tp, 6),
+            "breakeven_price":  round(bep, 6),
             "stop_loss":        round(sl, 6),
-            "tp_hit":           price >= tp if price and tp else False,
+            "profitable":       price > bep if price and bep else False,
             "sl_hit":           price <= sl if price and sl else False,
             "hold_time_sec":    hold_sec,
             "hold_time_min":    round(hold_sec / 60, 1),
@@ -834,9 +843,10 @@ def api_sell_monitor():
     return {
         "sell_monitor_alive": alive,
         "heartbeat_age_sec":  age,
-        "take_profit_pct":    config.TAKE_PROFIT_PCT * 100,
-        "stop_loss_pct":      config.STOP_LOSS_PCT   * 100,
+        "breakeven_pct":      round(fee_rate * 2 * 100, 4),
+        "stop_loss_pct":      config.STOP_LOSS_PCT * 100,
         "max_hold_minutes":   config.MAX_HOLD_SECONDS // 60,
+        "sell_trigger":       "price > entry × (1 + buy_fee + sell_fee)",
         "open_positions":     len(checks),
         "positions":          checks,
     }

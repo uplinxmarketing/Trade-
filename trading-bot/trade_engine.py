@@ -20,6 +20,7 @@ import os
 import time
 import math
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -43,6 +44,10 @@ _cooldowns: dict = {}
 # ── In-progress sell guard — prevents double-sells from monitor + guardian ────
 _selling: set = set()
 _selling_lock = threading.Lock()
+
+# ── Sell executor — parallel sells so 10 simultaneous exits never queue up ───
+# Each position gets its own worker thread; _selling guard prevents duplicates.
+_sell_executor = ThreadPoolExecutor(max_workers=12, thread_name_prefix="sell-worker")
 
 # ── Real-time signal cache — updated on every kline close ────────────────────
 _signal_cache: Dict[str, dict] = {}
@@ -129,9 +134,31 @@ def _in_cooldown(symbol: str) -> bool:
 # ── DB / startup helpers ──────────────────────────────────────────────────────
 
 def load_positions_from_db():
-    """Called on startup — restores open positions from SQLite."""
+    """Called on startup — restores open positions from SQLite, or Supabase if SQLite is empty."""
     global _positions
     rows = database.load_positions()
+
+    if not rows:
+        # SQLite is empty (fresh Railway deploy) — try to restore from Supabase
+        try:
+            import supabase_sync
+            restored = supabase_sync.restore_from_supabase()
+            if restored.get("positions"):
+                for pos in restored["positions"]:
+                    pos_id = database.save_position(pos)
+                    pos["id"] = pos_id
+                rows = database.load_positions()
+                print(f"[TradeEngine] Restored {len(rows)} position(s) from Supabase.")
+            if restored.get("usdt_balance") is not None:
+                usdt = restored["usdt_balance"]
+                if hasattr(client, "_balances"):
+                    with client._lock:
+                        client._balances["USDT"] = usdt
+                    database.save_paper_state(dict(client._balances))
+                    print(f"[TradeEngine] Restored USDT balance from Supabase: {usdt:.2f}")
+        except Exception as e:
+            print(f"[TradeEngine] Supabase restore failed (non-fatal): {e}")
+
     with _positions_lock:
         _positions = list(rows)
     print(f"[TradeEngine] Loaded {len(_positions)} open position(s) from DB.")
@@ -406,6 +433,12 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     try:
         database.log_trade(trade_record)
         try:
+            import supabase_sync
+            supabase_sync.sync_trade(trade_record)
+            supabase_sync.sync_position_close(sym)
+        except Exception:
+            pass
+        try:
             learning.learn_from_trade(trade_record)
         except Exception as le:
             database.log_activity(f"learn_from_trade error ({sym}): {le}", "warn")
@@ -587,6 +620,13 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         with _positions_lock:
             _positions.append(pos_record)
 
+        try:
+            import supabase_sync
+            supabase_sync.sync_position_open(pos_record)
+            supabase_sync.sync_balance(usdt_balance - budget - budget * _fee_rate)
+        except Exception:
+            pass
+
         usdt_balance -= budget + budget * _fee_rate
 
         score     = cached["score"]
@@ -697,12 +737,12 @@ def _sell_monitor_loop():
                         sym   = p["symbol"]
                         price = prices.get(sym, 0.0)
                         entry = p["entry_price"]
-                        tp    = entry * (1.0 + config.TAKE_PROFIT_PCT)
+                        bep   = entry * _breakeven_mult   # price at which we're profitable
                         sl    = entry * (1.0 - config.STOP_LOSS_PCT)
                         pct   = ((price - entry) / entry * 100) if entry else 0
                         lines.append(
                             f"{sym} entry={entry:.4f} cur={price:.4f}({pct:+.3f}%) "
-                            f"tp={tp:.4f}({'HIT' if price >= tp else 'no'}) "
+                            f"bep={bep:.4f}({'SELL' if price > bep else 'no'}) "
                             f"sl={sl:.4f}({'HIT' if price <= sl else 'no'})"
                         )
                     database.log_activity(
@@ -725,27 +765,32 @@ def _sell_monitor_loop():
 
                 entry = pos["entry_price"]
 
-                # Time-based exit: sell any position held longer than MAX_HOLD_SECONDS
-                # regardless of P&L — prevents positions from being stuck forever when
-                # the market never reaches the take-profit threshold.
+                # Time-based exit: force-sell any position held longer than MAX_HOLD_SECONDS.
+                # Set cooldown before dispatch so re-buys can't fire during the async sell.
                 try:
                     ts = pos.get("timestamp", "")
                     if ts:
                         open_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                         age_sec = (datetime.now(timezone.utc) - open_dt).total_seconds()
                         if age_sec >= config.MAX_HOLD_SECONDS:
-                            _execute_sell(pos, price, f"max-hold-{int(age_sec // 60)}min")
                             if price <= entry * (1.0 - config.STOP_LOSS_PCT):
                                 _set_cooldown(sym)
+                            _sell_executor.submit(
+                                _execute_sell, pos, price, f"max-hold-{int(age_sec // 60)}min"
+                            )
                             continue
                 except Exception:
                     pass
 
-                if price >= entry * (1.0 + config.TAKE_PROFIT_PCT):
-                    _execute_sell(pos, price, "take-profit")
+                # Sell the instant price crosses break-even — any profit after fees.
+                # _breakeven_mult = 1 + fee_buy + fee_sell ≈ 1.0015 (BNB) or 1.002 (standard).
+                # Dispatched to thread pool so all 10+ positions sell simultaneously — never
+                # queue up sequentially (which caused the 20-second delay for the last position).
+                if price > entry * _breakeven_mult:
+                    _sell_executor.submit(_execute_sell, pos, price, "take-profit")
                 elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
-                    _execute_sell(pos, price, "stop-loss")
-                    _set_cooldown(sym)
+                    _set_cooldown(sym)  # set before dispatch so buy loop can't re-enter
+                    _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
 
         except Exception as exc:
             try:

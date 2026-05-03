@@ -1,5 +1,5 @@
 {
-  "version": "4.0.2",
-  "buildTime": "2026-05-03T22:50:00.000Z",
-  "commit": "coin-validation-chart-fix-data-warning"
+  "version": "4.0.4",
+  "buildTime": "2026-05-03T23:35:00.000Z",
+  "commit": "parallel-sells-breakeven-trigger"
 }
