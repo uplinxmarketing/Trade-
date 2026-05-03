@@ -120,14 +120,19 @@ def _get_positions():
 
 def _get_usdt_balance() -> float:
     try:
-        from connection import client
+        from connection import client, get_mode
+        if get_mode() != "live":
+            # Fast path: read directly from PaperClient._balances
+            if hasattr(client, "_balances"):
+                with client._lock:
+                    return float(client._balances.get("USDT", 0.0))
         acc = client.get_account()
         for b in acc["balances"]:
             if b["asset"] == "USDT":
                 return float(b["free"])
     except Exception:
         pass
-    return 0.0
+    return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
 
 
 def _trades_today() -> int:
@@ -519,7 +524,8 @@ def api_status():
         "running":          strategy.get("trading_active", False),
         "mode":             get_mode(),
         "balance_usdt":     balance,
-        "initial_balance":  initial,
+        "paper_balance":    balance,   # alias for frontend compatibility
+        "initial_balance":  initial or balance,
         "open_positions":   len(_get_positions()),
         "trades_today":     database.get_trades_today_count(),
         "win_rate":         round(wins / len(sells), 3) if sells else 0.0,
@@ -610,6 +616,10 @@ def api_agent_start():
     # Refresh approved coins from config before starting so stale strategy.json
     # never limits which coins are scanned.
     strategy_engine.write_default_strategy()
+    s = _load_strategy()
+    if not s.get("initial_balance_usdt"):
+        bal = _get_usdt_balance()
+        _write_strategy_patch({"initial_balance_usdt": bal or float(os.getenv("STARTING_PAPER_USDT", "10000.0"))})
     _write_strategy_patch({"trading_active": True, "pause_reason": None})
     return {"ok": True, "running": True}
 
@@ -618,6 +628,58 @@ def api_agent_start():
 def api_agent_stop():
     _write_strategy_patch({"trading_active": False, "pause_reason": "Stopped via API"})
     return {"ok": True, "running": False}
+
+
+class ForceBuyRequest(BaseModel):
+    price: float = 0.0   # frontend sends its known WebSocket price
+
+
+@app.post("/api/force-buy/{symbol}")
+def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
+    """Force-buy a coin immediately regardless of current signals."""
+    sym = symbol.upper()
+    try:
+        from trade_engine import get_budget_for_coin, _positions, _positions_lock
+        from connection import client as _client
+        from data_collector import prices as live_prices
+
+        # Use price hint from frontend; fall back to WebSocket cache if not provided
+        hint_price = (req.price if req else 0) or 0
+        price = hint_price or live_prices.get(sym, 0)
+        if not price:
+            return {"ok": False, "error": f"No live price for {sym} — WebSocket not yet connected"}
+
+        usdt_balance = _get_usdt_balance()
+        budget = get_budget_for_coin(sym, usdt_balance)
+        if budget <= 0:
+            return {"ok": False, "error": f"Budget 0 — balance: {usdt_balance:.2f} USDT"}
+
+        with _positions_lock:
+            already_held = any(p["symbol"] == sym for p in _positions)
+        if already_held:
+            return {"ok": False, "error": f"Already holding {sym}"}
+
+        _client.update_price(sym, price)
+        result = _client.order_market_buy(symbol=sym, quoteOrderQty=budget)
+        fill       = result.get("fills", [{}])[0]
+        fill_price = float(fill.get("price", price))
+        qty        = float(result.get("executedQty", 0))
+        if qty <= 0:
+            return {"ok": False, "error": "Order returned 0 quantity"}
+
+        pos = {
+            "symbol": sym, "entry_price": fill_price, "quantity": qty,
+            "budget_usdt": budget, "timestamp": datetime.now(timezone.utc).isoformat(),
+            "mode": get_mode(),
+        }
+        pos["id"] = database.save_position(pos)
+        with _positions_lock:
+            _positions.append(pos)
+
+        database.log_activity(f"Force buy: {sym} @ ${fill_price:.4f} | qty={qty:.6f} | budget={budget:.2f} USDT", "info")
+        return {"ok": True, "symbol": sym, "price": fill_price, "quantity": qty, "budget": budget}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.post("/api/force-sell/{symbol}")

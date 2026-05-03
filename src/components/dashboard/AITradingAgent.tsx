@@ -198,7 +198,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [editingInstr, setEditingInstr]   = useState(false);
   const [instrDraft, setInstrDraft]       = useState('');
   const [actLog, setActLog]       = useState<string[]>([]);
-  const [showLog, setShowLog]     = useState(false);
+  const [showLog, setShowLog]     = useState(true);
   // Unified deployment: frontend and API are served from the same Railway URL.
   // railwayUrl defaults to '' (same origin) so all /api/* calls are relative.
   // Users can override via localStorage if they ever need to point at a different backend.
@@ -246,6 +246,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
   // ── Load state from DB ───────────────────────────────────────────────────
   const loadData = useCallback(async () => {
+    // Server mode: all data comes from pollRailway (Railway SQLite), not Supabase.
+    // Letting loadData run would race with pollRailway and overwrite Railway data with empty Supabase rows.
+    if (isServerMode) return;
+
     const [trdRes, posRes, cfgRes] = await Promise.all([
       supabase.from('bot_trade_history').select('*').eq('user_session', SESSION).order('created_at', { ascending: false }).limit(100),
       supabase.from('paper_portfolio').select('*').eq('user_session', SESSION).gt('quantity', 0),
@@ -446,16 +450,37 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     const scan = async () => {
       if (cancelled) return;
       setScanning(true);
-      try {
-        const signals = await analyseAll(selectedCoins);
-        if (!cancelled) setCoinSignals(signals);
-      } catch { /* ignore network errors */ }
-      finally { if (!cancelled) setScanning(false); }
+      // Show loading cards immediately
+      const loadingCards: CoinSignal[] = selectedCoins.map(sym => ({
+        symbol: sym,
+        price: parseFloat(pricesRef.current[sym]?.price || '0'),
+        rsi: 50, emaBullish: false, rsiOk: false, macdPos: false, volUp: false,
+        signal: 'loading' as const, reason: 'Scanning…',
+      }));
+      setCoinSignals(loadingCards);
+      const results: CoinSignal[] = [...loadingCards];
+      for (let i = 0; i < selectedCoins.length; i++) {
+        if (cancelled) return;
+        results[i] = await analyseCoin(selectedCoins[i]);
+        if (!cancelled) setCoinSignals([...results]);
+        if (i < selectedCoins.length - 1) await new Promise(r => setTimeout(r, 300));
+      }
+      if (!cancelled) setScanning(false);
     };
     scan();
     const id = setInterval(scan, AGENT_CYCLE_MS);
     return () => { cancelled = true; clearInterval(id); };
   }, [selectedCoins]); // eslint-disable-line
+
+  // ── Sync selectedCoins to Railway so Python bot watches the right coins ──
+  useEffect(() => {
+    if (!isServerMode || !selectedCoins.length) return;
+    fetch(`${railwayUrl}/api/coins`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ coins: selectedCoins }),
+    }).catch(() => {});
+  }, [selectedCoins, railwayUrl]); // eslint-disable-line
 
   // ── Railway server-mode poller ─────────────────────────────────────────────
   // When a Railway URL is configured the JS trading loop is disabled.
@@ -468,10 +493,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 8000);
-      const [sRes, pRes, tRes] = await Promise.all([
+      const [sRes, pRes, tRes, aRes] = await Promise.all([
         fetch(`${railwayUrl}/api/status`,    { signal: ctrl.signal }),
         fetch(`${railwayUrl}/api/positions`, { signal: ctrl.signal }),
         fetch(`${railwayUrl}/api/trades`,    { signal: ctrl.signal }),
+        fetch(`${railwayUrl}/api/activity`,  { signal: ctrl.signal }),
       ]);
       clearTimeout(timer);
 
@@ -497,24 +523,47 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         positionsRef.current = mapped;
       }
 
+      let tradePayload: {side:'BUY'|'SELL'; pnl:number|null; quantity:number; price:number}[] = [];
       if (tRes.ok) {
         const t = await tRes.json();
-        const mapped: TradeRow[] = (t.trades ?? [])
-          .filter((tr: any) => tr.exit_price != null)
-          .map((tr: any) => ({
-            id:         String(tr.id),
-            created_at: tr.timestamp_sell ?? tr.timestamp_buy ?? new Date().toISOString(),
-            symbol:     tr.coin,
-            side:       'SELL' as const,
-            price:      Number(tr.exit_price),
-            quantity:   Number(tr.quantity),
-            pnl:        Number(tr.net_profit ?? 0),
-            reason:     null,
-          }));
-        setTrades(mapped);
-        // Keep parent wallet in sync with Railway state
-        const tradePayload = mapped.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
-        onStateChangeRef.current?.(positionsRef.current, balanceRef.current, initialBalance, tradePayload);
+        const railwayTrades: TradeRow[] = [];
+        for (const tr of (t.trades ?? [])) {
+          if (tr.entry_price && tr.timestamp_buy) {
+            railwayTrades.push({
+              id: `rw-buy-${tr.id}`, created_at: tr.timestamp_buy,
+              symbol: tr.coin, side: 'BUY' as const,
+              price: Number(tr.entry_price), quantity: Number(tr.quantity),
+              pnl: null, reason: null,
+            });
+          }
+          if (tr.exit_price && tr.timestamp_sell) {
+            railwayTrades.push({
+              id: `rw-sell-${tr.id}`, created_at: tr.timestamp_sell,
+              symbol: tr.coin, side: 'SELL' as const,
+              price: Number(tr.exit_price), quantity: Number(tr.quantity),
+              pnl: Number(tr.net_profit ?? 0), reason: null,
+            });
+          }
+        }
+        const sorted = railwayTrades.sort((a, b) =>
+          new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+        if (sorted.length > 0) setTrades(sorted);
+        tradePayload = sorted.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
+      }
+
+      // Always sync parent wallet after every poll (positions + balance are always fresh here)
+      onStateChangeRef.current?.(positionsRef.current, balanceRef.current, initialBalance, tradePayload);
+
+      // Activity log from Python bot's SQLite activity_log table
+      if (aRes.ok) {
+        const a = await aRes.json();
+        const entries: string[] = (a.entries ?? []).map((e: any) => {
+          const ts = new Date(e.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          const icon = e.level === 'warn' ? '⚠ ' : e.level === 'error' ? '✕ ' : '';
+          return `[${ts}] ${icon}${e.message}`;
+        });
+        // Always update — even empty clears stale entries
+        setActLog(entries.length > 0 ? entries : ['[Bot] Waiting for first activity...']);
       }
     } catch (e: any) {
       if (e.name !== 'AbortError') addLog(`[Railway] poll failed: ${e.message}`);
@@ -529,13 +578,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     }
     // Immediate poll then every 30 s
     pollRailway();
-    serverPollRef.current = setInterval(pollRailway, 30_000);
+    serverPollRef.current = setInterval(pollRailway, 5_000);
     return () => { if (serverPollRef.current) { clearInterval(serverPollRef.current); serverPollRef.current = null; } };
   }, [isServerMode, pollRailway]);
 
   // ── Mode change (paper ↔ live) ───────────────────────────────────────────
   const handleModeChange = useCallback(async (newMode: 'test' | 'live') => {
-    if (isRunning) return;
+    if (isRunning) { toast.error('Stop the bot first to switch modes'); return; }
     if (isServerMode) {
       if (newMode === 'live') {
         setMode('live'); // reveals the API key form below — no toast
@@ -685,13 +734,27 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (!wsPrice) { toast.error('No live price yet'); return; }
     setForcingBuy(sym);
     try {
+      // Server mode: delegate to Railway's force-buy endpoint
+      if (isServerModeRef.current) {
+        const res  = await fetch(`${railwayUrl}/api/force-buy/${sym}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ price: wsPrice }),  // send known price so backend never fails on "no live price"
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error ?? 'Force buy failed');
+        addLog(`FORCE BUY ${sym} via Railway @ ${Number(data.price).toFixed(4)} USDT · ${Number(data.budget).toFixed(2)} USDT`);
+        toast.success(`Force BUY: ${sym.replace('USDT','')} @ ${Number(data.price).toFixed(4)} USDT`);
+        await pollRailway();
+        return;
+      }
+      // Local paper mode: write directly to Supabase
       const bal   = balanceRef.current;
       const alloc = getAllocation(bal, sym);
       if (alloc < MIN_USDT) { toast.error(`Balance too low (${bal.toFixed(2)} USDT)`); return; }
       const fee = alloc * TAKER_FEE;
       const qty = (alloc - fee) / wsPrice;
       const newBal = bal - alloc;
-      // Read existing position to accumulate (weighted avg entry)
       const { data: existingPos } = await supabase.from('paper_portfolio')
         .select('quantity,avg_entry_price').eq('user_session', SESSION).eq('symbol', sym).maybeSingle();
       const portWrite = existingPos && Number(existingPos.quantity) > 0
@@ -718,7 +781,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       toast.success(`Force BUY: ${sym.replace('USDT','')} @ ${wsPrice.toFixed(4)} USDT`);
       await loadData();
     } finally { setForcingBuy(null); }
-  }, [addLog, loadData]);
+  }, [addLog, loadData, railwayUrl, pollRailway]);
 
   // ── Force SELL ───────────────────────────────────────────────────────────
   const forceSell = useCallback(async (pos: OpenPosition) => {
@@ -734,6 +797,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         if (!data.ok) throw new Error(data.error ?? 'Force sell failed');
         addLog(`FORCE SELL ${pos.symbol} via Railway @ ${Number(data.price).toFixed(4)} USDT`);
         toast.success(`Force SELL sent: ${pos.symbol.replace('USDT','')}`);
+        await pollRailway();
       } catch (e) {
         toast.error(`Force sell failed: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
@@ -855,7 +919,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       {/* ── Mode toggle ── */}
       <div className="grid grid-cols-2 gap-1 bg-muted/30 rounded-md p-0.5">
         {(['test', 'live'] as const).map(m => (
-          <button key={m} onClick={() => handleModeChange(m)} disabled={isRunning}
+          <button key={m} onClick={() => handleModeChange(m)}
             className={`flex items-center justify-center gap-1.5 py-2 rounded text-xs font-semibold transition-colors disabled:opacity-60
               ${mode === m ? (m === 'live' ? 'bg-loss/80 text-white' : 'bg-accent text-accent-foreground') : 'text-muted-foreground hover:text-foreground'}`}>
             {m === 'test'
@@ -1026,7 +1090,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       }
 
       {/* ── Live coin signals ── */}
-      {coinSignals.length > 0 && (
+      {(coinSignals.length > 0 || scanning) && (
         <div>
           <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2 flex items-center gap-1.5">
             <Activity className="w-3 h-3 text-accent" />Live Signals — last scan
@@ -1036,7 +1100,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               const held = positions.some(p => p.symbol === sig.symbol);
               const wsP  = parseFloat(pricesRef.current[sig.symbol]?.price || '0') || sig.price;
               return (
-                <div key={sig.symbol} className={`rounded-lg p-2.5 space-y-1.5 border ${sig.signal==='BUY'?'bg-gain/5 border-gain/30':held?'border-accent/30 bg-accent/5':'bg-secondary/40 border-border'}`}>
+                <div key={sig.symbol} className={`rounded-lg p-2.5 space-y-1.5 border ${sig.signal==='loading'?'animate-pulse bg-muted/30 border-border/50':sig.signal==='BUY'?'bg-gain/5 border-gain/30':held?'border-accent/30 bg-accent/5':'bg-secondary/40 border-border'}`}>
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold font-mono">{sig.symbol.replace('USDT','')}</span>
                     <span className={`text-[10px] font-bold ${sig.signal==='BUY'?'text-gain':sig.signal==='error'?'text-muted-foreground':'text-warn'}`}>
