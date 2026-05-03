@@ -374,7 +374,9 @@ def update_coin_signals(symbol: str, closes: list, volumes: list):
 # ── Shared sell execution (used by both realtime_monitor and signal_scanner) ──
 
 def _execute_sell(pos: dict, price: float, reason: str):
-    """Execute a market sell for pos at price. Logs trade, cleans up state."""
+    """Execute a market sell for pos at price. Logs trade, cleans up state.
+    Caller MUST have already added pos['symbol'] to _selling before submitting
+    to the executor — this function just verifies and executes."""
     from datetime import timezone as _tz
     sym  = pos["symbol"]
     qty  = _floor_qty(pos["quantity"])
@@ -382,19 +384,18 @@ def _execute_sell(pos: dict, price: float, reason: str):
     now  = datetime.now(_tz.utc).isoformat()
 
     if qty <= 0 or price <= 0:
+        with _selling_lock:
+            _selling.discard(sym)
         return
 
-    # Dedup guard — only one sell per symbol at a time. Also verify the position
-    # still exists (realtime_monitor may submit multiple ticks before _pos_by_symbol
-    # is rebuilt; the second submission must not proceed after the first completed).
-    with _selling_lock:
-        if sym in _selling:
-            return
-        with _positions_lock:
-            pos_id = pos.get("id")
-            if pos_id and not any(p.get("id") == pos_id for p in _positions):
-                return  # already sold by a concurrent submission
-        _selling.add(sym)
+    # Verify position still exists — another executor task may have already sold it
+    # (e.g. force-sell came in while we were queued).
+    with _positions_lock:
+        pos_id = pos.get("id")
+        if pos_id and not any(p.get("id") == pos_id for p in _positions):
+            with _selling_lock:
+                _selling.discard(sym)
+            return  # already sold
 
     try:
         _do_execute_sell(pos, sym, qty, price, reason, mode, now)
@@ -743,14 +744,19 @@ def realtime_monitor(prices: Dict[str, float]):
         pos = pos_index.get(sym)
         if pos is None or price <= 0:
             continue
-        with _selling_lock:
-            if sym in _selling:
-                continue
         entry  = pos["entry_price"]
         target = pos.get("exit_target") or entry * _breakeven_mult
         if price >= target:
+            with _selling_lock:
+                if sym in _selling:
+                    continue
+                _selling.add(sym)          # reserve BEFORE submitting to executor
             _sell_executor.submit(_execute_sell, pos, price, "take-profit")
         elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
+            with _selling_lock:
+                if sym in _selling:
+                    continue
+                _selling.add(sym)
             _set_cooldown(sym)
             _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
 
@@ -831,8 +837,16 @@ def _sell_monitor_loop():
                 entry  = pos["entry_price"]
                 target = pos.get("exit_target") or entry * _breakeven_mult
                 if price >= target:
+                    with _selling_lock:
+                        if sym in _selling:
+                            continue
+                        _selling.add(sym)
                     _sell_executor.submit(_execute_sell, pos, price, "take-profit")
                 elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
+                    with _selling_lock:
+                        if sym in _selling:
+                            continue
+                        _selling.add(sym)
                     _set_cooldown(sym)
                     _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
 

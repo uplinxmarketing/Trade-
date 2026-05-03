@@ -602,17 +602,24 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     setActLog(entries.length > 0 ? entries : ['[Bot] Waiting for first activity...']);
   }, [railwayUrl, addLog]);
 
-  // Start/stop the polling interval whenever server mode changes
+  // Start/stop the polling interval whenever server mode changes.
+  // When any position is at or above its exit target, poll every 1 s so the
+  // position disappears from the UI almost instantly after the backend sells it.
   useEffect(() => {
     if (!isServerMode) {
       if (serverPollRef.current) { clearInterval(serverPollRef.current); serverPollRef.current = null; }
       return;
     }
-    // Immediate poll then every 30 s
     pollRailway();
-    serverPollRef.current = setInterval(pollRailway, 5_000);
+    const hasSelling = positions.some(pos => {
+      const live   = parseFloat((prices as any)[pos.symbol]?.price || '0') || pos.avg_entry_price;
+      const target = pos.exit_target ?? pos.avg_entry_price * BEP_MULT;
+      return live >= target;
+    });
+    const interval = hasSelling ? 1_000 : 5_000;
+    serverPollRef.current = setInterval(pollRailway, interval);
     return () => { if (serverPollRef.current) { clearInterval(serverPollRef.current); serverPollRef.current = null; } };
-  }, [isServerMode, pollRailway]);
+  }, [isServerMode, pollRailway, positions, prices]);
 
   // ── Mode change (paper ↔ live) ───────────────────────────────────────────
   const handleModeChange = useCallback(async (newMode: 'test' | 'live') => {

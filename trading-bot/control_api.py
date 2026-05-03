@@ -760,6 +760,11 @@ def api_force_sell(symbol: str, req: Optional[ForceSellRequest] = None):
         price = hint_price or live_prices.get(sym, 0) or pos.get("entry_price", 0)
         if not price:
             return {"ok": False, "error": f"No live price for {sym}"}
+        from trade_engine import _selling, _selling_lock
+        with _selling_lock:
+            if sym in _selling:
+                return {"ok": False, "error": f"Sell already in progress for {sym}"}
+            _selling.add(sym)
         _execute_sell(pos, price, "force-sell")
         database.log_activity(f"Force sell: {sym} @ ${price:.4f} | qty={pos.get('quantity',0):.6f}", "info")
         return {"ok": True, "symbol": sym, "price": price}
