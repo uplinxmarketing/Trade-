@@ -40,6 +40,10 @@ _breakeven_mult = 1.0 + _fee_rate + _fee_rate
 
 _cooldowns: dict = {}
 
+# ── In-progress sell guard — prevents double-sells from monitor + guardian ────
+_selling: set = set()
+_selling_lock = threading.Lock()
+
 # ── Real-time signal cache — updated on every kline close ────────────────────
 _signal_cache: Dict[str, dict] = {}
 _signal_cache_lock = threading.Lock()
@@ -135,6 +139,28 @@ def load_positions_from_db():
     with _positions_lock:
         _positions = list(rows)
     print(f"[TradeEngine] Loaded {len(_positions)} open position(s) from DB.")
+
+    # Sync PaperClient coin balances from the restored positions.
+    # After a restart, PaperClient loads from saved paper_state, but if that
+    # state is out of sync with the positions table (e.g. a partial crash),
+    # sells will fail with "Insufficient balance". Self-heal by crediting the
+    # exact quantity that each open position holds.
+    if hasattr(client, "_balances") and _positions:
+        changed = False
+        for pos in _positions:
+            sym  = pos["symbol"]
+            coin = sym[:-4]  # strip USDT
+            qty  = float(pos.get("quantity", 0))
+            if qty <= 0:
+                continue
+            with client._lock:
+                current = client._balances.get(coin, 0.0)
+                if current < qty * 0.99:
+                    client._balances[coin] = qty
+                    changed = True
+                    print(f"[TradeEngine] Synced paper balance: {coin}={qty:.8f} (was {current:.8f})")
+        if changed:
+            database.save_paper_state(dict(client._balances))
 
 
 def get_open_positions() -> List[dict]:
@@ -288,16 +314,52 @@ def _execute_sell(pos: dict, price: float, reason: str):
     if qty <= 0 or price <= 0:
         return
 
-    # Make sure PaperClient uses the latest known price before the sell
+    # Dedup guard — only one sell per symbol at a time (realtime_monitor +
+    # position_guardian can both fire; whichever gets here first wins).
+    with _selling_lock:
+        if sym in _selling:
+            return
+        _selling.add(sym)
+
+    try:
+        _do_execute_sell(pos, sym, qty, price, reason, mode, now)
+    finally:
+        with _selling_lock:
+            _selling.discard(sym)
+
+
+def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str, mode: str, now: str):
+    """Inner sell logic — called only when the _selling guard is held."""
+    from datetime import timezone as _tz
+
+    # Ensure PaperClient price is current before the sell
     try:
         client.update_price(sym, price)
     except Exception:
         pass
 
+    # Paper mode: self-heal coin balance if it went missing after a restart.
+    # open position record is the source of truth for what we own.
+    if hasattr(client, "_balances"):
+        coin = sym[:-4]
+        with client._lock:
+            current_coin_bal = client._balances.get(coin, 0.0)
+        if current_coin_bal < qty * 0.99:
+            with client._lock:
+                client._balances[coin] = qty
+            database.save_paper_state(dict(client._balances))
+            database.log_activity(
+                f"[PaperWallet] Auto-credited {qty:.8f} {coin} "
+                f"(had {current_coin_bal:.8f}) — balance was out of sync after restart",
+                "warn",
+            )
+
     try:
         result = client.order_market_sell(symbol=sym, quantity=qty)
     except Exception as e:
-        print(f"[TradeEngine] SELL failed {sym}: {e}")
+        msg = f"SELL failed {sym} ({reason}): {e}"
+        print(f"[TradeEngine] {msg}")
+        database.log_activity(msg, "error")
         return
 
     fill_price = float(result["fills"][0]["price"]) if result.get("fills") else price
@@ -353,11 +415,13 @@ def _execute_sell(pos: dict, price: float, reason: str):
 
     usdt_received = gross - sell_fee
     pnl_sign      = "+" if net_profit >= 0 else ""
-    print(
-        f"[{sell_ts}] SELL {sym} @ {fill_price:.4f} USDT "
-        f"· {usdt_received:.4f} USDT · P&L: {pnl_sign}{net_profit:.4f} USDT"
+    sell_msg = (
+        f"SOLD {sym} @ ${fill_price:.4f} "
+        f"· received {usdt_received:.4f} USDT · P&L: {pnl_sign}{net_profit:.4f} USDT"
         f"  ({reason}, held {duration}s)"
     )
+    print(f"[{sell_ts}] {sell_msg}")
+    database.log_activity(sell_msg, "info")
 
 
 # ── Real-time buy check from signal cache (called from realtime_monitor) ──────
@@ -608,40 +672,46 @@ def realtime_monitor(prices: Dict[str, float]):
     _check_buys_from_cache(prices)
 
 
-# ── Position guardian: REST-based sell check when WebSocket prices are stale ──
+# ── Position guardian: real-time exit monitor using live WebSocket prices ──────
 
 async def position_guardian():
     """
-    Polls open positions every 30 s via REST.
-    Acts as a backstop when the WebSocket is disconnected or a symbol's
-    price never arrives in the prices dict (e.g. right after startup).
+    Checks open positions every 500 ms using live in-memory WebSocket prices
+    (zero network I/O). Runs _execute_sell in a thread-pool executor so SQLite
+    writes don't block the event loop. Acts as the primary exit trigger — the
+    sell guard in _execute_sell prevents double-sells with realtime_monitor.
     """
+    import data_collector as _dc
+    loop = asyncio.get_running_loop()
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(0.5)
         with _positions_lock:
             snap = list(_positions)
         if not snap:
             continue
-        loop = asyncio.get_running_loop()
+
+        prices = dict(_dc.prices)  # live WS prices — no REST, no blocking
         for pos in snap:
-            sym = pos["symbol"]
-            try:
-                def _fetch(s=sym):
-                    return client.get_symbol_ticker(symbol=s)
-                ticker = await loop.run_in_executor(None, _fetch)
-                price  = float(ticker.get("price", 0))
-                if price <= 0:
+            sym   = pos["symbol"]
+            price = prices.get(sym, 0.0)
+            if price <= 0:
+                continue
+
+            # Skip if a sell is already in progress for this symbol
+            with _selling_lock:
+                if sym in _selling:
                     continue
-                entry       = pos["entry_price"]
-                take_profit = entry * (1.0 + config.TAKE_PROFIT_PCT)
-                stop_loss   = entry * (1.0 - config.STOP_LOSS_PCT)
-                if price >= take_profit:
-                    _execute_sell(pos, price, "take-profit-guardian")
-                elif price <= stop_loss:
-                    _execute_sell(pos, price, "stop-loss-guardian")
-                    _set_cooldown(sym)
-            except Exception as e:
-                print(f"[Guardian] {sym} price check failed: {e}")
+
+            entry = pos["entry_price"]
+            if price >= entry * (1.0 + config.TAKE_PROFIT_PCT):
+                await loop.run_in_executor(
+                    None, _execute_sell, pos, price, "take-profit"
+                )
+            elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
+                await loop.run_in_executor(
+                    None, _execute_sell, pos, price, "stop-loss"
+                )
+                _set_cooldown(sym)
 
 
 # ── Process 2: signal scanner (async, refreshes cache every SCAN_INTERVAL_SEC) ─
