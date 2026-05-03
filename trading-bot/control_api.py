@@ -56,10 +56,11 @@ async def lifespan(app: FastAPI):
     data_collector.register_price_callback(trade_engine.realtime_monitor)
     data_collector.register_kline_callback(trade_engine.update_coin_signals)
 
-    # 6. Launch WebSocket feed + strategy loop + signal scanner as async tasks
+    # 6. Launch WebSocket feed + strategy loop + signal scanner + guardian as async tasks
     asyncio.create_task(data_collector.start_websocket())
     asyncio.create_task(strategy_engine.strategy_loop())
     asyncio.create_task(trade_engine.signal_scanner(data_collector.prices))
+    asyncio.create_task(trade_engine.position_guardian())  # REST backstop for sells
 
     print("[ControlAPI] All trading tasks started.")
     yield

@@ -529,11 +529,11 @@ def realtime_monitor(prices: Dict[str, float]):
         if price <= 0:
             continue
 
-        entry     = pos["entry_price"]
-        breakeven = entry * _breakeven_mult
-        stop_loss = entry * (1 - config.STOP_LOSS_PCT)
+        entry       = pos["entry_price"]
+        take_profit = entry * (1.0 + config.TAKE_PROFIT_PCT)
+        stop_loss   = entry * (1.0 - config.STOP_LOSS_PCT)
 
-        if price > breakeven:
+        if price >= take_profit:
             _execute_sell(pos, price, "take-profit")
         elif price <= stop_loss:
             _execute_sell(pos, price, "stop-loss")
@@ -541,6 +541,42 @@ def realtime_monitor(prices: Dict[str, float]):
 
     # Real-time buy check — reads signal cache, zero network I/O
     _check_buys_from_cache(prices)
+
+
+# ── Position guardian: REST-based sell check when WebSocket prices are stale ──
+
+async def position_guardian():
+    """
+    Polls open positions every 30 s via REST.
+    Acts as a backstop when the WebSocket is disconnected or a symbol's
+    price never arrives in the prices dict (e.g. right after startup).
+    """
+    while True:
+        await asyncio.sleep(30)
+        with _positions_lock:
+            snap = list(_positions)
+        if not snap:
+            continue
+        loop = asyncio.get_running_loop()
+        for pos in snap:
+            sym = pos["symbol"]
+            try:
+                def _fetch(s=sym):
+                    return client.get_symbol_ticker(symbol=s)
+                ticker = await loop.run_in_executor(None, _fetch)
+                price  = float(ticker.get("price", 0))
+                if price <= 0:
+                    continue
+                entry       = pos["entry_price"]
+                take_profit = entry * (1.0 + config.TAKE_PROFIT_PCT)
+                stop_loss   = entry * (1.0 - config.STOP_LOSS_PCT)
+                if price >= take_profit:
+                    _execute_sell(pos, price, "take-profit-guardian")
+                elif price <= stop_loss:
+                    _execute_sell(pos, price, "stop-loss-guardian")
+                    _set_cooldown(sym)
+            except Exception as e:
+                print(f"[Guardian] {sym} price check failed: {e}")
 
 
 # ── Process 2: signal scanner (async, refreshes cache every SCAN_INTERVAL_SEC) ─

@@ -56,12 +56,30 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
     }
   }, []);
 
-  // Check once on mount (after a short delay so the app fully renders first)
-  // and then every 5 minutes in the background.
+  // Check on mount, then retry with backoff until first success,
+  // then settle into the normal poll interval.
   useEffect(() => {
-    const initial = setTimeout(() => { checkForUpdates().catch(() => {}); }, 3000);
-    const interval = setInterval(() => { checkForUpdates().catch(() => {}); }, pollIntervalMs);
-    return () => { clearTimeout(initial); clearInterval(interval); };
+    let timer: ReturnType<typeof setTimeout>;
+    let settled = false;
+
+    const tryCheck = async (retryDelay: number) => {
+      try {
+        await checkForUpdates();
+        settled = true;
+        // Success — switch to normal polling cadence
+        timer = setInterval(() => checkForUpdates().catch(() => {}), pollIntervalMs) as unknown as ReturnType<typeof setTimeout>;
+      } catch {
+        if (!settled) {
+          // Server still unreachable — retry with capped backoff (max 60 s)
+          const next = Math.min(retryDelay * 2, 60_000);
+          timer = setTimeout(() => tryCheck(next), retryDelay);
+        }
+      }
+    };
+
+    // First attempt 4 s after mount; start backoff at 15 s
+    timer = setTimeout(() => tryCheck(15_000), 4_000);
+    return () => { clearTimeout(timer); clearInterval(timer as unknown as ReturnType<typeof setInterval>); };
   }, [checkForUpdates, pollIntervalMs]);
 
   const applyUpdate = useCallback(async () => {
