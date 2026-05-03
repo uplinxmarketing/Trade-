@@ -44,14 +44,6 @@ class PaperClient:
         with self._lock:
             return self._balances.get(asset, 0.0)
 
-    def _set_balance(self, asset: str, amount: float):
-        with self._lock:
-            if amount <= 0:
-                self._balances.pop(asset, None)
-            else:
-                self._balances[asset] = amount
-        database.save_paper_state(dict(self._balances))
-
     # ── Account ─────────────────────────────────────────────────────────────
 
     def get_account(self) -> dict:
@@ -98,6 +90,8 @@ class PaperClient:
             self._balances["USDT"] = usdt_bal - total_cost
             self._balances[coin]   = self._balances.get(coin, 0.0) + qty
             snapshot = dict(self._balances)
+
+        # Single save after all balance changes are applied
         database.save_paper_state(snapshot)
 
         order_id = str(uuid.uuid4())[:12].replace("-", "")
@@ -129,19 +123,27 @@ class PaperClient:
     def order_market_sell(self, symbol: str, quantity: float) -> dict:
         price = self._get_price(symbol)
         coin  = symbol[:-4]  # strip USDT
-        coin_bal = self._get_balance(coin)
 
-        if coin_bal < quantity * 0.9999:  # small tolerance for float precision
-            raise ValueError(
-                f"Insufficient paper {coin} balance: need {quantity:.8f}, have {coin_bal:.8f}"
-            )
+        with self._lock:
+            coin_bal = self._balances.get(coin, 0.0)
+            if coin_bal < quantity * 0.9999:  # small tolerance for float precision
+                raise ValueError(
+                    f"Insufficient paper {coin} balance: need {quantity:.8f}, have {coin_bal:.8f}"
+                )
+            gross_usdt = quantity * price
+            fee        = gross_usdt * self._fee_rate
+            net_usdt   = gross_usdt - fee
 
-        gross_usdt = quantity * price
-        fee        = gross_usdt * self._fee_rate
-        net_usdt   = gross_usdt - fee
+            new_coin = coin_bal - quantity
+            if new_coin <= 0:
+                self._balances.pop(coin, None)
+            else:
+                self._balances[coin] = new_coin
+            self._balances["USDT"] = self._balances.get("USDT", 0.0) + net_usdt
+            snapshot = dict(self._balances)
 
-        self._set_balance(coin, coin_bal - quantity)
-        self._set_balance("USDT", self._get_balance("USDT") + net_usdt)
+        # Single save after all balance changes are applied (was 2 saves before)
+        database.save_paper_state(snapshot)
 
         order_id = str(uuid.uuid4())[:12].replace("-", "")
         now_ms   = int(time.time() * 1000)

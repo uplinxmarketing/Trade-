@@ -4,8 +4,16 @@ Railway redeploys entirely in code with no infrastructure changes.
 
 All writes are dispatched to a ThreadPoolExecutor; the calling code never
 blocks.  On startup, restore_from_supabase() is called to recover open
-positions and USDT balance from the last known good Supabase state when
-SQLite is empty (i.e. after a fresh Railway deploy).
+positions and USDT balance when SQLite is empty (i.e. after a fresh deploy).
+
+Schema reality (from types.ts):
+  bot_trade_history : user_session, symbol, side, price, quantity, pnl, reason, bot_id(FK/null), created_at
+  paper_portfolio   : user_session, symbol, quantity, avg_entry_price, updated_at, bot_id(FK/null), id
+  bot_config        : user_session, current_balance, initial_balance, is_running, mode,
+                      selected_coins, min_profit_percent, stop_loss_percent, updated_at, id
+
+IMPORTANT: bot_id is a FK to trading_bots.id — never send a freeform string.
+           Leave it NULL (omit the key entirely) so the constraint is never violated.
 """
 
 import json
@@ -17,9 +25,6 @@ from urllib import request
 from urllib.error import HTTPError
 
 # ── Credentials ───────────────────────────────────────────────────────────────
-# Railway Supabase connector injects SUPABASE_URL + SUPABASE_ANON_KEY.
-# Fall back to VITE_ prefixed vars (same values used by the React frontend)
-# and finally to the hardcoded project values.
 SUPABASE_URL = (
     os.getenv("SUPABASE_URL")
     or os.getenv("VITE_SUPABASE_URL")
@@ -30,15 +35,13 @@ SUPABASE_KEY = (
     or os.getenv("VITE_SUPABASE_PUBLISHABLE_KEY")
     or "sb_publishable_6p26q62HNaU7pqv9k9jb_w_8S0ixNrP"
 )
-
-# Separate session tag from the browser frontend ("default") so rows never collide.
 SESSION = "railway_bot"
 
 _enabled = bool(SUPABASE_URL and SUPABASE_KEY)
 _pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="supa-sync")
 
 
-# ── Low-level REST helpers ────────────────────────────────────────────────────
+# ── Low-level helpers ─────────────────────────────────────────────────────────
 
 def _hdrs(prefer: str = "") -> dict:
     h = {
@@ -51,18 +54,37 @@ def _hdrs(prefer: str = "") -> dict:
     return h
 
 
-def _post(table: str, payload: dict, upsert: bool = False):
-    prefer = "resolution=merge-duplicates,return=minimal" if upsert else "return=minimal"
+def _post(table: str, payload: dict) -> bool:
+    """INSERT one row. Returns True on success."""
     url  = f"{SUPABASE_URL}/rest/v1/{table}"
     data = json.dumps(payload).encode()
-    req  = request.Request(url, data=data, headers=_hdrs(prefer), method="POST")
+    req  = request.Request(url, data=data, headers=_hdrs("return=minimal"), method="POST")
     try:
         with request.urlopen(req, timeout=8):
-            pass
+            return True
     except HTTPError as e:
-        print(f"[SupaSync] POST {table} HTTP {e.code}: {e.read().decode('utf-8','replace')[:200]}")
+        print(f"[SupaSync] POST {table} HTTP {e.code}: {e.read().decode('utf-8','replace')[:300]}")
+        return False
     except Exception as e:
         print(f"[SupaSync] POST {table} error: {e}")
+        return False
+
+
+def _patch(table: str, query: str, payload: dict) -> int:
+    """PATCH rows matching query. Returns count of updated rows (-1 on error)."""
+    url  = f"{SUPABASE_URL}/rest/v1/{table}?{query}"
+    data = json.dumps(payload).encode()
+    req  = request.Request(url, data=data, headers=_hdrs("return=representation"), method="PATCH")
+    try:
+        with request.urlopen(req, timeout=8) as resp:
+            body = json.loads(resp.read() or b"[]")
+            return len(body) if isinstance(body, list) else 0
+    except HTTPError as e:
+        print(f"[SupaSync] PATCH {table} HTTP {e.code}: {e.read().decode('utf-8','replace')[:300]}")
+        return -1
+    except Exception as e:
+        print(f"[SupaSync] PATCH {table} error: {e}")
+        return -1
 
 
 def _delete(table: str, query: str):
@@ -72,7 +94,7 @@ def _delete(table: str, query: str):
         with request.urlopen(req, timeout=8):
             pass
     except HTTPError as e:
-        print(f"[SupaSync] DELETE {table} HTTP {e.code}: {e.read().decode('utf-8','replace')[:200]}")
+        print(f"[SupaSync] DELETE {table} HTTP {e.code}: {e.read().decode('utf-8','replace')[:300]}")
     except Exception as e:
         print(f"[SupaSync] DELETE {table} error: {e}")
 
@@ -84,7 +106,7 @@ def _get(table: str, query: str) -> Optional[list]:
         with request.urlopen(req, timeout=8) as resp:
             return json.loads(resp.read())
     except HTTPError as e:
-        print(f"[SupaSync] GET {table} HTTP {e.code}: {e.read().decode('utf-8','replace')[:200]}")
+        print(f"[SupaSync] GET {table} HTTP {e.code}: {e.read().decode('utf-8','replace')[:300]}")
         return None
     except Exception as e:
         print(f"[SupaSync] GET {table} error: {e}")
@@ -96,16 +118,59 @@ def _bg(fn, *args):
         _pool.submit(fn, *args)
 
 
+# ── Upsert helpers (PATCH first, INSERT if no row exists) ─────────────────────
+
+def _upsert_portfolio(pos: dict):
+    """Update an existing paper_portfolio row, or insert if it doesn't exist."""
+    sym = pos.get("symbol", "")
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "quantity":        pos.get("quantity", 0),
+        "avg_entry_price": pos.get("entry_price", 0),
+        "updated_at":      now,
+    }
+    n = _patch("paper_portfolio",
+               f"user_session=eq.{SESSION}&symbol=eq.{sym}", payload)
+    if n == 0:
+        # Row doesn't exist yet — insert
+        _post("paper_portfolio", {
+            "user_session":    SESSION,
+            "symbol":          sym,
+            "quantity":        pos.get("quantity", 0),
+            "avg_entry_price": pos.get("entry_price", 0),
+            "updated_at":      now,
+        })
+
+
+def _upsert_config(usdt: float):
+    """Update the bot_config row for this session, or insert if missing."""
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "current_balance": usdt,
+        "updated_at":      now,
+    }
+    n = _patch("bot_config", f"user_session=eq.{SESSION}", payload)
+    if n == 0:
+        _post("bot_config", {
+            "user_session":    SESSION,
+            "current_balance": usdt,
+            "initial_balance": usdt,
+            "is_running":      True,
+            "mode":            "paper",
+            "selected_coins":  [],
+            "updated_at":      now,
+        })
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def sync_trade(trade: dict):
-    """Mirror a completed trade (both buy + sell rows) to bot_trade_history."""
+    """Mirror a completed trade (buy + sell rows) to bot_trade_history."""
     _bg(_sync_trade_impl, trade)
 
 
 def _sync_trade_impl(trade: dict):
     now = datetime.now(timezone.utc).isoformat()
-    # Buy row
     _post("bot_trade_history", {
         "user_session": SESSION,
         "symbol":       trade.get("coin", ""),
@@ -114,10 +179,8 @@ def _sync_trade_impl(trade: dict):
         "quantity":     trade.get("quantity", 0),
         "pnl":          None,
         "reason":       f"entry | {trade.get('mode','paper')}",
-        "bot_id":       SESSION,
         "created_at":   trade.get("timestamp_buy") or now,
     })
-    # Sell row
     _post("bot_trade_history", {
         "user_session": SESSION,
         "symbol":       trade.get("coin", ""),
@@ -126,25 +189,13 @@ def _sync_trade_impl(trade: dict):
         "quantity":     trade.get("quantity", 0),
         "pnl":          trade.get("net_profit", 0),
         "reason":       f"duration={trade.get('duration_seconds',0)}s | {trade.get('mode','paper')}",
-        "bot_id":       SESSION,
         "created_at":   trade.get("timestamp_sell") or now,
     })
 
 
 def sync_position_open(pos: dict):
     """Upsert an open position into paper_portfolio."""
-    _bg(_sync_position_open_impl, pos)
-
-
-def _sync_position_open_impl(pos: dict):
-    _post("paper_portfolio", {
-        "user_session":    SESSION,
-        "symbol":          pos.get("symbol", ""),
-        "quantity":        pos.get("quantity", 0),
-        "avg_entry_price": pos.get("entry_price", 0),
-        "updated_at":      datetime.now(timezone.utc).isoformat(),
-        "bot_id":          SESSION,
-    }, upsert=True)
+    _bg(_upsert_portfolio, pos)
 
 
 def sync_position_close(symbol: str):
@@ -155,26 +206,36 @@ def sync_position_close(symbol: str):
 
 def sync_balance(usdt: float):
     """Persist the current USDT balance to bot_config."""
-    _bg(_sync_balance_impl, usdt)
+    _bg(_upsert_config, usdt)
 
 
-def _sync_balance_impl(usdt: float):
-    _post("bot_config", {
-        "user_session":    SESSION,
-        "current_balance": usdt,
-        "updated_at":      datetime.now(timezone.utc).isoformat(),
-        "bot_id":          SESSION,
-    }, upsert=True)
+def sync_all(positions: list, usdt: float):
+    """
+    Full state push — call on startup so Supabase always has current data
+    even when SQLite was restored from a previous state.  Deletes stale
+    portfolio rows first (positions that were closed between restarts).
+    """
+    _bg(_sync_all_impl, list(positions), usdt)
+
+
+def _sync_all_impl(positions: list, usdt: float):
+    # Remove stale portfolio rows for this session
+    _delete("paper_portfolio", f"user_session=eq.{SESSION}")
+    # Push each current open position
+    for pos in positions:
+        _upsert_portfolio(pos)
+    # Sync balance
+    _upsert_config(usdt)
+    print(f"[SupaSync] Full sync: {len(positions)} position(s), balance={usdt:.2f}")
 
 
 def restore_from_supabase() -> dict:
     """
-    Called on startup when SQLite is empty.  Fetches the last known open
-    positions and USDT balance from Supabase so a fresh Railway deploy picks
-    up exactly where the previous one left off.
+    Called on startup when SQLite is empty.  Fetches last known open
+    positions and USDT balance from Supabase.
 
     Returns {"positions": [...], "usdt_balance": float|None}.
-    Returns {} on any network error so callers can treat it as a no-op.
+    Returns {} on any network error so callers treat it as a no-op.
     """
     if not _enabled:
         return {}
@@ -209,9 +270,11 @@ def restore_from_supabase() -> dict:
     except Exception as e:
         print(f"[SupaSync] restore balance error: {e}")
 
-    n = len(result["positions"])
+    n   = len(result["positions"])
     bal = result["usdt_balance"]
     if n or bal is not None:
         print(f"[SupaSync] Restored from Supabase: {n} position(s), balance={bal}")
+    else:
+        print("[SupaSync] Nothing to restore from Supabase (first run or no data)")
 
     return result

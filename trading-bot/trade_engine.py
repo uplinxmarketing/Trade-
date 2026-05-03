@@ -154,7 +154,8 @@ def load_positions_from_db():
                 if hasattr(client, "_balances"):
                     with client._lock:
                         client._balances["USDT"] = usdt
-                    database.save_paper_state(dict(client._balances))
+                        snapshot = dict(client._balances)
+                    database.save_paper_state(snapshot)
                     print(f"[TradeEngine] Restored USDT balance from Supabase: {usdt:.2f}")
         except Exception as e:
             print(f"[TradeEngine] Supabase restore failed (non-fatal): {e}")
@@ -162,6 +163,16 @@ def load_positions_from_db():
     with _positions_lock:
         _positions = list(rows)
     print(f"[TradeEngine] Loaded {len(_positions)} open position(s) from DB.")
+
+    # Push current state to Supabase immediately so the next redeploy can restore it.
+    # This runs even when SQLite had data (not just after a restore) so Supabase
+    # always has an up-to-date snapshot regardless of how the data got into SQLite.
+    try:
+        import supabase_sync
+        usdt = _get_usdt_balance()
+        supabase_sync.sync_all(list(rows), usdt)
+    except Exception:
+        pass
 
     # Sync PaperClient coin balances from the restored positions.
     # After a restart, PaperClient loads from saved paper_state, but if that
@@ -367,10 +378,13 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         coin = sym[:-4]
         with client._lock:
             current_coin_bal = client._balances.get(coin, 0.0)
-        if current_coin_bal < qty * 0.99:
-            with client._lock:
+            if current_coin_bal < qty * 0.99:
                 client._balances[coin] = qty
-            database.save_paper_state(dict(client._balances))
+                snapshot = dict(client._balances)
+            else:
+                snapshot = None
+        if snapshot is not None:
+            database.save_paper_state(snapshot)
             database.log_activity(
                 f"[PaperWallet] Auto-credited {qty:.8f} {coin} "
                 f"(had {current_coin_bal:.8f}) — balance was out of sync after restart",

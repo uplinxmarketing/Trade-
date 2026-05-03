@@ -70,6 +70,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(strategy_engine.strategy_loop())
     asyncio.create_task(trade_engine.signal_scanner(data_collector.prices))
     asyncio.create_task(trade_engine.position_guardian())  # REST backstop for sells
+    asyncio.create_task(_supabase_periodic_sync())         # persist balance every 5 min
 
     print("[ControlAPI] All trading tasks started.")
     yield
@@ -83,6 +84,23 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# ── Periodic Supabase sync — ensures data survives Railway redeploys ──────────
+
+async def _supabase_periodic_sync():
+    """Every 5 minutes push current balance + open positions to Supabase."""
+    import asyncio as _aio
+    while True:
+        await _aio.sleep(300)   # 5 minutes
+        try:
+            from trade_engine import get_open_positions
+            import supabase_sync
+            positions = get_open_positions()
+            usdt = _get_usdt_balance()
+            supabase_sync.sync_all(positions, usdt)
+        except Exception as e:
+            print(f"[PeriodicSync] Supabase sync error: {e}")
+
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
