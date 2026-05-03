@@ -630,6 +630,52 @@ def api_agent_stop():
     return {"ok": True, "running": False}
 
 
+@app.post("/api/force-buy/{symbol}")
+def api_force_buy(symbol: str):
+    """Force-buy a coin immediately regardless of current signals."""
+    sym = symbol.upper()
+    try:
+        from trade_engine import get_budget_for_coin, _positions, _positions_lock
+        from connection import client as _client
+        from data_collector import prices as live_prices
+
+        price = live_prices.get(sym, 0)
+        if not price:
+            return {"ok": False, "error": f"No live price for {sym}"}
+
+        usdt_balance = _get_usdt_balance()
+        budget = get_budget_for_coin(sym, usdt_balance)
+        if budget <= 0:
+            return {"ok": False, "error": f"Budget 0 — balance: {usdt_balance:.2f} USDT"}
+
+        with _positions_lock:
+            already_held = any(p["symbol"] == sym for p in _positions)
+        if already_held:
+            return {"ok": False, "error": f"Already holding {sym}"}
+
+        _client.update_price(sym, price)
+        result = _client.order_market_buy(symbol=sym, quoteOrderQty=budget)
+        fill       = result.get("fills", [{}])[0]
+        fill_price = float(fill.get("price", price))
+        qty        = float(result.get("executedQty", 0))
+        if qty <= 0:
+            return {"ok": False, "error": "Order returned 0 quantity"}
+
+        pos = {
+            "symbol": sym, "entry_price": fill_price, "quantity": qty,
+            "budget_usdt": budget, "timestamp": datetime.now(timezone.utc).isoformat(),
+            "mode": get_mode(),
+        }
+        pos["id"] = database.save_position(pos)
+        with _positions_lock:
+            _positions.append(pos)
+
+        database.log_activity(f"Force buy: {sym} @ ${fill_price:.4f} | qty={qty:.6f} | budget={budget:.2f} USDT", "info")
+        return {"ok": True, "symbol": sym, "price": fill_price, "quantity": qty, "budget": budget}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/api/force-sell/{symbol}")
 def api_force_sell(symbol: str):
     """Immediately sell an open position by symbol (case-insensitive)."""

@@ -159,13 +159,17 @@ def _load_strategy() -> dict:
 
 def _get_usdt_balance() -> float:
     try:
+        # Fast path: read directly from PaperClient's in-memory balance dict
+        if hasattr(client, "_balances"):
+            with client._lock:
+                return float(client._balances.get("USDT", 0.0))
         acc = client.get_account()
         for b in acc["balances"]:
             if b["asset"] == "USDT":
                 return float(b["free"])
     except Exception:
         pass
-    return 0.0
+    return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
 
 
 def _floor_qty(qty: float, decimals: int = 6) -> float:

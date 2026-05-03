@@ -246,6 +246,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
   // ── Load state from DB ───────────────────────────────────────────────────
   const loadData = useCallback(async () => {
+    // Server mode: all data comes from pollRailway (Railway SQLite), not Supabase.
+    // Letting loadData run would race with pollRailway and overwrite Railway data with empty Supabase rows.
+    if (isServerMode) return;
+
     const [trdRes, posRes, cfgRes] = await Promise.all([
       supabase.from('bot_trade_history').select('*').eq('user_session', SESSION).order('created_at', { ascending: false }).limit(100),
       supabase.from('paper_portfolio').select('*').eq('user_session', SESSION).gt('quantity', 0),
@@ -489,10 +493,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 8000);
-      const [sRes, pRes, tRes] = await Promise.all([
+      const [sRes, pRes, tRes, aRes] = await Promise.all([
         fetch(`${railwayUrl}/api/status`,    { signal: ctrl.signal }),
         fetch(`${railwayUrl}/api/positions`, { signal: ctrl.signal }),
         fetch(`${railwayUrl}/api/trades`,    { signal: ctrl.signal }),
+        fetch(`${railwayUrl}/api/activity`,  { signal: ctrl.signal }),
       ]);
       clearTimeout(timer);
 
@@ -545,6 +550,17 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         // Keep parent wallet in sync with Railway state
         const tradePayload = sorted.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
         onStateChangeRef.current?.(positionsRef.current, balanceRef.current, initialBalance, tradePayload);
+      }
+
+      // Activity log from Python bot's SQLite activity_log table
+      if (aRes.ok) {
+        const a = await aRes.json();
+        const entries: string[] = (a.entries ?? []).map((e: any) => {
+          const ts = new Date(e.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          const icon = e.level === 'warn' ? '⚠ ' : e.level === 'error' ? '✕ ' : '';
+          return `[${ts}] ${icon}${e.message}`;
+        });
+        if (entries.length > 0) setActLog(entries);
       }
     } catch (e: any) {
       if (e.name !== 'AbortError') addLog(`[Railway] poll failed: ${e.message}`);
@@ -715,13 +731,23 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (!wsPrice) { toast.error('No live price yet'); return; }
     setForcingBuy(sym);
     try {
+      // Server mode: delegate to Railway's force-buy endpoint
+      if (isServerModeRef.current) {
+        const res  = await fetch(`${railwayUrl}/api/force-buy/${sym}`, { method: 'POST' });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error ?? 'Force buy failed');
+        addLog(`FORCE BUY ${sym} via Railway @ ${Number(data.price).toFixed(4)} USDT · ${Number(data.budget).toFixed(2)} USDT`);
+        toast.success(`Force BUY: ${sym.replace('USDT','')} @ ${Number(data.price).toFixed(4)} USDT`);
+        await pollRailway();
+        return;
+      }
+      // Local paper mode: write directly to Supabase
       const bal   = balanceRef.current;
       const alloc = getAllocation(bal, sym);
       if (alloc < MIN_USDT) { toast.error(`Balance too low (${bal.toFixed(2)} USDT)`); return; }
       const fee = alloc * TAKER_FEE;
       const qty = (alloc - fee) / wsPrice;
       const newBal = bal - alloc;
-      // Read existing position to accumulate (weighted avg entry)
       const { data: existingPos } = await supabase.from('paper_portfolio')
         .select('quantity,avg_entry_price').eq('user_session', SESSION).eq('symbol', sym).maybeSingle();
       const portWrite = existingPos && Number(existingPos.quantity) > 0
@@ -748,7 +774,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       toast.success(`Force BUY: ${sym.replace('USDT','')} @ ${wsPrice.toFixed(4)} USDT`);
       await loadData();
     } finally { setForcingBuy(null); }
-  }, [addLog, loadData]);
+  }, [addLog, loadData, railwayUrl, pollRailway]);
 
   // ── Force SELL ───────────────────────────────────────────────────────────
   const forceSell = useCallback(async (pos: OpenPosition) => {
@@ -764,6 +790,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         if (!data.ok) throw new Error(data.error ?? 'Force sell failed');
         addLog(`FORCE SELL ${pos.symbol} via Railway @ ${Number(data.price).toFixed(4)} USDT`);
         toast.success(`Force SELL sent: ${pos.symbol.replace('USDT','')}`);
+        await pollRailway();
       } catch (e) {
         toast.error(`Force sell failed: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
