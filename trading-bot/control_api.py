@@ -120,14 +120,19 @@ def _get_positions():
 
 def _get_usdt_balance() -> float:
     try:
-        from connection import client
+        from connection import client, get_mode
+        if get_mode() != "live":
+            # Fast path: read directly from PaperClient._balances
+            if hasattr(client, "_balances"):
+                with client._lock:
+                    return float(client._balances.get("USDT", 0.0))
         acc = client.get_account()
         for b in acc["balances"]:
             if b["asset"] == "USDT":
                 return float(b["free"])
     except Exception:
         pass
-    return 0.0
+    return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
 
 
 def _trades_today() -> int:
@@ -519,7 +524,8 @@ def api_status():
         "running":          strategy.get("trading_active", False),
         "mode":             get_mode(),
         "balance_usdt":     balance,
-        "initial_balance":  initial,
+        "paper_balance":    balance,   # alias for frontend compatibility
+        "initial_balance":  initial or balance,
         "open_positions":   len(_get_positions()),
         "trades_today":     database.get_trades_today_count(),
         "win_rate":         round(wins / len(sells), 3) if sells else 0.0,
@@ -610,6 +616,10 @@ def api_agent_start():
     # Refresh approved coins from config before starting so stale strategy.json
     # never limits which coins are scanned.
     strategy_engine.write_default_strategy()
+    s = _load_strategy()
+    if not s.get("initial_balance_usdt"):
+        bal = _get_usdt_balance()
+        _write_strategy_patch({"initial_balance_usdt": bal or float(os.getenv("STARTING_PAPER_USDT", "10000.0"))})
     _write_strategy_patch({"trading_active": True, "pause_reason": None})
     return {"ok": True, "running": True}
 
