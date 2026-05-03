@@ -1,12 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
 import { toast } from 'sonner';
+import { API_BASE } from '@/config';
 
 const REMOTE_VERSION_URL =
   'https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/public/version.json';
 
-// Baked into the JS bundle at Vite startup — frozen for the life of this run.
-// When new code is pushed to GitHub and start.bat is restarted, the new
-// version.json is baked in. Mismatch = update available.
+// Baked into the JS bundle at build time — frozen for the life of this run.
 const LOCAL_FINGERPRINT = `${__APP_COMMIT__}:${__APP_BUILD_TIME__}`;
 
 interface VersionInfo { version: string; buildTime: string; commit: string; }
@@ -45,25 +44,23 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
     setUpdating(true);
     const toastId = toast.loading('Applying update…');
     try {
-      const resp = await fetch('/api/update', { method: 'POST' });
+      const resp = await fetch(`${API_BASE}/api/update`, { method: 'POST' });
       const data = await resp.json();
 
       if (!data.success) {
-        // Local server returned failure — fall back to hard reload
         toast.loading('Reloading with latest version…', { id: toastId });
         setTimeout(() => window.location.reload(), 800);
         return;
       }
 
-      // Pull succeeded — Vite is restarting with the new bundle.
-      // Poll /api/ping until the server comes back, then reload.
+      // Server restarting — poll /api/ping until it responds, then reload.
       toast.loading('Restarting with new code…', { id: toastId });
       let attempts = 0;
       const poll = setInterval(async () => {
         attempts++;
         if (attempts > 30) { clearInterval(poll); window.location.reload(); return; }
         try {
-          const ping = await fetch('/api/ping', { cache: 'no-store' });
+          const ping = await fetch(`${API_BASE}/api/ping`, { cache: 'no-store' });
           if (ping.ok) {
             clearInterval(poll);
             toast.success('Updated! Reloading…', { id: toastId });
@@ -72,8 +69,7 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
         } catch { /* server still restarting */ }
       }, 1000);
     } catch {
-      // /api/update unreachable — running on Vercel or similar static host.
-      // New code is already deployed; a hard reload picks it up immediately.
+      // /api/update unreachable — hard reload picks up latest static build.
       toast.loading('Reloading with latest version…', { id: toastId });
       setTimeout(() => window.location.reload(), 800);
     }

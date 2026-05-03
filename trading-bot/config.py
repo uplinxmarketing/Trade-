@@ -28,8 +28,8 @@ STOP_LOSS_PCT        = 0.015   # 1.5%
 COOLDOWN_AFTER_LOSS  = 180     # 3 min cooldown after stop-loss
 MIN_SIGNALS_TO_BUY   = 2       # out of 4 signals must be bullish
 RSI_BUY_MIN          = 35
-RSI_BUY_MAX          = 70
-VOLUME_RATIO_MIN     = 1.05    # current volume just 5% above 20-candle average
+RSI_BUY_MAX          = 65      # RSI above 65 fails — tighter overbought guard
+VOLUME_RATIO_MIN     = 1.5     # volume must be 1.5× the 20-candle average
 
 # ── Budget allocation settings ────────────────────────────────────────────────
 BUDGET_MODE           = "percent" # fixed | percent | capped | per_coin

@@ -688,6 +688,46 @@ def api_set_mode(req: ModeRequest):
     return {"ok": True, "mode": req.mode, "restarting": True}
 
 
+@app.get("/api/ping")
+def api_ping():
+    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/api/version")
+def api_version():
+    import pathlib, json as _json
+    vf = pathlib.Path(__file__).parent / "dist" / "version.json"
+    if vf.exists():
+        try:
+            return _json.loads(vf.read_text())
+        except Exception:
+            pass
+    return {"version": "unknown"}
+
+
+# ── Serve React build (must come after all /api/* routes) ────────────────────
+
+def _mount_static():
+    """
+    Mount the React dist/ folder as static files.
+    html=True makes FastAPI return index.html for any path that has no real
+    file at that location — this is required for React Router to work.
+    Skipped silently if the dist/ folder doesn't exist yet (dev mode).
+    """
+    import pathlib
+    from fastapi.staticfiles import StaticFiles
+
+    dist = pathlib.Path(__file__).parent / "dist"
+    if dist.exists():
+        app.mount("/", StaticFiles(directory=str(dist), html=True), name="static")
+        print(f"[ControlAPI] Serving React build from {dist}")
+    else:
+        print("[ControlAPI] No dist/ folder found — static files not mounted (API-only mode)")
+
+
+_mount_static()
+
+
 def start_control_api():
     """Block the main thread on uvicorn — all bot logic starts via lifespan."""
     port = int(os.getenv("PORT", 8000))

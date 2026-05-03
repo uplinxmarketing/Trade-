@@ -2,223 +2,27 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
 import fs from "fs";
-import { componentTagger } from "lovable-tagger";
-import type { Plugin } from "vite";
-import type { IncomingMessage, ServerResponse } from "http";
 
 const versionJson = JSON.parse(fs.readFileSync("./public/version.json", "utf-8"));
 
-const SYSTEM_PROMPT = `You are DeepTrade AI, an expert crypto trading assistant built into a live paper-trading bot dashboard.
-You help the user by:
-- Explaining what the bot is doing and why it entered/exited trades
-- Analysing specific coins on request (RSI, MACD, EMA trends, volume, support/resistance)
-- Suggesting bot settings (interval, profit target, stop-loss)
-- Teaching trading concepts clearly with concrete numbers
-- Warning about risk — always mention that this is paper trading
-Be concise, use markdown for structure, use specific numbers. Never give financial advice — always frame as analysis.`;
-
-function chatProxyPlugin(): Plugin {
-  return {
-    name: "chat-proxy",
-    configureServer(server) {
-      server.middlewares.use(
-        "/api/chat",
-        async (req: IncomingMessage, res: ServerResponse) => {
-          if (req.method === "OPTIONS") {
-            res.writeHead(200, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "content-type" });
-            res.end();
-            return;
-          }
-          if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
-
-          let body = "";
-          for await (const chunk of req) body += chunk;
-
-          // API key: use env var if set, otherwise accept from the request body
-          // (user pastes it into the UI — stored in localStorage, sent per-request)
-          let parsed: { messages: unknown[]; apiKey?: string };
-          try { parsed = JSON.parse(body); } catch { res.writeHead(400); res.end(); return; }
-          const apiKey = process.env.ANTHROPIC_API_KEY || parsed.apiKey || "";
-
-          if (!apiKey) {
-            const msg = "**Add your Anthropic API key to use this chat.**\n\nClick the **Add key** button at the top of this panel and paste your key from [console.anthropic.com](https://console.anthropic.com).\n\nThe trading bot itself works completely without any API key.";
-            const chunk = JSON.stringify({ choices: [{ delta: { content: msg } }] });
-            res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
-            res.write(`data: ${chunk}\n\ndata: [DONE]\n\n`);
-            res.end();
-            return;
-          }
-
-          try {
-            const { messages } = parsed;
-            const upstream = await fetch("https://api.anthropic.com/v1/messages", {
-              method: "POST",
-              headers: {
-                "x-api-key": apiKey,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-              },
-              body: JSON.stringify({
-                model: "claude-haiku-4-5-20251001",
-                max_tokens: 1024,
-                system: SYSTEM_PROMPT,
-                stream: true,
-                messages: messages.map((m: { role: string; content: string }) => ({ role: m.role, content: m.content })),
-              }),
-            });
-
-            if (!upstream.ok) {
-              const txt = await upstream.text();
-              throw new Error(`Anthropic ${upstream.status}: ${txt}`);
-            }
-
-            res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
-
-            const reader = upstream.body!.getReader();
-            const dec = new TextDecoder();
-            let buf = "";
-
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              buf += dec.decode(value, { stream: true });
-              let nl: number;
-              while ((nl = buf.indexOf("\n")) !== -1) {
-                const line = buf.slice(0, nl).trimEnd();
-                buf = buf.slice(nl + 1);
-                if (!line.startsWith("data: ")) continue;
-                const json = line.slice(6).trim();
-                if (json === "[DONE]") continue;
-                try {
-                  const evt = JSON.parse(json);
-                  if (evt.type === "content_block_delta" && evt.delta?.type === "text_delta") {
-                    res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: evt.delta.text } }] })}\n\n`);
-                  }
-                  if (evt.type === "message_stop") res.write("data: [DONE]\n\n");
-                } catch { /* skip malformed */ }
-              }
-            }
-            res.end();
-          } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : "Unknown error";
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: msg }));
-          }
-        }
-      );
-    },
-  };
-}
-
-
-function updatePlugin(): Plugin {
-  return {
-    name: "update-puller",
-    configureServer(server) {
-      server.middlewares.use("/api/ping", (_req: IncomingMessage, res: ServerResponse) => {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      });
-
-      server.middlewares.use("/api/update", async (req: IncomingMessage, res: ServerResponse) => {
-        if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
-        try {
-          const { execSync } = await import("child_process");
-          const nodeOs   = await import("os");
-          const nodePath = await import("path");
-          const nodeFs   = await import("fs");
-          const https    = await import("https");
-          const http     = await import("http");
-          const appDir   = process.cwd();
-          const SKIP     = new Set(["node_modules", "logs", ".env", "dist", ".git"]);
-
-          // ── Try git first (fastest for git clones) ──────────────────────
-          let gitWorked = false;
-          try {
-            execSync("git fetch origin main && git reset --hard origin/main", {
-              cwd: appDir, timeout: 30_000, encoding: "utf8",
-              env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-            });
-            gitWorked = true;
-          } catch { /* not a git repo or no network — fall through to ZIP */ }
-
-          // ── ZIP fallback (works for non-git downloads) ───────────────────
-          if (!gitWorked) {
-            const ZIP_URL = "https://github.com/uplinxmarketing/Trade-/archive/refs/heads/main.zip";
-            const uid     = Date.now();
-            const zipPath = nodePath.join(nodeOs.tmpdir(), `tb_upd_${uid}.zip`);
-            const extPath = nodePath.join(nodeOs.tmpdir(), `tb_upd_ext_${uid}`);
-
-            // Download ZIP following redirects
-            await new Promise<void>((resolve, reject) => {
-              function get(url: string) {
-                const mod = url.startsWith("https") ? https : http;
-                (mod as typeof https).get(url, { headers: { "User-Agent": "TradeBot-Updater/1.0" } }, (r) => {
-                  if (r.statusCode && r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) return get(r.headers.location);
-                  const out = nodeFs.createWriteStream(zipPath);
-                  r.pipe(out);
-                  out.on("finish", () => out.close(() => resolve()));
-                  out.on("error", reject);
-                  r.on("error", reject);
-                }).on("error", reject);
-              }
-              get(ZIP_URL);
-            });
-
-            // Extract — PowerShell on Windows, unzip on Linux/Mac
-            nodeFs.mkdirSync(extPath, { recursive: true });
-            if (process.platform === "win32") {
-              execSync(`powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${extPath}' -Force"`, { timeout: 120_000 });
-            } else {
-              execSync(`unzip -o "${zipPath}" -d "${extPath}"`, { timeout: 120_000 });
-            }
-
-            // Copy all files except protected dirs
-            const entries = nodeFs.readdirSync(extPath);
-            if (!entries.length) throw new Error("Extracted ZIP is empty");
-            const srcDir = nodePath.join(extPath, entries[0]);
-            for (const entry of nodeFs.readdirSync(srcDir)) {
-              if (SKIP.has(entry)) continue;
-              nodeFs.cpSync(nodePath.join(srcDir, entry), nodePath.join(appDir, entry), { recursive: true, force: true });
-            }
-
-            // Cleanup
-            try { nodeFs.unlinkSync(zipPath); } catch { /* ok */ }
-            try { nodeFs.rmSync(extPath, { recursive: true, force: true }); } catch { /* ok */ }
-          }
-
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true, output: gitWorked ? "git pull" : "zip download" }));
-          setTimeout(() => server.restart(), 1500);
-        } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : String(e);
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: msg }));
-        }
-      });
-    },
-  };
-}
-
-export default defineConfig(({ mode }) => ({
-  server: {
-    host: "0.0.0.0",
-    port: 8080,
-    hmr: { overlay: false },
+export default defineConfig({
+  plugins: [react()],
+  resolve: {
+    alias: { "@": path.resolve(__dirname, "./src") },
   },
-  // Bake version into the JS bundle so update checker works even after git pull
+  build: {
+    outDir: "dist",
+    emptyOutDir: true,
+  },
+  // Bake version into the JS bundle so update checker can compare
   define: {
     __APP_COMMIT__: JSON.stringify(versionJson.commit),
     __APP_BUILD_TIME__: JSON.stringify(versionJson.buildTime),
     __APP_VERSION__: JSON.stringify(versionJson.version),
   },
-  plugins: [
-    react(),
-    chatProxyPlugin(),
-    updatePlugin(),
-    mode === "development" && componentTagger(),
-  ].filter(Boolean),
-  resolve: {
-    alias: { "@": path.resolve(__dirname, "./src") },
+  server: {
+    host: "0.0.0.0",
+    port: 8080,
+    hmr: { overlay: false },
   },
-}));
+});

@@ -1,5 +1,5 @@
-// Railway backend base URL.
-// Override via VITE_API_URL env var in Vercel if the domain ever changes.
+// API base URL.
+// Empty string = same origin (Railway serves both frontend and API).
+// Override via VITE_API_URL env var if pointing at a separate backend.
 export const API_BASE =
-  (import.meta.env.VITE_API_URL as string | undefined) ??
-  'https://trade-production-a519.up.railway.app';
+  (import.meta.env.VITE_API_URL as string | undefined) ?? '';

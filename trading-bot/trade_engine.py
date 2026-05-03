@@ -237,14 +237,13 @@ def evaluate_signals(closes: list, volumes: list) -> dict:
         histo[-2] is not None
         and histo[-2] > 0
     )
-    # Volume: ratio check OR recent-period increase (matches frontend dual condition).
-    recent_vol = sum(volumes[-10:]) if len(volumes) >= 10 else 0
-    prev_vol   = sum(volumes[-20:-10]) if len(volumes) >= 20 else 0
+    # Volume: current candle must exceed VOLUME_RATIO_MIN × 20-candle average.
+    # No OR fallback — volume counts toward 3-of-4 only if the ratio threshold is met.
     volume = bool(
-        (volumes[-2] is not None
-         and vol_ma[-2] is not None
-         and volumes[-2] > vol_ma[-2] * config.VOLUME_RATIO_MIN)
-        or (recent_vol > 0 and prev_vol > 0 and recent_vol > prev_vol)
+        volumes[-2] is not None
+        and vol_ma[-2] is not None
+        and vol_ma[-2] > 0
+        and volumes[-2] >= vol_ma[-2] * config.VOLUME_RATIO_MIN
     )
 
     return {"trend": trend, "rsi": rsi, "macd": macd, "volume": volume}

@@ -199,18 +199,21 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [instrDraft, setInstrDraft]       = useState('');
   const [actLog, setActLog]       = useState<string[]>([]);
   const [showLog, setShowLog]     = useState(false);
-  // Priority: localStorage override → VITE_RAILWAY_URL env var → hardcoded default
+  // Unified deployment: frontend and API are served from the same Railway URL.
+  // railwayUrl defaults to '' (same origin) so all /api/* calls are relative.
+  // Users can override via localStorage if they ever need to point at a different backend.
   const [railwayUrl, setRailwayUrl] = useState(() =>
     localStorage.getItem(RAILWAY_URL_KEY) ??
-    (import.meta.env.VITE_RAILWAY_URL as string | undefined) ??
-    'https://trade-production-a519.up.railway.app'
+    (import.meta.env.VITE_API_URL as string | undefined) ??
+    ''
   );
   const [showRailwayInput, setShowRailwayInput] = useState(false);
   const [railwayDraft, setRailwayDraft] = useState('');
 
-  const isServerMode    = railwayUrl.trim().length > 0;
-  const isServerModeRef = useRef(isServerMode);
-  useEffect(() => { isServerModeRef.current = isServerMode; }, [isServerMode]);
+  // Always server mode — the Python bot is always running on the same Railway instance.
+  const isServerMode    = true;
+  const isServerModeRef = useRef(true);
+  useEffect(() => { isServerModeRef.current = true; }, []);
 
   const isRunningRef    = useRef(false);
   const processingRef   = useRef(false);
@@ -794,13 +797,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         </div>
         {showRailwayInput ? (
           <input value={railwayDraft} onChange={e => setRailwayDraft(e.target.value)}
-            placeholder="https://your-bot.up.railway.app"
+            placeholder="Leave empty for same-origin (Railway unified deployment)"
             className="w-full text-xs bg-background border border-border rounded px-2 py-1.5 font-mono outline-none focus:border-accent" />
         ) : (
           <p className="text-[10px] text-muted-foreground font-mono break-all">
-            {isServerMode
+            {railwayUrl
               ? railwayUrl
-              : <span className="font-sans">Not configured — set <code className="bg-muted px-1 rounded">VITE_RAILWAY_URL</code> in Vercel env vars, or click Set URL.</span>}
+              : <span className="font-sans text-gain">Same-origin · API calls go to <code className="bg-muted px-1 rounded text-foreground">/api/*</code></span>}
           </p>
         )}
       </div>
