@@ -54,24 +54,34 @@ def _build_market_data() -> dict:
 
 def write_default_strategy():
     """
-    Write a default strategy using current config.py settings.
-    Always called on startup — preserves trading_active from any existing file
-    so restarts don't stop a running bot.
+    Ensure a valid strategy.json exists.
+    If the file is already present and contains approved_coins (i.e. the user's
+    settings from a prior run, preserved on the Railway volume), keep it intact —
+    only touch updated_at so nothing is lost across redeploys.
+    Creates a fresh default only when the file is missing or corrupt.
     """
-    starting_usdt = float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
-
-    # Preserve running state across restarts
-    existing_active = True
+    # ── Preserve existing strategy across redeploys ───────────────────────────
     if os.path.exists(config.STRATEGY_FILE):
         try:
             with open(config.STRATEGY_FILE) as f:
-                existing_active = json.load(f).get("trading_active", True)
-        except Exception:
-            pass
+                existing = json.load(f)
+            if existing.get("approved_coins"):
+                # Valid file — keep all user settings, just refresh the timestamp
+                existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+                with open(config.STRATEGY_FILE, "w") as f:
+                    json.dump(existing, f, indent=2)
+                n = len(existing["approved_coins"])
+                active = existing.get("trading_active", True)
+                print(f"[StrategyEngine] strategy.json preserved — {n} coins, active={active}.")
+                return existing
+        except Exception as e:
+            print(f"[StrategyEngine] strategy.json unreadable ({e}) — writing defaults.")
 
+    # ── First run or corrupt file — create defaults ───────────────────────────
+    starting_usdt = float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
     strategy = {
         "updated_at":           datetime.now(timezone.utc).isoformat(),
-        "trading_active":       existing_active,
+        "trading_active":       True,
         "pause_reason":         None,
         "initial_balance_usdt": starting_usdt,
         "approved_coins": [
@@ -90,7 +100,7 @@ def write_default_strategy():
     }
     with open(config.STRATEGY_FILE, "w") as f:
         json.dump(strategy, f, indent=2)
-    print(f"[StrategyEngine] strategy.json written — {len(config.WATCHED_COINS)} coins, active={existing_active}.")
+    print(f"[StrategyEngine] strategy.json created — {len(config.WATCHED_COINS)} coins.")
     return strategy
 
 

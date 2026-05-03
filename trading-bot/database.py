@@ -1,12 +1,17 @@
 """SQLite database layer — thread-safe, no async required."""
 
+import os
 import sqlite3
 import threading
 import json
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
 
-DB_PATH = "bot.db"
+# DATA_DIR is set to the Railway volume mount path (/data) via railway.toml.
+# Falls back to the current directory for local development.
+_DATA_DIR = os.getenv("DATA_DIR", "/data")
+os.makedirs(_DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(_DATA_DIR, "bot.db")
 _lock = threading.Lock()
 
 

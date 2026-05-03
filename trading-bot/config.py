@@ -29,7 +29,9 @@ FEE_RATE_BNB            = 0.00075
 FEE_RATE_STANDARD       = 0.001
 CLAUDE_MODEL            = "claude-haiku-4-5-20251001"
 CLAUDE_MAX_TOKENS       = 400
-STRATEGY_FILE           = "strategy.json"
+import os as _os
+_DATA_DIR     = _os.getenv("DATA_DIR", "/data")
+STRATEGY_FILE = _os.path.join(_DATA_DIR, "strategy.json")
 
 # ── Two-speed architecture constants ─────────────────────────────────────────
 SCAN_INTERVAL_SEC    = 60      # REST backup cache refresh (buys fire in realtime via WebSocket)

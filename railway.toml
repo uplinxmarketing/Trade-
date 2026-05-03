@@ -5,3 +5,9 @@ builder = "dockerfile"
 restartPolicyType = "always"
 healthcheckPath   = "/api/ping"
 healthcheckTimeout = 300
+
+# Persistent volume — keeps bot.db (trades, positions, candles) and
+# strategy.json (approved coins, budget settings) across deploys.
+# Without this, all open positions and trade history are lost on every update.
+[[volumes]]
+mountPath = "/data"
