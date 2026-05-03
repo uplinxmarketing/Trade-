@@ -89,7 +89,7 @@ def write_default_strategy():
                 "symbol":         coin,
                 "approved":       True,
                 "budget_usdt":    config.BUDGET_PER_TRADE_USDT,
-                "max_concurrent": 2,
+                "max_concurrent": 3,
                 "confidence":     0.5,
                 "reason":         "Default — all coins approved",
             }
@@ -159,7 +159,7 @@ Respond ONLY with valid JSON matching this exact schema (no text outside JSON):
       "symbol": "BTCUSDT",
       "approved": true,
       "budget_usdt": 100,
-      "max_concurrent": 2,
+      "max_concurrent": 3,
       "confidence": 0.75,
       "reason": "one sentence"
     }}
