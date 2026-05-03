@@ -497,8 +497,9 @@ def api_wallet():
         return {"balances": [], "total_usdt": 0.0, "mode": "paper", "error": str(e)}
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/bot-dashboard", response_class=HTMLResponse)
 def dashboard():
+    """Python bot dashboard — accessible at /bot-dashboard when React app is at /."""
     return HTMLResponse(DASHBOARD_HTML)
 
 
@@ -705,31 +706,25 @@ def api_version():
     return {"version": "unknown"}
 
 
-# ── Serve React build (must come after all /api/* routes) ────────────────────
-
-def _mount_static():
-    """
-    Mount the React dist/ folder as static files.
-    html=True makes FastAPI return index.html for any path that has no real
-    file at that location — this is required for React Router to work.
-    Skipped silently if the dist/ folder doesn't exist yet (dev mode).
-    """
-    import pathlib
-    from fastapi.staticfiles import StaticFiles
-
-    dist = pathlib.Path(__file__).parent / "dist"
-    if dist.exists():
-        app.mount("/", StaticFiles(directory=str(dist), html=True), name="static")
-        print(f"[ControlAPI] Serving React build from {dist}")
-    else:
-        print("[ControlAPI] No dist/ folder found — static files not mounted (API-only mode)")
-
-
-_mount_static()
-
-
 def start_control_api():
     """Block the main thread on uvicorn — all bot logic starts via lifespan."""
+    import pathlib
+
+    # Mount React build INSIDE start_control_api so any failure (missing
+    # aiofiles, missing dist/) is caught and logged — it never prevents the
+    # HTTP server from binding and passing Railway's health check.
+    dist = pathlib.Path(__file__).parent / "dist"
+    if dist.exists():
+        try:
+            from fastapi.staticfiles import StaticFiles
+            app.mount("/", StaticFiles(directory=str(dist), html=True), name="static")
+            print(f"[ControlAPI] Serving React build from {dist}")
+        except Exception as e:
+            print(f"[ControlAPI] WARNING: Could not mount static files: {e}")
+            print("[ControlAPI] Continuing without static file serving — API-only mode")
+    else:
+        print("[ControlAPI] No dist/ folder — API-only mode")
+
     port = int(os.getenv("PORT", 8000))
     print(f"[ControlAPI] Binding to 0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
