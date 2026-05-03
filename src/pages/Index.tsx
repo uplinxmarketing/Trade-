@@ -21,8 +21,25 @@ const DEFAULT_COINS = [
   'ARBUSDT',  'OPUSDT',  'INJUSDT', 'NEARUSDT', 'FETUSDT',
 ];
 
+const COINS_KEY = 'trade_selected_coins';
+
 const Index = () => {
-  const [selectedCoins, setSelectedCoins] = useState<string[]>(DEFAULT_COINS);
+  const [selectedCoins, setSelectedCoins] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem(COINS_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved) as string[];
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch { /* fall through */ }
+    return DEFAULT_COINS;
+  });
+
+  // Persist coin list whenever it changes so refreshes restore the same set
+  useEffect(() => {
+    try { localStorage.setItem(COINS_KEY, JSON.stringify(selectedCoins)); }
+    catch { /* storage quota */ }
+  }, [selectedCoins]);
   const [activeCoin, setActiveCoin]        = useState('BTCUSDT');
   const [binanceConnected, setBinanceConnected] = useState(false);
   const [showBinanceConnect, setShowBinanceConnect] = useState(false);

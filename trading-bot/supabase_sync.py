@@ -158,13 +158,45 @@ def sync_balance(usdt: float):
     _bg(_sync_balance_impl, usdt)
 
 
-def _sync_balance_impl(usdt: float):
-    _post("bot_config", {
-        "user_session":    SESSION,
-        "current_balance": usdt,
-        "updated_at":      datetime.now(timezone.utc).isoformat(),
-        "bot_id":          SESSION,
-    }, upsert=True)
+def sync_selected_coins(coins: list):
+    """Persist the bot's selected coin list to bot_config."""
+    _bg(_sync_coins_impl, list(coins))
+
+
+def _sync_coins_impl(coins: list):
+    now = datetime.now(timezone.utc).isoformat()
+    n = _patch("bot_config", f"user_session=eq.{SESSION}",
+               {"selected_coins": coins, "updated_at": now})
+    if n == 0:
+        _post("bot_config", {
+            "user_session":    SESSION,
+            "current_balance": 0,
+            "initial_balance": 0,
+            "is_running":      True,
+            "mode":            "paper",
+            "selected_coins":  coins,
+            "updated_at":      now,
+        })
+
+
+def sync_all(positions: list, usdt: float):
+    """
+    Full state push — call on startup so Supabase always has current data
+    even when SQLite was restored from a previous state.  Deletes stale
+    portfolio rows first (positions that were closed between restarts).
+    """
+    _bg(_sync_all_impl, list(positions), usdt)
+
+
+def _sync_all_impl(positions: list, usdt: float):
+    # Remove stale portfolio rows for this session
+    _delete("paper_portfolio", f"user_session=eq.{SESSION}")
+    # Push each current open position
+    for pos in positions:
+        _upsert_portfolio(pos)
+    # Sync balance
+    _upsert_config(usdt)
+    print(f"[SupaSync] Full sync: {len(positions)} position(s), balance={usdt:.2f}")
 
 
 def restore_from_supabase() -> dict:
@@ -203,9 +235,12 @@ def restore_from_supabase() -> dict:
 
     try:
         rows = _get("bot_config",
-                    f"user_session=eq.{SESSION}&select=current_balance&order=updated_at.desc&limit=1")
-        if rows and rows[0].get("current_balance"):
-            result["usdt_balance"] = float(rows[0]["current_balance"])
+                    f"user_session=eq.{SESSION}&select=current_balance,selected_coins&order=updated_at.desc&limit=1")
+        if rows:
+            if rows[0].get("current_balance"):
+                result["usdt_balance"] = float(rows[0]["current_balance"])
+            if rows[0].get("selected_coins"):
+                result["selected_coins"] = rows[0]["selected_coins"]
     except Exception as e:
         print(f"[SupaSync] restore balance error: {e}")
 

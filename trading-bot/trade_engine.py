@@ -332,16 +332,21 @@ def _execute_sell(pos: dict, price: float, reason: str):
     sym  = pos["symbol"]
     qty  = _floor_qty(pos["quantity"])
     mode = get_mode()
-    now  = datetime.now(_tz.utc).isoformat()  # always UTC with timezone info
+    now  = datetime.now(_tz.utc).isoformat()
 
     if qty <= 0 or price <= 0:
         return
 
-    # Dedup guard — only one sell per symbol at a time (realtime_monitor +
-    # position_guardian can both fire; whichever gets here first wins).
+    # Dedup guard — only one sell per symbol at a time. Also verify the position
+    # still exists (realtime_monitor may submit multiple ticks before _pos_by_symbol
+    # is rebuilt; the second submission must not proceed after the first completed).
     with _selling_lock:
         if sym in _selling:
             return
+        with _positions_lock:
+            pos_id = pos.get("id")
+            if pos_id and not any(p.get("id") == pos_id for p in _positions):
+                return  # already sold by a concurrent submission
         _selling.add(sym)
 
     try:

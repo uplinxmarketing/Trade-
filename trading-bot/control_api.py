@@ -606,6 +606,14 @@ def api_set_coins(req: CoinsRequest):
             "reason":         cfg.get("reason", "Updated via dashboard"),
         })
     _write_strategy_patch({"approved_coins": new_approved})
+
+    # Persist coin list to Supabase so it survives Railway redeploys
+    try:
+        import supabase_sync
+        supabase_sync.sync_selected_coins(valid)
+    except Exception:
+        pass
+
     return {"ok": True, "coins": valid}
 
 
