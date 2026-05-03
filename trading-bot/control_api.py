@@ -11,9 +11,15 @@ import os
 import sys
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
+
+# Unique ID generated once per process start.  Railway restarts the process on
+# every deploy, so this changes on every deployment — the browser can compare
+# the stored value against the polled value to detect new deploys reliably.
+_DEPLOY_ID = str(uuid.uuid4())
 
 import uvicorn
 from fastapi import FastAPI, Response
@@ -880,24 +886,18 @@ def api_version():
 @app.get("/version.json")
 def serve_version_json(response: Response):
     """
-    Dynamic version endpoint — always returns fresh data so the update checker
-    can detect new Railway deploys even when Docker layer cache is involved.
-    Uses RAILWAY_GIT_COMMIT_SHA (unique per commit) as the commit identifier;
-    falls back to reading dist/version.json if the env var isn't set.
+    Dynamic version endpoint — includes deployId (UUID generated at process
+    start) so the browser can detect a new Railway deployment without relying
+    on Docker build-cache or bundle fingerprint matching.
     """
     import pathlib, json as _json
     response.headers["Cache-Control"] = "no-store"
-    sha_full = os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
-    sha = sha_full[:8] if sha_full else ""
     vf = pathlib.Path(__file__).parent / "dist" / "version.json"
     try:
         data = _json.loads(vf.read_text())
     except Exception:
         data = {"version": "3.8.0", "buildTime": "unknown", "commit": "unknown"}
-    if sha:
-        data["commit"] = sha
-        # Keep buildTime from the static file so the bundle fingerprint matches
-        # (bundle uses buildTime from its own build, server echoes the same file)
+    data["deployId"] = _DEPLOY_ID
     return data
 
 

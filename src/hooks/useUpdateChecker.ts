@@ -1,13 +1,18 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { toast } from 'sonner';
 import { API_BASE } from '@/config';
 
-// Baked into the JS bundle at build time — frozen for the life of this bundle.
+// Baked into the JS bundle at build time.
 const LOCAL_VERSION     = __APP_VERSION__;
 const LOCAL_FINGERPRINT = `${__APP_COMMIT__}:${__APP_BUILD_TIME__}`;
-const SEEN_KEY          = 'tradebot_seen_version';
 
-interface VersionInfo { version: string; buildTime: string; commit: string; }
+// Two separate localStorage keys:
+// SEEN_VERSION  — for the "Updated to vX" toast on first load after a rebuild
+// SEEN_DEPLOY   — for the "Update available" polling banner (UUID-based)
+const SEEN_VERSION = 'tradebot_seen_version';
+const SEEN_DEPLOY  = 'tradebot_deploy_id';
+
+interface VersionInfo { version: string; buildTime: string; commit: string; deployId?: string; }
 
 // Hard cache-busting redirect — forces browser to re-download index.html and
 // all assets, bypassing bfcache and HTTP cache for the entry point.
@@ -20,13 +25,17 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
   const [checking, setChecking]               = useState(false);
   const [updating, setUpdating]               = useState(false);
 
-  // On first load: if the version baked into this bundle differs from the last
-  // seen version stored in localStorage, a new deployment just happened.
-  // Show a toast so the user knows new code is active.
+  // Holds the deployId from the most recent successful poll so applyUpdate
+  // can store it before the hard-reload (prevents false "update available"
+  // immediately after the page comes back up).
+  const latestDeployIdRef = useRef<string>('');
+
+  // On first load: if the bundle fingerprint changed, a new build is running.
+  // Show a toast so the user knows new frontend code is active.
   useEffect(() => {
-    const lastSeen = localStorage.getItem(SEEN_KEY) ?? '';
+    const lastSeen = localStorage.getItem(SEEN_VERSION) ?? '';
     if (lastSeen !== LOCAL_FINGERPRINT) {
-      localStorage.setItem(SEEN_KEY, LOCAL_FINGERPRINT);
+      localStorage.setItem(SEEN_VERSION, LOCAL_FINGERPRINT);
       if (lastSeen) {
         toast.success(`Updated to v${LOCAL_VERSION}`, {
           description: 'New fixes and features are now active.',
@@ -42,6 +51,29 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
       const resp = await fetch(`/version.json?t=${Date.now()}`, { cache: 'no-store' });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data: VersionInfo = await resp.json();
+
+      // ── Primary: deployment UUID comparison ───────────────────────────────
+      // _DEPLOY_ID on the server is a UUID generated at process start.
+      // Railway restarts the process on every deploy, so this value changes
+      // reliably regardless of Docker layer caching or build artifacts.
+      if (data.deployId) {
+        latestDeployIdRef.current = data.deployId;
+        const seenDeploy = localStorage.getItem(SEEN_DEPLOY) ?? '';
+        if (!seenDeploy) {
+          // First visit — establish baseline, no notification
+          localStorage.setItem(SEEN_DEPLOY, data.deployId);
+          setUpdateAvailable(false);
+          return false;
+        }
+        if (data.deployId !== seenDeploy) {
+          setUpdateAvailable(true);
+          return true;
+        }
+        setUpdateAvailable(false);
+        return false;
+      }
+
+      // ── Fallback: bundle fingerprint comparison (older server builds) ─────
       const remote = `${data.commit}:${data.buildTime}`;
       if (remote !== LOCAL_FINGERPRINT) {
         setUpdateAvailable(true);
@@ -66,18 +98,15 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
       try {
         await checkForUpdates();
         settled = true;
-        // Success — switch to normal polling cadence
         timer = setInterval(() => checkForUpdates().catch(() => {}), pollIntervalMs) as unknown as ReturnType<typeof setTimeout>;
       } catch {
         if (!settled) {
-          // Server still unreachable — retry with capped backoff (max 60 s)
           const next = Math.min(retryDelay * 2, 60_000);
           timer = setTimeout(() => tryCheck(next), retryDelay);
         }
       }
     };
 
-    // First attempt 4 s after mount; start backoff at 15 s
     timer = setTimeout(() => tryCheck(15_000), 4_000);
     return () => { clearTimeout(timer); clearInterval(timer as unknown as ReturnType<typeof setInterval>); };
   }, [checkForUpdates, pollIntervalMs]);
@@ -85,13 +114,15 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
   const applyUpdate = useCallback(async () => {
     setUpdating(true);
     const toastId = toast.loading('Applying update…');
+    // Store the new deployId BEFORE reloading so the page doesn't immediately
+    // show "Update available" again right after it comes back up.
+    if (latestDeployIdRef.current) {
+      localStorage.setItem(SEEN_DEPLOY, latestDeployIdRef.current);
+    }
     try {
-      // Try the server-side update endpoint first; it returns {success: false}
-      // on Railway (auto-deploy handles rebuilds), which triggers a hard reload.
       await fetch(`${API_BASE}/api/update`, { method: 'POST' }).catch(() => {});
     } finally {
       toast.loading('Reloading with fresh build…', { id: toastId });
-      // Small delay so the toast is visible, then hard-reload to bypass cache.
       setTimeout(hardReload, 600);
     }
   }, []);
