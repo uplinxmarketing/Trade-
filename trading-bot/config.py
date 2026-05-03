@@ -2,7 +2,7 @@ WATCHED_COINS = [
     # Large-caps
     "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
     "ADAUSDT",  "AVAXUSDT", "DOGEUSDT", "DOTUSDT",  "LINKUSDT",
-    "MATICUSDT","UNIUSDT",  "LTCUSDT",  "ATOMUSDT", "TRXUSDT",
+    "POLUSDT",  "UNIUSDT",  "LTCUSDT",  "ATOMUSDT", "TRXUSDT",
     # Mid-caps / L2
     "ARBUSDT",  "OPUSDT",   "INJUSDT",  "FETUSDT",  "NEARUSDT",
     "TONUSDT",  "APTUSDT",  "SUIUSDT",  "SHIBUSDT", "RENDERUSDT",
@@ -30,7 +30,16 @@ FEE_RATE_STANDARD       = 0.001
 CLAUDE_MODEL            = "claude-haiku-4-5-20251001"
 CLAUDE_MAX_TOKENS       = 400
 import os as _os
-_DATA_DIR     = _os.getenv("DATA_DIR", "/data")
+def _data_dir() -> str:
+    c = _os.getenv("DATA_DIR", "/data")
+    try:
+        _os.makedirs(c, exist_ok=True)
+        p = _os.path.join(c, ".cfg_probe")
+        open(p, "w").close(); _os.remove(p)
+        return c
+    except OSError:
+        return _os.path.dirname(_os.path.abspath(__file__))
+_DATA_DIR     = _data_dir()
 STRATEGY_FILE = _os.path.join(_DATA_DIR, "strategy.json")
 
 # ── Two-speed architecture constants ─────────────────────────────────────────

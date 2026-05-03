@@ -598,13 +598,16 @@ async def position_guardian():
 async def signal_scanner(prices: dict):
     """
     Async coroutine — runs every SCAN_INTERVAL_SEC (60 s).
-    Only refreshes the signal cache from REST / DB.
-    Actual buy execution happens in realtime_monitor via _check_buys_from_cache.
-    Runs immediately on startup (no initial sleep) so buys can fire within seconds.
+    Refreshes the signal cache from REST, then immediately attempts buys.
+    This is the primary buy trigger — WebSocket callbacks are a fast-path
+    supplement, but buys MUST fire even when WebSocket is slow or disconnected.
     """
     while True:
         try:
             await _refresh_signal_cache()
+            # Trigger buy checks right after refreshing — don't wait for WebSocket
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _check_buys_from_cache, dict(prices))
         except Exception as e:
             print(f"[SignalScanner] Unexpected error: {e}")
 

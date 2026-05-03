@@ -7,10 +7,24 @@ import json
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
 
-# DATA_DIR is set to the Railway volume mount path (/data) via railway.toml.
-# Falls back to the current directory for local development.
-_DATA_DIR = os.getenv("DATA_DIR", "/data")
-os.makedirs(_DATA_DIR, exist_ok=True)
+# DATA_DIR is the Railway persistent volume mount path.
+# We test write access and fall back to the script directory if /data isn't
+# available yet (e.g. before the Railway volume is attached).
+def _resolve_data_dir() -> str:
+    candidate = os.getenv("DATA_DIR", "/data")
+    try:
+        os.makedirs(candidate, exist_ok=True)
+        probe = os.path.join(candidate, ".write_probe")
+        with open(probe, "w") as _f:
+            _f.write("ok")
+        os.remove(probe)
+        return candidate
+    except OSError:
+        fallback = os.path.dirname(os.path.abspath(__file__))
+        print(f"[DB] {candidate} not writable — falling back to {fallback}")
+        return fallback
+
+_DATA_DIR = _resolve_data_dir()
 DB_PATH = os.path.join(_DATA_DIR, "bot.db")
 _lock = threading.Lock()
 
