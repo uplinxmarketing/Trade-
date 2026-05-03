@@ -198,7 +198,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [editingInstr, setEditingInstr]   = useState(false);
   const [instrDraft, setInstrDraft]       = useState('');
   const [actLog, setActLog]       = useState<string[]>([]);
-  const [showLog, setShowLog]     = useState(false);
+  const [showLog, setShowLog]     = useState(true);
   // Unified deployment: frontend and API are served from the same Railway URL.
   // railwayUrl defaults to '' (same origin) so all /api/* calls are relative.
   // Users can override via localStorage if they ever need to point at a different backend.
@@ -523,6 +523,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         positionsRef.current = mapped;
       }
 
+      let tradePayload: {side:'BUY'|'SELL'; pnl:number|null; quantity:number; price:number}[] = [];
       if (tRes.ok) {
         const t = await tRes.json();
         const railwayTrades: TradeRow[] = [];
@@ -547,10 +548,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         const sorted = railwayTrades.sort((a, b) =>
           new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
         if (sorted.length > 0) setTrades(sorted);
-        // Keep parent wallet in sync with Railway state
-        const tradePayload = sorted.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
-        onStateChangeRef.current?.(positionsRef.current, balanceRef.current, initialBalance, tradePayload);
+        tradePayload = sorted.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
       }
+
+      // Always sync parent wallet after every poll (positions + balance are always fresh here)
+      onStateChangeRef.current?.(positionsRef.current, balanceRef.current, initialBalance, tradePayload);
 
       // Activity log from Python bot's SQLite activity_log table
       if (aRes.ok) {
@@ -560,7 +562,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           const icon = e.level === 'warn' ? '⚠ ' : e.level === 'error' ? '✕ ' : '';
           return `[${ts}] ${icon}${e.message}`;
         });
-        if (entries.length > 0) setActLog(entries);
+        // Always update — even empty clears stale entries
+        setActLog(entries.length > 0 ? entries : ['[Bot] Waiting for first activity...']);
       }
     } catch (e: any) {
       if (e.name !== 'AbortError') addLog(`[Railway] poll failed: ${e.message}`);
@@ -733,7 +736,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     try {
       // Server mode: delegate to Railway's force-buy endpoint
       if (isServerModeRef.current) {
-        const res  = await fetch(`${railwayUrl}/api/force-buy/${sym}`, { method: 'POST' });
+        const res  = await fetch(`${railwayUrl}/api/force-buy/${sym}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ price: wsPrice }),  // send known price so backend never fails on "no live price"
+        });
         const data = await res.json();
         if (!data.ok) throw new Error(data.error ?? 'Force buy failed');
         addLog(`FORCE BUY ${sym} via Railway @ ${Number(data.price).toFixed(4)} USDT · ${Number(data.budget).toFixed(2)} USDT`);
