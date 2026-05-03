@@ -44,6 +44,11 @@ _cooldowns: dict = {}
 _signal_cache: Dict[str, dict] = {}
 _signal_cache_lock = threading.Lock()
 _last_buy_check: float = 0.0
+_last_no_signal_log: float = 0.0   # throttle "no coins ready" log to once per 60 s
+
+# Per-coin timestamp of last inline tick-driven signal refresh
+_tick_signal_ts: Dict[str, float] = {}
+_TICK_REFRESH_SEC = 5.0   # recompute at most every 5 s per coin from price ticks
 
 
 # ── Balance guard + budget helpers ───────────────────────────────────────────
@@ -371,23 +376,26 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         cache_size = len(_signal_cache)
 
     if not any_ready:
-        if cache_size == 0:
-            database.log_activity("Buy check: signal cache empty — waiting for first scan", "info")
-        else:
-            # Log scores so the user can see why no coin qualified
-            with _signal_cache_lock:
-                scores = {s: v["score"] for s, v in _signal_cache.items()}
-            top = sorted(scores.items(), key=lambda x: -x[1])[:5]
-            summary = " | ".join(f"{s}={sc}" for s, sc in top)
-            database.log_activity(
-                f"Buy check: cache={cache_size} coins, none at score≥{config.MIN_SIGNALS_TO_BUY} "
-                f"(top5: {summary})", "info"
-            )
+        global _last_no_signal_log
+        now_ns = time.time()
+        if now_ns - _last_no_signal_log >= 60.0:
+            _last_no_signal_log = now_ns
+            if cache_size == 0:
+                database.log_activity("Buy check: signal cache empty — waiting for first scan", "info")
+            else:
+                with _signal_cache_lock:
+                    scores = {s: v["score"] for s, v in _signal_cache.items()}
+                top = sorted(scores.items(), key=lambda x: -x[1])[:5]
+                summary = " | ".join(f"{s}={sc}" for s, sc in top)
+                database.log_activity(
+                    f"Buy check: {cache_size} coins cached, none at score≥{config.MIN_SIGNALS_TO_BUY} "
+                    f"(top5: {summary})", "info"
+                )
         return
 
-    # Throttle: don't call get_account() faster than every 3 s
+    # Throttle: don't call get_account() faster than every 1 s
     now = time.time()
-    if now - _last_buy_check < 3.0:
+    if now - _last_buy_check < 1.0:
         return
     _last_buy_check = now
 
@@ -527,6 +535,25 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             break
 
 
+# ── Inline tick-driven signal refresh ────────────────────────────────────────
+
+def _inline_refresh_from_ticks(sym: str, price: float):
+    """
+    Recompute signals for sym using the latest price_ticks — no I/O, pure math.
+    Called from realtime_monitor every _TICK_REFRESH_SEC per coin so the signal
+    cache reflects the current price, not the last candle close.
+    """
+    import data_collector as _dc
+    ticks = list(_dc.price_ticks.get(sym, []))
+    if not ticks:
+        return
+    ticks[-1] = price          # replace stale last tick with the freshest price
+    if len(ticks) < _dc._MIN_TICKS:
+        return
+    vols = [1.0] * len(ticks)  # uniform volume — volume signal won't fire, RSI/EMA/MACD do
+    update_coin_signals(sym, ticks, vols)
+
+
 # ── Process 1: realtime monitor (called on every WebSocket tick) ──────────────
 
 def realtime_monitor(prices: Dict[str, float]):
@@ -552,6 +579,16 @@ def realtime_monitor(prices: Dict[str, float]):
         elif price <= stop_loss:
             _execute_sell(pos, price, "stop-loss")
             _set_cooldown(sym)
+
+    # Inline signal refresh from price ticks — keeps RSI/EMA/MACD current between
+    # kline closes and REST scanner runs. Throttled to every 5 s per coin.
+    now = time.time()
+    for sym, price in prices.items():
+        if price <= 0:
+            continue
+        if now - _tick_signal_ts.get(sym, 0) >= _TICK_REFRESH_SEC:
+            _tick_signal_ts[sym] = now
+            _inline_refresh_from_ticks(sym, price)
 
     # Real-time buy check — reads signal cache, zero network I/O
     _check_buys_from_cache(prices)
