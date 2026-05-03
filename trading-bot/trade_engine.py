@@ -274,13 +274,20 @@ def update_coin_signals(symbol: str, closes: list, volumes: list):
 
 def _execute_sell(pos: dict, price: float, reason: str):
     """Execute a market sell for pos at price. Logs trade, cleans up state."""
+    from datetime import timezone as _tz
     sym  = pos["symbol"]
     qty  = _floor_qty(pos["quantity"])
     mode = get_mode()
-    now  = datetime.utcnow().isoformat()
+    now  = datetime.now(_tz.utc).isoformat()  # always UTC with timezone info
 
     if qty <= 0 or price <= 0:
         return
+
+    # Make sure PaperClient uses the latest known price before the sell
+    try:
+        client.update_price(sym, price)
+    except Exception:
+        pass
 
     try:
         result = client.order_market_sell(symbol=sym, quantity=qty)
@@ -289,20 +296,26 @@ def _execute_sell(pos: dict, price: float, reason: str):
         return
 
     fill_price = float(result["fills"][0]["price"]) if result.get("fills") else price
-    sell_fee   = float(result["fills"][0]["commission"]) * fill_price if result.get("fills") else (qty * fill_price * _fee_rate)
-    buy_fee    = pos["budget_usdt"] * _fee_rate
-    gross      = qty * fill_price
+    # commission from PaperClient is already in USDT (fee = gross * fee_rate).
+    # Do NOT multiply by fill_price again — that was double-counting.
+    sell_fee = float(result["fills"][0]["commission"]) if result.get("fills") else (qty * fill_price * _fee_rate)
+    buy_fee  = pos["budget_usdt"] * _fee_rate
+    gross    = qty * fill_price
     net_profit = gross - sell_fee - pos["budget_usdt"] - buy_fee
 
     buy_ts  = pos.get("timestamp", now)
     sell_ts = now
     try:
-        buy_dt  = datetime.fromisoformat(buy_ts)
-        sell_dt = datetime.fromisoformat(sell_ts)
-        duration = int((sell_dt - buy_dt).total_seconds())
+        buy_dt  = datetime.fromisoformat(buy_ts.replace("Z", "+00:00"))
+        sell_dt = datetime.fromisoformat(sell_ts.replace("Z", "+00:00"))
+        # Both are timezone-aware; subtraction works directly
+        if buy_dt.tzinfo and sell_dt.tzinfo:
+            duration = int((sell_dt - buy_dt).total_seconds())
+        else:
+            duration = 0
     except Exception:
         duration = 0
-        buy_dt   = datetime.utcnow()
+        buy_dt   = datetime.now(_tz.utc)
 
     trade_record = {
         "coin":               sym,
@@ -402,8 +415,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         )
         return
 
+    from datetime import timezone as _tz
     usdt_balance = _get_usdt_balance()
-    ts_now = datetime.utcnow().isoformat()
+    ts_now = datetime.now(_tz.utc).isoformat()
     mode   = get_mode()
 
     # Log a readable snapshot so the activity log always shows what's happening

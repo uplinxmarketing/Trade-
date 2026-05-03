@@ -791,7 +791,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     // Server mode: delegate to Railway's force-sell endpoint
     if (isServerModeRef.current) {
       try {
-        const res = await fetch(`${railwayUrl}/api/force-sell/${pos.symbol}`, { method: 'POST' });
+        const wsPrice = parseFloat(pricesRef.current[pos.symbol]?.price || '0');
+        const res = await fetch(`${railwayUrl}/api/force-sell/${pos.symbol}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ price: wsPrice }),
+        });
         const data = await res.json();
         if (!data.ok) throw new Error(data.error ?? 'Force sell failed');
         addLog(`FORCE SELL ${pos.symbol} via Railway @ ${Number(data.price).toFixed(4)} USDT`);

@@ -39,7 +39,7 @@ MIN_SIGNALS_TO_BUY   = 1       # at least 1 of 4 signals must be bullish
 RSI_BUY_MIN          = 30
 RSI_BUY_MAX          = 70      # wider RSI window for more trade opportunities
 VOLUME_RATIO_MIN     = 1.1     # volume must be 1.1× the 20-candle average
-TAKE_PROFIT_PCT      = 0.015   # sell at 1.5% profit (not just breakeven +0.15%)
+TAKE_PROFIT_PCT      = 0.002   # sell at +0.2% — just above the 0.15% fee breakeven
 
 # ── Budget allocation settings ────────────────────────────────────────────────
 BUDGET_MODE           = "percent" # fixed | percent | capped | per_coin

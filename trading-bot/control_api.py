@@ -683,9 +683,15 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
         return {"ok": False, "error": str(e)}
 
 
+class ForceSellRequest(BaseModel):
+    price: float = 0.0   # frontend sends its live WebSocket price
+
+
 @app.post("/api/force-sell/{symbol}")
-def api_force_sell(symbol: str):
-    """Immediately sell an open position by symbol (case-insensitive)."""
+def api_force_sell(symbol: str, req: Optional[ForceSellRequest] = None):
+    """Immediately sell an open position by symbol (case-insensitive).
+    Accepts an optional price hint from the frontend so stale WebSocket
+    prices on the server side never cause the sell to use the wrong price."""
     sym = symbol.upper()
     try:
         from trade_engine import get_open_positions, _execute_sell
@@ -694,10 +700,13 @@ def api_force_sell(symbol: str):
         pos = next((p for p in pos_list if p["symbol"] == sym), None)
         if pos is None:
             return {"ok": False, "error": f"No open position for {sym}"}
-        price = live_prices.get(sym, 0) or pos.get("entry_price", 0)
+        # Priority: frontend hint → server WebSocket cache → entry price (last resort)
+        hint_price = (req.price if req else 0) or 0
+        price = hint_price or live_prices.get(sym, 0) or pos.get("entry_price", 0)
         if not price:
             return {"ok": False, "error": f"No live price for {sym}"}
         _execute_sell(pos, price, "force-sell")
+        database.log_activity(f"Force sell: {sym} @ ${price:.4f} | qty={pos.get('quantity',0):.6f}", "info")
         return {"ok": True, "symbol": sym, "price": price}
     except Exception as e:
         return {"ok": False, "error": str(e)}
