@@ -46,6 +46,9 @@ async def lifespan(app: FastAPI):
 
     # 1. DB (already done in main.py before uvicorn starts, but idempotent)
     database.init_db()
+    print(f"[ControlAPI] DATA DIRECTORY : {database._DATA_DIR}")
+    print(f"[ControlAPI] DATABASE FILE  : {database.DB_PATH}")
+    database.log_activity(f"Bot started — DB: {database.DB_PATH}", "info")
 
     # 2. Regenerate strategy.json
     strategy_engine.write_default_strategy()
@@ -541,6 +544,8 @@ def api_status():
         "total_trades":     len(sells),
         "realized_pnl":     round(realized, 4),
         "watched_coins":    approved or config.WATCHED_COINS,
+        "data_dir":         database._DATA_DIR,
+        "db_path":          database.DB_PATH,
     }
 
 

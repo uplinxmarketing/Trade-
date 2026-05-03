@@ -401,13 +401,24 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         "timestamp_buy":      buy_ts,
         "timestamp_sell":     sell_ts,
     }
-    database.log_trade(trade_record)
-    learning.learn_from_trade(trade_record)
-
-    if pos.get("id"):
-        database.delete_position(pos["id"])
-    with _positions_lock:
-        _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
+    # Position cleanup runs in finally so it always executes even if logging raises.
+    # The sell already completed — we must never leave a ghost position in memory.
+    try:
+        database.log_trade(trade_record)
+        try:
+            learning.learn_from_trade(trade_record)
+        except Exception as le:
+            database.log_activity(f"learn_from_trade error ({sym}): {le}", "warn")
+    except Exception as te:
+        database.log_activity(f"log_trade error ({sym}): {te}", "warn")
+    finally:
+        if pos.get("id"):
+            try:
+                database.delete_position(pos["id"])
+            except Exception:
+                pass
+        with _positions_lock:
+            _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
 
     usdt_received = gross - sell_fee
     pnl_sign      = "+" if net_profit >= 0 else ""
@@ -417,7 +428,10 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         f"  ({reason}, held {duration}s)"
     )
     print(f"[{sell_ts}] {sell_msg}")
-    database.log_activity(sell_msg, "info")
+    try:
+        database.log_activity(sell_msg, "info")
+    except Exception:
+        pass
 
 
 # ── Real-time buy check from signal cache (called from realtime_monitor) ──────
@@ -631,11 +645,14 @@ def realtime_monitor(prices: Dict[str, float]):
         take_profit = entry * (1.0 + config.TAKE_PROFIT_PCT)
         stop_loss   = entry * (1.0 - config.STOP_LOSS_PCT)
 
-        if price >= take_profit:
-            _execute_sell(pos, price, "take-profit")
-        elif price <= stop_loss:
-            _execute_sell(pos, price, "stop-loss")
-            _set_cooldown(sym)
+        try:
+            if price >= take_profit:
+                _execute_sell(pos, price, "take-profit")
+            elif price <= stop_loss:
+                _execute_sell(pos, price, "stop-loss")
+                _set_cooldown(sym)
+        except Exception as _se:
+            print(f"[realtime_monitor] sell error {sym}: {_se}")
 
     # Inline signal refresh from price ticks — keeps RSI/EMA/MACD current between
     # kline closes and REST scanner runs. Throttled to every 5 s per coin.
