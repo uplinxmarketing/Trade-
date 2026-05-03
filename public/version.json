@@ -1,5 +1,5 @@
 {
-  "version": "4.1.0",
-  "buildTime": "2026-05-04T00:30:00.000Z",
-  "commit": "instant-sells-no-hold-time-perf-fix"
+  "version": "4.2.0",
+  "buildTime": "2026-05-03T12:00:00.000Z",
+  "commit": "exit-target-on-buy-coin-history-persistence"
 }

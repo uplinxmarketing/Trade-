@@ -126,20 +126,21 @@ def _get_positions():
         pos = get_open_positions()
         out = []
         for p in pos:
-            sym   = p["symbol"]
-            price = prices.get(sym, 0)
-            entry = p.get("entry_price", 0)
-            qty   = p.get("quantity", 0)
-            bep   = entry * (1 + config.FEE_RATE_BNB * 2) if config.BNB_FEE_MODE else entry * 1.002
-            pnl   = (price - entry) * qty if price and entry else 0
-            dist  = ((price - bep) / bep * 100) if bep and price else 0
+            sym    = p["symbol"]
+            price  = prices.get(sym, 0)
+            entry  = p.get("entry_price", 0)
+            qty    = p.get("quantity", 0)
+            target = p.get("exit_target") or (entry * (1 + config.FEE_RATE_BNB * 2) if config.BNB_FEE_MODE else entry * 1.002)
+            pnl    = (price - entry) * qty if price and entry else 0
+            dist   = ((price - target) / target * 100) if target and price else 0
             out.append({
                 **p,
                 "current_price":   price,
-                "breakeven_price": round(bep, 6),
+                "exit_target":     round(target, 8),
+                "breakeven_price": round(target, 6),
                 "unrealized_pnl":  round(pnl, 4),
-                "dist_to_bep_pct": round(dist, 4),
-                "profitable":      price > bep if price and bep else False,
+                "dist_to_exit_pct": round(dist, 4),
+                "profitable":      price >= target if price and target else False,
             })
         return out
     except Exception:

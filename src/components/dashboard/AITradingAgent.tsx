@@ -146,6 +146,9 @@ interface OpenPosition {
   symbol: string;
   quantity: number;
   avg_entry_price: number;
+  exit_target?: number;
+  current_price?: number;
+  profitable?: boolean;
 }
 
 interface TradeRow {
@@ -538,6 +541,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       symbol:          pos.symbol,
       quantity:        Number(pos.quantity),
       avg_entry_price: Number(pos.entry_price ?? pos.avg_entry_price ?? 0),
+      exit_target:     pos.exit_target ? Number(pos.exit_target) : undefined,
+      current_price:   pos.current_price ? Number(pos.current_price) : undefined,
+      profitable:      Boolean(pos.profitable),
     }));
     setPositions(mapped);
     positionsRef.current = mapped;
@@ -1197,21 +1203,21 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         ) : (
           <div className="space-y-1.5">
             {positions.map(pos => {
-              const live  = parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.avg_entry_price;
-              const sells = live * pos.quantity * (1-TAKER_FEE);
-              const cost  = pos.avg_entry_price * pos.quantity / (1-TAKER_FEE);
-              const uPnl  = sells - cost;
-              const pct   = cost > 0 ? (uPnl/cost)*100 : 0;
-              const bep   = pos.avg_entry_price * BEP_MULT;
-              const prof  = live >= bep;
-              const bepProgress = Math.min(100, Math.max(0, ((live-pos.avg_entry_price)/(bep-pos.avg_entry_price))*100));
-              const qty   = Number(pos.quantity);
+              const live   = parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.avg_entry_price;
+              const sells  = live * pos.quantity * (1-TAKER_FEE);
+              const cost   = pos.avg_entry_price * pos.quantity / (1-TAKER_FEE);
+              const uPnl   = sells - cost;
+              const pct    = cost > 0 ? (uPnl/cost)*100 : 0;
+              const target = pos.exit_target ?? pos.avg_entry_price * BEP_MULT;
+              const prof   = live >= target;
+              const toTarget = Math.min(100, Math.max(0, ((live - pos.avg_entry_price) / (target - pos.avg_entry_price)) * 100));
+              const qty    = Number(pos.quantity);
               const budget = pos.avg_entry_price * qty;
               return (
                 <div key={pos.symbol} className="bg-muted/20 border border-border/50 rounded-lg px-3 py-2.5 space-y-2">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      <div className={`w-1.5 h-1.5 rounded-full ${uPnl>=0?'bg-gain animate-pulse':'bg-loss'}`}/>
+                      <div className={`w-1.5 h-1.5 rounded-full ${prof?'bg-gain animate-pulse':'bg-warn animate-pulse'}`}/>
                       <span className="font-mono font-bold text-sm">{pos.symbol.replace('USDT','')}</span>
                       <span className={`text-xs font-mono font-bold ${pct>=0?'text-gain':'text-loss'}`}>{pct>=0?'+':''}{pct.toFixed(3)}%</span>
                     </div>
@@ -1225,17 +1231,17 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                   </div>
                   <div className="grid grid-cols-2 gap-x-4 text-[10px] text-muted-foreground font-mono">
                     <span>Entry <span className="text-foreground">{pos.avg_entry_price.toFixed(4)}</span></span>
-                    <span>BEP <span className="text-accent">{bep.toFixed(4)}</span></span>
+                    <span>Exit target <span className="text-accent font-bold">{target.toFixed(4)}</span></span>
                     <span>Now <span className={prof?'text-gain':'text-foreground'}>{live.toFixed(4)}</span></span>
                     <span>Qty <span className="text-foreground">{qty.toFixed(6)}</span> · <span className="text-foreground">{budget.toFixed(2)} USDT</span></span>
                   </div>
                   <div className="space-y-1">
                     <div className="flex justify-between text-[9px]">
-                      <span className="text-muted-foreground">Break-even progress</span>
-                      <span className={prof?'text-gain font-bold':'text-warn'}>{prof?'✓ Profitable':bepProgress.toFixed(0)+'% to BEP'}</span>
+                      <span className="text-muted-foreground">Progress to exit target</span>
+                      <span className={prof?'text-gain font-bold':'text-warn'}>{prof?'✓ SELLING NOW…':toTarget.toFixed(0)+'% to target'}</span>
                     </div>
                     <div className="h-1.5 bg-muted/40 rounded-full overflow-hidden">
-                      <div className={`h-full rounded-full transition-all ${prof?'bg-gain':'bg-warn'}`} style={{width:`${Math.max(2, bepProgress)}%`}}/>
+                      <div className={`h-full rounded-full transition-all ${prof?'bg-gain':'bg-warn'}`} style={{width:`${Math.max(2, toTarget)}%`}}/>
                     </div>
                   </div>
                 </div>

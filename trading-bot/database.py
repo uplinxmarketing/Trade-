@@ -122,6 +122,7 @@ def init_db():
                 id                 INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol             TEXT,
                 entry_price        REAL,
+                exit_target        REAL,
                 quantity           REAL,
                 budget_usdt        REAL,
                 timestamp          TEXT,
@@ -149,6 +150,7 @@ def init_db():
             "ALTER TABLE positions ADD COLUMN entry_ma_position  TEXT",
             "ALTER TABLE positions ADD COLUMN entry_bb_position  TEXT",
             "ALTER TABLE positions ADD COLUMN entry_volume_trend TEXT",
+            "ALTER TABLE positions ADD COLUMN exit_target         REAL",
         ]
         for sql in migrations:
             try:
@@ -297,12 +299,12 @@ def save_position(pos: dict) -> Optional[int]:
         conn = _conn()
         conn.execute("""
             INSERT INTO positions
-                (symbol, entry_price, quantity, budget_usdt, timestamp, mode,
+                (symbol, entry_price, exit_target, quantity, budget_usdt, timestamp, mode,
                  entry_rsi, entry_ma_position, entry_bb_position, entry_volume_trend)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            pos["symbol"], pos["entry_price"], pos["quantity"],
-            pos["budget_usdt"], pos["timestamp"], pos.get("mode", "paper"),
+            pos["symbol"], pos["entry_price"], pos.get("exit_target"),
+            pos["quantity"], pos["budget_usdt"], pos["timestamp"], pos.get("mode", "paper"),
             pos.get("entry_rsi"), pos.get("entry_ma_position"),
             pos.get("entry_bb_position"), pos.get("entry_volume_trend"),
         ))

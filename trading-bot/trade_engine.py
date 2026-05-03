@@ -658,9 +658,11 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         except Exception:
             pass
 
+        exit_target = round(fill_price * _breakeven_mult, 8)
         pos_record = {
             "symbol":             sym,
             "entry_price":        fill_price,
+            "exit_target":        exit_target,
             "quantity":           qty,
             "budget_usdt":        budget,
             "timestamp":          ts_now,
@@ -687,10 +689,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         usdt_balance -= budget + budget * _fee_rate
 
         score     = cached["score"]
-        breakeven = fill_price * _breakeven_mult
         msg = (
             f"BOUGHT {sym} @ ${fill_price:.4f} "
-            f"| qty={qty:.6f} | BEP=${breakeven:.4f} "
+            f"| qty={qty:.6f} | EXIT TARGET=${exit_target:.4f} "
             f"| signals={score}/4"
         )
         print(f"[RealtimeBuy] {msg}")
@@ -745,8 +746,9 @@ def realtime_monitor(prices: Dict[str, float]):
         with _selling_lock:
             if sym in _selling:
                 continue
-        entry = pos["entry_price"]
-        if price > entry * _breakeven_mult:
+        entry  = pos["entry_price"]
+        target = pos.get("exit_target") or entry * _breakeven_mult
+        if price >= target:
             _sell_executor.submit(_execute_sell, pos, price, "take-profit")
         elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
             _set_cooldown(sym)
@@ -826,8 +828,9 @@ def _sell_monitor_loop():
                 with _selling_lock:
                     if sym in _selling:
                         continue
-                entry = pos["entry_price"]
-                if price > entry * _breakeven_mult:
+                entry  = pos["entry_price"]
+                target = pos.get("exit_target") or entry * _breakeven_mult
+                if price >= target:
                     _sell_executor.submit(_execute_sell, pos, price, "take-profit")
                 elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
                     _set_cooldown(sym)
