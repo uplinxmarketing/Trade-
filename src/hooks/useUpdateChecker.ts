@@ -20,7 +20,7 @@ function hardReload() {
   window.location.href = `${window.location.pathname}?_cb=${Date.now()}`;
 }
 
-export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
+export function useUpdateChecker(pollIntervalMs = 60_000) {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [checking, setChecking]               = useState(false);
   const [updating, setUpdating]               = useState(false);
@@ -107,7 +107,7 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
       }
     };
 
-    timer = setTimeout(() => tryCheck(15_000), 4_000);
+    timer = setTimeout(() => tryCheck(10_000), 500);
     return () => { clearTimeout(timer); clearInterval(timer as unknown as ReturnType<typeof setInterval>); };
   }, [checkForUpdates, pollIntervalMs]);
 
