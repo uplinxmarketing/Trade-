@@ -7,6 +7,7 @@ import asyncio
 import json
 import time
 import urllib.request
+from collections import deque
 from datetime import datetime
 from typing import Dict, Callable, Optional
 
@@ -25,6 +26,14 @@ prices: Dict[str, float] = {}
 ws_candles: Dict[str, list] = {}
 _WS_CANDLE_MAX = 60   # candles to keep per coin
 _MIN_CANDLES   = 16   # minimum candles needed for at least RSI signal to work
+
+# Rolling price-tick buffer — filled by every WebSocket @trade event.
+# Trade events arrive within seconds of connecting (no candle-close wait).
+# Once 20+ ticks accumulate (~seconds), RSI/EMA/MACD all fire.
+# Used as 4th fallback when REST, DB candles, and WS candles are all empty.
+price_ticks: Dict[str, deque] = {}
+_TICK_MAX  = 50
+_MIN_TICKS = 20
 
 # Callbacks registered by main.py to avoid circular imports
 _price_callback: Optional[Callable[[Dict[str, float]], None]] = None
@@ -187,6 +196,8 @@ async def start_websocket():
                             symbol = data["s"]
                             price  = float(data["p"])
                             prices[symbol] = price
+                            ticks = price_ticks.setdefault(symbol, deque(maxlen=_TICK_MAX))
+                            ticks.append(price)
                             client.update_price(symbol, price)
                             if _price_callback:
                                 _price_callback(dict(prices))

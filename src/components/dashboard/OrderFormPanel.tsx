@@ -1,12 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
-import { ChevronDown, Info } from 'lucide-react';
-import { supabase } from '@/integrations/supabase/client';
+import { Info } from 'lucide-react';
 import { TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
 import { toast } from 'sonner';
 
 const BREAK_EVEN_MULT = 1 / Math.pow(1 - TAKER_FEE, 2);
 const MAKER_FEE = 0.001 * 0.075 / 0.1; // ~0.075% maker
+const RAILWAY_URL_KEY = 'railway_bot_url';
+const apiBase = () => localStorage.getItem(RAILWAY_URL_KEY) ?? (import.meta.env.VITE_API_URL as string | undefined) ?? '';
 
 type TradingMode = 'spot' | 'futures';
 type Side        = 'buy' | 'sell';
@@ -53,23 +54,24 @@ export default function OrderFormPanel({ activeCoin, prices, binanceConnected }:
   const mktPrice = parseFloat(lp?.price ?? '0');
   const ticker   = activeCoin.replace('USDT', '');
 
+  // Load balance from Railway bot API
   useEffect(() => {
-    const readBal = (val: unknown) => {
-      const n = Number(val ?? 0);
-      // Fall back to localStorage startingBalance when DB value is 0
-      if (n > 0) { setBalance(n); return; }
+    const loadBalance = async () => {
+      try {
+        const res = await fetch(`${apiBase()}/api/status`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const bal = Number(data?.paper_balance ?? data?.usdt_balance ?? 0);
+        if (bal > 0) { setBalance(bal); return; }
+      } catch { /* ignore */ }
       try {
         const cfg = JSON.parse(localStorage.getItem('paper_wallet_config') ?? '{}');
         setBalance(cfg.startingBalance ?? 1000);
       } catch { setBalance(1000); }
     };
-    supabase.from('bot_config').select('current_balance').eq('user_session', 'default').maybeSingle()
-      .then(({ data }) => readBal(data?.current_balance));
-    const ch = supabase.channel('ofp-bal')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_config' }, (p) => {
-        readBal(p.new?.current_balance);
-      }).subscribe();
-    return () => { supabase.removeChannel(ch); };
+    loadBalance();
+    const id = setInterval(loadBalance, 15_000);
+    return () => clearInterval(id);
   }, []);
 
   // Reset form on coin change
@@ -97,61 +99,26 @@ export default function OrderFormPanel({ activeCoin, prices, binanceConnected }:
     setSubmitting(true);
     try {
       if (side === 'buy') {
-        await supabase.from('bot_trade_history').insert({
-          user_session: 'default', symbol: activeCoin, side: 'BUY',
-          price: execPrice, quantity: coinQty, pnl: null,
-          reason: `Manual ${orderType} ${tradingMode} buy`,
+        const res  = await fetch(`${apiBase()}/api/force-buy/${activeCoin}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ price: execPrice }),
         });
-        // Accumulate into existing position (weighted avg entry) rather than overwriting
-        const { data: existingPos } = await supabase.from('paper_portfolio')
-          .select('quantity,avg_entry_price').eq('user_session', 'default').eq('symbol', activeCoin).maybeSingle();
-        if (existingPos && Number(existingPos.quantity) > 0) {
-          const prevQty = Number(existingPos.quantity);
-          const prevAvg = Number(existingPos.avg_entry_price);
-          const newQty  = prevQty + coinQty;
-          const newAvg  = (prevQty * prevAvg + coinQty * execPrice) / newQty;
-          await supabase.from('paper_portfolio').update({
-            quantity: newQty, avg_entry_price: newAvg, updated_at: new Date().toISOString(),
-          }).eq('user_session', 'default').eq('symbol', activeCoin);
-        } else {
-          await supabase.from('paper_portfolio').upsert({
-            user_session: 'default', symbol: activeCoin,
-            quantity: coinQty, avg_entry_price: execPrice,
-            updated_at: new Date().toISOString(),
-          }, { onConflict: 'user_session,symbol' });
-        }
-        await supabase.from('bot_config').update({
-          current_balance: balance - usdt, updated_at: new Date().toISOString(),
-        }).eq('user_session', 'default');
-        toast.success(`Bought ${coinQty.toFixed(6)} ${ticker}`, { description: `at $${fmtPrice(execPrice)} · fee $${fee.toFixed(4)}` });
+        const data = await res.json();
+        if (!data.ok) { toast.error(`Buy failed: ${data.error ?? 'unknown'}`); return; }
+        toast.success(
+          `Bought ${Number(data.quantity ?? coinQty).toFixed(6)} ${ticker}`,
+          { description: `at $${fmtPrice(data.price ?? execPrice)} · fee $${fee.toFixed(4)}` },
+        );
       } else {
-        const { data: pos } = await supabase.from('paper_portfolio')
-          .select('quantity,avg_entry_price').eq('user_session', 'default').eq('symbol', activeCoin).single();
-        if (!pos || Number(pos.quantity) <= 0) { toast.error('No position to sell'); setSubmitting(false); return; }
-        const sellQty      = Math.min(coinQty || Number(pos.quantity), Number(pos.quantity));
-        const remainingQty = Number(pos.quantity) - sellQty;
-        const costBasis    = sellQty * Number(pos.avg_entry_price) / (1 - TAKER_FEE);
-        const proceeds     = sellQty * execPrice * (1 - TAKER_FEE);
-        const pnl          = proceeds - costBasis;
-        await supabase.from('bot_trade_history').insert({
-          user_session: 'default', symbol: activeCoin, side: 'SELL',
-          price: execPrice, quantity: sellQty, pnl,
-          reason: `Manual ${orderType} ${tradingMode} sell`,
+        const res  = await fetch(`${apiBase()}/api/force-sell/${activeCoin}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ price: execPrice }),
         });
-        await supabase.from('bot_config').update({
-          current_balance: balance + proceeds, updated_at: new Date().toISOString(),
-        }).eq('user_session', 'default');
-        // Close or reduce position
-        if (remainingQty <= 0.000001) {
-          await supabase.from('paper_portfolio').delete().eq('user_session', 'default').eq('symbol', activeCoin);
-        } else {
-          await supabase.from('paper_portfolio').update({
-            quantity: remainingQty, updated_at: new Date().toISOString(),
-          }).eq('user_session', 'default').eq('symbol', activeCoin);
-        }
-        toast.success(`Sold ${sellQty.toFixed(6)} ${ticker}`, {
-          description: `PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)}`,
-        });
+        const data = await res.json();
+        if (!data.ok) { toast.error(`Sell failed: ${data.error ?? 'unknown'}`); return; }
+        toast.success(`Sold ${ticker}`, { description: `at $${fmtPrice(data.price ?? execPrice)}` });
       }
       setAmount('');
     } catch (e) {

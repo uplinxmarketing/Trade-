@@ -687,6 +687,16 @@ async def _refresh_signal_cache():
                 closes  = [float(r[4]) for r in buf]
                 volumes = [float(r[5]) for r in buf]
 
+        # 4. Fall back to trade-price tick buffer — available within seconds of
+        #    WebSocket connect, no candle-close wait required.
+        #    Volumes are uniform (no trade-volume in @trade events) so volume
+        #    signal won't fire, but RSI / EMA / MACD all produce valid values.
+        if not closes or len(closes) < MIN:
+            ticks = list(_dc.price_ticks.get(sym, []))
+            if len(ticks) >= _dc._MIN_TICKS:
+                closes  = ticks
+                volumes = [1.0] * len(ticks)
+
         if closes and len(closes) >= MIN:
             update_coin_signals(sym, closes, volumes)
             return True
