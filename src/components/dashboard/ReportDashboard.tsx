@@ -49,17 +49,21 @@ const ReportDashboard = () => {
   const [refreshing, setRefreshing]     = useState(false);
 
   const load = useCallback(async () => {
-    const [supabaseRes, railwayRes, statusRes] = await Promise.all([
+    const [supabaseRes, railwayRes, statusRes, sbBotRes] = await Promise.all([
       supabase.from('bot_trade_history').select('*')
         .eq('user_session', 'default').order('created_at', { ascending: true }),
       fetch(`${API_BASE}/api/trades`).then(r => r.ok ? r.json() : { trades: [] }).catch(() => ({ trades: [] })),
       fetch(`${API_BASE}/api/status`).then(r => r.ok ? r.json() : null).catch(() => null),
+      // Always pull Railway bot history from Supabase — survives Railway redeploys
+      supabase.from('bot_trade_history').select('*')
+        .eq('user_session', 'railway_bot').order('created_at', { ascending: true }),
     ]);
 
     setTrades((supabaseRes.data as Trade[]) ?? []);
     if (statusRes) setBotStatus(statusRes as BotStatus);
 
-    const rPairs: PairTrade[] = ((railwayRes.trades ?? []) as any[])
+    // Railway SQLite trades (current deploy)
+    const rwFromSqlite: PairTrade[] = ((railwayRes.trades ?? []) as any[])
       .filter(tr => tr.exit_price != null)
       .map(tr => {
         const qty        = Number(tr.quantity);
@@ -79,7 +83,47 @@ const ReportDashboard = () => {
           netPnl: Number(tr.net_profit ?? 0), duration: dur, closedAt,
         };
       });
-    setRailwayPairs(rPairs);
+
+    // Supabase Railway bot trades (persist across redeploys)
+    // Pair up buy→sell rows from bot_trade_history using reason field
+    const sbBotTrades = (sbBotRes.data ?? []) as any[];
+    const sbBotPairs: PairTrade[] = (() => {
+      // bot_trade_history has separate buy and sell rows; match by symbol+created_at proximity
+      // The sell row has pnl set; use those directly
+      const sellRows = sbBotTrades.filter(t => t.side === 'sell' && t.pnl != null);
+      const buyRows  = sbBotTrades.filter(t => t.side === 'buy');
+      const buyMap: Record<string, any> = {};
+      for (const b of buyRows) buyMap[`${b.symbol}|${b.created_at}`] = b;
+
+      return sellRows.map(s => {
+        // find the closest buy row for this symbol at or before this sell
+        const matchingBuys = buyRows.filter(b => b.symbol === s.symbol && b.created_at <= s.created_at);
+        const buy = matchingBuys.length > 0 ? matchingBuys[matchingBuys.length - 1] : null;
+        const qty        = Number(s.quantity ?? 0);
+        const entryPrice = Number(buy?.price ?? 0);
+        const exitPrice  = Number(s.price ?? 0);
+        const budget     = entryPrice > 0 && qty > 0 ? qty * entryPrice : 0;
+        const buyFee     = budget * TAKER_FEE;
+        const sellFee    = qty * exitPrice * TAKER_FEE;
+        const closedAt   = s.created_at;
+        const durationMs = buy ? new Date(s.created_at).getTime() - new Date(buy.created_at).getTime() : 0;
+        const dur = durationMs > 3_600_000
+          ? `${(durationMs / 3_600_000).toFixed(1)}h` : `${Math.round(durationMs / 60_000)}m`;
+        return {
+          id: `sb-${s.id}`, pair: String(s.symbol).replace('USDT', '/USDT'),
+          direction: 'LONG' as const, entryPrice, exitPrice, qty, budget, buyFee, sellFee,
+          netPnl: Number(s.pnl ?? 0), duration: dur, closedAt,
+        };
+      });
+    })();
+
+    // Merge SQLite + Supabase Railway trades; deduplicate by closedAt+pair
+    const sqliteKeys = new Set(rwFromSqlite.map(p => `${p.closedAt}|${p.pair}`));
+    const merged = [
+      ...rwFromSqlite,
+      ...sbBotPairs.filter(p => !sqliteKeys.has(`${p.closedAt}|${p.pair}`)),
+    ];
+    setRailwayPairs(merged);
     setLoading(false);
     setRefreshing(false);
   }, []);
@@ -123,9 +167,11 @@ const ReportDashboard = () => {
   const pairTrades: PairTrade[] = [...supabasePairs, ...railwayPairs]
     .sort((a, b) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime());
 
-  // Prefer pre-computed Railway stats when available; fall back to computed from pair trades
-  const totalProfit = botStatus ? botStatus.realized_pnl
-    : pairTrades.reduce((s, p) => s + p.netPnl, 0);
+  // Always compute from full pairTrades (includes Supabase history); overlay Railway live stats
+  const computedPnl  = pairTrades.reduce((s, p) => s + p.netPnl, 0);
+  const totalProfit  = botStatus
+    ? Math.max(botStatus.realized_pnl, computedPnl)  // take whichever is larger (more complete)
+    : computedPnl;
 
   const todayProfit = pairTrades.filter(p => {
     const d = new Date(p.closedAt), now = new Date();
@@ -135,9 +181,11 @@ const ReportDashboard = () => {
   const totalFees   = pairTrades.reduce((s, p) => s + p.buyFee + p.sellFee, 0);
   const bnbSavings  = totalFees * BNB_DISCOUNT;
 
-  const total    = botStatus?.total_trades ?? pairTrades.length;
-  const wins     = botStatus?.wins ?? pairTrades.filter(p => p.netPnl > 0).length;
-  const winRateN = botStatus ? (botStatus.win_rate * 100) : (total > 0 ? (wins / total) * 100 : 0);
+  // Use the larger of Railway SQLite count vs full pairTrades count (Supabase may have more history)
+  const computedWins  = pairTrades.filter(p => p.netPnl > 0).length;
+  const total         = Math.max(botStatus?.total_trades ?? 0, pairTrades.length);
+  const wins          = Math.max(botStatus?.wins ?? 0, computedWins);
+  const winRateN      = total > 0 ? (wins / total) * 100 : 0;
   const winRate  = total > 0 ? winRateN.toFixed(1) : '—';
 
   const isActive = botStatus?.running ?? false;
