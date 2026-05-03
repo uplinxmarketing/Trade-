@@ -17,7 +17,7 @@ from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -692,6 +692,71 @@ def api_set_mode(req: ModeRequest):
 @app.get("/api/ping")
 def api_ping():
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
+
+
+class ChatRequest(BaseModel):
+    messages: list[dict]
+    apiKey: str
+
+
+@app.post("/api/chat")
+async def api_chat(req: ChatRequest):
+    """Proxy streaming chat to Anthropic API, converting to OpenAI SSE format."""
+    import aiohttp
+    import json as _json
+
+    if not req.apiKey:
+        return Response(content="data: [DONE]\n\n", media_type="text/event-stream")
+
+    anthropic_messages = [
+        {"role": m["role"], "content": m["content"]}
+        for m in req.messages
+        if m.get("role") in ("user", "assistant") and m.get("content")
+    ]
+
+    async def generate():
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": req.apiKey,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 1024,
+                        "stream": True,
+                        "messages": anthropic_messages,
+                    },
+                ) as resp:
+                    async for raw_line in resp.content:
+                        line = raw_line.decode("utf-8").rstrip("\r\n")
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            yield "data: [DONE]\n\n"
+                            return
+                        try:
+                            event = _json.loads(data_str)
+                            if event.get("type") == "content_block_delta":
+                                text = event.get("delta", {}).get("text", "")
+                                if text:
+                                    chunk = _json.dumps({"choices": [{"delta": {"content": text}}]})
+                                    yield f"data: {chunk}\n\n"
+                            elif event.get("type") == "message_stop":
+                                yield "data: [DONE]\n\n"
+                                return
+                        except Exception:
+                            pass
+        except Exception as exc:
+            err = _json.dumps({"choices": [{"delta": {"content": f"\n\n[Error: {exc}]"}}]})
+            yield f"data: {err}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 @app.get("/api/version")

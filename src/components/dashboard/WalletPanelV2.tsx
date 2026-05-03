@@ -119,21 +119,20 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
       const next = { ...prev, ...updates };
       try { localStorage.setItem(PAPER_CFG_KEY, JSON.stringify(next)); } catch { /* */ }
 
-      // Sync budget changes to the Railway server so it uses the same values
-      if (API_BASE) {
-        const serverPatch: Record<string, unknown> = {};
-        if (updates.budgetMode)   serverPatch.budget_mode           = updates.budgetMode;
-        if (updates.budgetFixed)  serverPatch.budget_fixed_usdt     = updates.budgetFixed;
-        if (updates.budgetPct)    serverPatch.budget_pct_of_free    = updates.budgetPct;
-        if (updates.budgetCap)    serverPatch.budget_total_cap_usdt = updates.budgetCap;
-        if (updates.budgetPerCoin) serverPatch.budget_per_coin      = updates.budgetPerCoin;
-        if (Object.keys(serverPatch).length > 0) {
-          fetch(`${API_BASE}/config`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(serverPatch),
-          }).catch(() => {});
-        }
+      // Sync budget changes to the Railway server so it uses the same values.
+      // API_BASE='' means same-origin — always sync regardless of API_BASE value.
+      const serverPatch: Record<string, unknown> = {};
+      if (updates.budgetMode)   serverPatch.budget_mode           = updates.budgetMode;
+      if (updates.budgetFixed)  serverPatch.budget_fixed_usdt     = updates.budgetFixed;
+      if (updates.budgetPct)    serverPatch.budget_pct_of_free    = updates.budgetPct;
+      if (updates.budgetCap)    serverPatch.budget_total_cap_usdt = updates.budgetCap;
+      if (updates.budgetPerCoin) serverPatch.budget_per_coin      = updates.budgetPerCoin;
+      if (Object.keys(serverPatch).length > 0) {
+        fetch(`${API_BASE}/config`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(serverPatch),
+        }).catch(() => {});
       }
 
       return next;
@@ -253,13 +252,12 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     if (!confirm(`Reset paper wallet to ${walletCfg.startingBalance.toLocaleString()} USDT and clear all positions?`)) return;
     setResetting(true);
     try {
-      // Reset server-side wallet (Railway SQLite) when running in server mode
-      if (API_BASE) {
-        const res = await fetch(`${API_BASE}/api/reset`, { method: 'POST' }).catch(() => null);
-        if (!res?.ok) {
-          toast.error('Server reset failed — check Railway logs');
-          return;
-        }
+      // Reset server-side wallet (Railway SQLite).
+      // API_BASE='' means same-origin — always attempt reset.
+      const res = await fetch(`${API_BASE}/api/reset`, { method: 'POST' }).catch(() => null);
+      if (!res?.ok) {
+        toast.error('Server reset failed — check Railway logs');
+        return;
       }
 
       // Always reset Supabase (browser paper wallet)

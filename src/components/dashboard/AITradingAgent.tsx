@@ -64,7 +64,7 @@ function evaluateSignals(closes: number[], volumes: number[]): {
     // RSI_BUY_MIN <= rsi <= RSI_BUY_MAX (both constants — RSI 65 passes, 66 fails)
     rsi:    rsiVal >= RSI_BUY_MIN && rsiVal <= RSI_BUY_MAX,
     macd:   macd.histogram > 0,
-    volume: volRat > 1.05 || recentVol > prevVol,
+    volume: volRat >= 1.5,
   };
 }
 
@@ -440,7 +440,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const serverPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const pollRailway = useCallback(async () => {
-    if (!railwayUrl) return;
+    // railwayUrl='' means same-origin — always poll in unified Railway deployment
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 8000);
