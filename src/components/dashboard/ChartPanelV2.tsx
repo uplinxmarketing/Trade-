@@ -104,9 +104,15 @@ export default function ChartPanelV2({ activeCoin, prices }: Props) {
   const breakEven = entryPrice > 0 ? entryPrice * BREAK_EVEN_MULT : 0;
 
   useEffect(() => {
-    supabase.from('paper_portfolio').select('avg_entry_price')
+    const fetchEntry = () => supabase.from('paper_portfolio').select('avg_entry_price')
       .eq('user_session', 'default').eq('symbol', activeCoin).gt('quantity', 0).maybeSingle()
       .then(({ data }) => setEntryPrice(data ? Number(data.avg_entry_price) : 0));
+    fetchEntry();
+    const ch = supabase.channel(`chart-entry-${activeCoin}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'paper_portfolio' },
+        (p) => { if ((p.new as any)?.symbol === activeCoin || (p.old as any)?.symbol === activeCoin) fetchEntry(); })
+      .subscribe();
+    return () => { supabase.removeChannel(ch); };
   }, [activeCoin]);
 
   const toggle = (key: keyof Overlays) =>

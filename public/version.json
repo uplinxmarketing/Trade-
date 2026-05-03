@@ -1,5 +1,5 @@
 {
-  "version": "3.6.2",
-  "buildTime": "2026-05-03T14:00:00Z",
-  "commit": "live-mode-form-more-coins"
+  "version": "3.6.3",
+  "buildTime": "2026-05-03T15:00:00Z",
+  "commit": "fix-all-modules-order-wallet-chart-reports"
 }

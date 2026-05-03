@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { BarChart3, DollarSign, TrendingUp, Percent, Loader2, RefreshCw } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
 import { TAKER_FEE } from '@/lib/trading-engine';
+import { API_BASE } from '@/config';
 
 const BNB_DISCOUNT = 0.25; // 25% BNB fee discount (typical Binance rate)
 
@@ -39,14 +40,40 @@ interface PairTrade {
 
 const ReportDashboard = () => {
   const [trades, setTrades]     = useState<Trade[]>([]);
+  const [railwayPairs, setRailwayPairs] = useState<PairTrade[]>([]);
   const [loading, setLoading]   = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(async () => {
-    const { data } = await supabase
-      .from('bot_trade_history').select('*')
-      .eq('user_session', 'default').order('created_at', { ascending: true });
-    setTrades((data as Trade[]) ?? []);
+    const [supabaseRes, railwayRes] = await Promise.all([
+      supabase.from('bot_trade_history').select('*')
+        .eq('user_session', 'default').order('created_at', { ascending: true }),
+      fetch(`${API_BASE}/api/trades`).then(r => r.ok ? r.json() : { trades: [] }).catch(() => ({ trades: [] })),
+    ]);
+    setTrades((supabaseRes.data as Trade[]) ?? []);
+
+    // Map Railway closed trades (already paired) into PairTrade format
+    const rPairs: PairTrade[] = ((railwayRes.trades ?? []) as any[])
+      .filter(tr => tr.exit_price != null)
+      .map(tr => {
+        const qty = Number(tr.quantity);
+        const entryPrice = Number(tr.entry_price);
+        const exitPrice  = Number(tr.exit_price);
+        const budget  = qty * entryPrice;
+        const buyFee  = budget * TAKER_FEE;
+        const sellFee = qty * exitPrice * TAKER_FEE;
+        const closedAt = tr.timestamp_sell ?? tr.timestamp_buy ?? new Date().toISOString();
+        const durationMs = tr.timestamp_sell && tr.timestamp_buy
+          ? new Date(tr.timestamp_sell).getTime() - new Date(tr.timestamp_buy).getTime() : 0;
+        const dur = durationMs > 3600000
+          ? `${(durationMs / 3600000).toFixed(1)}h` : `${(durationMs / 60000).toFixed(0)}m`;
+        return {
+          id: `rw-${tr.id}`, pair: String(tr.coin).replace('USDT', '/USDT'), direction: 'LONG' as const,
+          entryPrice, exitPrice, qty, budget, buyFee, sellFee,
+          netPnl: Number(tr.net_profit ?? 0), duration: dur, closedAt,
+        };
+      });
+    setRailwayPairs(rPairs);
     setLoading(false);
     setRefreshing(false);
   }, []);
@@ -59,8 +86,8 @@ const ReportDashboard = () => {
     return () => { supabase.removeChannel(ch); };
   }, [load]);
 
-  // Build matched buy→sell pairs for table display
-  const pairTrades: PairTrade[] = (() => {
+  // Build matched buy→sell pairs from Supabase trade history
+  const supabasePairs: PairTrade[] = (() => {
     const buyMap: Record<string, Trade> = {};
     const result: PairTrade[] = [];
     for (const t of trades) {
@@ -83,8 +110,12 @@ const ReportDashboard = () => {
         delete buyMap[t.symbol];
       }
     }
-    return result.reverse(); // newest first
+    return result;
   })();
+
+  // Merge Supabase + Railway pairs, newest first
+  const pairTrades: PairTrade[] = [...supabasePairs, ...railwayPairs]
+    .sort((a, b) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime());
 
   // Metrics
   const closedPnls   = pairTrades.map(p => p.netPnl);

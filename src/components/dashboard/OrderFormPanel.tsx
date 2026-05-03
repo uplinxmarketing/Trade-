@@ -100,11 +100,24 @@ export default function OrderFormPanel({ activeCoin, prices, binanceConnected }:
           price: execPrice, quantity: coinQty, pnl: null,
           reason: `Manual ${orderType} ${tradingMode} buy`,
         });
-        await supabase.from('paper_portfolio').upsert({
-          user_session: 'default', symbol: activeCoin,
-          quantity: coinQty, avg_entry_price: execPrice,
-          updated_at: new Date().toISOString(),
-        }, { onConflict: 'user_session,symbol' });
+        // Accumulate into existing position (weighted avg entry) rather than overwriting
+        const { data: existingPos } = await supabase.from('paper_portfolio')
+          .select('quantity,avg_entry_price').eq('user_session', 'default').eq('symbol', activeCoin).maybeSingle();
+        if (existingPos && Number(existingPos.quantity) > 0) {
+          const prevQty = Number(existingPos.quantity);
+          const prevAvg = Number(existingPos.avg_entry_price);
+          const newQty  = prevQty + coinQty;
+          const newAvg  = (prevQty * prevAvg + coinQty * execPrice) / newQty;
+          await supabase.from('paper_portfolio').update({
+            quantity: newQty, avg_entry_price: newAvg, updated_at: new Date().toISOString(),
+          }).eq('user_session', 'default').eq('symbol', activeCoin);
+        } else {
+          await supabase.from('paper_portfolio').upsert({
+            user_session: 'default', symbol: activeCoin,
+            quantity: coinQty, avg_entry_price: execPrice,
+            updated_at: new Date().toISOString(),
+          }, { onConflict: 'user_session,symbol' });
+        }
         await supabase.from('bot_config').update({
           current_balance: balance - usdt, updated_at: new Date().toISOString(),
         }).eq('user_session', 'default');
@@ -113,10 +126,11 @@ export default function OrderFormPanel({ activeCoin, prices, binanceConnected }:
         const { data: pos } = await supabase.from('paper_portfolio')
           .select('quantity,avg_entry_price').eq('user_session', 'default').eq('symbol', activeCoin).single();
         if (!pos || Number(pos.quantity) <= 0) { toast.error('No position to sell'); setSubmitting(false); return; }
-        const sellQty   = Math.min(coinQty || Number(pos.quantity), Number(pos.quantity));
-        const costBasis = sellQty * Number(pos.avg_entry_price) / (1 - TAKER_FEE);
-        const proceeds  = sellQty * execPrice * (1 - TAKER_FEE);
-        const pnl       = proceeds - costBasis;
+        const sellQty      = Math.min(coinQty || Number(pos.quantity), Number(pos.quantity));
+        const remainingQty = Number(pos.quantity) - sellQty;
+        const costBasis    = sellQty * Number(pos.avg_entry_price) / (1 - TAKER_FEE);
+        const proceeds     = sellQty * execPrice * (1 - TAKER_FEE);
+        const pnl          = proceeds - costBasis;
         await supabase.from('bot_trade_history').insert({
           user_session: 'default', symbol: activeCoin, side: 'SELL',
           price: execPrice, quantity: sellQty, pnl,
@@ -125,6 +139,14 @@ export default function OrderFormPanel({ activeCoin, prices, binanceConnected }:
         await supabase.from('bot_config').update({
           current_balance: balance + proceeds, updated_at: new Date().toISOString(),
         }).eq('user_session', 'default');
+        // Close or reduce position
+        if (remainingQty <= 0.000001) {
+          await supabase.from('paper_portfolio').delete().eq('user_session', 'default').eq('symbol', activeCoin);
+        } else {
+          await supabase.from('paper_portfolio').update({
+            quantity: remainingQty, updated_at: new Date().toISOString(),
+          }).eq('user_session', 'default').eq('symbol', activeCoin);
+        }
         toast.success(`Sold ${sellQty.toFixed(6)} ${ticker}`, {
           description: `PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)}`,
         });

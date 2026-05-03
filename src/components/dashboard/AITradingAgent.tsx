@@ -691,16 +691,27 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       const fee = alloc * TAKER_FEE;
       const qty = (alloc - fee) / wsPrice;
       const newBal = bal - alloc;
+      // Read existing position to accumulate (weighted avg entry)
+      const { data: existingPos } = await supabase.from('paper_portfolio')
+        .select('quantity,avg_entry_price').eq('user_session', SESSION).eq('symbol', sym).maybeSingle();
+      const portWrite = existingPos && Number(existingPos.quantity) > 0
+        ? supabase.from('paper_portfolio').update({
+            quantity: Number(existingPos.quantity) + qty,
+            avg_entry_price: (Number(existingPos.quantity) * Number(existingPos.avg_entry_price) + qty * wsPrice)
+              / (Number(existingPos.quantity) + qty),
+            updated_at: new Date().toISOString(),
+          }).eq('user_session', SESSION).eq('symbol', sym)
+        : supabase.from('paper_portfolio').upsert({
+            user_session: SESSION, symbol: sym, quantity: qty, avg_entry_price: wsPrice,
+            updated_at: new Date().toISOString(),
+          }, { onConflict: 'user_session,symbol' });
       await Promise.all([
         supabase.from('bot_trade_history').insert({
           user_session: SESSION, symbol: sym, side: 'BUY',
           price: wsPrice, quantity: qty, pnl: null,
           reason: `[Force BUY] manual test · ${alloc.toFixed(2)} USDT @ ${wsPrice.toFixed(4)} USDT`,
         }),
-        supabase.from('paper_portfolio').upsert({
-          user_session: SESSION, symbol: sym, quantity: qty, avg_entry_price: wsPrice,
-          updated_at: new Date().toISOString(),
-        }, { onConflict: 'user_session,symbol' }),
+        portWrite,
         supabase.from('bot_config').update({ current_balance: newBal }).eq('user_session', SESSION),
       ]);
       addLog(`FORCE BUY ${sym} @ ${wsPrice.toFixed(4)} USDT · ${alloc.toFixed(2)} USDT`);
