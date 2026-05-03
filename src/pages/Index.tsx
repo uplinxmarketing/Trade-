@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import TopBar from '@/components/dashboard/TopBar';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import AITradingAgent from '@/components/dashboard/AITradingAgent';
+import CoinSelector from '@/components/dashboard/CoinSelector';
 import BinanceConnect from '@/components/dashboard/BinanceConnect';
 import NotificationCenter from '@/components/dashboard/NotificationCenter';
 import CoinSelectorPanel from '@/components/dashboard/CoinSelectorPanel';
@@ -136,6 +137,12 @@ const Index = () => {
               }}
               onCoinsChange={setSelectedCoins}
             />
+
+            {/* Bot Watch List */}
+            <div className="trading-card p-3">
+              <div className="text-xs font-medium text-muted-foreground mb-2">Bot Watch List</div>
+              <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} />
+            </div>
 
             {/* Reports */}
             <ReportDashboard />
