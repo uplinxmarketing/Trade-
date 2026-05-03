@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Play, Square, Brain, TrendingUp, TrendingDown, Zap,
   RotateCcw, ChevronDown, ChevronUp, FlaskConical,
-  Pencil, Check, X, BookOpen, Activity,
+  Pencil, Check, X, BookOpen, Activity, Eye, EyeOff,
   ShoppingCart, Banknote, RefreshCw,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -209,6 +209,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   );
   const [showRailwayInput, setShowRailwayInput] = useState(false);
   const [railwayDraft, setRailwayDraft] = useState('');
+  const [liveApiKey, setLiveApiKey]         = useState('');
+  const [liveApiSecret, setLiveApiSecret]   = useState('');
+  const [showLiveSecret, setShowLiveSecret] = useState(false);
+  const [liveSetupLoading, setLiveSetupLoading] = useState(false);
 
   // Always server mode — the Python bot is always running on the same Railway instance.
   const isServerMode    = true;
@@ -534,11 +538,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (isRunning) return;
     if (isServerMode) {
       if (newMode === 'live') {
-        toast.info(
-          'To enable Live trading on Railway, add MODE=live and BINANCE_API_KEY / BINANCE_API_SECRET to your Railway service environment variables, then redeploy.',
-          { duration: 8000 }
-        );
-        setMode('live');
+        setMode('live'); // reveals the API key form below — no toast
       } else {
         try {
           const res = await fetch(`${railwayUrl}/api/mode`, {
@@ -555,6 +555,50 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       setMode(newMode);
     }
   }, [isRunning, isServerMode, railwayUrl, binanceConnected, onConnectBinance]);
+
+  // ── Switch Railway bot to live mode with API keys ────────────────────────
+  const submitLiveMode = useCallback(async () => {
+    if (!liveApiKey.trim() || !liveApiSecret.trim()) return;
+    setLiveSetupLoading(true);
+    const toastId = toast.loading('Switching Railway bot to Live mode…');
+    try {
+      const res = await fetch(`${railwayUrl}/api/mode`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'live', api_key: liveApiKey.trim(), api_secret: liveApiSecret.trim() }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error ?? 'Mode switch failed');
+
+      toast.loading('Railway restarting with Live mode…', { id: toastId });
+      addLog('=== Switching to LIVE mode — Railway restarting ===');
+
+      // Poll /api/ping until the server comes back after restart
+      let attempts = 0;
+      const poll = setInterval(async () => {
+        attempts++;
+        if (attempts > 60) {
+          clearInterval(poll);
+          toast.error('Restart timed out — check Railway logs', { id: toastId });
+          setLiveSetupLoading(false);
+          return;
+        }
+        try {
+          const ping = await fetch(`${railwayUrl}/api/ping`, { cache: 'no-store' });
+          if (ping.ok) {
+            clearInterval(poll);
+            toast.success('Live mode active — bot restarted!', { id: toastId });
+            setLiveApiKey(''); setLiveApiSecret('');
+            addLog('=== Railway bot is now in LIVE mode ===');
+            await pollRailway();
+            setLiveSetupLoading(false);
+          }
+        } catch { /* still restarting */ }
+      }, 1000);
+    } catch (e: any) {
+      toast.error(`Live mode failed: ${e.message}`, { id: toastId });
+      setLiveSetupLoading(false);
+    }
+  }, [liveApiKey, liveApiSecret, railwayUrl, addLog, pollRailway]);
 
   // ── Start / Stop ─────────────────────────────────────────────────────────
   const toggleBot = async () => {
@@ -810,13 +854,61 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         ))}
       </div>
 
-      {mode === 'live' && (
-        <div className={`rounded-md px-3 py-2 text-xs ${isServerMode ? 'bg-warn/10 border border-warn/30 text-warn' : binanceConnected ? 'bg-loss/10 border border-loss/30 text-loss' : 'bg-warn/10 border border-warn/30 text-warn'}`}>
-          {isServerMode
-            ? 'Live mode: set MODE=live + BINANCE_API_KEY + BINANCE_API_SECRET in Railway env vars, then redeploy.'
-            : binanceConnected
-              ? '⚠️ LIVE MODE — real USDT will be used.'
-              : <span>Binance API not connected. <button onClick={onConnectBinance} className="underline font-semibold">Connect now →</button></span>}
+      {mode === 'live' && isServerMode && (
+        <div className="bg-loss/5 border border-loss/25 rounded-md px-3 py-3 space-y-2.5">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-loss flex items-center gap-1.5">
+              <Zap className="w-3.5 h-3.5" />Live Trading — Real Money
+            </span>
+            <button onClick={() => handleModeChange('test')} className="text-[10px] text-muted-foreground hover:text-foreground">
+              ← Back to Paper
+            </button>
+          </div>
+          <p className="text-[10px] text-muted-foreground leading-relaxed">
+            Enter your Binance API credentials. They are sent to the Railway bot and stored in its environment — the bot will restart and connect to your real account.
+          </p>
+          <div className="space-y-1.5">
+            <input
+              type="text"
+              value={liveApiKey}
+              onChange={e => setLiveApiKey(e.target.value)}
+              placeholder="Binance API Key"
+              disabled={liveSetupLoading}
+              className="w-full bg-muted/40 border border-border rounded px-2 py-1.5 text-xs font-mono focus:outline-none focus:border-loss/60 disabled:opacity-50"
+            />
+            <div className="relative">
+              <input
+                type={showLiveSecret ? 'text' : 'password'}
+                value={liveApiSecret}
+                onChange={e => setLiveApiSecret(e.target.value)}
+                placeholder="Binance API Secret"
+                disabled={liveSetupLoading}
+                className="w-full bg-muted/40 border border-border rounded px-2 py-1.5 pr-8 text-xs font-mono focus:outline-none focus:border-loss/60 disabled:opacity-50"
+              />
+              <button onClick={() => setShowLiveSecret(p => !p)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                {showLiveSecret ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+              </button>
+            </div>
+          </div>
+          <Button
+            onClick={submitLiveMode}
+            disabled={!liveApiKey.trim() || !liveApiSecret.trim() || liveSetupLoading}
+            className="w-full bg-loss/80 hover:bg-loss text-white text-xs py-2 h-auto"
+          >
+            {liveSetupLoading
+              ? <><span className="animate-spin mr-1.5">⟳</span>Restarting Railway in Live mode…</>
+              : '⚡ Enable Live Trading on Railway'}
+          </Button>
+          <p className="text-[9px] text-muted-foreground">Bot will be offline ~30s during restart. Make sure your API key has Spot Trading enabled.</p>
+        </div>
+      )}
+
+      {mode === 'live' && !isServerMode && (
+        <div className={`rounded-md px-3 py-2 text-xs ${binanceConnected ? 'bg-loss/10 border border-loss/30 text-loss' : 'bg-warn/10 border border-warn/30 text-warn'}`}>
+          {binanceConnected
+            ? '⚠️ LIVE MODE — real USDT will be used.'
+            : <span>Binance API not connected. <button onClick={onConnectBinance} className="underline font-semibold">Connect now →</button></span>}
         </div>
       )}
 

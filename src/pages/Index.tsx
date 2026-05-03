@@ -15,7 +15,11 @@ import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
 
-const DEFAULT_COINS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT'];
+const DEFAULT_COINS = [
+  'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT',
+  'XRPUSDT', 'ADAUSDT', 'AVAXUSDT', 'LINKUSDT', 'MATICUSDT',
+  'ARBUSDT',  'OPUSDT',  'INJUSDT', 'NEARUSDT', 'FETUSDT',
+];
 
 const Index = () => {
   const [selectedCoins, setSelectedCoins] = useState<string[]>(DEFAULT_COINS);
