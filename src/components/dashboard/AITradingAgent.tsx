@@ -529,6 +529,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     setAgentStatus(`Railway · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${new Date().toLocaleTimeString()}`);
     if (s.data_persistent !== undefined) setDataPersistent(Boolean(s.data_persistent));
 
+    // Restore coin selection from Railway's watchlist (survives page refresh)
+    if (Array.isArray(s.watched_coins) && s.watched_coins.length > 0) {
+      onCoinsChange?.(s.watched_coins as string[]);
+    }
+
     const mapped: OpenPosition[] = (data.positions ?? []).map((pos: any) => ({
       symbol:          pos.symbol,
       quantity:        Number(pos.quantity),
@@ -556,8 +561,25 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         });
       }
     }
-    const sorted = railwayTrades.sort((a, b) =>
+    let sorted = railwayTrades.sort((a, b) =>
       new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+    // Railway SQLite was wiped on redeploy (empty trades) — fall back to Supabase.
+    // The Python bot writes trades with user_session='railway_bot' so they survive deploys.
+    if (sorted.length === 0) {
+      try {
+        const { data: sbTrades } = await supabase
+          .from('bot_trade_history')
+          .select('*')
+          .eq('user_session', 'railway_bot')
+          .order('created_at', { ascending: false })
+          .limit(100);
+        if (sbTrades && sbTrades.length > 0) {
+          sorted = sbTrades as TradeRow[];
+        }
+      } catch { /* Supabase fallback failed — show empty list */ }
+    }
+
     if (sorted.length > 0) setTrades(sorted);
     const tradePayload = sorted.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
 
