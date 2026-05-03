@@ -1,8 +1,19 @@
 # ── Stage 1: Build React frontend ─────────────────────────────────────────────
 FROM node:20-slim AS frontend
 WORKDIR /app
+
+# Cache npm dependencies separately (only busts when package.json changes)
 COPY package*.json ./
 RUN npm ci
+
+# Railway auto-injects RAILWAY_GIT_COMMIT_SHA as a build arg on every push.
+# Declaring it HERE (after npm ci, before the build) means:
+#   - npm ci stays cached (fast rebuilds when only code changes)
+#   - npm run build always re-runs when the SHA changes (every commit)
+# Without this, Docker can reuse a stale build that has old version.json timestamps.
+ARG RAILWAY_GIT_COMMIT_SHA=local
+ENV RAILWAY_GIT_COMMIT_SHA=$RAILWAY_GIT_COMMIT_SHA
+
 COPY . .
 RUN npm run build
 

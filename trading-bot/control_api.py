@@ -877,6 +877,30 @@ def api_version():
     return {"version": "unknown"}
 
 
+@app.get("/version.json")
+def serve_version_json(response: Response):
+    """
+    Dynamic version endpoint — always returns fresh data so the update checker
+    can detect new Railway deploys even when Docker layer cache is involved.
+    Uses RAILWAY_GIT_COMMIT_SHA (unique per commit) as the commit identifier;
+    falls back to reading dist/version.json if the env var isn't set.
+    """
+    import pathlib, json as _json
+    response.headers["Cache-Control"] = "no-store"
+    sha_full = os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
+    sha = sha_full[:8] if sha_full else ""
+    vf = pathlib.Path(__file__).parent / "dist" / "version.json"
+    try:
+        data = _json.loads(vf.read_text())
+    except Exception:
+        data = {"version": "3.8.0", "buildTime": "unknown", "commit": "unknown"}
+    if sha:
+        data["commit"] = sha
+        # Keep buildTime from the static file so the bundle fingerprint matches
+        # (bundle uses buildTime from its own build, server echoes the same file)
+    return data
+
+
 @app.post("/api/update")
 def api_update():
     """Railway deployments are handled automatically — the client just needs to reload."""

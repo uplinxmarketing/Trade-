@@ -6,16 +6,20 @@ import { execSync } from "child_process";
 
 const versionJson = JSON.parse(fs.readFileSync("./public/version.json", "utf-8"));
 
-// Generate a unique fingerprint for each build.
-// buildTime is set FIRST so it's always the real "now" — even inside Docker
-// where git is not installed and execSync would throw.
-let buildCommit = versionJson.commit;
-let buildTime   = new Date().toISOString(); // always unique per build run
+// Prefer RAILWAY_GIT_COMMIT_SHA (injected by Railway Dockerfile ARG) so the
+// fingerprint is based on the git commit rather than wall-clock time.
+// Falls back to git CLI, then to the last committed value.
+// buildTime is always a fresh timestamp for the "Updated to vX.Y.Z" toast.
+const railwayShort = (process.env.RAILWAY_GIT_COMMIT_SHA || '').slice(0, 8);
+let buildCommit = railwayShort || versionJson.commit;
+let buildTime   = new Date().toISOString();
 
-try {
-  buildCommit = execSync("git rev-parse --short HEAD", { stdio: ["pipe","pipe","ignore"] }).toString().trim();
-} catch {
-  // git unavailable in Docker — buildTime still advances, fingerprint is still unique
+if (!railwayShort) {
+  try {
+    buildCommit = execSync("git rev-parse --short HEAD", { stdio: ["pipe","pipe","ignore"] }).toString().trim();
+  } catch {
+    // git unavailable — buildCommit keeps last committed value
+  }
 }
 
 // Always write version.json so dist/ matches the baked bundle constants
