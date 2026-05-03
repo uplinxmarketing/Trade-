@@ -18,9 +18,11 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
     try {
       const found = await checkForUpdates();
       if (found) {
-        toast.success('Update available!', { id: toastId, description: 'Click the banner to reload' });
+        // Update found — apply it immediately instead of waiting for a second click
+        toast.success('Update found — reloading…', { id: toastId });
+        await applyUpdate();
       } else {
-        toast.success('You\'re up to date', { id: toastId, description: `Version ${APP_VERSION}` });
+        toast.success('You\'re up to date', { id: toastId, description: `v${APP_VERSION} is the latest` });
       }
     } catch {
       toast.error('Update check failed', { id: toastId, description: 'Check your connection and try again' });

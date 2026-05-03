@@ -9,30 +9,33 @@ const SEEN_KEY          = 'tradebot_seen_version';
 
 interface VersionInfo { version: string; buildTime: string; commit: string; }
 
+// Hard cache-busting redirect — forces browser to re-download index.html and
+// all assets, bypassing bfcache and HTTP cache for the entry point.
+function hardReload() {
+  window.location.href = `${window.location.pathname}?_cb=${Date.now()}`;
+}
+
 export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [checking, setChecking]               = useState(false);
   const [updating, setUpdating]               = useState(false);
 
-  // On first load: if the version baked into this bundle is newer than what the
-  // browser last saw, show a "just updated" toast so the user knows new code arrived.
+  // On first load: if the version baked into this bundle differs from the last
+  // seen version stored in localStorage, a new deployment just happened.
+  // Show a toast so the user knows new code is active.
   useEffect(() => {
     const lastSeen = localStorage.getItem(SEEN_KEY) ?? '';
     if (lastSeen !== LOCAL_FINGERPRINT) {
       localStorage.setItem(SEEN_KEY, LOCAL_FINGERPRINT);
       if (lastSeen) {
-        // Not the very first load — a real version change happened
         toast.success(`Updated to v${LOCAL_VERSION}`, {
-          description: 'New fixes are now active.',
-          duration: 6000,
+          description: 'New fixes and features are now active.',
+          duration: 7000,
         });
       }
     }
   }, []);
 
-  // Check whether the server is now serving a NEWER bundle than what this
-  // browser session has loaded.  After a Railway redeploy the server's
-  // /version.json changes; users who haven't refreshed yet will see the banner.
   const checkForUpdates = useCallback(async (): Promise<boolean> => {
     setChecking(true);
     try {
@@ -44,6 +47,7 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
         setUpdateAvailable(true);
         return true;
       }
+      setUpdateAvailable(false);
       return false;
     } catch {
       throw new Error('Could not reach server to check for updates');
@@ -52,42 +56,25 @@ export function useUpdateChecker(pollIntervalMs = 5 * 60 * 1000) {
     }
   }, []);
 
-  // Background polling every 5 min — catches a live Railway redeploy
-  // while the user has the app open without refreshing.
+  // Check once on mount (after a short delay so the app fully renders first)
+  // and then every 5 minutes in the background.
   useEffect(() => {
-    const id = setInterval(() => { checkForUpdates().catch(() => {}); }, pollIntervalMs);
-    return () => clearInterval(id);
+    const initial = setTimeout(() => { checkForUpdates().catch(() => {}); }, 3000);
+    const interval = setInterval(() => { checkForUpdates().catch(() => {}); }, pollIntervalMs);
+    return () => { clearTimeout(initial); clearInterval(interval); };
   }, [checkForUpdates, pollIntervalMs]);
 
   const applyUpdate = useCallback(async () => {
     setUpdating(true);
     const toastId = toast.loading('Applying update…');
     try {
-      const resp = await fetch(`${API_BASE}/api/update`, { method: 'POST' });
-      const data = await resp.json();
-      if (!data.success) {
-        toast.loading('Reloading with latest version…', { id: toastId });
-        setTimeout(() => window.location.reload(), 800);
-        return;
-      }
-      // Server restarting — poll /api/ping then reload.
-      toast.loading('Restarting with new code…', { id: toastId });
-      let attempts = 0;
-      const poll = setInterval(async () => {
-        attempts++;
-        if (attempts > 30) { clearInterval(poll); window.location.reload(); return; }
-        try {
-          const ping = await fetch(`${API_BASE}/api/ping`, { cache: 'no-store' });
-          if (ping.ok) {
-            clearInterval(poll);
-            toast.success('Updated! Reloading…', { id: toastId });
-            setTimeout(() => window.location.reload(), 300);
-          }
-        } catch { /* server still restarting */ }
-      }, 1000);
-    } catch {
-      toast.loading('Reloading with latest version…', { id: toastId });
-      setTimeout(() => window.location.reload(), 800);
+      // Try the server-side update endpoint first; it returns {success: false}
+      // on Railway (auto-deploy handles rebuilds), which triggers a hard reload.
+      await fetch(`${API_BASE}/api/update`, { method: 'POST' }).catch(() => {});
+    } finally {
+      toast.loading('Reloading with fresh build…', { id: toastId });
+      // Small delay so the toast is visible, then hard-reload to bypass cache.
+      setTimeout(hardReload, 600);
     }
   }, []);
 
