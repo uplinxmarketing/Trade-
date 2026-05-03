@@ -1,5 +1,5 @@
 {
-  "version": "3.6.4",
-  "buildTime": "2026-05-03T16:00:00Z",
-  "commit": "fix-update-checker-use-local-version-json"
+  "version": "3.6.5",
+  "buildTime": "2026-05-03T17:00:00Z",
+  "commit": "fix-update-checker-show-toast-on-new-version"
 }
