@@ -600,6 +600,7 @@ async def signal_scanner(prices: dict):
     Async coroutine — runs every SCAN_INTERVAL_SEC (60 s).
     Only refreshes the signal cache from REST / DB.
     Actual buy execution happens in realtime_monitor via _check_buys_from_cache.
+    Runs immediately on startup (no initial sleep) so buys can fire within seconds.
     """
     while True:
         try:
@@ -608,6 +609,7 @@ async def signal_scanner(prices: dict):
             print(f"[SignalScanner] Unexpected error: {e}")
 
         await asyncio.sleep(config.SCAN_INTERVAL_SEC)
+
 
 
 _KLINE_BASES = [

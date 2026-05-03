@@ -47,10 +47,10 @@ async def lifespan(app: FastAPI):
     # 3. Restore open positions
     trade_engine.load_positions_from_db()
 
-    # 4. History download runs in a thread so it doesn't block the event loop
-    #    (makes ~30 synchronous HTTP requests with time.sleep between them)
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, data_collector.download_history)
+    # 4. History download runs in a background daemon thread — NOT awaited.
+    #    Awaiting it blocks the lifespan yield for ~2 min (55 coins × REST calls),
+    #    which causes Railway health-checks to time out and restart the deploy.
+    threading.Thread(target=data_collector.download_history, daemon=True).start()
 
     # 5. Register callbacks
     data_collector.register_price_callback(trade_engine.realtime_monitor)

@@ -75,12 +75,14 @@ export default function OrderFormPanel({ activeCoin, prices, binanceConnected }:
   // Reset form on coin change
   useEffect(() => { setAmount(''); setLimitPrice(''); setStopPrice(''); setTpPrice(''); }, [activeCoin]);
 
-  const execPrice = orderType === 'market' ? mktPrice : (parseFloat(limitPrice) || mktPrice);
-  const usdt      = amtMode === 'usdt' ? parseFloat(amount) || 0 : (parseFloat(amount) || 0) * execPrice;
-  const coinQty   = usdt > 0 && execPrice > 0 ? (usdt / execPrice) * (1 - TAKER_FEE) : 0;
-  const fee       = usdt * (orderType === 'market' || orderType === 'stop-market' ? TAKER_FEE : MAKER_FEE);
-  const breakEven = execPrice * BREAK_EVEN_MULT;
-  const total     = amtMode === 'usdt' ? usdt : coinQty * execPrice;
+  const execPrice    = orderType === 'market' ? mktPrice : (parseFloat(limitPrice) || mktPrice);
+  const usdt         = amtMode === 'usdt' ? parseFloat(amount) || 0 : (parseFloat(amount) || 0) * execPrice;
+  const effectiveLev = tradingMode === 'futures' ? leverage : 1;
+  const notional     = usdt * effectiveLev;
+  const coinQty      = notional > 0 && execPrice > 0 ? (notional / execPrice) * (1 - TAKER_FEE) : 0;
+  const fee          = notional * (orderType === 'market' || orderType === 'stop-market' ? TAKER_FEE : MAKER_FEE);
+  const breakEven    = execPrice * BREAK_EVEN_MULT;
+  const total        = amtMode === 'usdt' ? usdt : coinQty * execPrice;
 
   const applyPct = useCallback((pct: number) => {
     if (pct === 0) { setAmount(''); return; }
