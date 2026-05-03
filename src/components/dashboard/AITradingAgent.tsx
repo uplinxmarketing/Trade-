@@ -199,11 +199,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [instrDraft, setInstrDraft]       = useState('');
   const [actLog, setActLog]       = useState<string[]>([]);
   const [showLog, setShowLog]     = useState(false);
-  // Priority: localStorage override → VITE_RAILWAY_URL env var (baked in at Vercel build time)
+  // Priority: localStorage override → VITE_RAILWAY_URL env var → hardcoded default
   const [railwayUrl, setRailwayUrl] = useState(() =>
     localStorage.getItem(RAILWAY_URL_KEY) ??
     (import.meta.env.VITE_RAILWAY_URL as string | undefined) ??
-    ''
+    'https://trade-production-a519.up.railway.app'
   );
   const [showRailwayInput, setShowRailwayInput] = useState(false);
   const [railwayDraft, setRailwayDraft] = useState('');
