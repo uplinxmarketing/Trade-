@@ -6,21 +6,23 @@ import { execSync } from "child_process";
 
 const versionJson = JSON.parse(fs.readFileSync("./public/version.json", "utf-8"));
 
-// Generate a unique fingerprint for each build using the real git commit and
-// current timestamp. Write it back to version.json so the served static file
-// always matches the bundle baked into this deploy.
+// Generate a unique fingerprint for each build.
+// buildTime is set FIRST so it's always the real "now" — even inside Docker
+// where git is not installed and execSync would throw.
 let buildCommit = versionJson.commit;
-let buildTime   = versionJson.buildTime;
+let buildTime   = new Date().toISOString(); // always unique per build run
+
 try {
   buildCommit = execSync("git rev-parse --short HEAD", { stdio: ["pipe","pipe","ignore"] }).toString().trim();
-  buildTime   = new Date().toISOString();
-  fs.writeFileSync("./public/version.json", JSON.stringify(
-    { version: versionJson.version, buildTime, commit: buildCommit },
-    null, 2
-  ) + "\n");
 } catch {
-  // git unavailable (rare) — fall back to static values already in version.json
+  // git unavailable in Docker — buildTime still advances, fingerprint is still unique
 }
+
+// Always write version.json so dist/ matches the baked bundle constants
+fs.writeFileSync("./public/version.json", JSON.stringify(
+  { version: versionJson.version, buildTime, commit: buildCommit },
+  null, 2
+) + "\n");
 
 export default defineConfig({
   plugins: [react()],
