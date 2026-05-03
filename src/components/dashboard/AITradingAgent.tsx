@@ -596,10 +596,28 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
     const entries: string[] = (data.activity ?? []).map((e: any) => {
       const ts = new Date(e.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      const icon = e.level === 'warn' ? '⚠ ' : e.level === 'error' ? '✕ ' : '';
+      const icon = e.level === 'warn' ? '⚠ ' : e.level === 'error' ? '✕ ERROR: ' : e.level === 'info' && e.message?.includes('STARTUP ERROR') ? '✕ ' : '';
       return `[${ts}] ${icon}${e.message}`;
     });
-    setActLog(entries.length > 0 ? entries : ['[Bot] Waiting for first activity...']);
+    if (entries.length > 0) {
+      setActLog(entries);
+    } else {
+      // No activity yet — fetch debug info to show startup status
+      try {
+        const dbg = await fetch(`${railwayUrl}/api/debug`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null);
+        if (dbg) {
+          const lines = [
+            `[Bot] Deploy ${dbg.deploy_id?.slice(0,8) ?? '?'} · ${dbg.trading_active ? '✓ trading' : '✗ stopped'}`,
+            `[Bot] ${dbg.approved_coins} coins watched · ${dbg.open_positions} open positions`,
+            `[Bot] WebSocket: ${dbg.websocket_alive ? `alive (${dbg.ws_prices_count} prices)` : 'connecting…'}`,
+            ...(dbg.recent_errors ?? []).map((e: any) => `[ERROR] ${e.message}`),
+          ];
+          setActLog(lines);
+        } else {
+          setActLog(['[Bot] Waiting for first activity…']);
+        }
+      } catch { setActLog(['[Bot] Waiting for first activity…']); }
+    }
   }, [railwayUrl, addLog]);
 
   // Start/stop the polling interval whenever server mode changes.
@@ -1312,13 +1330,23 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         <button onClick={() => setShowLog(p=>!p)} className="flex items-center gap-1.5 text-[10px] text-muted-foreground hover:text-foreground w-full">
           <Activity className="w-3 h-3"/>
           Activity Log ({actLog.length})
+          {actLog.some(l => l.includes('ERROR') || l.includes('STARTUP ERROR')) && (
+            <span className="ml-1 text-[9px] px-1 py-0.5 rounded bg-destructive/20 text-destructive font-bold">ERROR</span>
+          )}
           {showLog?<ChevronUp className="w-3 h-3 ml-auto"/>:<ChevronDown className="w-3 h-3 ml-auto"/>}
         </button>
         {showLog && (
-          <div className="mt-1.5 bg-secondary/30 rounded-lg p-2 max-h-40 overflow-y-auto scrollbar-thin space-y-0.5">
+          <div className="mt-1.5 bg-secondary/30 rounded-lg p-2 max-h-56 overflow-y-auto scrollbar-thin space-y-0.5">
             {actLog.length===0 && <div className="text-[10px] text-muted-foreground text-center py-2">No activity yet</div>}
             {actLog.map((line,i) => (
-              <div key={i} className={`text-[10px] font-mono ${line.includes('BUY')?'text-gain':line.includes('SELL')?'text-loss':line.includes('ERROR')?'text-destructive':'text-muted-foreground'}`}>
+              <div key={i} className={`text-[10px] font-mono break-all ${
+                line.includes('STARTUP ERROR') || line.includes('ERROR') ? 'text-destructive font-bold' :
+                line.includes('Bot ready') || line.includes('STARTED') ? 'text-gain' :
+                line.includes('BUY') ? 'text-gain' :
+                line.includes('SELL') || line.includes('SOLD') ? 'text-accent' :
+                line.includes('warn') || line.includes('⚠') ? 'text-warn' :
+                'text-muted-foreground'
+              }`}>
                 {line}
               </div>
             ))}

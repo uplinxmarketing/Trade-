@@ -218,8 +218,12 @@ def run_strategy_once():
         return strategy
 
     except Exception as e:
-        print(f"[StrategyEngine] Claude error: {e} — writing default fallback")
-        return write_default_strategy()
+        print(f"[StrategyEngine] Claude error: {e} — keeping existing strategy")
+        # Preserve user coins/settings; only ensure trading stays active
+        existing = write_default_strategy()
+        if existing.get("trading_active") is False:
+            existing["trading_active"] = True
+        return existing
 
 
 async def strategy_loop():

@@ -44,35 +44,59 @@ async def lifespan(app: FastAPI):
     import trade_engine
     import strategy_engine
 
-    # 1. DB (already done in main.py before uvicorn starts, but idempotent)
-    database.init_db()
-    print(f"[ControlAPI] DATA DIRECTORY : {database._DATA_DIR}")
-    print(f"[ControlAPI] DATABASE FILE  : {database.DB_PATH}")
-    database.log_activity(f"Bot started — DB: {database.DB_PATH}", "info")
+    steps: list[str] = []
+    try:
+        # 1. DB (already done in main.py before uvicorn starts, but idempotent)
+        database.init_db()
+        steps.append("init_db OK")
+        print(f"[ControlAPI] DATA DIRECTORY : {database._DATA_DIR}")
+        print(f"[ControlAPI] DATABASE FILE  : {database.DB_PATH}")
+        database.log_activity(f"Deploy started — DB: {database.DB_PATH}", "info")
 
-    # 2. Regenerate strategy.json
-    strategy_engine.write_default_strategy()
+        # 2. Ensure strategy.json exists (preserve user settings if file already present)
+        strategy_engine.write_default_strategy()
+        steps.append("strategy OK")
 
-    # 3. Restore open positions
-    trade_engine.load_positions_from_db()
+        # 3. Restore open positions + coins + balance from SQLite / Supabase
+        trade_engine.load_positions_from_db()
+        steps.append("positions OK")
 
-    # 4. History download runs in a background daemon thread — NOT awaited.
-    #    Awaiting it blocks the lifespan yield for ~2 min (55 coins × REST calls),
-    #    which causes Railway health-checks to time out and restart the deploy.
-    threading.Thread(target=data_collector.download_history, daemon=True).start()
+        # 4. Auto-resume trading — always start trading on deploy so no manual
+        #    Start button press is required after a Railway update.
+        _write_strategy_patch({"trading_active": True, "pause_reason": None})
+        steps.append("trading_active=True")
 
-    # 5. Register callbacks
-    data_collector.register_price_callback(trade_engine.realtime_monitor)
-    data_collector.register_kline_callback(trade_engine.update_coin_signals)
+        # 5. History download — daemon thread, never blocks health-check
+        threading.Thread(target=data_collector.download_history, daemon=True).start()
+        steps.append("history_dl started")
 
-    # 6. Launch WebSocket feed + strategy loop + signal scanner + guardian as async tasks
-    asyncio.create_task(data_collector.start_websocket())
-    asyncio.create_task(strategy_engine.strategy_loop())
-    asyncio.create_task(trade_engine.signal_scanner(data_collector.prices))
-    asyncio.create_task(trade_engine.position_guardian())  # REST backstop for sells
-    asyncio.create_task(_supabase_periodic_sync())         # persist balance every 5 min
+        # 6. Register price/kline callbacks
+        data_collector.register_price_callback(trade_engine.realtime_monitor)
+        data_collector.register_kline_callback(trade_engine.update_coin_signals)
+        steps.append("callbacks OK")
 
-    print("[ControlAPI] All trading tasks started.")
+        # 7. Launch async tasks
+        asyncio.create_task(data_collector.start_websocket())
+        asyncio.create_task(strategy_engine.strategy_loop())
+        asyncio.create_task(trade_engine.signal_scanner(data_collector.prices))
+        asyncio.create_task(trade_engine.position_guardian())
+        asyncio.create_task(_supabase_periodic_sync())
+        steps.append("async tasks launched")
+
+        msg = "Bot ready — " + " | ".join(steps)
+        print(f"[ControlAPI] {msg}")
+        database.log_activity(msg, "info")
+
+    except Exception as exc:
+        err = f"STARTUP ERROR at step {steps[-1] if steps else '?'}: {exc}"
+        print(f"[ControlAPI] {err}")
+        try:
+            database.log_activity(err, "error")
+        except Exception:
+            pass
+        # Do NOT re-raise — let uvicorn keep running so health-check passes
+        # and the /api/activity endpoint can show the error.
+
     yield
     # Shutdown — daemon threads and tasks stop with the process
 
@@ -662,15 +686,12 @@ def api_reset():
 
 @app.post("/api/agent/start")
 def api_agent_start():
-    import strategy_engine
-    # Refresh approved coins from config before starting so stale strategy.json
-    # never limits which coins are scanned.
-    strategy_engine.write_default_strategy()
     s = _load_strategy()
     if not s.get("initial_balance_usdt"):
         bal = _get_usdt_balance()
         _write_strategy_patch({"initial_balance_usdt": bal or float(os.getenv("STARTING_PAPER_USDT", "10000.0"))})
     _write_strategy_patch({"trading_active": True, "pause_reason": None})
+    database.log_activity("Bot started via API", "info")
     return {"ok": True, "running": True}
 
 
@@ -903,6 +924,47 @@ def api_all():
         "positions": _get_positions(),
         "trades":    database.get_recent_trades(limit=200),
         "activity":  database.get_activity_log(limit=100),
+    }
+
+
+@app.get("/api/debug")
+def api_debug():
+    """Diagnostic endpoint — returns full bot health including startup status."""
+    import sys
+    strategy = _load_strategy()
+    approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
+    try:
+        from trade_engine import get_open_positions, _sell_monitor_heartbeat, _breakeven_mult
+        pos_count = len(get_open_positions())
+        sm_alive  = (time.time() - _sell_monitor_heartbeat) < 10 if _sell_monitor_heartbeat else False
+        bep_mult  = _breakeven_mult
+    except Exception as e:
+        pos_count = -1; sm_alive = False; bep_mult = 0
+        database.log_activity(f"debug endpoint trade_engine error: {e}", "warn")
+    try:
+        from data_collector import prices as ws_prices
+        ws_alive = len(ws_prices) > 0
+        ws_count = len(ws_prices)
+    except Exception:
+        ws_alive = False; ws_count = 0
+    last_logs = database.get_activity_log(limit=20)
+    errors    = [e for e in last_logs if e.get("level") == "error"]
+    return {
+        "deploy_id":       _DEPLOY_ID,
+        "python_version":  sys.version,
+        "data_dir":        database._DATA_DIR,
+        "db_path":         database.DB_PATH,
+        "strategy_file":   config.STRATEGY_FILE,
+        "trading_active":  strategy.get("trading_active", False),
+        "approved_coins":  len(approved),
+        "coin_list":       approved[:10],
+        "open_positions":  pos_count,
+        "sell_monitor_ok": sm_alive,
+        "websocket_alive": ws_alive,
+        "ws_prices_count": ws_count,
+        "breakeven_mult":  round(bep_mult, 6),
+        "recent_errors":   errors[:5],
+        "startup_log":     [e for e in last_logs if "Deploy started" in e.get("message","") or "Bot ready" in e.get("message","") or "STARTUP ERROR" in e.get("message","")],
     }
 
 
