@@ -578,7 +578,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     }
     // Immediate poll then every 30 s
     pollRailway();
-    serverPollRef.current = setInterval(pollRailway, 30_000);
+    serverPollRef.current = setInterval(pollRailway, 5_000);
     return () => { if (serverPollRef.current) { clearInterval(serverPollRef.current); serverPollRef.current = null; } };
   }, [isServerMode, pollRailway]);
 
