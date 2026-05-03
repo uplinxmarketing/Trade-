@@ -199,7 +199,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [instrDraft, setInstrDraft]       = useState('');
   const [actLog, setActLog]       = useState<string[]>([]);
   const [showLog, setShowLog]     = useState(false);
-  const [railwayUrl, setRailwayUrl] = useState(() => localStorage.getItem(RAILWAY_URL_KEY) ?? '');
+  // Priority: localStorage override → VITE_RAILWAY_URL env var (baked in at Vercel build time)
+  const [railwayUrl, setRailwayUrl] = useState(() =>
+    localStorage.getItem(RAILWAY_URL_KEY) ??
+    (import.meta.env.VITE_RAILWAY_URL as string | undefined) ??
+    ''
+  );
   const [showRailwayInput, setShowRailwayInput] = useState(false);
   const [railwayDraft, setRailwayDraft] = useState('');
 
@@ -765,8 +770,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             placeholder="https://your-bot.up.railway.app"
             className="w-full text-xs bg-background border border-border rounded px-2 py-1.5 font-mono outline-none focus:border-accent" />
         ) : (
-          <p className="text-[10px] text-muted-foreground">
-            {isServerMode ? railwayUrl : 'Not configured — force-sells run locally against Supabase paper wallet.'}
+          <p className="text-[10px] text-muted-foreground font-mono break-all">
+            {isServerMode
+              ? railwayUrl
+              : <span className="font-sans">Not configured — set <code className="bg-muted px-1 rounded">VITE_RAILWAY_URL</code> in Vercel env vars, or click Set URL.</span>}
           </p>
         )}
       </div>
