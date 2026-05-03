@@ -1087,13 +1087,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       {isRunning
         ? <p className="text-[10px] text-center text-muted-foreground -mt-2">
             {isServerMode
-              ? <>Railway bot running 24/7 · closes browser safe · polling every 30s{agentStatus && <> · <span className="text-gain font-mono">{agentStatus}</span></>}</>
-              : <>Every 30s: fetches live candles → checks EMA / RSI / MACD / Volume → buys or holds{agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}</>}
+              ? <>Railway bot running 24/7 · real-time prices · sells in &lt;1s · UI syncs every 5s{agentStatus && <> · <span className="text-gain font-mono">{agentStatus}</span></>}</>
+              : <>Every 10s: fetches live candles → checks EMA / RSI / MACD / Volume → buys or holds{agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}</>}
           </p>
         : <p className="text-[10px] text-center text-muted-foreground -mt-2">
             {isServerMode
               ? 'Railway bot handles all trading 24/7 — no browser required'
-              : 'Sells on every price tick · Buys checked every 30s · EMA+RSI+MACD+Volume signals · no API key needed'}
+              : 'Sells on every price tick · Buys checked every 10s · EMA+RSI+MACD+Volume signals · no API key needed'}
           </p>
       }
 

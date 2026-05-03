@@ -1,5 +1,5 @@
 {
-  "version": "4.0.0",
-  "buildTime": "2026-05-03T22:15:00.000Z",
-  "commit": "max-hold-exit-tight-sl"
+  "version": "4.0.1",
+  "buildTime": "2026-05-03T22:30:00.000Z",
+  "commit": "realtime-scan-10s"
 }
