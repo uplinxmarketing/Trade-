@@ -18,6 +18,14 @@ from connection import client
 # Shared live prices dict — imported by trade_engine and strategy_engine
 prices: Dict[str, float] = {}
 
+# In-memory rolling candle buffer — filled by WebSocket kline-close events.
+# Used as the primary data source for signal computation when Binance REST
+# is geo-blocked from Railway's servers.  Holds up to 60 closed 1m candles
+# per coin; once 16+ have accumulated, RSI signals fire and buys can happen.
+ws_candles: Dict[str, list] = {}
+_WS_CANDLE_MAX = 60   # candles to keep per coin
+_MIN_CANDLES   = 16   # minimum candles needed for at least RSI signal to work
+
 # Callbacks registered by main.py to avoid circular imports
 _price_callback: Optional[Callable[[Dict[str, float]], None]] = None
 _kline_callback: Optional[Callable[[str, list, list], None]]  = None
@@ -187,31 +195,32 @@ async def start_websocket():
                             k = data["k"]
                             if k.get("x"):   # candle closed
                                 sym = k["s"]
-                                new_row = {
-                                    "open_time": int(k["t"]),
-                                    "open":   float(k["o"]),
-                                    "high":   float(k["h"]),
-                                    "low":    float(k["l"]),
-                                    "close":  float(k["c"]),
-                                    "volume": float(k["v"]),
-                                }
-                                # Re-fetch last 50 candles and recalculate indicators
+                                closed = [
+                                    int(k["t"]),   float(k["o"]), float(k["h"]),
+                                    float(k["l"]), float(k["c"]), float(k["v"]),
+                                ]
+
+                                # ── Update in-memory candle buffer (primary signal source)
+                                buf = ws_candles.setdefault(sym, [])
+                                buf.append(closed)
+                                if len(buf) > _WS_CANDLE_MAX:
+                                    buf.pop(0)
+
+                                # ── Also persist to DB (best-effort, not required)
                                 existing = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=50)
-                                all_raw = [
+                                db_raw = [
                                     [row["open_time"], row["open"], row["high"],
                                      row["low"], row["close"], row["volume"]]
                                     for row in existing
-                                ] + [[
-                                    new_row["open_time"], new_row["open"], new_row["high"],
-                                    new_row["low"], new_row["close"], new_row["volume"]
-                                ]]
+                                ]
+                                all_raw = db_raw + [closed]
                                 _compute_and_save(sym, all_raw)
 
-                                # Notify trade_engine so signal cache is updated
-                                # immediately on kline close — enables real-time buys.
-                                if _kline_callback and len(all_raw) >= 27:
-                                    closes  = [float(r[4]) for r in all_raw]
-                                    volumes = [float(r[5]) for r in all_raw]
+                                # ── Signal update: prefer DB+new, fall back to WS buffer
+                                signal_src = all_raw if len(all_raw) >= _MIN_CANDLES else buf
+                                if _kline_callback and len(signal_src) >= _MIN_CANDLES:
+                                    closes  = [float(r[4]) for r in signal_src]
+                                    volumes = [float(r[5]) for r in signal_src]
                                     _kline_callback(sym, closes, volumes)
 
                     except Exception as e:

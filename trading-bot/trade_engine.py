@@ -255,7 +255,7 @@ def evaluate_signals(closes: list, volumes: list) -> dict:
 
 def update_coin_signals(symbol: str, closes: list, volumes: list):
     """Update the signal cache on every kline close (WebSocket-driven)."""
-    if len(closes) < 27:
+    if len(closes) < 16:  # 16 = minimum for RSI-14 to produce a valid value at [-2]
         return
     try:
         signals = evaluate_signals(closes, volumes)
@@ -659,18 +659,35 @@ async def _refresh_signal_cache():
         return
 
     async def _refresh_one(session, sym: str) -> bool:
+        import data_collector as _dc
+        MIN = 16          # matches _dc._MIN_CANDLES — enough for RSI to fire
         closes = volumes = None
+
+        # 1. Try Binance REST (fastest, most data)
         try:
             raw     = await _fetch_klines(session, sym)
             closes  = [float(k[4]) for k in raw]
             volumes = [float(k[5]) for k in raw]
         except Exception:
-            db_rows = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=50)
-            if len(db_rows) >= 27:
+            pass
+
+        # 2. Fall back to DB candles (populated by download_history / kline saves)
+        if not closes or len(closes) < MIN:
+            db_rows = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=60)
+            if len(db_rows) >= MIN:
                 closes  = [float(c["close"])  for c in db_rows]
                 volumes = [float(c["volume"]) for c in db_rows]
 
-        if closes and len(closes) >= 27:
+        # 3. Fall back to in-memory WebSocket candle buffer (no REST needed)
+        #    This kicks in when Binance REST is geo-blocked from Railway's servers.
+        #    Fills up at 1 candle/minute; RSI fires after 16 minutes.
+        if not closes or len(closes) < MIN:
+            buf = _dc.ws_candles.get(sym, [])
+            if len(buf) >= MIN:
+                closes  = [float(r[4]) for r in buf]
+                volumes = [float(r[5]) for r in buf]
+
+        if closes and len(closes) >= MIN:
             update_coin_signals(sym, closes, volumes)
             return True
         return False
