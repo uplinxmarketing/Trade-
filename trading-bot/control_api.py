@@ -710,7 +710,8 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
     """Force-buy a coin immediately regardless of current signals."""
     sym = symbol.upper()
     try:
-        from trade_engine import get_budget_for_coin, _positions, _positions_lock
+        from trade_engine import (get_budget_for_coin, _positions, _positions_lock,
+                                    _breakeven_mult, _rebuild_pos_index)
         from connection import client as _client
         from data_collector import prices as live_prices
 
@@ -738,14 +739,16 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
         if qty <= 0:
             return {"ok": False, "error": "Order returned 0 quantity"}
 
+        exit_target = round(fill_price * _breakeven_mult, 8)
         pos = {
             "symbol": sym, "entry_price": fill_price, "quantity": qty,
             "budget_usdt": budget, "timestamp": datetime.now(timezone.utc).isoformat(),
-            "mode": get_mode(),
+            "mode": get_mode(), "exit_target": exit_target,
         }
         pos["id"] = database.save_position(pos)
         with _positions_lock:
             _positions.append(pos)
+        _rebuild_pos_index()
 
         try:
             import supabase_sync

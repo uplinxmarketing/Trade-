@@ -491,6 +491,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // Instead we poll the Railway bot's REST API every 30 s and mirror its state
   // into the same React state variables so the UI shows live Railway data.
   const serverPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fastPollRef   = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const pollRailway = useCallback(async () => {
     // Single /api/all request (status + positions + trades + activity in one round trip)
@@ -620,24 +621,33 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     }
   }, [railwayUrl, addLog]);
 
-  // Start/stop the polling interval whenever server mode changes.
-  // When any position is at or above its exit target, poll every 1 s so the
-  // position disappears from the UI almost instantly after the backend sells it.
+  // Normal 5 s polling — stable deps so the interval never races with price ticks.
+  // DO NOT add `prices` or `positions` here: they update every ~100 ms and would
+  // cause the effect to re-run constantly, clearing and restarting the interval
+  // on every WebSocket tick so the timed poll never actually fires.
   useEffect(() => {
     if (!isServerMode) {
       if (serverPollRef.current) { clearInterval(serverPollRef.current); serverPollRef.current = null; }
       return;
     }
     pollRailway();
-    const hasSelling = positions.some(pos => {
-      const live   = parseFloat((prices as any)[pos.symbol]?.price || '0') || pos.avg_entry_price;
-      const target = pos.exit_target ?? pos.avg_entry_price * BEP_MULT;
-      return live >= target;
-    });
-    const interval = hasSelling ? 1_000 : 5_000;
-    serverPollRef.current = setInterval(pollRailway, interval);
+    serverPollRef.current = setInterval(pollRailway, 5_000);
     return () => { if (serverPollRef.current) { clearInterval(serverPollRef.current); serverPollRef.current = null; } };
-  }, [isServerMode, pollRailway, positions, prices]);
+  }, [isServerMode, pollRailway]); // eslint-disable-line
+
+  // Fast 1 s polling only while a position is at or above its exit target.
+  // Uses `current_price` from the Railway API response (not WebSocket prices)
+  // so this effect only re-runs when positions change, not on every tick.
+  useEffect(() => {
+    if (fastPollRef.current) { clearInterval(fastPollRef.current); fastPollRef.current = null; }
+    if (!isServerMode || !positions.length) return;
+    const hasSelling = positions.some(p =>
+      (p.current_price ?? p.avg_entry_price) >= (p.exit_target ?? p.avg_entry_price * BEP_MULT)
+    );
+    if (!hasSelling) return;
+    fastPollRef.current = setInterval(pollRailway, 1_000);
+    return () => { if (fastPollRef.current) { clearInterval(fastPollRef.current); fastPollRef.current = null; } };
+  }, [isServerMode, positions, pollRailway]); // eslint-disable-line
 
   // ── Mode change (paper ↔ live) ───────────────────────────────────────────
   const handleModeChange = useCallback(async (newMode: 'test' | 'live') => {
