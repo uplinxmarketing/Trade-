@@ -629,31 +629,18 @@ def _inline_refresh_from_ticks(sym: str, price: float):
 
 def realtime_monitor(prices: Dict[str, float]):
     """
-    Synchronous. Called by data_collector on EVERY WebSocket 'trade' event.
-    Handles both stop-loss/take-profit exits AND buy entry (via signal cache).
+    Synchronous — called inside data_collector's async WebSocket loop on EVERY
+    trade event. MUST NOT do any blocking I/O (SQLite, network) or it will
+    stall the event loop, kill the WebSocket connection, and stop all price
+    updates (including the sells we're trying to trigger).
+
+    Responsibility: keep the in-memory signal cache fresh so position_guardian
+    and signal_scanner can act on up-to-date data.  Buy execution is also done
+    here (throttled to 1 s) but is already brief (~1 ms SQLite write).
+
+    Sell execution is intentionally NOT done here — it is handled exclusively
+    by position_guardian which runs _execute_sell in a thread-pool executor.
     """
-    with _positions_lock:
-        snapshot = list(_positions)
-
-    for pos in snapshot:
-        sym   = pos["symbol"]
-        price = prices.get(sym, 0.0)
-        if price <= 0:
-            continue
-
-        entry       = pos["entry_price"]
-        take_profit = entry * (1.0 + config.TAKE_PROFIT_PCT)
-        stop_loss   = entry * (1.0 - config.STOP_LOSS_PCT)
-
-        try:
-            if price >= take_profit:
-                _execute_sell(pos, price, "take-profit")
-            elif price <= stop_loss:
-                _execute_sell(pos, price, "stop-loss")
-                _set_cooldown(sym)
-        except Exception as _se:
-            print(f"[realtime_monitor] sell error {sym}: {_se}")
-
     # Inline signal refresh from price ticks — keeps RSI/EMA/MACD current between
     # kline closes and REST scanner runs. Throttled to every 5 s per coin.
     now = time.time()
@@ -664,50 +651,89 @@ def realtime_monitor(prices: Dict[str, float]):
             _tick_signal_ts[sym] = now
             _inline_refresh_from_ticks(sym, price)
 
-    # Real-time buy check — reads signal cache, zero network I/O
+    # Real-time buy check — reads signal cache, brief SQLite write on buy only
     _check_buys_from_cache(prices)
 
 
 # ── Position guardian: real-time exit monitor using live WebSocket prices ──────
 
+_guardian_diag_ts: float = 0.0   # last time guardian wrote a diagnostic log
+
+
 async def position_guardian():
     """
-    Checks open positions every 500 ms using live in-memory WebSocket prices
-    (zero network I/O). Runs _execute_sell in a thread-pool executor so SQLite
-    writes don't block the event loop. Acts as the primary exit trigger — the
-    sell guard in _execute_sell prevents double-sells with realtime_monitor.
+    The ONLY place sells are executed. Checks every 500 ms using live
+    in-memory WebSocket prices (zero network I/O). Runs _execute_sell in a
+    thread-pool executor so SQLite writes don't block the event loop.
+
+    This coroutine must never die — any exception is caught, logged, and the
+    loop continues after a 1 s backoff.
     """
     import data_collector as _dc
+    global _guardian_diag_ts
     loop = asyncio.get_running_loop()
-    while True:
-        await asyncio.sleep(0.5)
-        with _positions_lock:
-            snap = list(_positions)
-        if not snap:
-            continue
+    database.log_activity("position_guardian started", "info")
 
-        prices = dict(_dc.prices)  # live WS prices — no REST, no blocking
-        for pos in snap:
-            sym   = pos["symbol"]
-            price = prices.get(sym, 0.0)
-            if price <= 0:
+    while True:
+        try:
+            await asyncio.sleep(0.5)
+
+            with _positions_lock:
+                snap = list(_positions)
+
+            prices = dict(_dc.prices)  # live WS prices — no REST, no blocking
+
+            # Diagnostic log every 60 s so activity feed shows guardian is alive
+            now_t = time.time()
+            if now_t - _guardian_diag_ts >= 60.0:
+                _guardian_diag_ts = now_t
+                if snap:
+                    lines = []
+                    for p in snap:
+                        sym   = p["symbol"]
+                        price = prices.get(sym, 0)
+                        entry = p["entry_price"]
+                        tp    = entry * (1.0 + config.TAKE_PROFIT_PCT)
+                        sl    = entry * (1.0 - config.STOP_LOSS_PCT)
+                        lines.append(
+                            f"{sym} entry={entry:.4f} cur={price:.4f} "
+                            f"tp={tp:.4f}({'✓' if price >= tp else '✗'}) "
+                            f"sl={sl:.4f}({'✓' if price <= sl else '✗'})"
+                        )
+                    database.log_activity(
+                        f"Guardian watching {len(snap)} position(s): " + " | ".join(lines),
+                        "info",
+                    )
+
+            if not snap:
                 continue
 
-            # Skip if a sell is already in progress for this symbol
-            with _selling_lock:
-                if sym in _selling:
+            for pos in snap:
+                sym   = pos["symbol"]
+                price = prices.get(sym, 0.0)
+                if price <= 0:
                     continue
 
-            entry = pos["entry_price"]
-            if price >= entry * (1.0 + config.TAKE_PROFIT_PCT):
-                await loop.run_in_executor(
-                    None, _execute_sell, pos, price, "take-profit"
-                )
-            elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
-                await loop.run_in_executor(
-                    None, _execute_sell, pos, price, "stop-loss"
-                )
-                _set_cooldown(sym)
+                with _selling_lock:
+                    if sym in _selling:
+                        continue
+
+                entry = pos["entry_price"]
+                if price >= entry * (1.0 + config.TAKE_PROFIT_PCT):
+                    await loop.run_in_executor(
+                        None, _execute_sell, pos, price, "take-profit"
+                    )
+                elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
+                    await loop.run_in_executor(
+                        None, _execute_sell, pos, price, "stop-loss"
+                    )
+                    _set_cooldown(sym)
+
+        except asyncio.CancelledError:
+            raise   # propagate cancellation — don't swallow it
+        except Exception as e:
+            database.log_activity(f"position_guardian error (will retry): {e}", "error")
+            await asyncio.sleep(1.0)  # brief backoff before resuming
 
 
 # ── Process 2: signal scanner (async, refreshes cache every SCAN_INTERVAL_SEC) ─
