@@ -125,7 +125,6 @@ def _get_positions():
         from data_collector import prices
         pos = get_open_positions()
         out = []
-        now_utc = datetime.now(timezone.utc)
         for p in pos:
             sym   = p["symbol"]
             price = prices.get(sym, 0)
@@ -134,14 +133,6 @@ def _get_positions():
             bep   = entry * (1 + config.FEE_RATE_BNB * 2) if config.BNB_FEE_MODE else entry * 1.002
             pnl   = (price - entry) * qty if price and entry else 0
             dist  = ((price - bep) / bep * 100) if bep and price else 0
-            hold_sec = 0
-            try:
-                ts = p.get("timestamp", "")
-                if ts:
-                    open_dt  = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    hold_sec = int((now_utc - open_dt).total_seconds())
-            except Exception:
-                pass
             out.append({
                 **p,
                 "current_price":   price,
@@ -149,8 +140,6 @@ def _get_positions():
                 "unrealized_pnl":  round(pnl, 4),
                 "dist_to_bep_pct": round(dist, 4),
                 "profitable":      price > bep if price and bep else False,
-                "hold_time_sec":   hold_sec,
-                "max_hold_sec":    config.MAX_HOLD_SECONDS,
             })
         return out
     except Exception:
@@ -585,7 +574,6 @@ def api_status():
         "data_dir":           database._DATA_DIR,
         "db_path":            database.DB_PATH,
         "data_persistent":    database._DATA_DIR == "/data",
-        "max_hold_minutes":   config.MAX_HOLD_SECONDS // 60,
         "sell_monitor_alive": _sell_monitor_alive(),
     }
 
@@ -830,32 +818,26 @@ def api_sell_monitor():
     age   = round(time.time() - hb, 1) if hb > 0 else None
 
     fee_rate = config.FEE_RATE_BNB if config.BNB_FEE_MODE else config.FEE_RATE_STANDARD
-    bep_mult = 1.0 + fee_rate * 2  # price ratio at which sell is profitable after fees
+    bep_mult = 1.0 + fee_rate * 2
 
     positions = _get_positions()
     checks = []
     for p in positions:
-        sym      = p["symbol"]
-        entry    = p.get("entry_price", 0)
-        price    = live_prices.get(sym, 0)
-        bep      = entry * bep_mult if entry else 0
-        sl       = entry * (1.0 - config.STOP_LOSS_PCT) if entry else 0
-        pct      = ((price - entry) / entry * 100) if entry else 0
-        hold_sec = p.get("hold_time_sec", 0)
-        max_hold = config.MAX_HOLD_SECONDS
+        sym   = p["symbol"]
+        entry = p.get("entry_price", 0)
+        price = live_prices.get(sym, 0)
+        bep   = entry * bep_mult if entry else 0
+        sl    = entry * (1.0 - config.STOP_LOSS_PCT) if entry else 0
+        pct   = ((price - entry) / entry * 100) if entry else 0
         checks.append({
-            "symbol":           sym,
-            "entry":            entry,
-            "current":          price,
-            "pct_from_entry":   round(pct, 4),
-            "breakeven_price":  round(bep, 6),
-            "stop_loss":        round(sl, 6),
-            "profitable":       price > bep if price and bep else False,
-            "sl_hit":           price <= sl if price and sl else False,
-            "hold_time_sec":    hold_sec,
-            "hold_time_min":    round(hold_sec / 60, 1),
-            "max_hold_min":     max_hold // 60,
-            "max_hold_hit":     hold_sec >= max_hold,
+            "symbol":          sym,
+            "entry":           entry,
+            "current":         price,
+            "pct_from_entry":  round(pct, 4),
+            "breakeven_price": round(bep, 6),
+            "stop_loss":       round(sl, 6),
+            "profitable":      price > bep if price and bep else False,
+            "sl_hit":          price <= sl if price and sl else False,
         })
 
     return {
@@ -863,7 +845,6 @@ def api_sell_monitor():
         "heartbeat_age_sec":  age,
         "breakeven_pct":      round(fee_rate * 2 * 100, 4),
         "stop_loss_pct":      config.STOP_LOSS_PCT * 100,
-        "max_hold_minutes":   config.MAX_HOLD_SECONDS // 60,
         "sell_trigger":       "price > entry × (1 + buy_fee + sell_fee)",
         "open_positions":     len(checks),
         "positions":          checks,

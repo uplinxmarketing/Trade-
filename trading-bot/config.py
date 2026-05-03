@@ -43,15 +43,13 @@ _DATA_DIR     = _data_dir()
 STRATEGY_FILE = _os.path.join(_DATA_DIR, "strategy.json")
 
 # ── Two-speed architecture constants ─────────────────────────────────────────
-SCAN_INTERVAL_SEC    = 10      # REST backup cache refresh (buys fire in realtime via WebSocket)
-STOP_LOSS_PCT        = 0.005   # 0.5% — tight stop; exit losers fast
+SCAN_INTERVAL_SEC    = 60      # REST backup cache refresh — WebSocket handles real-time
+STOP_LOSS_PCT        = 0.005   # 0.5% stop-loss
 COOLDOWN_AFTER_LOSS  = 180     # 3 min cooldown after stop-loss
 MIN_SIGNALS_TO_BUY   = 2       # at least 2 of 4 signals must be bullish
 RSI_BUY_MIN          = 20
 RSI_BUY_MAX          = 80      # wide window — scalping works across most RSI zones
 VOLUME_RATIO_MIN     = 1.1     # volume must be 1.1× the 20-candle average
-TAKE_PROFIT_PCT      = 0.002   # sell at +0.2% — just above the 0.15% fee breakeven
-MAX_HOLD_SECONDS     = 1800    # force-sell any position held longer than 30 minutes
 
 # ── Budget allocation settings ────────────────────────────────────────────────
 BUDGET_MODE           = "percent" # fixed | percent | capped | per_coin

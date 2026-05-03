@@ -1,5 +1,5 @@
 {
-  "version": "4.0.5",
-  "buildTime": "2026-05-03T23:55:00.000Z",
-  "commit": "fix-supabase-sync-perf-data-persist"
+  "version": "4.1.0",
+  "buildTime": "2026-05-04T00:30:00.000Z",
+  "commit": "instant-sells-no-hold-time-perf-fix"
 }

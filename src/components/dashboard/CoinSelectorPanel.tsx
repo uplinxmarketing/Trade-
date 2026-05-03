@@ -141,13 +141,13 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
     return all.filter(c => validSymbols.has(c));
   }, [selectedCoins, validSymbols]);
 
-  // Fetch 24hr ticker only for validated coins not already in the WebSocket feed
+  // Fetch 24hr ticker once when allCoins list is ready (not on every price tick).
+  // WebSocket prices override these values via getPrice() — this is just seed data
+  // for coins that haven't received a WebSocket tick yet.
   useEffect(() => {
-    const missing = allCoins.filter(c => !prices[c]);
-    if (missing.length === 0) return;
-    // Batch endpoint — only include coins that passed validation so no 400 errors
-    const symbols = JSON.stringify(missing);
+    if (allCoins.length === 0) return;
     const bases = ['https://data-api.binance.vision', 'https://api.binance.com'];
+    const symbols = JSON.stringify(allCoins);
     const tryFetch = async () => {
       for (const base of bases) {
         try {
@@ -167,7 +167,7 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
       }
     };
     tryFetch();
-  }, [allCoins, prices]);
+  }, [allCoins]); // intentionally excludes prices — WebSocket updates handle real-time
 
   const toggleFav = (coin: string) => {
     setFavorites(prev => {

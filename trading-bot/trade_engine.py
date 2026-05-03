@@ -41,6 +41,9 @@ _breakeven_mult = 1.0 + _fee_rate + _fee_rate
 
 _cooldowns: dict = {}
 
+# ── Position index — rebuilt on every WebSocket tick for O(1) sell lookups ───
+_pos_by_symbol: Dict[str, dict] = {}
+
 # ── In-progress sell guard — prevents double-sells from monitor + guardian ────
 _selling: set = set()
 _selling_lock = threading.Lock()
@@ -57,7 +60,7 @@ _last_no_signal_log: float = 0.0   # throttle "no coins ready" log to once per 6
 
 # Per-coin timestamp of last inline tick-driven signal refresh
 _tick_signal_ts: Dict[str, float] = {}
-_TICK_REFRESH_SEC = 5.0   # recompute at most every 5 s per coin from price ticks
+_TICK_REFRESH_SEC = 30.0  # recompute at most every 30 s per coin from price ticks
 
 
 # ── Balance guard + budget helpers ───────────────────────────────────────────
@@ -133,6 +136,13 @@ def _in_cooldown(symbol: str) -> bool:
 
 # ── DB / startup helpers ──────────────────────────────────────────────────────
 
+def _rebuild_pos_index():
+    """Rebuild O(1) symbol→position lookup. Call whenever _positions changes."""
+    global _pos_by_symbol
+    with _positions_lock:
+        _pos_by_symbol = {p["symbol"]: p for p in _positions}
+
+
 def load_positions_from_db():
     """Called on startup — restores open positions from SQLite, or Supabase if SQLite is empty."""
     global _positions
@@ -162,6 +172,7 @@ def load_positions_from_db():
 
     with _positions_lock:
         _positions = list(rows)
+    _rebuild_pos_index()
     print(f"[TradeEngine] Loaded {len(_positions)} open position(s) from DB.")
 
     # Push current state to Supabase immediately so the next redeploy can restore it.
@@ -466,6 +477,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
                 pass
         with _positions_lock:
             _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
+        _rebuild_pos_index()
 
     usdt_received = gross - sell_fee
     pnl_sign      = "+" if net_profit >= 0 else ""
@@ -633,6 +645,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         with _positions_lock:
             _positions.append(pos_record)
+        _rebuild_pos_index()
 
         try:
             import supabase_sync
@@ -684,20 +697,32 @@ def _inline_refresh_from_ticks(sym: str, price: float):
 def realtime_monitor(prices: Dict[str, float]):
     """
     Synchronous — called inside data_collector's async WebSocket loop on EVERY
-    trade event. MUST NOT do any blocking I/O (SQLite, network) or it will
-    stall the event loop, kill the WebSocket connection, and stop all price
-    updates (including the sells we're trying to trigger).
+    trade event (~100 ms per coin). MUST NOT do any blocking I/O.
 
-    Responsibility: keep the in-memory signal cache fresh so position_guardian
-    and signal_scanner can act on up-to-date data.  Buy execution is also done
-    here (throttled to 1 s) but is already brief (~1 ms SQLite write).
-
-    Sell execution is intentionally NOT done here — it is handled exclusively
-    by position_guardian which runs _execute_sell in a thread-pool executor.
+    Sell exits and buy entries are dispatched to _sell_executor (non-blocking
+    O(1) submit) so the event loop is never stalled.  The _sell_monitor_loop
+    daemon thread acts as a 5-second fallback in case a tick is missed.
     """
-    # Inline signal refresh from price ticks — keeps RSI/EMA/MACD current between
-    # kline closes and REST scanner runs. Throttled to every 5 s per coin.
     now = time.time()
+
+    # ── Real-time sell check — fires within ~100 ms of price crossing threshold ──
+    # Reads the pre-built symbol→position index (no lock needed for dict reads).
+    pos_index = _pos_by_symbol   # local ref; atomically replaced on each mutation
+    for sym, price in prices.items():
+        pos = pos_index.get(sym)
+        if pos is None or price <= 0:
+            continue
+        with _selling_lock:
+            if sym in _selling:
+                continue
+        entry = pos["entry_price"]
+        if price > entry * _breakeven_mult:
+            _sell_executor.submit(_execute_sell, pos, price, "take-profit")
+        elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
+            _set_cooldown(sym)
+            _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
+
+    # ── Inline signal refresh — throttled to every 30 s per coin ─────────────
     for sym, price in prices.items():
         if price <= 0:
             continue
@@ -705,7 +730,7 @@ def realtime_monitor(prices: Dict[str, float]):
             _tick_signal_ts[sym] = now
             _inline_refresh_from_ticks(sym, price)
 
-    # Real-time buy check — reads signal cache, brief SQLite write on buy only
+    # ── Real-time buy check — throttled to 1 s ────────────────────────────────
     _check_buys_from_cache(prices)
 
 
@@ -718,11 +743,9 @@ _sell_monitor_thread: Optional[threading.Thread] = None
 
 def _sell_monitor_loop():
     """
-    Daemon thread — wakes every 500 ms, checks every open position against
-    take-profit / stop-loss using live in-memory WebSocket prices, and calls
-    _execute_sell directly.  Because this runs in its own OS thread (not on the
-    asyncio event loop), blocking SQLite writes inside _execute_sell never stall
-    the WebSocket, the signal scanner, or any other async task.
+    Fallback daemon thread — wakes every 5 s and catches any positions that
+    the realtime_monitor missed (e.g. while WebSocket was reconnecting).
+    Primary sell path is realtime_monitor which fires within ~100 ms of each tick.
     """
     import data_collector as _dc
     global _sell_diag_ts, _sell_monitor_heartbeat
@@ -733,77 +756,51 @@ def _sell_monitor_loop():
         pass
 
     while True:
-        time.sleep(0.5)
-        _sell_monitor_heartbeat = time.time()   # heartbeat — proves loop is running
+        time.sleep(5.0)
+        _sell_monitor_heartbeat = time.time()
         try:
             with _positions_lock:
                 snap = list(_positions)
 
+            if not snap:
+                continue
+
             prices = dict(_dc.prices)
 
-            # Diagnostic log every 60 s — visible in the activity feed
+            # Diagnostic log every 60 s
             now_t = time.time()
             if now_t - _sell_diag_ts >= 60.0:
                 _sell_diag_ts = now_t
-                if snap:
-                    lines = []
-                    for p in snap:
-                        sym   = p["symbol"]
-                        price = prices.get(sym, 0.0)
-                        entry = p["entry_price"]
-                        bep   = entry * _breakeven_mult   # price at which we're profitable
-                        sl    = entry * (1.0 - config.STOP_LOSS_PCT)
-                        pct   = ((price - entry) / entry * 100) if entry else 0
-                        lines.append(
-                            f"{sym} entry={entry:.4f} cur={price:.4f}({pct:+.3f}%) "
-                            f"bep={bep:.4f}({'SELL' if price > bep else 'no'}) "
-                            f"sl={sl:.4f}({'HIT' if price <= sl else 'no'})"
-                        )
-                    database.log_activity(
-                        f"Sell monitor: {len(snap)} open — "
-                        + " | ".join(lines),
-                        "info",
+                lines = []
+                for p in snap:
+                    sym   = p["symbol"]
+                    price = prices.get(sym, 0.0)
+                    entry = p["entry_price"]
+                    bep   = entry * _breakeven_mult
+                    sl    = entry * (1.0 - config.STOP_LOSS_PCT)
+                    pct   = ((price - entry) / entry * 100) if entry else 0
+                    lines.append(
+                        f"{sym} entry={entry:.4f} cur={price:.4f}({pct:+.3f}%) "
+                        f"bep={bep:.4f}({'SELL' if price > bep else 'no'}) "
+                        f"sl={sl:.4f}({'HIT' if price <= sl else 'no'})"
                     )
-                else:
-                    database.log_activity("Sell monitor: no open positions", "info")
+                database.log_activity(
+                    f"Sell monitor fallback: {len(snap)} open — " + " | ".join(lines), "info"
+                )
 
             for pos in snap:
                 sym   = pos["symbol"]
                 price = prices.get(sym, 0.0)
                 if price <= 0:
                     continue
-
                 with _selling_lock:
                     if sym in _selling:
                         continue
-
                 entry = pos["entry_price"]
-
-                # Time-based exit: force-sell any position held longer than MAX_HOLD_SECONDS.
-                # Set cooldown before dispatch so re-buys can't fire during the async sell.
-                try:
-                    ts = pos.get("timestamp", "")
-                    if ts:
-                        open_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        age_sec = (datetime.now(timezone.utc) - open_dt).total_seconds()
-                        if age_sec >= config.MAX_HOLD_SECONDS:
-                            if price <= entry * (1.0 - config.STOP_LOSS_PCT):
-                                _set_cooldown(sym)
-                            _sell_executor.submit(
-                                _execute_sell, pos, price, f"max-hold-{int(age_sec // 60)}min"
-                            )
-                            continue
-                except Exception:
-                    pass
-
-                # Sell the instant price crosses break-even — any profit after fees.
-                # _breakeven_mult = 1 + fee_buy + fee_sell ≈ 1.0015 (BNB) or 1.002 (standard).
-                # Dispatched to thread pool so all 10+ positions sell simultaneously — never
-                # queue up sequentially (which caused the 20-second delay for the last position).
                 if price > entry * _breakeven_mult:
                     _sell_executor.submit(_execute_sell, pos, price, "take-profit")
                 elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
-                    _set_cooldown(sym)  # set before dispatch so buy loop can't re-enter
+                    _set_cooldown(sym)
                     _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
 
         except Exception as exc:
