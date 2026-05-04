@@ -186,9 +186,11 @@ def load_positions_from_db():
 
     # Always fetch from Supabase so coins + balance are current even when
     # SQLite still has stale data from a previous deploy.
+    supa_ok = False
     try:
         import supabase_sync
         restored = supabase_sync.restore_from_supabase()
+        supa_ok = bool(restored)
 
         # ── Coins: ALWAYS restore — user selection must survive every deploy ──
         _apply_coin_restore(restored.get("selected_coins"))
@@ -199,7 +201,19 @@ def load_positions_from_db():
                 pos_id = database.save_position(pos)
                 pos["id"] = pos_id
             rows = database.load_positions()
-            print(f"[TradeEngine] Restored {len(rows)} position(s) from Supabase.")
+            n_pos = len(rows)
+            print(f"[TradeEngine] Restored {n_pos} position(s) from Supabase.")
+            database.log_activity(
+                f"Restored {n_pos} open position(s) from Supabase after redeploy", "info"
+            )
+        elif rows:
+            database.log_activity(
+                f"Startup: {len(rows)} position(s) loaded from local DB (Supabase backup intact)", "info"
+            )
+        else:
+            database.log_activity(
+                "Startup: no positions in local DB or Supabase — fresh wallet", "info"
+            )
 
         # ── Trade history: restore when SQLite trades table is empty ────────────
         # Rebuilds win-rate, P&L stats and trade list from bot_trade_history.
@@ -214,6 +228,13 @@ def load_positions_from_db():
                         pass
                 if imported:
                     print(f"[TradeEngine] Imported {imported} trade(s) from Supabase history.")
+                    database.log_activity(
+                        f"Restored {imported} trade record(s) from Supabase history", "info"
+                    )
+            elif database.get_recent_trades(limit=1):
+                database.log_activity(
+                    f"Trade history intact in local DB — no restore needed", "info"
+                )
         except Exception as te:
             print(f"[TradeEngine] Trade history restore failed (non-fatal): {te}")
 
@@ -230,9 +251,13 @@ def load_positions_from_db():
                         snapshot = dict(client._balances)
                     database.save_paper_state(snapshot)
                     print(f"[TradeEngine] Restored USDT balance from Supabase: {usdt:.2f}")
+                    database.log_activity(
+                        f"Restored USDT balance from Supabase: {usdt:.2f} USDT", "info"
+                    )
 
     except Exception as e:
         print(f"[TradeEngine] Supabase restore failed (non-fatal): {e}")
+        database.log_activity(f"Supabase restore failed — data may not survive redeploy: {e}", "warn")
 
     with _positions_lock:
         _positions = list(rows)
@@ -246,8 +271,11 @@ def load_positions_from_db():
         import supabase_sync
         usdt = _get_usdt_balance()
         supabase_sync.sync_all(list(rows), usdt)
-    except Exception:
-        pass
+        database.log_activity(
+            f"Supabase snapshot pushed — {len(rows)} position(s), {usdt:.2f} USDT backed up", "info"
+        )
+    except Exception as e:
+        database.log_activity(f"Supabase snapshot push failed: {e}", "warn")
 
     # Sync PaperClient coin balances from the restored positions.
     # After a restart, PaperClient loads from saved paper_state, but if that

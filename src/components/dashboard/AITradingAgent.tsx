@@ -160,6 +160,7 @@ interface TradeRow {
   quantity: number;
   pnl: number | null;
   reason: string | null;
+  volume_usdt?: number;
 }
 
 interface AITradingAgentProps {
@@ -194,7 +195,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [cycleCountdown, setCycleCountdown] = useState(0);
   const [agentStatus, setAgentStatus]       = useState('');
   const [scanning, setScanning]   = useState(false);
-  const [showAll, setShowAll]     = useState(false);
+  const [showAllTrades, setShowAllTrades] = useState(false);
+  const [showAllPositions, setShowAllPositions] = useState(false);
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
   const [instructions, setInstructions]   = useState(() => localStorage.getItem(INSTRUCTIONS_KEY) ?? '');
@@ -551,12 +553,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
     const railwayTrades: TradeRow[] = [];
     for (const tr of (data.trades ?? [])) {
+      const vol = Number(tr.budget_usdt ?? 0);
       if (tr.entry_price && tr.timestamp_buy) {
         railwayTrades.push({
           id: `rw-buy-${tr.id}`, created_at: tr.timestamp_buy,
           symbol: tr.coin, side: 'BUY' as const,
           price: Number(tr.entry_price), quantity: Number(tr.quantity),
-          pnl: null, reason: null,
+          pnl: null, reason: null, volume_usdt: vol,
         });
       }
       if (tr.exit_price && tr.timestamp_sell) {
@@ -564,7 +567,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           id: `rw-sell-${tr.id}`, created_at: tr.timestamp_sell,
           symbol: tr.coin, side: 'SELL' as const,
           price: Number(tr.exit_price), quantity: Number(tr.quantity),
-          pnl: Number(tr.net_profit ?? 0), reason: null,
+          pnl: Number(tr.net_profit ?? 0), reason: null, volume_usdt: vol,
         });
       }
     }
@@ -943,7 +946,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const winRate     = sellTrades.length ? Math.round((wins / sellTrades.length) * 100) : 0;
   const pnlColor    = totalPnl >= 0 ? 'text-gain' : 'text-loss';
   const pnlPct      = initialBalance > 0 ? ((totalPnl / initialBalance) * 100).toFixed(2) : '0.00';
-  const displayedTrades = showAll ? trades : trades.slice(0, 12);
+  const ROWS_DEFAULT = 5;
+  const displayedTrades    = showAllTrades    ? trades    : trades.slice(0, ROWS_DEFAULT);
+  const displayedPositions = showAllPositions ? positions : positions.slice(0, ROWS_DEFAULT);
 
   return (
     <div className="bg-card border border-border rounded-lg p-4 space-y-4">
@@ -1236,52 +1241,59 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             {isRunning ? '⏳ No open positions — bot will buy when signals align' : '▶ Start the agent to begin trading'}
           </div>
         ) : (
-          <div className="space-y-1.5">
-            {positions.map(pos => {
-              const live   = parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.avg_entry_price;
-              const sells  = live * pos.quantity * (1-TAKER_FEE);
-              const cost   = pos.avg_entry_price * pos.quantity / (1-TAKER_FEE);
-              const uPnl   = sells - cost;
-              const pct    = cost > 0 ? (uPnl/cost)*100 : 0;
-              const target = pos.exit_target ?? pos.avg_entry_price * BEP_MULT;
-              const prof   = live >= target;
-              const toTarget = Math.min(100, Math.max(0, ((live - pos.avg_entry_price) / (target - pos.avg_entry_price)) * 100));
-              const qty    = Number(pos.quantity);
-              const budget = pos.avg_entry_price * qty;
-              return (
-                <div key={pos.symbol} className="bg-muted/20 border border-border/50 rounded-lg px-3 py-2.5 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <div className={`w-1.5 h-1.5 rounded-full ${prof?'bg-gain animate-pulse':'bg-warn animate-pulse'}`}/>
-                      <span className="font-mono font-bold text-sm">{pos.symbol.replace('USDT','')}</span>
-                      <span className={`text-xs font-mono font-bold ${pct>=0?'text-gain':'text-loss'}`}>{pct>=0?'+':''}{pct.toFixed(3)}%</span>
+          <div>
+            <div className={`space-y-1.5 overflow-y-auto scrollbar-thin ${!showAllPositions && positions.length > ROWS_DEFAULT ? 'max-h-[500px]' : ''}`}>
+              {displayedPositions.map(pos => {
+                const live   = parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.avg_entry_price;
+                const sells  = live * pos.quantity * (1-TAKER_FEE);
+                const cost   = pos.avg_entry_price * pos.quantity / (1-TAKER_FEE);
+                const uPnl   = sells - cost;
+                const pct    = cost > 0 ? (uPnl/cost)*100 : 0;
+                const target = pos.exit_target ?? pos.avg_entry_price * BEP_MULT;
+                const prof   = live >= target;
+                const toTarget = Math.min(100, Math.max(0, ((live - pos.avg_entry_price) / (target - pos.avg_entry_price)) * 100));
+                const qty    = Number(pos.quantity);
+                const budget = pos.avg_entry_price * qty;
+                return (
+                  <div key={pos.symbol} className="bg-muted/20 border border-border/50 rounded-lg px-3 py-2.5 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <div className={`w-1.5 h-1.5 rounded-full ${prof?'bg-gain animate-pulse':'bg-warn animate-pulse'}`}/>
+                        <span className="font-mono font-bold text-sm">{pos.symbol.replace('USDT','')}</span>
+                        <span className={`text-xs font-mono font-bold ${pct>=0?'text-gain':'text-loss'}`}>{pct>=0?'+':''}{pct.toFixed(3)}%</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className={`font-mono text-xs font-bold ${uPnl>=0?'text-gain':'text-loss'}`}>{uPnl>=0?'+':''}{uPnl.toFixed(4)} USDT</span>
+                        <button onClick={() => forceSell(pos)} disabled={!!forcingSell}
+                          className="text-[10px] px-2 py-1 rounded bg-loss/10 hover:bg-loss/20 text-loss font-semibold disabled:opacity-40 flex items-center gap-1">
+                          <Banknote className="w-2.5 h-2.5"/>{forcingSell===pos.symbol?'…':'Sell'}
+                        </button>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <span className={`font-mono text-xs font-bold ${uPnl>=0?'text-gain':'text-loss'}`}>{uPnl>=0?'+':''}{uPnl.toFixed(4)} USDT</span>
-                      <button onClick={() => forceSell(pos)} disabled={!!forcingSell}
-                        className="text-[10px] px-2 py-1 rounded bg-loss/10 hover:bg-loss/20 text-loss font-semibold disabled:opacity-40 flex items-center gap-1">
-                        <Banknote className="w-2.5 h-2.5"/>{forcingSell===pos.symbol?'…':'Sell'}
-                      </button>
+                    <div className="grid grid-cols-2 gap-x-4 text-[10px] text-muted-foreground font-mono">
+                      <span>Entry <span className="text-foreground">{pos.avg_entry_price.toFixed(4)}</span></span>
+                      <span>Exit target <span className="text-accent font-bold">{target.toFixed(4)}</span></span>
+                      <span>Now <span className={prof?'text-gain':'text-foreground'}>{live.toFixed(4)}</span></span>
+                      <span>Qty <span className="text-foreground">{qty.toFixed(6)}</span> · <span className="text-foreground">{budget.toFixed(2)} USDT</span></span>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[9px]">
+                        <span className="text-muted-foreground">Progress to exit target</span>
+                        <span className={prof?'text-gain font-bold':'text-warn'}>{prof?'✓ SELLING NOW…':toTarget.toFixed(0)+'% to target'}</span>
+                      </div>
+                      <div className="h-1.5 bg-muted/40 rounded-full overflow-hidden">
+                        <div className={`h-full rounded-full transition-all ${prof?'bg-gain':'bg-warn'}`} style={{width:`${Math.max(2, toTarget)}%`}}/>
+                      </div>
                     </div>
                   </div>
-                  <div className="grid grid-cols-2 gap-x-4 text-[10px] text-muted-foreground font-mono">
-                    <span>Entry <span className="text-foreground">{pos.avg_entry_price.toFixed(4)}</span></span>
-                    <span>Exit target <span className="text-accent font-bold">{target.toFixed(4)}</span></span>
-                    <span>Now <span className={prof?'text-gain':'text-foreground'}>{live.toFixed(4)}</span></span>
-                    <span>Qty <span className="text-foreground">{qty.toFixed(6)}</span> · <span className="text-foreground">{budget.toFixed(2)} USDT</span></span>
-                  </div>
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[9px]">
-                      <span className="text-muted-foreground">Progress to exit target</span>
-                      <span className={prof?'text-gain font-bold':'text-warn'}>{prof?'✓ SELLING NOW…':toTarget.toFixed(0)+'% to target'}</span>
-                    </div>
-                    <div className="h-1.5 bg-muted/40 rounded-full overflow-hidden">
-                      <div className={`h-full rounded-full transition-all ${prof?'bg-gain':'bg-warn'}`} style={{width:`${Math.max(2, toTarget)}%`}}/>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
+            {positions.length > ROWS_DEFAULT && (
+              <button onClick={() => setShowAllPositions(p=>!p)} className="w-full text-[10px] text-accent hover:underline py-1 mt-1 flex items-center justify-center gap-1">
+                {showAllPositions?<><ChevronUp className="w-3 h-3"/>Show less</>:<><ChevronDown className="w-3 h-3"/>Show all {positions.length} positions</>}
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -1305,30 +1317,35 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             {isRunning ? '⏳ First scan running — trades will appear here…' : '▶ Start the agent to begin paper trading'}
           </p>
         ) : (
-          <div className="space-y-0.5">
-            {displayedTrades.map(t => {
-              const isBuy = t.side === 'BUY';
-              const win   = (t.pnl ?? 0) > 0;
-              const loss  = (t.pnl ?? 0) < 0;
-              return (
-                <div key={t.id} className={`flex items-center justify-between px-2.5 py-1.5 rounded text-xs border
-                  ${win?'bg-gain/5 border-gain/20':loss?'bg-loss/5 border-loss/20':isBuy?'bg-muted/20 border-border/30':'bg-muted/10 border-border/20'}`}>
-                  <div className="flex items-center gap-2 min-w-0">
-                    {isBuy?<TrendingUp className="w-3 h-3 text-accent shrink-0"/>:win?<TrendingUp className="w-3 h-3 text-gain shrink-0"/>:<TrendingDown className="w-3 h-3 text-loss shrink-0"/>}
-                    <span className={`text-[9px] font-bold px-1 py-0.5 rounded shrink-0 ${isBuy?'bg-accent/20 text-accent':win?'bg-gain/20 text-gain':'bg-loss/20 text-loss'}`}>{t.side}</span>
-                    <span className="font-mono font-semibold shrink-0">{t.symbol.replace('USDT','')}</span>
-                    <span className="text-muted-foreground font-mono text-[10px] truncate">{Number(t.price).toLocaleString('en-US',{maximumFractionDigits:4})} USDT</span>
+          <div>
+            <div className={`space-y-0.5 overflow-y-auto scrollbar-thin ${!showAllTrades && trades.length > ROWS_DEFAULT ? 'max-h-[180px]' : ''}`}>
+              {displayedTrades.map(t => {
+                const isBuy = t.side === 'BUY' || (t.side as string).toLowerCase() === 'buy';
+                const win   = (t.pnl ?? 0) > 0;
+                const loss  = (t.pnl ?? 0) < 0;
+                return (
+                  <div key={t.id} className={`flex items-center justify-between px-2.5 py-1.5 rounded text-xs border
+                    ${win?'bg-gain/5 border-gain/20':loss?'bg-loss/5 border-loss/20':isBuy?'bg-muted/20 border-border/30':'bg-muted/10 border-border/20'}`}>
+                    <div className="flex items-center gap-2 min-w-0">
+                      {isBuy?<TrendingUp className="w-3 h-3 text-accent shrink-0"/>:win?<TrendingUp className="w-3 h-3 text-gain shrink-0"/>:<TrendingDown className="w-3 h-3 text-loss shrink-0"/>}
+                      <span className={`text-[9px] font-bold px-1 py-0.5 rounded shrink-0 ${isBuy?'bg-accent/20 text-accent':win?'bg-gain/20 text-gain':'bg-loss/20 text-loss'}`}>{isBuy?'BUY':'SELL'}</span>
+                      <span className="font-mono font-semibold shrink-0">{t.symbol.replace('USDT','')}</span>
+                      <span className="text-muted-foreground font-mono text-[10px] truncate">{Number(t.price).toLocaleString('en-US',{maximumFractionDigits:4})} USDT</span>
+                      {(t.volume_usdt ?? 0) > 0 && (
+                        <span className="text-[9px] font-mono text-muted-foreground/70 shrink-0 hidden sm:inline">{t.volume_usdt!.toFixed(2)} vol</span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {t.pnl!==null && <span className={`font-mono font-bold text-[10px] ${t.pnl>=0?'text-gain':'text-loss'}`}>{t.pnl>=0?'+':''}{t.pnl.toFixed(4)} USDT</span>}
+                      <span className="text-muted-foreground text-[9px] font-mono">{new Date(t.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    {t.pnl!==null && <span className={`font-mono font-bold text-[10px] ${t.pnl>=0?'text-gain':'text-loss'}`}>{t.pnl>=0?'+':''}{t.pnl.toFixed(4)} USDT</span>}
-                    <span className="text-muted-foreground text-[9px] font-mono">{new Date(t.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>
-                  </div>
-                </div>
-              );
-            })}
-            {trades.length > 12 && (
-              <button onClick={() => setShowAll(p=>!p)} className="w-full text-[10px] text-accent hover:underline py-1 flex items-center justify-center gap-1">
-                {showAll?<><ChevronUp className="w-3 h-3"/>Show less</>:<><ChevronDown className="w-3 h-3"/>Show all {trades.length} trades</>}
+                );
+              })}
+            </div>
+            {trades.length > ROWS_DEFAULT && (
+              <button onClick={() => setShowAllTrades(p=>!p)} className="w-full text-[10px] text-accent hover:underline py-1 mt-0.5 flex items-center justify-center gap-1">
+                {showAllTrades?<><ChevronUp className="w-3 h-3"/>Show less</>:<><ChevronDown className="w-3 h-3"/>Show all {trades.length} trades</>}
               </button>
             )}
           </div>
