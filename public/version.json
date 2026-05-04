@@ -1,5 +1,5 @@
 {
-  "version": "4.2.0",
-  "buildTime": "2026-05-03T12:00:00.000Z",
-  "commit": "exit-target-on-buy-coin-history-persistence"
+  "version": "4.3.0",
+  "buildTime": "2026-05-04T12:00:00.000Z",
+  "commit": "fix-sell-nonblocking-heartbeat-exit-target-restore"
 }
