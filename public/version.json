@@ -1,5 +1,5 @@
 {
-  "version": "4.9.2",
-  "buildTime": "2026-05-04T23:00:00.000Z",
-  "commit": "fix-position-lifecycle-wallet-formula-realized-pnl-sql"
+  "version": "4.9.3",
+  "buildTime": "2026-05-04T23:30:00.000Z",
+  "commit": "force-redeploy-all-fixes-included"
 }
