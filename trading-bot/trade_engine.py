@@ -454,7 +454,13 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             )
 
     try:
-        result = client.order_market_sell(symbol=sym, quantity=qty)
+        # For paper mode: pass the trigger price directly so any concurrent
+        # WebSocket/REST update to _prices cannot cause the sell to execute
+        # at the wrong (potentially lower) price between now and order execution.
+        if hasattr(client, "_balances"):
+            result = client.order_market_sell(symbol=sym, quantity=qty, price=price)
+        else:
+            result = client.order_market_sell(symbol=sym, quantity=qty)
     except Exception as e:
         msg = f"SELL failed {sym} ({reason}): {e}"
         print(f"[TradeEngine] {msg}")
@@ -801,7 +807,7 @@ _sell_monitor_thread: Optional[threading.Thread] = None
 # REST price fallback cache — populated when WebSocket is geo-blocked on Railway
 _rest_px: Dict[str, float] = {}
 _rest_px_ts: float = 0.0
-_REST_PX_TTL = 8.0   # refetch at most every 8 s
+_REST_PX_TTL = 4.0   # refetch REST prices every 4 s when WebSocket is down
 
 
 def _fetch_rest_prices(symbols: list) -> Dict[str, float]:
@@ -867,22 +873,15 @@ def _sell_monitor_loop():
 
             prices = dict(_dc.prices)
 
-            # ── REST / signal-cache fallback when WebSocket is down ───────────
-            # Root cause of "sells never happen": Railway geo-block empties _dc.prices.
-            # Without this, every position is skipped (price == 0 guard below).
+            # ── Price fallback when WebSocket is geo-blocked on Railway ──────
+            # _dc.prices is empty when Binance blocks Railway's WS connection.
+            # REST is tried FIRST (accurate) — signal cache is the last resort.
             missing = [p["symbol"] for p in snap if not prices.get(p["symbol"])]
             if missing:
-                # 1. Signal cache — zero latency, up to ~60 s stale
-                with _signal_cache_lock:
-                    for sym in missing:
-                        sc = _signal_cache.get(sym)
-                        if sc and sc.get("price", 0) > 0:
-                            prices[sym] = sc["price"]
-                # 2. REST batch fetch for anything still missing
-                still_missing = [s for s in missing if not prices.get(s)]
+                # 1. REST batch fetch (accurate current price, rate-limited to 4 s)
                 now_t2 = time.time()
-                if still_missing and (now_t2 - _rest_px_ts) >= _REST_PX_TTL:
-                    fetched = _fetch_rest_prices(still_missing)
+                if (now_t2 - _rest_px_ts) >= _REST_PX_TTL:
+                    fetched = _fetch_rest_prices(missing)
                     if fetched:
                         _rest_px.update(fetched)
                         _rest_px_ts = now_t2
@@ -890,9 +889,17 @@ def _sell_monitor_loop():
                             f"Sell monitor: WebSocket down — REST prices for "
                             f"{list(fetched.keys())}", "warn"
                         )
-                for sym, p in _rest_px.items():
-                    if sym not in prices or not prices[sym]:
-                        prices[sym] = p
+                # Merge REST cache into prices dict
+                for sym in missing:
+                    if not prices.get(sym) and _rest_px.get(sym):
+                        prices[sym] = _rest_px[sym]
+                # 2. Signal cache as last resort (last kline close, ≤60 s stale)
+                with _signal_cache_lock:
+                    for sym in missing:
+                        if not prices.get(sym):
+                            sc = _signal_cache.get(sym)
+                            if sc and sc.get("price", 0) > 0:
+                                prices[sym] = sc["price"]
 
             # Diagnostic log every 60 s
             now_t = time.time()
@@ -944,7 +951,9 @@ def _sell_monitor_loop():
                 database.log_activity(f"Sell monitor error: {exc}", "error")
             except Exception:
                 pass
-        time.sleep(5.0)
+        # Sleep shorter when positions are open so we catch exits faster.
+        # 2 s with open positions; 5 s when idle to avoid unnecessary REST calls.
+        time.sleep(2.0 if snap else 5.0)
 
 
 async def position_guardian():

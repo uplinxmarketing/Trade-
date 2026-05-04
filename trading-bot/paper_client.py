@@ -120,8 +120,12 @@ class PaperClient:
             }],
         }
 
-    def order_market_sell(self, symbol: str, quantity: float) -> dict:
-        price = self._get_price(symbol)
+    def order_market_sell(self, symbol: str, quantity: float, price: float = 0) -> dict:
+        # Use caller-supplied price when provided — prevents race conditions where
+        # a concurrent update_price() call overwrites the trigger price before
+        # order execution, causing sells to execute at the wrong (lower) price.
+        if price <= 0:
+            price = self._get_price(symbol)
         coin  = symbol[:-4]  # strip USDT
 
         with self._lock:
