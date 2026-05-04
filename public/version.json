@@ -1,5 +1,5 @@
 {
-  "version": "4.9.0",
-  "buildTime": "2026-05-04T21:00:00.000Z",
-  "commit": "fix-no-stop-loss-parallel-supabase-writes-fast-sells"
+  "version": "4.9.1",
+  "buildTime": "2026-05-04T22:00:00.000Z",
+  "commit": "fix-supabase-syntax-breakeven-buffer-no-loss-sells"
 }

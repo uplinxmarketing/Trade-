@@ -37,7 +37,9 @@ _strategy_mtime: float = 0.0
 _strategy_cache: dict = {}
 
 _fee_rate = config.FEE_RATE_BNB if config.BNB_FEE_MODE else config.FEE_RATE_STANDARD
-_breakeven_mult = 1.0 + _fee_rate + _fee_rate
+# 0.02% buffer above fees: floor-rounding of qty during buy means the exact breakeven
+# is slightly above entry*(1+2*fee), so a buffer guarantees P&L is always positive.
+_breakeven_mult = 1.0 + _fee_rate + _fee_rate + 0.0002
 
 _cooldowns: dict = {}
 
@@ -803,7 +805,9 @@ def realtime_monitor(prices: Dict[str, float]):
         if pos is None or price <= 0:
             continue
         entry  = pos["entry_price"]
-        target = pos.get("exit_target") or entry * _breakeven_mult
+        # Always recompute from entry with current multiplier (includes 0.02% buffer)
+        # so stale stored exit_target values from old deploys never cause loss sells.
+        target = entry * _breakeven_mult
         if price >= target:
             with _selling_lock:
                 if sym in _selling:
@@ -964,12 +968,10 @@ def _sell_monitor_loop():
                     price = prices.get(sym, 0.0)
                     entry = p["entry_price"]
                     bep   = entry * _breakeven_mult
-                    sl    = entry * (1.0 - config.STOP_LOSS_PCT)
                     pct   = ((price - entry) / entry * 100) if entry else 0
                     lines.append(
                         f"{sym} entry={entry:.4f} cur={price:.4f}({pct:+.3f}%) "
-                        f"bep={bep:.4f}({'SELL' if price > bep else 'no'}) "
-                        f"sl={sl:.4f}({'HIT' if price <= sl else 'no'})"
+                        f"target={bep:.4f}({'SELL' if price >= bep else 'hold'})"
                     )
                 database.log_activity(
                     f"Sell monitor fallback: {len(snap)} open — " + " | ".join(lines), "info"
@@ -984,7 +986,7 @@ def _sell_monitor_loop():
                     if sym in _selling:
                         continue
                 entry  = pos["entry_price"]
-                target = pos.get("exit_target") or entry * _breakeven_mult
+                target = entry * _breakeven_mult   # always recompute; includes 0.02% buffer
                 if price >= target:
                     with _selling_lock:
                         if sym in _selling:

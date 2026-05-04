@@ -212,7 +212,8 @@ def sync_balance(usdt: float):
     _bg(_upsert_config, usdt)
 
 
-def sync_selected_coins(coins: list):    """Persist the bot's selected coin list to bot_config."""
+def sync_selected_coins(coins: list):
+    """Persist the bot's selected coin list to bot_config."""
     _bg(_sync_coins_impl, list(coins))
 
 
@@ -310,9 +311,9 @@ def restore_from_supabase() -> dict:
         rows = _get("paper_portfolio",
                     f"user_session=eq.{SESSION}&select=symbol,quantity,avg_entry_price,updated_at")
         if rows:
-            # fee_rate hard-coded to match trade_engine default (BNB 0.075%)
+            # fee_rate + 0.02% buffer — must match trade_engine._breakeven_mult
             _fee = 0.00075
-            _bep_mult = 1.0 + _fee + _fee
+            _bep_mult = 1.0 + _fee + _fee + 0.0002
             for r in rows:
                 qty   = float(r.get("quantity") or 0)
                 price = float(r.get("avg_entry_price") or 0)
