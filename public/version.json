@@ -1,5 +1,5 @@
 {
   "version": "4.6.0",
-  "buildTime": "2026-05-04T17:00:00.000Z",
+  "buildTime": "2026-05-04T18:00:00.000Z",
   "commit": "fix-sell-delay-and-wrong-price-race-condition"
 }
