@@ -794,14 +794,10 @@ def _sell_monitor_loop():
         pass
 
     while True:
-        time.sleep(5.0)
-        _sell_monitor_heartbeat = time.time()
+        _sell_monitor_heartbeat = time.time()   # update at START so alive-check is always fresh
         try:
             with _positions_lock:
                 snap = list(_positions)
-
-            if not snap:
-                continue
 
             prices = dict(_dc.prices)
 
@@ -855,6 +851,7 @@ def _sell_monitor_loop():
                 database.log_activity(f"Sell monitor error: {exc}", "error")
             except Exception:
                 pass
+        time.sleep(5.0)
 
 
 async def position_guardian():

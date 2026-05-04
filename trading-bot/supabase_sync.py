@@ -267,6 +267,9 @@ def restore_from_supabase() -> dict:
         rows = _get("paper_portfolio",
                     f"user_session=eq.{SESSION}&select=symbol,quantity,avg_entry_price,updated_at")
         if rows:
+            # fee_rate hard-coded to match trade_engine default (BNB 0.075%)
+            _fee = 0.00075
+            _bep_mult = 1.0 + _fee + _fee
             for r in rows:
                 qty   = float(r.get("quantity") or 0)
                 price = float(r.get("avg_entry_price") or 0)
@@ -275,6 +278,7 @@ def restore_from_supabase() -> dict:
                 result["positions"].append({
                     "symbol":      r["symbol"],
                     "entry_price": price,
+                    "exit_target": round(price * _bep_mult, 8),
                     "quantity":    qty,
                     "budget_usdt": round(qty * price, 4),
                     "timestamp":   r.get("updated_at") or datetime.now(timezone.utc).isoformat(),

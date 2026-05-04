@@ -175,7 +175,9 @@ def _sell_monitor_alive() -> bool:
     try:
         import trade_engine as _te
         hb = _te._sell_monitor_heartbeat
-        return hb > 0 and (time.time() - hb) < 5.0
+        # Heartbeat is set at the START of each 5 s loop iteration.
+        # Allow 15 s window (5 s sleep + up to 10 s for work) before calling it dead.
+        return hb > 0 and (time.time() - hb) < 15.0
     except Exception:
         return False
 
@@ -769,11 +771,13 @@ class ForceSellRequest(BaseModel):
 @app.post("/api/force-sell/{symbol}")
 def api_force_sell(symbol: str, req: Optional[ForceSellRequest] = None):
     """Immediately sell an open position by symbol (case-insensitive).
+    Returns immediately — the sell is dispatched to the background executor
+    so this endpoint never blocks the HTTP response (prevents UI freeze).
     Accepts an optional price hint from the frontend so stale WebSocket
     prices on the server side never cause the sell to use the wrong price."""
     sym = symbol.upper()
     try:
-        from trade_engine import get_open_positions, _execute_sell
+        from trade_engine import get_open_positions, _execute_sell, _sell_executor
         from data_collector import prices as live_prices
         pos_list = get_open_positions()
         pos = next((p for p in pos_list if p["symbol"] == sym), None)
@@ -788,9 +792,10 @@ def api_force_sell(symbol: str, req: Optional[ForceSellRequest] = None):
         with _selling_lock:
             if sym in _selling:
                 return {"ok": False, "error": f"Sell already in progress for {sym}"}
-            _selling.add(sym)
-        _execute_sell(pos, price, "force-sell")
-        database.log_activity(f"Force sell: {sym} @ ${price:.4f} | qty={pos.get('quantity',0):.6f}", "info")
+            _selling.add(sym)   # reserve BEFORE submitting — _execute_sell expects this
+        # Dispatch to executor so this HTTP handler returns immediately.
+        # _execute_sell handles all logging, DB cleanup, and _selling.discard in its finally.
+        _sell_executor.submit(_execute_sell, pos, price, "force-sell")
         return {"ok": True, "symbol": sym, "price": price}
     except Exception as e:
         return {"ok": False, "error": str(e)}
