@@ -47,6 +47,7 @@ _pos_by_symbol: Dict[str, dict] = {}
 # ── In-progress sell guard — prevents double-sells from monitor + guardian ────
 _selling: set = set()
 _selling_lock = threading.Lock()
+_selling_ts: Dict[str, float] = {}   # when each sym was added — for watchdog
 
 # ── Sell executor — parallel sells so 10 simultaneous exits never queue up ───
 # Each position gets its own worker thread; _selling guard prevents duplicates.
@@ -422,6 +423,7 @@ def _execute_sell(pos: dict, price: float, reason: str):
     if qty <= 0 or price <= 0:
         with _selling_lock:
             _selling.discard(sym)
+            _selling_ts.pop(sym, None)
         return
 
     # Verify position still exists — another executor task may have already sold it
@@ -431,6 +433,7 @@ def _execute_sell(pos: dict, price: float, reason: str):
         if pos_id and not any(p.get("id") == pos_id for p in _positions):
             with _selling_lock:
                 _selling.discard(sym)
+                _selling_ts.pop(sym, None)
             return  # already sold
 
     try:
@@ -438,6 +441,7 @@ def _execute_sell(pos: dict, price: float, reason: str):
     finally:
         with _selling_lock:
             _selling.discard(sym)
+            _selling_ts.pop(sym, None)
 
 
 def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str, mode: str, now: str):
@@ -532,10 +536,24 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         database.log_trade(trade_record)
         try:
             import supabase_sync
-            supabase_sync.sync_trade(trade_record)
-            supabase_sync.sync_position_close(sym)
-        except Exception:
-            pass
+            # Write trade to Supabase SYNCHRONOUSLY — background writes can be
+            # lost when Railway kills the process before the thread finishes.
+            supabase_sync._sync_trade_impl(trade_record)
+            supabase_sync._delete("paper_portfolio",
+                                  f"user_session=eq.{supabase_sync.SESSION}&symbol=eq.{sym}")
+            # Sync updated USDT balance
+            try:
+                usdt_now = _get_usdt_balance()
+                supabase_sync._upsert_config(usdt_now)
+            except Exception:
+                pass
+        except Exception as se:
+            err_msg = f"Supabase sync error after selling {sym}: {se}"
+            print(f"[TradeEngine] {err_msg}")
+            try:
+                database.log_activity(err_msg, "error")
+            except Exception:
+                pass
         try:
             learning.learn_from_trade(trade_record)
         except Exception as le:
@@ -724,10 +742,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         try:
             import supabase_sync
-            supabase_sync.sync_position_open(pos_record)
-            supabase_sync.sync_balance(usdt_balance - budget - budget * _fee_rate)
-        except Exception:
-            pass
+            # Sync position open synchronously so it survives Railway redeploys
+            supabase_sync._upsert_portfolio(pos_record)
+            supabase_sync._upsert_config(usdt_balance - budget - budget * _fee_rate)
+        except Exception as _be:
+            try:
+                database.log_activity(f"Supabase sync error after buying {sym}: {_be}", "error")
+            except Exception:
+                pass
 
         usdt_balance -= budget + budget * _fee_rate
 
@@ -792,13 +814,15 @@ def realtime_monitor(prices: Dict[str, float]):
             with _selling_lock:
                 if sym in _selling:
                     continue
-                _selling.add(sym)          # reserve BEFORE submitting to executor
+                _selling.add(sym)
+                _selling_ts[sym] = time.time()
             _sell_executor.submit(_execute_sell, pos, price, "take-profit")
         elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
             with _selling_lock:
                 if sym in _selling:
                     continue
                 _selling.add(sym)
+                _selling_ts[sym] = time.time()
             _set_cooldown(sym)
             _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
 
@@ -887,35 +911,62 @@ def _sell_monitor_loop():
             with _positions_lock:
                 snap = list(_positions)
 
+            # ── Watchdog: force-clear _selling entries stuck > 90 s ──────────
+            # Prevents positions from showing "SELLING NOW" forever when the
+            # executor thread hangs or crashes without clearing the guard.
+            now_wd = time.time()
+            with _selling_lock:
+                stuck = [s for s, t in list(_selling_ts.items()) if now_wd - t > 90]
+            for s in stuck:
+                with _selling_lock:
+                    _selling.discard(s)
+                    _selling_ts.pop(s, None)
+                try:
+                    database.log_activity(
+                        f"Sell monitor: force-cleared stuck guard for {s} (>90 s)", "warn"
+                    )
+                except Exception:
+                    pass
+
             prices = dict(_dc.prices)
 
-            # ── Price fallback when WebSocket is geo-blocked on Railway ──────
-            # _dc.prices is empty when Binance blocks Railway's WS connection.
-            # REST is tried FIRST (accurate) — signal cache is the last resort.
-            missing = [p["symbol"] for p in snap if not prices.get(p["symbol"])]
-            if missing:
-                # 1. REST batch fetch (accurate current price, rate-limited to 4 s)
+            # ── ALWAYS refresh REST prices for ALL open positions ─────────────
+            # CRITICAL: _dc.prices may contain STALE prices from a WebSocket
+            # that connected briefly then was geo-blocked by Railway/Binance.
+            # A stale price below the exit target means the sell condition is
+            # never met even when the real market price has crossed the target.
+            # REST prices are fetched every 4 s and ALWAYS override WS prices.
+            if snap:
                 now_t2 = time.time()
                 if (now_t2 - _rest_px_ts) >= _REST_PX_TTL:
-                    fetched = _fetch_rest_prices(missing)
+                    all_syms = list({p["symbol"] for p in snap})
+                    fetched = _fetch_rest_prices(all_syms)
                     if fetched:
                         _rest_px.update(fetched)
                         _rest_px_ts = now_t2
-                        database.log_activity(
-                            f"Sell monitor: WebSocket down — REST prices for "
-                            f"{list(fetched.keys())}", "warn"
-                        )
-                # Merge REST cache into prices dict
-                for sym in missing:
-                    if not prices.get(sym) and _rest_px.get(sym):
-                        prices[sym] = _rest_px[sym]
-                # 2. Signal cache as last resort (last kline close, ≤60 s stale)
-                with _signal_cache_lock:
-                    for sym in missing:
-                        if not prices.get(sym):
-                            sc = _signal_cache.get(sym)
-                            if sc and sc.get("price", 0) > 0:
-                                prices[sym] = sc["price"]
+                        stale = [
+                            s for s in fetched
+                            if s in prices and prices[s] > 0
+                            and abs(fetched[s] - prices[s]) / max(fetched[s], 1) > 0.001
+                        ]
+                        if stale or not prices:
+                            database.log_activity(
+                                f"Sell monitor REST refresh: {len(fetched)} prices"
+                                + (f" | WS stale override: {stale}" if stale else ""), "info"
+                            )
+                    else:
+                        # REST failed — fall back to signal cache for missing symbols
+                        with _signal_cache_lock:
+                            for pos2 in snap:
+                                s2 = pos2["symbol"]
+                                if not prices.get(s2):
+                                    sc = _signal_cache.get(s2)
+                                    if sc and sc.get("price", 0) > 0:
+                                        prices[s2] = sc["price"]
+
+            # Apply cached REST prices — these ALWAYS override stale WS prices
+            for sym2, p2 in _rest_px.items():
+                prices[sym2] = p2
 
             # Diagnostic log every 60 s
             now_t = time.time()
@@ -953,12 +1004,14 @@ def _sell_monitor_loop():
                         if sym in _selling:
                             continue
                         _selling.add(sym)
+                        _selling_ts[sym] = time.time()
                     _sell_executor.submit(_execute_sell, pos, price, "take-profit")
                 elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
                     with _selling_lock:
                         if sym in _selling:
                             continue
                         _selling.add(sym)
+                        _selling_ts[sym] = time.time()
                     _set_cooldown(sym)
                     _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
 

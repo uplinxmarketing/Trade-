@@ -1,5 +1,5 @@
 {
-  "version": "4.7.0",
-  "buildTime": "2026-05-04T19:00:00.000Z",
-  "commit": "fix-full-data-persistence-trade-history-coins-positions"
+  "version": "4.8.0",
+  "buildTime": "2026-05-04T20:00:00.000Z",
+  "commit": "fix-sell-stale-price-selling-stuck-supabase-sync"
 }

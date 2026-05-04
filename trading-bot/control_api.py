@@ -145,13 +145,14 @@ def _write_strategy_patch(patch: dict):
 
 def _get_positions():
     try:
-        from trade_engine import get_open_positions
+        from trade_engine import get_open_positions, _rest_px
         from data_collector import prices
         pos = get_open_positions()
         out = []
         for p in pos:
             sym    = p["symbol"]
-            price  = prices.get(sym, 0)
+            # Prefer REST cache (always fresh) over potentially stale WebSocket price
+            price  = _rest_px.get(sym) or prices.get(sym, 0)
             entry  = p.get("entry_price", 0)
             qty    = p.get("quantity", 0)
             target = p.get("exit_target") or (entry * (1 + config.FEE_RATE_BNB * 2) if config.BNB_FEE_MODE else entry * 1.002)
@@ -754,9 +755,10 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
 
         try:
             import supabase_sync
-            supabase_sync.sync_position_open(pos)
-        except Exception:
-            pass
+            supabase_sync._upsert_portfolio(pos)
+            supabase_sync._upsert_config(_get_usdt_balance())
+        except Exception as _sbe:
+            database.log_activity(f"Supabase sync error after force-buy {sym}: {_sbe}", "error")
 
         database.log_activity(f"Force buy: {sym} @ ${fill_price:.4f} | qty={qty:.6f} | budget={budget:.2f} USDT", "info")
         return {"ok": True, "symbol": sym, "price": fill_price, "quantity": qty, "budget": budget}
@@ -788,11 +790,13 @@ def api_force_sell(symbol: str, req: Optional[ForceSellRequest] = None):
         price = hint_price or live_prices.get(sym, 0) or pos.get("entry_price", 0)
         if not price:
             return {"ok": False, "error": f"No live price for {sym}"}
-        from trade_engine import _selling, _selling_lock
+        from trade_engine import _selling, _selling_lock, _selling_ts
+        import time as _time
         with _selling_lock:
             if sym in _selling:
                 return {"ok": False, "error": f"Sell already in progress for {sym}"}
-            _selling.add(sym)   # reserve BEFORE submitting — _execute_sell expects this
+            _selling.add(sym)
+            _selling_ts[sym] = _time.time()
         # Dispatch to executor so this HTTP handler returns immediately.
         # _execute_sell handles all logging, DB cleanup, and _selling.discard in its finally.
         _sell_executor.submit(_execute_sell, pos, price, "force-sell")
