@@ -25,15 +25,18 @@ from urllib import request
 from urllib.error import HTTPError
 
 # ── Credentials ───────────────────────────────────────────────────────────────
+# MUST match the frontend Supabase project (src/integrations/supabase/client.ts).
+# The bot and the UI share the same Supabase project so trades/positions are
+# visible in the UI and survive Railway redeploys.
 SUPABASE_URL = (
     os.getenv("SUPABASE_URL")
     or os.getenv("VITE_SUPABASE_URL")
-    or "https://hkwirofdkgdamqnlcjqf.supabase.co"
+    or "https://vrmnmedrwsddxovqcuns.supabase.co"
 )
 SUPABASE_KEY = (
     os.getenv("SUPABASE_ANON_KEY")
     or os.getenv("VITE_SUPABASE_PUBLISHABLE_KEY")
-    or "sb_publishable_6p26q62HNaU7pqv9k9jb_w_8S0ixNrP"
+    or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZybW5tZWRyd3NkZHhvdnFjdW5zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3MjYwNTIsImV4cCI6MjA5MzMwMjA1Mn0.sV_iJu0CYQwQ9aQGWgFfusqH92QhPKgThOWrCmKKXJo"
 )
 SESSION = "railway_bot"
 

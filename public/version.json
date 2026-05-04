@@ -1,5 +1,5 @@
 {
-  "version": "4.3.0",
-  "buildTime": "2026-05-04T12:00:00.000Z",
-  "commit": "fix-sell-nonblocking-heartbeat-exit-target-restore"
+  "version": "4.4.0",
+  "buildTime": "2026-05-04T14:00:00.000Z",
+  "commit": "fix-supabase-wrong-project-always-restore-coins"
 }

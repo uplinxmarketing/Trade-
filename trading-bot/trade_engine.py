@@ -143,57 +143,77 @@ def _rebuild_pos_index():
         _pos_by_symbol = {p["symbol"]: p for p in _positions}
 
 
+def _apply_coin_restore(coins: list):
+    """Write a list of coin symbols back into strategy.json approved_coins."""
+    if not (coins and isinstance(coins, list) and len(coins) > 0):
+        return
+    try:
+        if os.path.exists(config.STRATEGY_FILE):
+            with open(config.STRATEGY_FILE) as f:
+                strat = json.load(f)
+            existing = {c["symbol"]: c for c in strat.get("approved_coins", [])}
+            strat["approved_coins"] = [
+                {
+                    "symbol":         sym,
+                    "approved":       True,
+                    "budget_usdt":    existing.get(sym, {}).get("budget_usdt", config.BUDGET_PER_TRADE_USDT),
+                    "max_concurrent": existing.get(sym, {}).get("max_concurrent", 3),
+                    "confidence":     existing.get(sym, {}).get("confidence", 0.5),
+                    "reason":         "Restored from Supabase",
+                }
+                for sym in coins
+            ]
+            strat["updated_at"] = datetime.now(timezone.utc).isoformat()
+            with open(config.STRATEGY_FILE, "w") as f:
+                json.dump(strat, f, indent=2)
+            print(f"[TradeEngine] Restored {len(coins)} coins from Supabase → strategy.json.")
+    except Exception as ce:
+        print(f"[TradeEngine] Coin restore to strategy.json failed: {ce}")
+
+
 def load_positions_from_db():
-    """Called on startup — restores open positions from SQLite, or Supabase if SQLite is empty."""
+    """
+    Called on startup.  Restores open positions from SQLite when available,
+    or from Supabase when SQLite is empty (fresh Railway deploy / no volume).
+    Coins and balance are ALWAYS restored from Supabase so the user's
+    watchlist and wallet survive every redeploy regardless of SQLite state.
+    """
     global _positions
     rows = database.load_positions()
 
-    if not rows:
-        # SQLite is empty (fresh Railway deploy) — try to restore from Supabase
-        try:
-            import supabase_sync
-            restored = supabase_sync.restore_from_supabase()
-            if restored.get("positions"):
-                for pos in restored["positions"]:
-                    pos_id = database.save_position(pos)
-                    pos["id"] = pos_id
-                rows = database.load_positions()
-                print(f"[TradeEngine] Restored {len(rows)} position(s) from Supabase.")
-            if restored.get("usdt_balance") is not None:
-                usdt = restored["usdt_balance"]
-                if hasattr(client, "_balances"):
+    # Always fetch from Supabase so coins + balance are current even when
+    # SQLite still has stale data from a previous deploy.
+    try:
+        import supabase_sync
+        restored = supabase_sync.restore_from_supabase()
+
+        # ── Coins: ALWAYS restore — user selection must survive every deploy ──
+        _apply_coin_restore(restored.get("selected_coins"))
+
+        # ── Positions: only restore when SQLite is empty (avoids duplicates) ──
+        if not rows and restored.get("positions"):
+            for pos in restored["positions"]:
+                pos_id = database.save_position(pos)
+                pos["id"] = pos_id
+            rows = database.load_positions()
+            print(f"[TradeEngine] Restored {len(rows)} position(s) from Supabase.")
+
+        # ── Balance: restore when SQLite paper-state is empty or zero ──────────
+        if restored.get("usdt_balance") is not None:
+            usdt = restored["usdt_balance"]
+            if hasattr(client, "_balances"):
+                with client._lock:
+                    current = client._balances.get("USDT", 0.0)
+                # Only overwrite if local balance looks wrong (zero or default)
+                if current <= 0 or not rows:
                     with client._lock:
                         client._balances["USDT"] = usdt
                         snapshot = dict(client._balances)
                     database.save_paper_state(snapshot)
                     print(f"[TradeEngine] Restored USDT balance from Supabase: {usdt:.2f}")
-            # Restore selected coins — write them back to strategy.json
-            coins = restored.get("selected_coins")
-            if coins and isinstance(coins, list) and len(coins) > 0:
-                try:
-                    if os.path.exists(config.STRATEGY_FILE):
-                        with open(config.STRATEGY_FILE) as f:
-                            strat = json.load(f)
-                        existing = {c["symbol"]: c for c in strat.get("approved_coins", [])}
-                        strat["approved_coins"] = [
-                            {
-                                "symbol":         sym,
-                                "approved":       True,
-                                "budget_usdt":    existing.get(sym, {}).get("budget_usdt", config.BUDGET_PER_TRADE_USDT),
-                                "max_concurrent": existing.get(sym, {}).get("max_concurrent", 3),
-                                "confidence":     existing.get(sym, {}).get("confidence", 0.5),
-                                "reason":         "Restored from Supabase",
-                            }
-                            for sym in coins
-                        ]
-                        strat["updated_at"] = datetime.now(timezone.utc).isoformat()
-                        with open(config.STRATEGY_FILE, "w") as f:
-                            json.dump(strat, f, indent=2)
-                        print(f"[TradeEngine] Restored {len(coins)} coins from Supabase to strategy.json.")
-                except Exception as ce:
-                    print(f"[TradeEngine] Coin restore to strategy.json failed: {ce}")
-        except Exception as e:
-            print(f"[TradeEngine] Supabase restore failed (non-fatal): {e}")
+
+    except Exception as e:
+        print(f"[TradeEngine] Supabase restore failed (non-fatal): {e}")
 
     with _positions_lock:
         _positions = list(rows)
