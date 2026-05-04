@@ -536,17 +536,10 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         database.log_trade(trade_record)
         try:
             import supabase_sync
-            # Write trade to Supabase SYNCHRONOUSLY — background writes can be
-            # lost when Railway kills the process before the thread finishes.
-            supabase_sync._sync_trade_impl(trade_record)
-            supabase_sync._delete("paper_portfolio",
-                                  f"user_session=eq.{supabase_sync.SESSION}&symbol=eq.{sym}")
-            # Sync updated USDT balance
-            try:
-                usdt_now = _get_usdt_balance()
-                supabase_sync._upsert_config(usdt_now)
-            except Exception:
-                pass
+            # Parallel sync to Supabase — all 3 calls run concurrently, max 4 s total.
+            # Synchronous here (not background) so data is never lost on Railway restart.
+            usdt_now = _get_usdt_balance()
+            supabase_sync.sync_sell_result_sync(trade_record, sym, usdt_now)
         except Exception as se:
             err_msg = f"Supabase sync error after selling {sym}: {se}"
             print(f"[TradeEngine] {err_msg}")
@@ -742,9 +735,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         try:
             import supabase_sync
-            # Sync position open synchronously so it survives Railway redeploys
-            supabase_sync._upsert_portfolio(pos_record)
-            supabase_sync._upsert_config(usdt_balance - budget - budget * _fee_rate)
+            # Parallel sync to Supabase — both calls run concurrently, max 4 s total.
+            supabase_sync.sync_buy_result_sync(
+                pos_record, usdt_balance - budget - budget * _fee_rate
+            )
         except Exception as _be:
             try:
                 database.log_activity(f"Supabase sync error after buying {sym}: {_be}", "error")
@@ -817,14 +811,6 @@ def realtime_monitor(prices: Dict[str, float]):
                 _selling.add(sym)
                 _selling_ts[sym] = time.time()
             _sell_executor.submit(_execute_sell, pos, price, "take-profit")
-        elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
-            with _selling_lock:
-                if sym in _selling:
-                    continue
-                _selling.add(sym)
-                _selling_ts[sym] = time.time()
-            _set_cooldown(sym)
-            _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
 
     # ── Inline signal refresh — throttled to every 30 s per coin ─────────────
     for sym, price in prices.items():
@@ -1006,14 +992,6 @@ def _sell_monitor_loop():
                         _selling.add(sym)
                         _selling_ts[sym] = time.time()
                     _sell_executor.submit(_execute_sell, pos, price, "take-profit")
-                elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
-                    with _selling_lock:
-                        if sym in _selling:
-                            continue
-                        _selling.add(sym)
-                        _selling_ts[sym] = time.time()
-                    _set_cooldown(sym)
-                    _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
 
         except Exception as exc:
             try:

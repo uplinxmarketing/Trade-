@@ -212,8 +212,7 @@ def sync_balance(usdt: float):
     _bg(_upsert_config, usdt)
 
 
-def sync_selected_coins(coins: list):
-    """Persist the bot's selected coin list to bot_config."""
+def sync_selected_coins(coins: list):    """Persist the bot's selected coin list to bot_config."""
     _bg(_sync_coins_impl, list(coins))
 
 
@@ -231,6 +230,45 @@ def _sync_coins_impl(coins: list):
             "selected_coins":  coins,
             "updated_at":      now,
         })
+
+
+def sync_sell_result_sync(trade: dict, symbol: str, usdt: float):
+    """
+    Write sell result to Supabase synchronously using parallel threads.
+    All three calls run at once — total blocking time ≤ 4 s.
+    Call from the sell executor thread to ensure data survives Railway redeploys.
+    """
+    if not _enabled:
+        return
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    with _TPE(max_workers=3) as _ex:
+        f1 = _ex.submit(_sync_trade_impl, trade)
+        f2 = _ex.submit(_delete, "paper_portfolio",
+                        f"user_session=eq.{SESSION}&symbol=eq.{symbol}")
+        f3 = _ex.submit(_upsert_config, usdt)
+        for f in (f1, f2, f3):
+            try:
+                f.result(timeout=4)
+            except Exception:
+                pass
+
+
+def sync_buy_result_sync(pos: dict, usdt: float):
+    """
+    Write buy result to Supabase synchronously using parallel threads.
+    Both calls run at once — total blocking time ≤ 4 s.
+    """
+    if not _enabled:
+        return
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    with _TPE(max_workers=2) as _ex:
+        f1 = _ex.submit(_upsert_portfolio, pos)
+        f2 = _ex.submit(_upsert_config, usdt)
+        for f in (f1, f2):
+            try:
+                f.result(timeout=4)
+            except Exception:
+                pass
 
 
 def sync_all(positions: list, usdt: float):

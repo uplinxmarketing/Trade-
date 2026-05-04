@@ -755,8 +755,7 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
 
         try:
             import supabase_sync
-            supabase_sync._upsert_portfolio(pos)
-            supabase_sync._upsert_config(_get_usdt_balance())
+            supabase_sync.sync_buy_result_sync(pos, _get_usdt_balance())
         except Exception as _sbe:
             database.log_activity(f"Supabase sync error after force-buy {sym}: {_sbe}", "error")
 

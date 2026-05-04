@@ -1,5 +1,5 @@
 {
-  "version": "4.8.0",
-  "buildTime": "2026-05-04T20:00:00.000Z",
-  "commit": "fix-sell-stale-price-selling-stuck-supabase-sync"
+  "version": "4.9.0",
+  "buildTime": "2026-05-04T21:00:00.000Z",
+  "commit": "fix-no-stop-loss-parallel-supabase-writes-fast-sells"
 }
