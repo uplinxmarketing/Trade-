@@ -57,6 +57,11 @@ async def lifespan(app: FastAPI):
         strategy_engine.write_default_strategy()
         steps.append("strategy OK")
 
+        # 2b. Record paper_starting_balance on first ever deploy (idempotent)
+        if not database.get_setting("paper_starting_balance"):
+            _starting = float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+            database.save_setting("paper_starting_balance", str(_starting))
+
         # 3. Restore open positions + coins + balance from SQLite / Supabase
         trade_engine.load_positions_from_db()
         steps.append("positions OK")
@@ -553,18 +558,44 @@ setInterval(refresh, 5000);  // auto-refresh every 5s
 def api_wallet():
     try:
         from connection import client
+        from trade_engine import get_open_positions, _rest_px
+        from data_collector import prices as live_prices
+
         acc = client.get_account()
         balances = [
             {"asset": b["asset"], "free": float(b["free"]), "locked": float(b["locked"])}
             for b in acc["balances"]
             if float(b["free"]) + float(b["locked"]) > 0
         ]
-        total_usdt = sum(
-            b["free"] for b in balances if b["asset"] == "USDT"
-        )
-        return {"balances": balances, "total_usdt": total_usdt, "mode": "paper"}
+        usdt_free = sum(b["free"] for b in balances if b["asset"] == "USDT")
+
+        # Total portfolio value = free USDT + mark-to-market value of open positions
+        total_value = usdt_free
+        for pos in get_open_positions():
+            sym = pos["symbol"]
+            px  = _rest_px.get(sym) or live_prices.get(sym) or pos["entry_price"]
+            total_value += pos["quantity"] * px
+
+        # Realized P&L: single source of truth — SQL SUM from trades table
+        realized_pnl = database.get_realized_pnl(mode="paper")
+
+        # Session P&L: current total portfolio value minus the balance at last reset
+        starting_str  = database.get_setting("paper_starting_balance")
+        starting_bal  = float(starting_str) if starting_str else float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+        session_pnl   = round(total_value - starting_bal, 4)
+
+        return {
+            "balances":        balances,
+            "total_usdt":      round(usdt_free, 4),
+            "total_value":     round(total_value, 4),
+            "realized_pnl":    round(realized_pnl, 4),
+            "session_pnl":     session_pnl,
+            "starting_balance": round(starting_bal, 4),
+            "mode":            "paper",
+        }
     except Exception as e:
-        return {"balances": [], "total_usdt": 0.0, "mode": "paper", "error": str(e)}
+        return {"balances": [], "total_usdt": 0.0, "total_value": 0.0,
+                "realized_pnl": 0.0, "session_pnl": 0.0, "mode": "paper", "error": str(e)}
 
 
 @app.get("/bot-dashboard", response_class=HTMLResponse)
@@ -581,7 +612,8 @@ def api_status():
     trades   = database.get_recent_trades(limit=500)
     sells    = [t for t in trades if t.get("exit_price") is not None]
     wins     = sum(1 for t in sells if (t.get("net_profit") or 0) > 0)
-    realized = sum(t.get("net_profit") or 0 for t in sells)
+    # Realized P&L: single source of truth — SQL SUM directly from trades table
+    realized = database.get_realized_pnl(mode="paper")
     initial  = float(strategy.get("initial_balance_usdt", 0))
     balance  = round(_get_usdt_balance(), 2)
     approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
@@ -589,7 +621,7 @@ def api_status():
         "running":          strategy.get("trading_active", False),
         "mode":             get_mode(),
         "balance_usdt":     balance,
-        "paper_balance":    balance,   # alias for frontend compatibility
+        "paper_balance":    balance,
         "initial_balance":  initial or balance,
         "open_positions":   len(_get_positions()),
         "trades_today":     database.get_trades_today_count(),
@@ -675,7 +707,10 @@ def api_reset():
         from trade_engine import load_positions_from_db
         load_positions_from_db()
 
-        # Reset initial_balance in strategy.json
+        # Record starting balance as authoritative session anchor
+        database.save_setting("paper_starting_balance", str(starting_usdt))
+
+        # Reset initial_balance in strategy.json (kept for legacy compatibility)
         s = _load_strategy()
         s["initial_balance_usdt"] = starting_usdt
         with open(config.STRATEGY_FILE, "w") as f:
@@ -910,7 +945,8 @@ def api_all():
     trades   = database.get_recent_trades(limit=500)
     sells    = [t for t in trades if t.get("exit_price") is not None]
     wins     = sum(1 for t in sells if (t.get("net_profit") or 0) > 0)
-    realized = sum(t.get("net_profit") or 0 for t in sells)
+    # Realized P&L: SQL SUM — single source of truth matching /api/wallet
+    realized = database.get_realized_pnl(mode="paper")
     initial  = float(strategy.get("initial_balance_usdt", 0))
     balance  = round(_get_usdt_balance(), 2)
     approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
@@ -927,10 +963,10 @@ def api_all():
             "wins":            wins,
             "losses":          len(sells) - wins,
             "total_trades":    len(sells),
-            "realized_pnl":     round(realized, 4),
-            "watched_coins":    approved or config.WATCHED_COINS,
-            "data_persistent":  database._DATA_DIR == "/data",
-            "data_dir":         database._DATA_DIR,
+            "realized_pnl":    round(realized, 4),
+            "watched_coins":   approved or config.WATCHED_COINS,
+            "data_persistent": database._DATA_DIR == "/data",
+            "data_dir":        database._DATA_DIR,
         },
         "positions": _get_positions(),
         "trades":    database.get_recent_trades(limit=200),

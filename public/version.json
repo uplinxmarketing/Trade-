@@ -1,5 +1,5 @@
 {
-  "version": "4.9.1",
-  "buildTime": "2026-05-04T22:00:00.000Z",
-  "commit": "fix-supabase-syntax-breakeven-buffer-no-loss-sells"
+  "version": "4.9.2",
+  "buildTime": "2026-05-04T23:00:00.000Z",
+  "commit": "fix-position-lifecycle-wallet-formula-realized-pnl-sql"
 }

@@ -489,13 +489,18 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         database.log_activity(msg, "error")
         return
 
-    fill_price = float(result["fills"][0]["price"]) if result.get("fills") else price
-    # commission from PaperClient is already in USDT (fee = gross * fee_rate).
-    # Do NOT multiply by fill_price again — that was double-counting.
-    sell_fee = float(result["fills"][0]["commission"]) if result.get("fills") else (qty * fill_price * _fee_rate)
-    buy_fee  = pos["budget_usdt"] * _fee_rate
-    gross    = qty * fill_price
-    net_profit = gross - sell_fee - pos["budget_usdt"] - buy_fee
+    # Read fill data directly from PaperClient's order response — no recalculation.
+    # cummulativeQuoteQty = gross - sell_fee = USDT actually returned to wallet.
+    fill          = result.get("fills", [{}])[0]
+    fill_price    = float(fill.get("price", price))
+    sell_fee      = float(fill.get("commission", 0))
+    usdt_returned = float(result.get("cummulativeQuoteQty", 0))  # gross - sell_fee
+    budget        = pos["budget_usdt"]
+    buy_fee       = budget * _fee_rate
+    # Single authoritative formula — must match wallet formula in PaperClient exactly:
+    #   net_profit = usdt_returned - budget - buy_fee
+    #             = (qty × sell_price - sell_fee) - budget - (budget × fee_rate)
+    net_profit    = usdt_returned - budget - buy_fee
 
     buy_ts  = pos.get("timestamp", now)
     sell_ts = now
@@ -565,11 +570,10 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
         _rebuild_pos_index()
 
-    usdt_received = gross - sell_fee
-    pnl_sign      = "+" if net_profit >= 0 else ""
+    pnl_sign = "+" if net_profit >= 0 else ""
     sell_msg = (
         f"SOLD {sym} @ ${fill_price:.4f} "
-        f"· received {usdt_received:.4f} USDT · P&L: {pnl_sign}{net_profit:.4f} USDT"
+        f"· received {usdt_returned:.4f} USDT · P&L: {pnl_sign}{net_profit:.4f} USDT"
         f"  ({reason}, held {duration}s)"
     )
     print(f"[{sell_ts}] {sell_msg}")

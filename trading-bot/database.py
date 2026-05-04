@@ -139,6 +139,12 @@ def init_db():
                 level     TEXT NOT NULL DEFAULT 'info',
                 timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
         """)
 
         # ── Schema migrations for existing databases ─────────────────────────
@@ -375,8 +381,45 @@ def reset_paper_wallet(starting_usdt: float):
             ON CONFLICT(id) DO UPDATE SET
                 balances=excluded.balances, updated_at=excluded.updated_at
         """, (json.dumps({"USDT": starting_usdt}),))
+        # Record the starting balance so session_pnl can be computed as current_total - this value.
+        conn.execute("""
+            INSERT INTO settings (key, value, updated_at) VALUES ('paper_starting_balance', ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+        """, (str(starting_usdt),))
         conn.commit()
         conn.close()
+
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+
+def save_setting(key: str, value: str):
+    with _lock:
+        conn = _conn()
+        conn.execute("""
+            INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+        """, (key, value))
+        conn.commit()
+        conn.close()
+
+
+def get_setting(key: str) -> Optional[str]:
+    with _lock:
+        conn = _conn()
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        conn.close()
+    return row["value"] if row else None
+
+
+def get_realized_pnl(mode: str = "paper") -> float:
+    """Return SUM(net_profit) from trades table — the single source of truth for realized P&L."""
+    with _lock:
+        conn = _conn()
+        row = conn.execute(
+            "SELECT COALESCE(SUM(net_profit), 0.0) AS total FROM trades WHERE mode=?", (mode,)
+        ).fetchone()
+        conn.close()
+    return float(row["total"]) if row else 0.0
 
 
 # ── Activity log ──────────────────────────────────────────────────────────────
