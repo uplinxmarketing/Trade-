@@ -227,18 +227,20 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     } finally { setLoading(false); }
   }, [binanceConnected, prices]);
 
-  // Paper subscription + polling — stable, never torn down by price changes
+  // Paper subscription + polling — disabled when Railway is the backend
+  // (hasAgentData=true means Railway /api/wallet is the authoritative source)
   useEffect(() => {
     if (mode === 'live' && binanceConnected) return;
+    if (hasAgentData) return; // Railway mode: no Supabase needed
     loadPaper();
     const ch = supabase.channel('walletv2')
       .on('postgres_changes',{event:'*',schema:'public',table:'bot_config'},loadPaper)
       .on('postgres_changes',{event:'*',schema:'public',table:'paper_portfolio'},loadPaper)
       .on('postgres_changes',{event:'*',schema:'public',table:'bot_trade_history'},loadPaper)
       .subscribe();
-    const poll = setInterval(loadPaper, 2000);
+    const poll = setInterval(loadPaper, 5000);
     return () => { supabase.removeChannel(ch); clearInterval(poll); };
-  }, [mode, binanceConnected, loadPaper]);
+  }, [mode, binanceConnected, loadPaper, hasAgentData]);
 
   // Live mode — re-run only when connection state changes (not on every price tick)
   useEffect(() => {
@@ -249,17 +251,45 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
 
   // ── Use agent-provided state when available (instant sync / server mode) ─────
   const hasAgentData = agentBalance !== undefined && agentBalance > 0;
+
+  // ── Server wallet — poll /api/wallet for authoritative P&L numbers ─────────
+  // Replaces Supabase-derived P&L when Railway is the backend.
+  const [serverWallet, setServerWallet] = useState<{
+    realized_pnl: number; session_pnl: number; starting_balance: number;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!hasAgentData) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/wallet`, { cache: 'no-store' });
+        if (!res.ok || cancelled) return;
+        const d = await res.json();
+        if (!cancelled) setServerWallet({
+          realized_pnl:     Number(d.realized_pnl     ?? 0),
+          session_pnl:      Number(d.session_pnl      ?? 0),
+          starting_balance: Number(d.starting_balance ?? 0),
+        });
+      } catch {}
+    };
+    poll();
+    const id = setInterval(poll, 5_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [hasAgentData]); // eslint-disable-line
   const effectivePositions = hasAgentData ? (agentPositions ?? positions) : positions;
   const effectiveUsdtFree  = hasAgentData ? agentBalance : usdtFree;
   const effectiveInitBal   = (agentInitialBalance && agentInitialBalance > 0) ? agentInitialBalance : initialBalance;
 
-  // Session stats: prefer agent trades (Railway server) over Supabase
+  // Session stats: server wallet (/api/wallet SQL) > agent trades > Supabase fallback
   const effectiveSells = agentTrades
-    ? agentTrades.filter(t => t.side === 'SELL' && t.pnl != null)
+    ? agentTrades.filter(t => (t.side === 'SELL' || (t.side as string).toLowerCase() === 'sell') && t.pnl != null)
     : [];
-  const effectiveSessionGain = effectiveSells.length > 0
+  const tradesRealizedPnl = effectiveSells.length > 0
     ? Math.round(effectiveSells.reduce((s, t) => s + (t.pnl ?? 0), 0) * 100) / 100
     : sessionGain;
+  // Authoritative realized P&L: prefer /api/wallet SQL sum
+  const effectiveSessionGain = serverWallet ? serverWallet.realized_pnl : tradesRealizedPnl;
   const effectiveFees = effectiveSells.length > 0
     ? Math.round(effectiveSells.reduce((s, t) => {
         const qty = Number(t.quantity), price = Number(t.price);
@@ -320,7 +350,13 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
 
   const paperPositionTotal = positionRows.reduce((s,r)=>s+r.currentValue, 0);
   const totalPortfolio     = effectiveUsdtFree + paperPositionTotal;
-  const sessionGainPct     = effectiveInitBal > 0 ? ((totalPortfolio - effectiveInitBal) / effectiveInitBal) * 100 : 0;
+  // Authoritative starting balance: /api/wallet > agentInitialBalance > Supabase
+  const displayStartingBal = (serverWallet?.starting_balance ?? 0) > 0
+    ? serverWallet!.starting_balance
+    : effectiveInitBal;
+  // Session P&L in USDT: /api/wallet computes total_value - starting_balance server-side
+  const displaySessionPnl  = serverWallet ? serverWallet.session_pnl : (totalPortfolio - displayStartingBal);
+  const sessionGainPct     = displayStartingBal > 0 ? (displaySessionPnl / displayStartingBal) * 100 : 0;
 
   // ── Live mode totals ─────────────────────────────────────────────────────────
   const liveTotal = liveAssets.reduce((s,a)=>s+a.usdValue, 0);
@@ -359,8 +395,9 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
               <div className={`text-xs font-mono font-semibold ${effectiveSessionGain >= 0 ? 'text-gain' : 'text-loss'}`}>
                 {effectiveSessionGain >= 0 ? '+' : ''}{effectiveSessionGain.toFixed(2)} USDT realized
               </div>
-              <div className={`text-[10px] font-mono ${sessionGainPct >= 0 ? 'text-gain' : 'text-loss'}`}>
-                {sessionGainPct >= 0 ? '+' : ''}{sessionGainPct.toFixed(2)}% since session open
+              <div className={`text-[10px] font-mono ${displaySessionPnl >= 0 ? 'text-gain' : 'text-loss'}`}>
+                {displaySessionPnl >= 0 ? '+' : ''}{displaySessionPnl.toFixed(2)} USDT
+                {' '}({sessionGainPct >= 0 ? '+' : ''}{sessionGainPct.toFixed(2)}%) session
               </div>
               <div className="text-[10px] text-muted-foreground">
                 Fees paid: <span className="font-mono text-foreground">{effectiveFees.toFixed(4)} USDT</span>

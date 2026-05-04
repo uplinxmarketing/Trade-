@@ -1,5 +1,5 @@
 {
-  "version": "4.9.6",
-  "buildTime": "2026-05-04T22:28:28.681Z",
-  "commit": "a7741b1"
+  "version": "4.9.7",
+  "buildTime": "2026-05-05T00:30:00.000Z",
+  "commit": "fix-wallet-balance-pnl-mismatch"
 }
