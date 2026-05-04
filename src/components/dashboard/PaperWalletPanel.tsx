@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Wallet, TrendingUp, TrendingDown } from 'lucide-react';
+import { Wallet, TrendingUp, TrendingDown, ChevronUp, ChevronDown } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
 import { TAKER_FEE } from '@/lib/trading-engine';
 
@@ -34,6 +34,7 @@ const PaperWalletPanel = ({ prices }: PaperWalletPanelProps) => {
   const [positions, setPositions]         = useState<Position[]>([]);
   const [realizedPnl, setRealizedPnl]     = useState(0);
   const [isRunning, setIsRunning]         = useState(false);
+  const [minimized, setMinimized]         = useState(false);
 
   const loadData = useCallback(async () => {
     const [cfgRes, posRes, tradeRes] = await Promise.all([
@@ -81,20 +82,23 @@ const PaperWalletPanel = ({ prices }: PaperWalletPanelProps) => {
     <div className="bg-card border border-border rounded-lg p-4 space-y-4">
 
       {/* ── Header ── */}
-      <div className="flex items-center justify-between">
+      <button onClick={() => setMinimized(p=>!p)} className="flex items-center justify-between w-full text-left">
         <div className="flex items-center gap-2">
           <Wallet className="w-4 h-4 text-accent" />
           <h3 className="text-sm font-semibold">Paper Wallet</h3>
           <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-accent/20 text-accent">paper</span>
         </div>
-        {isRunning && (
-          <div className="flex items-center gap-1 text-[9px] text-gain font-mono">
-            <span className="w-1.5 h-1.5 rounded-full bg-gain animate-pulse inline-block" /> Bot active
-          </div>
-        )}
-      </div>
+        <div className="flex items-center gap-2">
+          {isRunning && (
+            <div className="flex items-center gap-1 text-[9px] text-gain font-mono">
+              <span className="w-1.5 h-1.5 rounded-full bg-gain animate-pulse inline-block" /> Bot active
+            </div>
+          )}
+          {minimized ? <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" /> : <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />}
+        </div>
+      </button>
 
-      {!hasActivity ? (
+      {!minimized && (!hasActivity ? (
         <p className="text-xs text-muted-foreground text-center py-6">
           Start the bot to see your paper wallet activity here.
         </p>
@@ -124,8 +128,8 @@ const PaperWalletPanel = ({ prices }: PaperWalletPanelProps) => {
           </div>
 
           {/* ── Holdings table ── */}
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
+          <div className="overflow-x-auto overflow-y-auto max-h-[260px] scrollbar-thin">
+            <table className="w-full text-xs min-w-[420px]">
               <thead>
                 <tr className="border-b border-border">
                   {['Coin', 'Quantity', 'Avg buy price', 'Current value', 'P&L'].map(h => (
@@ -229,7 +233,7 @@ const PaperWalletPanel = ({ prices }: PaperWalletPanelProps) => {
             Quantities in coin units · values in USDT · green = profitable · red = at loss · gray = breakeven · all balances marked (paper)
           </div>
         </>
-      )}
+      ))}
     </div>
   );
 };

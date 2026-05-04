@@ -197,6 +197,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [scanning, setScanning]   = useState(false);
   const [showAllTrades, setShowAllTrades] = useState(false);
   const [showAllPositions, setShowAllPositions] = useState(false);
+  const [showPositionsSection, setShowPositionsSection] = useState(true);
+  const [showTradesSection, setShowTradesSection] = useState(true);
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
   const [instructions, setInstructions]   = useState(() => localStorage.getItem(INSTRUCTIONS_KEY) ?? '');
@@ -1222,21 +1224,20 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         </div>
       )}
 
-      {/* ── Open positions ── always visible so the user can see status */}
+      {/* ── Open positions ── */}
       <div>
-        <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2 flex items-center justify-between">
-          <div className="flex items-center gap-1.5">
-            <Zap className="w-3 h-3 text-warn"/>
-            Open Positions
-            <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${positions.length>0?'bg-warn/20 text-warn':'bg-muted/40 text-muted-foreground'}`}>
-              {positions.length}
-            </span>
-          </div>
+        <button onClick={() => setShowPositionsSection(p=>!p)} className="flex items-center gap-1.5 text-[10px] uppercase tracking-widest text-muted-foreground hover:text-foreground w-full mb-2">
+          <Zap className="w-3 h-3 text-warn shrink-0"/>
+          Open Positions
+          <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${positions.length>0?'bg-warn/20 text-warn':'bg-muted/40 text-muted-foreground'}`}>
+            {positions.length}
+          </span>
           {isServerMode && positions.length > 0 && (
-            <span className="text-[9px] text-muted-foreground">live from Railway</span>
+            <span className="text-[9px] text-muted-foreground font-normal normal-case tracking-normal ml-1">live from Railway</span>
           )}
-        </div>
-        {positions.length === 0 ? (
+          {showPositionsSection?<ChevronUp className="w-3 h-3 ml-auto"/>:<ChevronDown className="w-3 h-3 ml-auto"/>}
+        </button>
+        {showPositionsSection && (positions.length === 0 ? (
           <div className="text-xs text-muted-foreground text-center py-5 border border-dashed border-border rounded-lg">
             {isRunning ? '⏳ No open positions — bot will buy when signals align' : '▶ Start the agent to begin trading'}
           </div>
@@ -1295,24 +1296,23 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               </button>
             )}
           </div>
-        )}
+        ))}
       </div>
 
       {/* ── Trade history ── */}
       <div>
-        <div className="flex items-center justify-between mb-2">
-          <div className="text-[10px] uppercase tracking-widest text-muted-foreground flex items-center gap-1.5">
-            {totalPnl>=0?<TrendingUp className="w-3 h-3 text-gain"/>:<TrendingDown className="w-3 h-3 text-loss"/>}
-            Trade History ({trades.length})
-          </div>
+        <button onClick={() => setShowTradesSection(p=>!p)} className="flex items-center gap-1.5 text-[10px] uppercase tracking-widest text-muted-foreground hover:text-foreground w-full mb-2">
+          {totalPnl>=0?<TrendingUp className="w-3 h-3 text-gain shrink-0"/>:<TrendingDown className="w-3 h-3 text-loss shrink-0"/>}
+          Trade History ({trades.length})
           {sellTrades.length > 0 && (
-            <div className="flex items-center gap-3 text-[10px] font-mono">
+            <span className="font-mono font-normal normal-case tracking-normal ml-1 flex items-center gap-2">
               <span className="text-muted-foreground">{wins}W/{sellTrades.length-wins}L</span>
-              <span className={pnlColor}>{totalPnl>=0?'+':''}{totalPnl.toFixed(4)} USDT</span>
-            </div>
+              <span className={pnlColor}>{totalPnl>=0?'+':''}{totalPnl.toFixed(4)}</span>
+            </span>
           )}
-        </div>
-        {!trades.length ? (
+          {showTradesSection?<ChevronUp className="w-3 h-3 ml-auto"/>:<ChevronDown className="w-3 h-3 ml-auto"/>}
+        </button>
+        {showTradesSection && (!trades.length ? (
           <p className="text-xs text-muted-foreground text-center py-6 border border-dashed border-border rounded-lg">
             {isRunning ? '⏳ First scan running — trades will appear here…' : '▶ Start the agent to begin paper trading'}
           </p>
@@ -1349,7 +1349,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               </button>
             )}
           </div>
-        )}
+        ))}
       </div>
 
       {/* ── Activity log (collapsible) ── */}
