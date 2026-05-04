@@ -1,5 +1,5 @@
 {
-  "version": "4.9.8",
-  "buildTime": "2026-05-05T00:44:39.000Z",
-  "commit": "force-rebuild-wallet-pnl-fix"
+  "version": "4.9.9",
+  "buildTime": "2026-05-04T22:52:09.000Z",
+  "commit": "fix-tdz-crash-hasAgentData"
 }

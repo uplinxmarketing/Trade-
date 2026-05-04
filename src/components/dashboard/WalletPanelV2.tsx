@@ -227,6 +227,11 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     } finally { setLoading(false); }
   }, [binanceConnected, prices]);
 
+  // ── Use agent-provided state when available (instant sync / server mode) ─────
+  const hasAgentData = agentBalance !== undefined && agentBalance > 0;
+
+  const isPaper = mode === 'test' || !binanceConnected;
+
   // Paper subscription + polling — disabled when Railway is the backend
   // (hasAgentData=true means Railway /api/wallet is the authoritative source)
   useEffect(() => {
@@ -246,11 +251,6 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   useEffect(() => {
     if (mode === 'live' && binanceConnected) loadLive();
   }, [mode, binanceConnected]); // eslint-disable-line
-
-  const isPaper = mode === 'test' || !binanceConnected;
-
-  // ── Use agent-provided state when available (instant sync / server mode) ─────
-  const hasAgentData = agentBalance !== undefined && agentBalance > 0;
 
   // ── Server wallet — poll /api/wallet for authoritative P&L numbers ─────────
   // Replaces Supabase-derived P&L when Railway is the backend.
