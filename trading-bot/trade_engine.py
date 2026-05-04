@@ -798,15 +798,61 @@ _sell_diag_ts: float      = 0.0
 _sell_monitor_heartbeat: float = 0.0   # updated every loop — 0 means not started
 _sell_monitor_thread: Optional[threading.Thread] = None
 
+# REST price fallback cache — populated when WebSocket is geo-blocked on Railway
+_rest_px: Dict[str, float] = {}
+_rest_px_ts: float = 0.0
+_REST_PX_TTL = 8.0   # refetch at most every 8 s
+
+
+def _fetch_rest_prices(symbols: list) -> Dict[str, float]:
+    """
+    Batch-fetch current prices via REST when WebSocket is unavailable.
+    Uses /api/v3/ticker/price?symbols=[...] — only fetches needed symbols.
+    Tries the public CDN first (rarely geo-blocked), then API fallbacks.
+    Returns {} on complete failure.
+    """
+    import urllib.request as _ur
+    import urllib.parse as _up
+    result: Dict[str, float] = {}
+    syms_param = _up.quote(json.dumps(symbols))
+    for base in _KLINE_BASES:
+        try:
+            url = f"{base}/api/v3/ticker/price?symbols={syms_param}"
+            req = _ur.Request(url, headers={"User-Agent": "TradingBot/1.0"})
+            with _ur.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+            if isinstance(data, list):
+                for item in data:
+                    s = item.get("symbol", "")
+                    p = float(item.get("price", 0) or 0)
+                    if s and p > 0:
+                        result[s] = p
+            elif isinstance(data, dict) and data.get("symbol"):
+                p = float(data.get("price", 0) or 0)
+                if p > 0:
+                    result[data["symbol"]] = p
+            if result:
+                return result
+        except Exception:
+            continue
+    return result
+
 
 def _sell_monitor_loop():
     """
     Fallback daemon thread — wakes every 5 s and catches any positions that
     the realtime_monitor missed (e.g. while WebSocket was reconnecting).
     Primary sell path is realtime_monitor which fires within ~100 ms of each tick.
+
+    CRITICAL: When Railway's WebSocket to Binance is geo-blocked, _dc.prices is
+    always empty → realtime_monitor never fires → this loop is the only sell path.
+    The fallback price chain:
+      1. WebSocket prices (_dc.prices) — accurate, updated every ~100 ms
+      2. Signal cache  — in-memory last kline close, refreshed every 60 s by REST
+      3. REST batch ticker fetch — accurate, ~200 ms latency, rate-limited to 8 s
     """
     import data_collector as _dc
-    global _sell_diag_ts, _sell_monitor_heartbeat
+    global _sell_diag_ts, _sell_monitor_heartbeat, _rest_px, _rest_px_ts
 
     try:
         database.log_activity("Sell monitor thread started", "info")
@@ -820,6 +866,33 @@ def _sell_monitor_loop():
                 snap = list(_positions)
 
             prices = dict(_dc.prices)
+
+            # ── REST / signal-cache fallback when WebSocket is down ───────────
+            # Root cause of "sells never happen": Railway geo-block empties _dc.prices.
+            # Without this, every position is skipped (price == 0 guard below).
+            missing = [p["symbol"] for p in snap if not prices.get(p["symbol"])]
+            if missing:
+                # 1. Signal cache — zero latency, up to ~60 s stale
+                with _signal_cache_lock:
+                    for sym in missing:
+                        sc = _signal_cache.get(sym)
+                        if sc and sc.get("price", 0) > 0:
+                            prices[sym] = sc["price"]
+                # 2. REST batch fetch for anything still missing
+                still_missing = [s for s in missing if not prices.get(s)]
+                now_t2 = time.time()
+                if still_missing and (now_t2 - _rest_px_ts) >= _REST_PX_TTL:
+                    fetched = _fetch_rest_prices(still_missing)
+                    if fetched:
+                        _rest_px.update(fetched)
+                        _rest_px_ts = now_t2
+                        database.log_activity(
+                            f"Sell monitor: WebSocket down — REST prices for "
+                            f"{list(fetched.keys())}", "warn"
+                        )
+                for sym, p in _rest_px.items():
+                    if sym not in prices or not prices[sym]:
+                        prices[sym] = p
 
             # Diagnostic log every 60 s
             now_t = time.time()

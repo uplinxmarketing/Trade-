@@ -1,5 +1,5 @@
 {
-  "version": "4.4.0",
-  "buildTime": "2026-05-04T14:00:00.000Z",
-  "commit": "fix-supabase-wrong-project-always-restore-coins"
+  "version": "4.5.0",
+  "buildTime": "2026-05-04T15:00:00.000Z",
+  "commit": "fix-sells-rest-price-fallback-websocket-geoblock"
 }
