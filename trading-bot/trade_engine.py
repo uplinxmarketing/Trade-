@@ -37,13 +37,19 @@ _strategy_mtime: float = 0.0
 _strategy_cache: dict = {}
 
 _fee_rate = config.FEE_RATE_BNB if config.BNB_FEE_MODE else config.FEE_RATE_STANDARD
-_breakeven_mult = 1.0 + _fee_rate + _fee_rate
+# 0.02% buffer above fees: floor-rounding of qty during buy means the exact breakeven
+# is slightly above entry*(1+2*fee), so a buffer guarantees P&L is always positive.
+_breakeven_mult = 1.0 + _fee_rate + _fee_rate + 0.0002
 
 _cooldowns: dict = {}
+
+# ── Position index — rebuilt on every WebSocket tick for O(1) sell lookups ───
+_pos_by_symbol: Dict[str, dict] = {}
 
 # ── In-progress sell guard — prevents double-sells from monitor + guardian ────
 _selling: set = set()
 _selling_lock = threading.Lock()
+_selling_ts: Dict[str, float] = {}   # when each sym was added — for watchdog
 
 # ── Sell executor — parallel sells so 10 simultaneous exits never queue up ───
 # Each position gets its own worker thread; _selling guard prevents duplicates.
@@ -57,7 +63,7 @@ _last_no_signal_log: float = 0.0   # throttle "no coins ready" log to once per 6
 
 # Per-coin timestamp of last inline tick-driven signal refresh
 _tick_signal_ts: Dict[str, float] = {}
-_TICK_REFRESH_SEC = 5.0   # recompute at most every 5 s per coin from price ticks
+_TICK_REFRESH_SEC = 30.0  # recompute at most every 30 s per coin from price ticks
 
 
 # ── Balance guard + budget helpers ───────────────────────────────────────────
@@ -133,35 +139,143 @@ def _in_cooldown(symbol: str) -> bool:
 
 # ── DB / startup helpers ──────────────────────────────────────────────────────
 
+def _rebuild_pos_index():
+    """Rebuild O(1) symbol→position lookup. Call whenever _positions changes."""
+    global _pos_by_symbol
+    with _positions_lock:
+        _pos_by_symbol = {p["symbol"]: p for p in _positions}
+
+
+def _apply_coin_restore(coins: list):
+    """Write a list of coin symbols back into strategy.json approved_coins."""
+    if not (coins and isinstance(coins, list) and len(coins) > 0):
+        return
+    try:
+        if os.path.exists(config.STRATEGY_FILE):
+            with open(config.STRATEGY_FILE) as f:
+                strat = json.load(f)
+            existing = {c["symbol"]: c for c in strat.get("approved_coins", [])}
+            strat["approved_coins"] = [
+                {
+                    "symbol":         sym,
+                    "approved":       True,
+                    "budget_usdt":    existing.get(sym, {}).get("budget_usdt", config.BUDGET_PER_TRADE_USDT),
+                    "max_concurrent": existing.get(sym, {}).get("max_concurrent", 3),
+                    "confidence":     existing.get(sym, {}).get("confidence", 0.5),
+                    "reason":         "Restored from Supabase",
+                }
+                for sym in coins
+            ]
+            strat["updated_at"] = datetime.now(timezone.utc).isoformat()
+            with open(config.STRATEGY_FILE, "w") as f:
+                json.dump(strat, f, indent=2)
+            print(f"[TradeEngine] Restored {len(coins)} coins from Supabase → strategy.json.")
+    except Exception as ce:
+        print(f"[TradeEngine] Coin restore to strategy.json failed: {ce}")
+
+
 def load_positions_from_db():
-    """Called on startup — restores open positions from SQLite, or Supabase if SQLite is empty."""
+    """
+    Called on startup.  Restores open positions from SQLite when available,
+    or from Supabase when SQLite is empty (fresh Railway deploy / no volume).
+    Coins and balance are ALWAYS restored from Supabase so the user's
+    watchlist and wallet survive every redeploy regardless of SQLite state.
+    """
     global _positions
     rows = database.load_positions()
 
-    if not rows:
-        # SQLite is empty (fresh Railway deploy) — try to restore from Supabase
+    # Always fetch from Supabase so coins + balance are current even when
+    # SQLite still has stale data from a previous deploy.
+    supa_ok = False
+    try:
+        import supabase_sync
+        restored = supabase_sync.restore_from_supabase()
+        supa_ok = bool(restored)
+
+        # ── Coins: ALWAYS restore — user selection must survive every deploy ──
+        _apply_coin_restore(restored.get("selected_coins"))
+
+        # ── Positions: only restore when SQLite is empty (avoids duplicates) ──
+        if not rows and restored.get("positions"):
+            for pos in restored["positions"]:
+                pos_id = database.save_position(pos)
+                pos["id"] = pos_id
+            rows = database.load_positions()
+            n_pos = len(rows)
+            print(f"[TradeEngine] Restored {n_pos} position(s) from Supabase.")
+            database.log_activity(
+                f"Restored {n_pos} open position(s) from Supabase after redeploy", "info"
+            )
+        elif rows:
+            database.log_activity(
+                f"Startup: {len(rows)} position(s) loaded from local DB (Supabase backup intact)", "info"
+            )
+        else:
+            database.log_activity(
+                "Startup: no positions in local DB or Supabase — fresh wallet", "info"
+            )
+
+        # ── Trade history: restore when SQLite trades table is empty ────────────
+        # Rebuilds win-rate, P&L stats and trade list from bot_trade_history.
         try:
-            import supabase_sync
-            restored = supabase_sync.restore_from_supabase()
-            if restored.get("positions"):
-                for pos in restored["positions"]:
-                    pos_id = database.save_position(pos)
-                    pos["id"] = pos_id
-                rows = database.load_positions()
-                print(f"[TradeEngine] Restored {len(rows)} position(s) from Supabase.")
-            if restored.get("usdt_balance") is not None:
-                usdt = restored["usdt_balance"]
-                if hasattr(client, "_balances"):
+            if not database.get_recent_trades(limit=1) and restored.get("trades"):
+                imported = 0
+                for trade in restored["trades"]:
+                    try:
+                        database.log_trade(trade)
+                        imported += 1
+                    except Exception:
+                        pass
+                if imported:
+                    print(f"[TradeEngine] Imported {imported} trade(s) from Supabase history.")
+                    database.log_activity(
+                        f"Restored {imported} trade record(s) from Supabase history", "info"
+                    )
+            elif database.get_recent_trades(limit=1):
+                database.log_activity(
+                    f"Trade history intact in local DB — no restore needed", "info"
+                )
+        except Exception as te:
+            print(f"[TradeEngine] Trade history restore failed (non-fatal): {te}")
+
+        # ── Balance: restore when SQLite paper-state is empty or zero ──────────
+        if restored.get("usdt_balance") is not None:
+            usdt = restored["usdt_balance"]
+            if hasattr(client, "_balances"):
+                with client._lock:
+                    current = client._balances.get("USDT", 0.0)
+                # Only overwrite if local balance looks wrong (zero or default)
+                if current <= 0 or not rows:
                     with client._lock:
                         client._balances["USDT"] = usdt
-                    database.save_paper_state(dict(client._balances))
+                        snapshot = dict(client._balances)
+                    database.save_paper_state(snapshot)
                     print(f"[TradeEngine] Restored USDT balance from Supabase: {usdt:.2f}")
-        except Exception as e:
-            print(f"[TradeEngine] Supabase restore failed (non-fatal): {e}")
+                    database.log_activity(
+                        f"Restored USDT balance from Supabase: {usdt:.2f} USDT", "info"
+                    )
+
+    except Exception as e:
+        print(f"[TradeEngine] Supabase restore failed (non-fatal): {e}")
+        database.log_activity(f"Supabase restore failed — data may not survive redeploy: {e}", "warn")
 
     with _positions_lock:
         _positions = list(rows)
+    _rebuild_pos_index()
     print(f"[TradeEngine] Loaded {len(_positions)} open position(s) from DB.")
+
+    # Push current state to Supabase immediately so the next redeploy can restore it.
+    # This runs even when SQLite had data (not just after a restore) so Supabase
+    # always has an up-to-date snapshot regardless of how the data got into SQLite.
+    try:
+        import supabase_sync
+        usdt = _get_usdt_balance()
+        supabase_sync.sync_all(list(rows), usdt)
+        database.log_activity(
+            f"Supabase snapshot pushed — {len(rows)} position(s), {usdt:.2f} USDT backed up", "info"
+        )
+    except Exception as e:
+        database.log_activity(f"Supabase snapshot push failed: {e}", "warn")
 
     # Sync PaperClient coin balances from the restored positions.
     # After a restart, PaperClient loads from saved paper_state, but if that
@@ -327,7 +441,9 @@ def update_coin_signals(symbol: str, closes: list, volumes: list):
 # ── Shared sell execution (used by both realtime_monitor and signal_scanner) ──
 
 def _execute_sell(pos: dict, price: float, reason: str):
-    """Execute a market sell for pos at price. Logs trade, cleans up state."""
+    """Execute a market sell for pos at price. Logs trade, cleans up state.
+    Caller MUST have already added pos['symbol'] to _selling before submitting
+    to the executor — this function just verifies and executes."""
     from datetime import timezone as _tz
     sym  = pos["symbol"]
     qty  = _floor_qty(pos["quantity"])
@@ -335,25 +451,27 @@ def _execute_sell(pos: dict, price: float, reason: str):
     now  = datetime.now(_tz.utc).isoformat()
 
     if qty <= 0 or price <= 0:
+        with _selling_lock:
+            _selling.discard(sym)
+            _selling_ts.pop(sym, None)
         return
 
-    # Dedup guard — only one sell per symbol at a time. Also verify the position
-    # still exists (realtime_monitor may submit multiple ticks before _pos_by_symbol
-    # is rebuilt; the second submission must not proceed after the first completed).
-    with _selling_lock:
-        if sym in _selling:
-            return
-        with _positions_lock:
-            pos_id = pos.get("id")
-            if pos_id and not any(p.get("id") == pos_id for p in _positions):
-                return  # already sold by a concurrent submission
-        _selling.add(sym)
+    # Verify position still exists — another executor task may have already sold it
+    # (e.g. force-sell came in while we were queued).
+    with _positions_lock:
+        pos_id = pos.get("id")
+        if pos_id and not any(p.get("id") == pos_id for p in _positions):
+            with _selling_lock:
+                _selling.discard(sym)
+                _selling_ts.pop(sym, None)
+            return  # already sold
 
     try:
         _do_execute_sell(pos, sym, qty, price, reason, mode, now)
     finally:
         with _selling_lock:
             _selling.discard(sym)
+            _selling_ts.pop(sym, None)
 
 
 def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str, mode: str, now: str):
@@ -372,10 +490,13 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         coin = sym[:-4]
         with client._lock:
             current_coin_bal = client._balances.get(coin, 0.0)
-        if current_coin_bal < qty * 0.99:
-            with client._lock:
+            if current_coin_bal < qty * 0.99:
                 client._balances[coin] = qty
-            database.save_paper_state(dict(client._balances))
+                snapshot = dict(client._balances)
+            else:
+                snapshot = None
+        if snapshot is not None:
+            database.save_paper_state(snapshot)
             database.log_activity(
                 f"[PaperWallet] Auto-credited {qty:.8f} {coin} "
                 f"(had {current_coin_bal:.8f}) — balance was out of sync after restart",
@@ -383,20 +504,31 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             )
 
     try:
-        result = client.order_market_sell(symbol=sym, quantity=qty)
+        # For paper mode: pass the trigger price directly so any concurrent
+        # WebSocket/REST update to _prices cannot cause the sell to execute
+        # at the wrong (potentially lower) price between now and order execution.
+        if hasattr(client, "_balances"):
+            result = client.order_market_sell(symbol=sym, quantity=qty, price=price)
+        else:
+            result = client.order_market_sell(symbol=sym, quantity=qty)
     except Exception as e:
         msg = f"SELL failed {sym} ({reason}): {e}"
         print(f"[TradeEngine] {msg}")
         database.log_activity(msg, "error")
         return
 
-    fill_price = float(result["fills"][0]["price"]) if result.get("fills") else price
-    # commission from PaperClient is already in USDT (fee = gross * fee_rate).
-    # Do NOT multiply by fill_price again — that was double-counting.
-    sell_fee = float(result["fills"][0]["commission"]) if result.get("fills") else (qty * fill_price * _fee_rate)
-    buy_fee  = pos["budget_usdt"] * _fee_rate
-    gross    = qty * fill_price
-    net_profit = gross - sell_fee - pos["budget_usdt"] - buy_fee
+    # Read fill data directly from PaperClient's order response — no recalculation.
+    # cummulativeQuoteQty = gross - sell_fee = USDT actually returned to wallet.
+    fill          = result.get("fills", [{}])[0]
+    fill_price    = float(fill.get("price", price))
+    sell_fee      = float(fill.get("commission", 0))
+    usdt_returned = float(result.get("cummulativeQuoteQty", 0))  # gross - sell_fee
+    budget        = pos["budget_usdt"]
+    buy_fee       = budget * _fee_rate
+    # Single authoritative formula — must match wallet formula in PaperClient exactly:
+    #   net_profit = usdt_returned - budget - buy_fee
+    #             = (qty × sell_price - sell_fee) - budget - (budget × fee_rate)
+    net_profit    = usdt_returned - budget - buy_fee
 
     buy_ts  = pos.get("timestamp", now)
     sell_ts = now
@@ -439,10 +571,17 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         database.log_trade(trade_record)
         try:
             import supabase_sync
-            supabase_sync.sync_trade(trade_record)
-            supabase_sync.sync_position_close(sym)
-        except Exception:
-            pass
+            # Parallel sync to Supabase — all 3 calls run concurrently, max 4 s total.
+            # Synchronous here (not background) so data is never lost on Railway restart.
+            usdt_now = _get_usdt_balance()
+            supabase_sync.sync_sell_result_sync(trade_record, sym, usdt_now)
+        except Exception as se:
+            err_msg = f"Supabase sync error after selling {sym}: {se}"
+            print(f"[TradeEngine] {err_msg}")
+            try:
+                database.log_activity(err_msg, "error")
+            except Exception:
+                pass
         try:
             learning.learn_from_trade(trade_record)
         except Exception as le:
@@ -457,12 +596,12 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
                 pass
         with _positions_lock:
             _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
+        _rebuild_pos_index()
 
-    usdt_received = gross - sell_fee
-    pnl_sign      = "+" if net_profit >= 0 else ""
+    pnl_sign = "+" if net_profit >= 0 else ""
     sell_msg = (
         f"SOLD {sym} @ ${fill_price:.4f} "
-        f"· received {usdt_received:.4f} USDT · P&L: {pnl_sign}{net_profit:.4f} USDT"
+        f"· received {usdt_returned:.4f} USDT · P&L: {pnl_sign}{net_profit:.4f} USDT"
         f"  ({reason}, held {duration}s)"
     )
     print(f"[{sell_ts}] {sell_msg}")
@@ -607,9 +746,11 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         except Exception:
             pass
 
+        exit_target = round(fill_price * _breakeven_mult, 8)
         pos_record = {
             "symbol":             sym,
             "entry_price":        fill_price,
+            "exit_target":        exit_target,
             "quantity":           qty,
             "budget_usdt":        budget,
             "timestamp":          ts_now,
@@ -624,21 +765,26 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         with _positions_lock:
             _positions.append(pos_record)
+        _rebuild_pos_index()
 
         try:
             import supabase_sync
-            supabase_sync.sync_position_open(pos_record)
-            supabase_sync.sync_balance(usdt_balance - budget - budget * _fee_rate)
-        except Exception:
-            pass
+            # Parallel sync to Supabase — both calls run concurrently, max 4 s total.
+            supabase_sync.sync_buy_result_sync(
+                pos_record, usdt_balance - budget - budget * _fee_rate
+            )
+        except Exception as _be:
+            try:
+                database.log_activity(f"Supabase sync error after buying {sym}: {_be}", "error")
+            except Exception:
+                pass
 
         usdt_balance -= budget + budget * _fee_rate
 
         score     = cached["score"]
-        breakeven = fill_price * _breakeven_mult
         msg = (
             f"BOUGHT {sym} @ ${fill_price:.4f} "
-            f"| qty={qty:.6f} | BEP=${breakeven:.4f} "
+            f"| qty={qty:.6f} | EXIT TARGET=${exit_target:.4f} "
             f"| signals={score}/4"
         )
         print(f"[RealtimeBuy] {msg}")
@@ -675,20 +821,34 @@ def _inline_refresh_from_ticks(sym: str, price: float):
 def realtime_monitor(prices: Dict[str, float]):
     """
     Synchronous — called inside data_collector's async WebSocket loop on EVERY
-    trade event. MUST NOT do any blocking I/O (SQLite, network) or it will
-    stall the event loop, kill the WebSocket connection, and stop all price
-    updates (including the sells we're trying to trigger).
+    trade event (~100 ms per coin). MUST NOT do any blocking I/O.
 
-    Responsibility: keep the in-memory signal cache fresh so position_guardian
-    and signal_scanner can act on up-to-date data.  Buy execution is also done
-    here (throttled to 1 s) but is already brief (~1 ms SQLite write).
-
-    Sell execution is intentionally NOT done here — it is handled exclusively
-    by position_guardian which runs _execute_sell in a thread-pool executor.
+    Sell exits and buy entries are dispatched to _sell_executor (non-blocking
+    O(1) submit) so the event loop is never stalled.  The _sell_monitor_loop
+    daemon thread acts as a 5-second fallback in case a tick is missed.
     """
-    # Inline signal refresh from price ticks — keeps RSI/EMA/MACD current between
-    # kline closes and REST scanner runs. Throttled to every 5 s per coin.
     now = time.time()
+
+    # ── Real-time sell check — fires within ~100 ms of price crossing threshold ──
+    # Reads the pre-built symbol→position index (no lock needed for dict reads).
+    pos_index = _pos_by_symbol   # local ref; atomically replaced on each mutation
+    for sym, price in prices.items():
+        pos = pos_index.get(sym)
+        if pos is None or price <= 0:
+            continue
+        entry  = pos["entry_price"]
+        # Always recompute from entry with current multiplier (includes 0.02% buffer)
+        # so stale stored exit_target values from old deploys never cause loss sells.
+        target = entry * _breakeven_mult
+        if price >= target:
+            with _selling_lock:
+                if sym in _selling:
+                    continue
+                _selling.add(sym)
+                _selling_ts[sym] = time.time()
+            _sell_executor.submit(_execute_sell, pos, price, "take-profit")
+
+    # ── Inline signal refresh — throttled to every 30 s per coin ─────────────
     for sym, price in prices.items():
         if price <= 0:
             continue
@@ -696,7 +856,7 @@ def realtime_monitor(prices: Dict[str, float]):
             _tick_signal_ts[sym] = now
             _inline_refresh_from_ticks(sym, price)
 
-    # Real-time buy check — reads signal cache, brief SQLite write on buy only
+    # ── Real-time buy check — throttled to 1 s ────────────────────────────────
     _check_buys_from_cache(prices)
 
 
@@ -706,17 +866,17 @@ _sell_diag_ts: float      = 0.0
 _sell_monitor_heartbeat: float = 0.0   # updated every loop — 0 means not started
 _sell_monitor_thread: Optional[threading.Thread] = None
 
-# REST price cache — used when WebSocket is geo-blocked on Railway
+# REST price fallback cache — populated when WebSocket is geo-blocked on Railway
 _rest_px: Dict[str, float] = {}
 _rest_px_ts: float = 0.0
-_REST_PX_TTL = 8.0   # refresh REST prices at most every 8 s
+_REST_PX_TTL = 4.0   # refetch REST prices every 4 s when WebSocket is down
 
 
 def _fetch_rest_prices(symbols: list) -> Dict[str, float]:
     """
-    Batch-fetch current prices from Binance REST (lightweight — only requested
-    symbols, not all 2000 tickers).  Fallback when WebSocket is geo-blocked.
-    Tries the public CDN first (rarely blocked), then official API endpoints.
+    Batch-fetch current prices via REST when WebSocket is unavailable.
+    Uses /api/v3/ticker/price?symbols=[...] — only fetches needed symbols.
+    Tries the public CDN first (rarely geo-blocked), then API fallbacks.
     Returns {} on complete failure.
     """
     import urllib.request as _ur
@@ -752,11 +912,12 @@ def _sell_monitor_loop():
     the realtime_monitor missed (e.g. while WebSocket was reconnecting).
     Primary sell path is realtime_monitor which fires within ~100 ms of each tick.
 
-    When Railway's WebSocket to Binance is geo-blocked, _dc.prices is always
-    empty and the primary path never fires.  This loop falls back to:
-      1. Signal cache price  (last kline close, refreshed every 60 s via REST)
-      2. Direct REST ticker fetch for any positions still without a price
-    Both paths work on REST alone — sells happen even with zero WebSocket ticks.
+    CRITICAL: When Railway's WebSocket to Binance is geo-blocked, _dc.prices is
+    always empty → realtime_monitor never fires → this loop is the only sell path.
+    The fallback price chain:
+      1. WebSocket prices (_dc.prices) — accurate, updated every ~100 ms
+      2. Signal cache  — in-memory last kline close, refreshed every 60 s by REST
+      3. REST batch ticker fetch — accurate, ~200 ms latency, rate-limited to 8 s
     """
     import data_collector as _dc
     global _sell_diag_ts, _sell_monitor_heartbeat, _rest_px, _rest_px_ts
@@ -767,64 +928,86 @@ def _sell_monitor_loop():
         pass
 
     while True:
-        _sell_monitor_heartbeat = time.time()   # update at START — alive-check uses 15 s window
+        _sell_monitor_heartbeat = time.time()   # update at START so alive-check is always fresh
         try:
             with _positions_lock:
                 snap = list(_positions)
 
+            # ── Watchdog: force-clear _selling entries stuck > 90 s ──────────
+            # Prevents positions from showing "SELLING NOW" forever when the
+            # executor thread hangs or crashes without clearing the guard.
+            now_wd = time.time()
+            with _selling_lock:
+                stuck = [s for s, t in list(_selling_ts.items()) if now_wd - t > 90]
+            for s in stuck:
+                with _selling_lock:
+                    _selling.discard(s)
+                    _selling_ts.pop(s, None)
+                try:
+                    database.log_activity(
+                        f"Sell monitor: force-cleared stuck guard for {s} (>90 s)", "warn"
+                    )
+                except Exception:
+                    pass
+
             prices = dict(_dc.prices)
 
-            # ── Price fallback when WebSocket is down (Railway geo-block fix) ──
-            # _dc.prices is empty when Binance blocks Railway's WS connections.
-            # Without this, the sell monitor skips every position (price == 0).
-            missing = [p["symbol"] for p in snap if not prices.get(p["symbol"])]
-            if missing:
-                # Step 1: signal cache — in-memory, zero latency, up to 60 s stale
-                with _signal_cache_lock:
-                    for sym in missing:
-                        sc = _signal_cache.get(sym)
-                        if sc and sc.get("price", 0) > 0:
-                            prices[sym] = sc["price"]
-
-                # Step 2: REST fetch for anything still missing — accurate, ~200 ms
-                still_missing = [s for s in missing if not prices.get(s)]
+            # ── ALWAYS refresh REST prices for ALL open positions ─────────────
+            # CRITICAL: _dc.prices may contain STALE prices from a WebSocket
+            # that connected briefly then was geo-blocked by Railway/Binance.
+            # A stale price below the exit target means the sell condition is
+            # never met even when the real market price has crossed the target.
+            # REST prices are fetched every 4 s and ALWAYS override WS prices.
+            if snap:
                 now_t2 = time.time()
-                if still_missing and (now_t2 - _rest_px_ts) >= _REST_PX_TTL:
-                    fetched = _fetch_rest_prices(still_missing)
+                if (now_t2 - _rest_px_ts) >= _REST_PX_TTL:
+                    all_syms = list({p["symbol"] for p in snap})
+                    fetched = _fetch_rest_prices(all_syms)
                     if fetched:
                         _rest_px.update(fetched)
                         _rest_px_ts = now_t2
-                        database.log_activity(
-                            f"Sell monitor: WebSocket down — REST prices fetched for "
-                            f"{list(fetched.keys())}", "warn"
-                        )
-                for sym, p in _rest_px.items():
-                    if sym not in prices or not prices[sym]:
-                        prices[sym] = p
+                        stale = [
+                            s for s in fetched
+                            if s in prices and prices[s] > 0
+                            and abs(fetched[s] - prices[s]) / max(fetched[s], 1) > 0.001
+                        ]
+                        if stale or not prices:
+                            database.log_activity(
+                                f"Sell monitor REST refresh: {len(fetched)} prices"
+                                + (f" | WS stale override: {stale}" if stale else ""), "info"
+                            )
+                    else:
+                        # REST failed — fall back to signal cache for missing symbols
+                        with _signal_cache_lock:
+                            for pos2 in snap:
+                                s2 = pos2["symbol"]
+                                if not prices.get(s2):
+                                    sc = _signal_cache.get(s2)
+                                    if sc and sc.get("price", 0) > 0:
+                                        prices[s2] = sc["price"]
+
+            # Apply cached REST prices — these ALWAYS override stale WS prices
+            for sym2, p2 in _rest_px.items():
+                prices[sym2] = p2
 
             # Diagnostic log every 60 s
             now_t = time.time()
             if now_t - _sell_diag_ts >= 60.0:
                 _sell_diag_ts = now_t
-                if snap:
-                    lines = []
-                    for p in snap:
-                        sym   = p["symbol"]
-                        price = prices.get(sym, 0.0)
-                        entry = p["entry_price"]
-                        bep   = entry * _breakeven_mult
-                        sl    = entry * (1.0 - config.STOP_LOSS_PCT)
-                        pct   = ((price - entry) / entry * 100) if entry else 0
-                        lines.append(
-                            f"{sym} entry={entry:.4f} cur={price:.4f}({pct:+.3f}%) "
-                            f"bep={bep:.4f}({'SELL' if price >= bep else 'no'}) "
-                            f"sl={sl:.4f}({'HIT' if price <= sl else 'no'})"
-                        )
-                    database.log_activity(
-                        f"Sell monitor: {len(snap)} open — " + " | ".join(lines), "info"
+                lines = []
+                for p in snap:
+                    sym   = p["symbol"]
+                    price = prices.get(sym, 0.0)
+                    entry = p["entry_price"]
+                    bep   = entry * _breakeven_mult
+                    pct   = ((price - entry) / entry * 100) if entry else 0
+                    lines.append(
+                        f"{sym} entry={entry:.4f} cur={price:.4f}({pct:+.3f}%) "
+                        f"target={bep:.4f}({'SELL' if price >= bep else 'hold'})"
                     )
-                else:
-                    database.log_activity("Sell monitor: no open positions", "info")
+                database.log_activity(
+                    f"Sell monitor fallback: {len(snap)} open — " + " | ".join(lines), "info"
+                )
 
             for pos in snap:
                 sym   = pos["symbol"]
@@ -835,27 +1018,23 @@ def _sell_monitor_loop():
                     if sym in _selling:
                         continue
                 entry  = pos["entry_price"]
-                target = pos.get("exit_target") or entry * _breakeven_mult
+                target = entry * _breakeven_mult   # always recompute; includes 0.02% buffer
                 if price >= target:
                     with _selling_lock:
                         if sym in _selling:
                             continue
                         _selling.add(sym)
+                        _selling_ts[sym] = time.time()
                     _sell_executor.submit(_execute_sell, pos, price, "take-profit")
-                elif price <= entry * (1.0 - config.STOP_LOSS_PCT):
-                    with _selling_lock:
-                        if sym in _selling:
-                            continue
-                        _selling.add(sym)
-                    _set_cooldown(sym)
-                    _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
 
         except Exception as exc:
             try:
                 database.log_activity(f"Sell monitor error: {exc}", "error")
             except Exception:
                 pass
-        time.sleep(5.0)
+        # Sleep shorter when positions are open so we catch exits faster.
+        # 2 s with open positions; 5 s when idle to avoid unnecessary REST calls.
+        time.sleep(2.0 if snap else 5.0)
 
 
 async def position_guardian():

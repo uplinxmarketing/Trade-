@@ -146,8 +146,9 @@ interface OpenPosition {
   symbol: string;
   quantity: number;
   avg_entry_price: number;
-  hold_time_sec?: number;
-  max_hold_sec?: number;
+  exit_target?: number;
+  current_price?: number;
+  profitable?: boolean;
 }
 
 interface TradeRow {
@@ -159,6 +160,7 @@ interface TradeRow {
   quantity: number;
   pnl: number | null;
   reason: string | null;
+  volume_usdt?: number;
 }
 
 interface AITradingAgentProps {
@@ -193,13 +195,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [cycleCountdown, setCycleCountdown] = useState(0);
   const [agentStatus, setAgentStatus]       = useState('');
   const [scanning, setScanning]   = useState(false);
-  const [showAll, setShowAll]     = useState(false);
+  const [showAllTrades, setShowAllTrades] = useState(false);
+  const [showAllPositions, setShowAllPositions] = useState(false);
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
   const [instructions, setInstructions]   = useState(() => localStorage.getItem(INSTRUCTIONS_KEY) ?? '');
   const [editingInstr, setEditingInstr]   = useState(false);
   const [instrDraft, setInstrDraft]       = useState('');
   const [actLog, setActLog]       = useState<string[]>([]);
+  const [dataPersistent, setDataPersistent] = useState<boolean | null>(null);
   const [showLog, setShowLog]     = useState(true);
   // Unified deployment: frontend and API are served from the same Railway URL.
   // railwayUrl defaults to '' (same origin) so all /api/* calls are relative.
@@ -489,6 +493,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // Instead we poll the Railway bot's REST API every 30 s and mirror its state
   // into the same React state variables so the UI shows live Railway data.
   const serverPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fastPollRef   = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const pollRailway = useCallback(async () => {
     // Single /api/all request (status + positions + trades + activity in one round trip)
@@ -528,6 +533,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     setBalance(bal); balanceRef.current = bal;
     setInitialBalance(Number(s.initial_balance ?? bal));
     setAgentStatus(`Railway · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${new Date().toLocaleTimeString()}`);
+    if (s.data_persistent !== undefined) setDataPersistent(Boolean(s.data_persistent));
 
     // Restore coin selection from Railway's watchlist (survives page refresh)
     if (Array.isArray(s.watched_coins) && s.watched_coins.length > 0) {
@@ -538,20 +544,22 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       symbol:          pos.symbol,
       quantity:        Number(pos.quantity),
       avg_entry_price: Number(pos.entry_price ?? pos.avg_entry_price ?? 0),
-      hold_time_sec:   Number(pos.hold_time_sec ?? 0),
-      max_hold_sec:    Number(pos.max_hold_sec ?? 1800),
+      exit_target:     pos.exit_target ? Number(pos.exit_target) : undefined,
+      current_price:   pos.current_price ? Number(pos.current_price) : undefined,
+      profitable:      Boolean(pos.profitable),
     }));
     setPositions(mapped);
     positionsRef.current = mapped;
 
     const railwayTrades: TradeRow[] = [];
     for (const tr of (data.trades ?? [])) {
+      const vol = Number(tr.budget_usdt ?? 0);
       if (tr.entry_price && tr.timestamp_buy) {
         railwayTrades.push({
           id: `rw-buy-${tr.id}`, created_at: tr.timestamp_buy,
           symbol: tr.coin, side: 'BUY' as const,
           price: Number(tr.entry_price), quantity: Number(tr.quantity),
-          pnl: null, reason: null,
+          pnl: null, reason: null, volume_usdt: vol,
         });
       }
       if (tr.exit_price && tr.timestamp_sell) {
@@ -559,28 +567,31 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           id: `rw-sell-${tr.id}`, created_at: tr.timestamp_sell,
           symbol: tr.coin, side: 'SELL' as const,
           price: Number(tr.exit_price), quantity: Number(tr.quantity),
-          pnl: Number(tr.net_profit ?? 0), reason: null,
+          pnl: Number(tr.net_profit ?? 0), reason: null, volume_usdt: vol,
         });
       }
     }
-    let sorted = railwayTrades.sort((a, b) =>
-      new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    // Always merge Supabase history so trades survive Railway redeploys.
+    // Bot writes to Supabase with user_session='railway_bot' on every trade.
+    // Deduplicate by created_at+symbol+side (Railway IDs differ from Supabase UUIDs).
+    try {
+      const { data: sbTrades } = await supabase
+        .from('bot_trade_history')
+        .select('*')
+        .eq('user_session', 'railway_bot')
+        .order('created_at', { ascending: false })
+        .limit(200);
+      if (sbTrades && sbTrades.length > 0) {
+        const rwKeys = new Set(railwayTrades.map(t => `${t.created_at}|${t.symbol}|${t.side}`));
+        const deduped = (sbTrades as TradeRow[]).filter(
+          t => !rwKeys.has(`${t.created_at}|${t.symbol}|${t.side}`)
+        );
+        railwayTrades.push(...deduped);
+      }
+    } catch { /* Supabase unavailable — Railway-only data shown */ }
 
-    // Railway SQLite was wiped on redeploy (empty trades) — fall back to Supabase.
-    // The Python bot writes trades with user_session='railway_bot' so they survive deploys.
-    if (sorted.length === 0) {
-      try {
-        const { data: sbTrades } = await supabase
-          .from('bot_trade_history')
-          .select('*')
-          .eq('user_session', 'railway_bot')
-          .order('created_at', { ascending: false })
-          .limit(100);
-        if (sbTrades && sbTrades.length > 0) {
-          sorted = sbTrades as TradeRow[];
-        }
-      } catch { /* Supabase fallback failed — show empty list */ }
-    }
+    const sorted = railwayTrades.sort((a, b) =>
+      new Date(b.created_at).getTime() - new Date(a.created_at).getTime()).slice(0, 200);
 
     if (sorted.length > 0) setTrades(sorted);
     const tradePayload = sorted.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
@@ -589,23 +600,57 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
     const entries: string[] = (data.activity ?? []).map((e: any) => {
       const ts = new Date(e.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      const icon = e.level === 'warn' ? '⚠ ' : e.level === 'error' ? '✕ ' : '';
+      const icon = e.level === 'warn' ? '⚠ ' : e.level === 'error' ? '✕ ERROR: ' : e.level === 'info' && e.message?.includes('STARTUP ERROR') ? '✕ ' : '';
       return `[${ts}] ${icon}${e.message}`;
     });
-    setActLog(entries.length > 0 ? entries : ['[Bot] Waiting for first activity...']);
+    if (entries.length > 0) {
+      setActLog(entries);
+    } else {
+      // No activity yet — fetch debug info to show startup status
+      try {
+        const dbg = await fetch(`${railwayUrl}/api/debug`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null);
+        if (dbg) {
+          const lines = [
+            `[Bot] Deploy ${dbg.deploy_id?.slice(0,8) ?? '?'} · ${dbg.trading_active ? '✓ trading' : '✗ stopped'}`,
+            `[Bot] ${dbg.approved_coins} coins watched · ${dbg.open_positions} open positions`,
+            `[Bot] WebSocket: ${dbg.websocket_alive ? `alive (${dbg.ws_prices_count} prices)` : 'connecting…'}`,
+            ...(dbg.recent_errors ?? []).map((e: any) => `[ERROR] ${e.message}`),
+          ];
+          setActLog(lines);
+        } else {
+          setActLog(['[Bot] Waiting for first activity…']);
+        }
+      } catch { setActLog(['[Bot] Waiting for first activity…']); }
+    }
   }, [railwayUrl, addLog]);
 
-  // Start/stop the polling interval whenever server mode changes
+  // Normal 5 s polling — stable deps so the interval never races with price ticks.
+  // DO NOT add `prices` or `positions` here: they update every ~100 ms and would
+  // cause the effect to re-run constantly, clearing and restarting the interval
+  // on every WebSocket tick so the timed poll never actually fires.
   useEffect(() => {
     if (!isServerMode) {
       if (serverPollRef.current) { clearInterval(serverPollRef.current); serverPollRef.current = null; }
       return;
     }
-    // Immediate poll then every 30 s
     pollRailway();
     serverPollRef.current = setInterval(pollRailway, 5_000);
     return () => { if (serverPollRef.current) { clearInterval(serverPollRef.current); serverPollRef.current = null; } };
-  }, [isServerMode, pollRailway]);
+  }, [isServerMode, pollRailway]); // eslint-disable-line
+
+  // Fast 1 s polling only while a position is at or above its exit target.
+  // Uses `current_price` from the Railway API response (not WebSocket prices)
+  // so this effect only re-runs when positions change, not on every tick.
+  useEffect(() => {
+    if (fastPollRef.current) { clearInterval(fastPollRef.current); fastPollRef.current = null; }
+    if (!isServerMode || !positions.length) return;
+    const hasSelling = positions.some(p =>
+      (p.current_price ?? p.avg_entry_price) >= (p.exit_target ?? p.avg_entry_price * BEP_MULT)
+    );
+    if (!hasSelling) return;
+    fastPollRef.current = setInterval(pollRailway, 1_000);
+    return () => { if (fastPollRef.current) { clearInterval(fastPollRef.current); fastPollRef.current = null; } };
+  }, [isServerMode, positions, pollRailway]); // eslint-disable-line
 
   // ── Mode change (paper ↔ live) ───────────────────────────────────────────
   const handleModeChange = useCallback(async (newMode: 'test' | 'live') => {
@@ -901,10 +946,27 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const winRate     = sellTrades.length ? Math.round((wins / sellTrades.length) * 100) : 0;
   const pnlColor    = totalPnl >= 0 ? 'text-gain' : 'text-loss';
   const pnlPct      = initialBalance > 0 ? ((totalPnl / initialBalance) * 100).toFixed(2) : '0.00';
-  const displayedTrades = showAll ? trades : trades.slice(0, 12);
+  const ROWS_DEFAULT = 5;
+  const displayedTrades    = showAllTrades    ? trades    : trades.slice(0, ROWS_DEFAULT);
+  const displayedPositions = showAllPositions ? positions : positions.slice(0, ROWS_DEFAULT);
 
   return (
     <div className="bg-card border border-border rounded-lg p-4 space-y-4">
+
+      {/* ── Data persistence warning ── */}
+      {dataPersistent === false && (
+        <div className="bg-loss/10 border border-loss/40 rounded-md px-3 py-2.5 space-y-1">
+          <div className="text-xs font-bold text-loss flex items-center gap-1.5">
+            ⚠️ Trade history will be lost on next Railway deploy
+          </div>
+          <p className="text-[10px] text-muted-foreground leading-relaxed">
+            The database is stored inside the container (no persistent volume).
+            Every redeploy wipes all trades, positions, and wallet history.
+            To fix: add a Railway Volume mounted at <code className="bg-muted px-1 rounded text-foreground">/data</code> and set{' '}
+            <code className="bg-muted px-1 rounded text-foreground">DATA_DIR=/data</code> in your Railway environment variables.
+          </p>
+        </div>
+      )}
 
       {/* ── Header ── */}
       <div className="flex items-center justify-between">
@@ -1179,69 +1241,59 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             {isRunning ? '⏳ No open positions — bot will buy when signals align' : '▶ Start the agent to begin trading'}
           </div>
         ) : (
-          <div className="space-y-1.5">
-            {positions.map(pos => {
-              const live  = parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.avg_entry_price;
-              const sells = live * pos.quantity * (1-TAKER_FEE);
-              const cost  = pos.avg_entry_price * pos.quantity / (1-TAKER_FEE);
-              const uPnl  = sells - cost;
-              const pct   = cost > 0 ? (uPnl/cost)*100 : 0;
-              const bep   = pos.avg_entry_price * BEP_MULT;
-              const prof  = live >= bep;
-              const bepProgress = Math.min(100, Math.max(0, ((live-pos.avg_entry_price)/(bep-pos.avg_entry_price))*100));
-              const qty   = Number(pos.quantity);
-              const budget = pos.avg_entry_price * qty;
-              return (
-                <div key={pos.symbol} className="bg-muted/20 border border-border/50 rounded-lg px-3 py-2.5 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <div className={`w-1.5 h-1.5 rounded-full ${uPnl>=0?'bg-gain animate-pulse':'bg-loss'}`}/>
-                      <span className="font-mono font-bold text-sm">{pos.symbol.replace('USDT','')}</span>
-                      <span className={`text-xs font-mono font-bold ${pct>=0?'text-gain':'text-loss'}`}>{pct>=0?'+':''}{pct.toFixed(3)}%</span>
+          <div>
+            <div className={`space-y-1.5 overflow-y-auto scrollbar-thin ${!showAllPositions && positions.length > ROWS_DEFAULT ? 'max-h-[500px]' : ''}`}>
+              {displayedPositions.map(pos => {
+                const live   = parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.avg_entry_price;
+                const sells  = live * pos.quantity * (1-TAKER_FEE);
+                const cost   = pos.avg_entry_price * pos.quantity / (1-TAKER_FEE);
+                const uPnl   = sells - cost;
+                const pct    = cost > 0 ? (uPnl/cost)*100 : 0;
+                const target = pos.exit_target ?? pos.avg_entry_price * BEP_MULT;
+                const prof   = live >= target;
+                const toTarget = Math.min(100, Math.max(0, ((live - pos.avg_entry_price) / (target - pos.avg_entry_price)) * 100));
+                const qty    = Number(pos.quantity);
+                const budget = pos.avg_entry_price * qty;
+                return (
+                  <div key={pos.symbol} className="bg-muted/20 border border-border/50 rounded-lg px-3 py-2.5 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <div className={`w-1.5 h-1.5 rounded-full ${prof?'bg-gain animate-pulse':'bg-warn animate-pulse'}`}/>
+                        <span className="font-mono font-bold text-sm">{pos.symbol.replace('USDT','')}</span>
+                        <span className={`text-xs font-mono font-bold ${pct>=0?'text-gain':'text-loss'}`}>{pct>=0?'+':''}{pct.toFixed(3)}%</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className={`font-mono text-xs font-bold ${uPnl>=0?'text-gain':'text-loss'}`}>{uPnl>=0?'+':''}{uPnl.toFixed(4)} USDT</span>
+                        <button onClick={() => forceSell(pos)} disabled={!!forcingSell}
+                          className="text-[10px] px-2 py-1 rounded bg-loss/10 hover:bg-loss/20 text-loss font-semibold disabled:opacity-40 flex items-center gap-1">
+                          <Banknote className="w-2.5 h-2.5"/>{forcingSell===pos.symbol?'…':'Sell'}
+                        </button>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <span className={`font-mono text-xs font-bold ${uPnl>=0?'text-gain':'text-loss'}`}>{uPnl>=0?'+':''}{uPnl.toFixed(4)} USDT</span>
-                      <button onClick={() => forceSell(pos)} disabled={!!forcingSell}
-                        className="text-[10px] px-2 py-1 rounded bg-loss/10 hover:bg-loss/20 text-loss font-semibold disabled:opacity-40 flex items-center gap-1">
-                        <Banknote className="w-2.5 h-2.5"/>{forcingSell===pos.symbol?'…':'Sell'}
-                      </button>
+                    <div className="grid grid-cols-2 gap-x-4 text-[10px] text-muted-foreground font-mono">
+                      <span>Entry <span className="text-foreground">{pos.avg_entry_price.toFixed(4)}</span></span>
+                      <span>Exit target <span className="text-accent font-bold">{target.toFixed(4)}</span></span>
+                      <span>Now <span className={prof?'text-gain':'text-foreground'}>{live.toFixed(4)}</span></span>
+                      <span>Qty <span className="text-foreground">{qty.toFixed(6)}</span> · <span className="text-foreground">{budget.toFixed(2)} USDT</span></span>
                     </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-x-4 text-[10px] text-muted-foreground font-mono">
-                    <span>Entry <span className="text-foreground">{pos.avg_entry_price.toFixed(4)}</span></span>
-                    <span>BEP <span className="text-accent">{bep.toFixed(4)}</span></span>
-                    <span>Now <span className={prof?'text-gain':'text-foreground'}>{live.toFixed(4)}</span></span>
-                    <span>Qty <span className="text-foreground">{qty.toFixed(6)}</span> · <span className="text-foreground">{budget.toFixed(2)} USDT</span></span>
-                    {pos.hold_time_sec != null && pos.max_hold_sec != null && (() => {
-                      const holdMin = Math.floor(pos.hold_time_sec! / 60);
-                      const maxMin  = Math.floor(pos.max_hold_sec! / 60);
-                      const pctHeld = Math.min(100, (pos.hold_time_sec! / pos.max_hold_sec!) * 100);
-                      const nearMax = pctHeld >= 80;
-                      return (
-                        <span className={`col-span-2 flex items-center gap-1.5 ${nearMax ? 'text-warn' : ''}`}>
-                          Held <span className={nearMax ? 'text-warn font-bold' : 'text-foreground'}>{holdMin}m</span>
-                          <span className="opacity-40">/</span>
-                          <span>{maxMin}m max · auto-exit</span>
-                          <span className="flex-1 h-1 bg-muted/40 rounded-full overflow-hidden" style={{display:'inline-block',minWidth:'30px'}}>
-                            <span className={`h-full rounded-full block ${nearMax ? 'bg-warn' : 'bg-muted-foreground/30'}`} style={{width:`${pctHeld}%`}}/>
-                          </span>
-                          {nearMax && <span className="text-warn font-bold animate-pulse">⏱</span>}
-                        </span>
-                      );
-                    })()}
-                  </div>
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[9px]">
-                      <span className="text-muted-foreground">Break-even progress</span>
-                      <span className={prof?'text-gain font-bold':'text-warn'}>{prof?'✓ Profitable':bepProgress.toFixed(0)+'% to BEP'}</span>
-                    </div>
-                    <div className="h-1.5 bg-muted/40 rounded-full overflow-hidden">
-                      <div className={`h-full rounded-full transition-all ${prof?'bg-gain':'bg-warn'}`} style={{width:`${Math.max(2, bepProgress)}%`}}/>
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[9px]">
+                        <span className="text-muted-foreground">Progress to exit target</span>
+                        <span className={prof?'text-gain font-bold':'text-warn'}>{prof?'✓ SELLING NOW…':toTarget.toFixed(0)+'% to target'}</span>
+                      </div>
+                      <div className="h-1.5 bg-muted/40 rounded-full overflow-hidden">
+                        <div className={`h-full rounded-full transition-all ${prof?'bg-gain':'bg-warn'}`} style={{width:`${Math.max(2, toTarget)}%`}}/>
+                      </div>
                     </div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
+            {positions.length > ROWS_DEFAULT && (
+              <button onClick={() => setShowAllPositions(p=>!p)} className="w-full text-[10px] text-accent hover:underline py-1 mt-1 flex items-center justify-center gap-1">
+                {showAllPositions?<><ChevronUp className="w-3 h-3"/>Show less</>:<><ChevronDown className="w-3 h-3"/>Show all {positions.length} positions</>}
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -1265,30 +1317,35 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             {isRunning ? '⏳ First scan running — trades will appear here…' : '▶ Start the agent to begin paper trading'}
           </p>
         ) : (
-          <div className="space-y-0.5">
-            {displayedTrades.map(t => {
-              const isBuy = t.side === 'BUY';
-              const win   = (t.pnl ?? 0) > 0;
-              const loss  = (t.pnl ?? 0) < 0;
-              return (
-                <div key={t.id} className={`flex items-center justify-between px-2.5 py-1.5 rounded text-xs border
-                  ${win?'bg-gain/5 border-gain/20':loss?'bg-loss/5 border-loss/20':isBuy?'bg-muted/20 border-border/30':'bg-muted/10 border-border/20'}`}>
-                  <div className="flex items-center gap-2 min-w-0">
-                    {isBuy?<TrendingUp className="w-3 h-3 text-accent shrink-0"/>:win?<TrendingUp className="w-3 h-3 text-gain shrink-0"/>:<TrendingDown className="w-3 h-3 text-loss shrink-0"/>}
-                    <span className={`text-[9px] font-bold px-1 py-0.5 rounded shrink-0 ${isBuy?'bg-accent/20 text-accent':win?'bg-gain/20 text-gain':'bg-loss/20 text-loss'}`}>{t.side}</span>
-                    <span className="font-mono font-semibold shrink-0">{t.symbol.replace('USDT','')}</span>
-                    <span className="text-muted-foreground font-mono text-[10px] truncate">{Number(t.price).toLocaleString('en-US',{maximumFractionDigits:4})} USDT</span>
+          <div>
+            <div className={`space-y-0.5 overflow-y-auto scrollbar-thin ${!showAllTrades && trades.length > ROWS_DEFAULT ? 'max-h-[180px]' : ''}`}>
+              {displayedTrades.map(t => {
+                const isBuy = t.side === 'BUY' || (t.side as string).toLowerCase() === 'buy';
+                const win   = (t.pnl ?? 0) > 0;
+                const loss  = (t.pnl ?? 0) < 0;
+                return (
+                  <div key={t.id} className={`flex items-center justify-between px-2.5 py-1.5 rounded text-xs border
+                    ${win?'bg-gain/5 border-gain/20':loss?'bg-loss/5 border-loss/20':isBuy?'bg-muted/20 border-border/30':'bg-muted/10 border-border/20'}`}>
+                    <div className="flex items-center gap-2 min-w-0">
+                      {isBuy?<TrendingUp className="w-3 h-3 text-accent shrink-0"/>:win?<TrendingUp className="w-3 h-3 text-gain shrink-0"/>:<TrendingDown className="w-3 h-3 text-loss shrink-0"/>}
+                      <span className={`text-[9px] font-bold px-1 py-0.5 rounded shrink-0 ${isBuy?'bg-accent/20 text-accent':win?'bg-gain/20 text-gain':'bg-loss/20 text-loss'}`}>{isBuy?'BUY':'SELL'}</span>
+                      <span className="font-mono font-semibold shrink-0">{t.symbol.replace('USDT','')}</span>
+                      <span className="text-muted-foreground font-mono text-[10px] truncate">{Number(t.price).toLocaleString('en-US',{maximumFractionDigits:4})} USDT</span>
+                      {(t.volume_usdt ?? 0) > 0 && (
+                        <span className="text-[9px] font-mono text-muted-foreground/70 shrink-0 hidden sm:inline">{t.volume_usdt!.toFixed(2)} vol</span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {t.pnl!==null && <span className={`font-mono font-bold text-[10px] ${t.pnl>=0?'text-gain':'text-loss'}`}>{t.pnl>=0?'+':''}{t.pnl.toFixed(4)} USDT</span>}
+                      <span className="text-muted-foreground text-[9px] font-mono">{new Date(t.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    {t.pnl!==null && <span className={`font-mono font-bold text-[10px] ${t.pnl>=0?'text-gain':'text-loss'}`}>{t.pnl>=0?'+':''}{t.pnl.toFixed(4)} USDT</span>}
-                    <span className="text-muted-foreground text-[9px] font-mono">{new Date(t.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>
-                  </div>
-                </div>
-              );
-            })}
-            {trades.length > 12 && (
-              <button onClick={() => setShowAll(p=>!p)} className="w-full text-[10px] text-accent hover:underline py-1 flex items-center justify-center gap-1">
-                {showAll?<><ChevronUp className="w-3 h-3"/>Show less</>:<><ChevronDown className="w-3 h-3"/>Show all {trades.length} trades</>}
+                );
+              })}
+            </div>
+            {trades.length > ROWS_DEFAULT && (
+              <button onClick={() => setShowAllTrades(p=>!p)} className="w-full text-[10px] text-accent hover:underline py-1 mt-0.5 flex items-center justify-center gap-1">
+                {showAllTrades?<><ChevronUp className="w-3 h-3"/>Show less</>:<><ChevronDown className="w-3 h-3"/>Show all {trades.length} trades</>}
               </button>
             )}
           </div>
@@ -1300,13 +1357,23 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         <button onClick={() => setShowLog(p=>!p)} className="flex items-center gap-1.5 text-[10px] text-muted-foreground hover:text-foreground w-full">
           <Activity className="w-3 h-3"/>
           Activity Log ({actLog.length})
+          {actLog.some(l => l.includes('ERROR') || l.includes('STARTUP ERROR')) && (
+            <span className="ml-1 text-[9px] px-1 py-0.5 rounded bg-destructive/20 text-destructive font-bold">ERROR</span>
+          )}
           {showLog?<ChevronUp className="w-3 h-3 ml-auto"/>:<ChevronDown className="w-3 h-3 ml-auto"/>}
         </button>
         {showLog && (
-          <div className="mt-1.5 bg-secondary/30 rounded-lg p-2 max-h-40 overflow-y-auto scrollbar-thin space-y-0.5">
+          <div className="mt-1.5 bg-secondary/30 rounded-lg p-2 max-h-56 overflow-y-auto scrollbar-thin space-y-0.5">
             {actLog.length===0 && <div className="text-[10px] text-muted-foreground text-center py-2">No activity yet</div>}
             {actLog.map((line,i) => (
-              <div key={i} className={`text-[10px] font-mono ${line.includes('BUY')?'text-gain':line.includes('SELL')?'text-loss':line.includes('ERROR')?'text-destructive':'text-muted-foreground'}`}>
+              <div key={i} className={`text-[10px] font-mono break-all ${
+                line.includes('STARTUP ERROR') || line.includes('ERROR') ? 'text-destructive font-bold' :
+                line.includes('Bot ready') || line.includes('STARTED') ? 'text-gain' :
+                line.includes('BUY') ? 'text-gain' :
+                line.includes('SELL') || line.includes('SOLD') ? 'text-accent' :
+                line.includes('warn') || line.includes('⚠') ? 'text-warn' :
+                'text-muted-foreground'
+              }`}>
                 {line}
               </div>
             ))}
