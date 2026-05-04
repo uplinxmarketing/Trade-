@@ -1,5 +1,5 @@
 {
-  "version": "4.9.5",
-  "buildTime": "2026-05-05T00:00:00.000Z",
-  "commit": "minimize-expand-side-scroll-all-sections"
+  "version": "4.9.6",
+  "buildTime": "2026-05-05T00:15:00.000Z",
+  "commit": "force-redeploy-minimize-expand-scroll"
 }
