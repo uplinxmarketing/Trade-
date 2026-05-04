@@ -37,9 +37,14 @@ _strategy_mtime: float = 0.0
 _strategy_cache: dict = {}
 
 _fee_rate = config.FEE_RATE_BNB if config.BNB_FEE_MODE else config.FEE_RATE_STANDARD
-# 0.02% buffer above fees: floor-rounding of qty during buy means the exact breakeven
-# is slightly above entry*(1+2*fee), so a buffer guarantees P&L is always positive.
+# Minimum multiplier needed to cover fees (breakeven floor).
 _breakeven_mult = 1.0 + _fee_rate + _fee_rate + 0.0002
+
+# Configurable exit multipliers — refreshed from strategy.json every buy/sell cycle.
+# _take_profit_mult: price must reach entry * this to trigger a sell (>=_breakeven_mult).
+# _stop_loss_mult:   price must fall to entry * this to trigger a stop-loss sell.
+_take_profit_mult: float = _breakeven_mult   # default: break-even
+_stop_loss_mult:   float = 1.0 - 0.02        # default: -2% stop loss
 
 _cooldowns: dict = {}
 
@@ -127,6 +132,18 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
 
 
 # ── Cooldown helpers ──────────────────────────────────────────────────────────
+
+def _refresh_risk_params():
+    """Read stop_loss_pct, take_profit_pct, max_positions, min_signals from strategy.json."""
+    global _take_profit_mult, _stop_loss_mult
+    strategy = _load_strategy()
+    tp_pct = float(strategy.get("take_profit_pct", 0.5))   # e.g. 0.5 → 0.5%
+    sl_pct = float(strategy.get("stop_loss_pct",   2.0))   # e.g. 2.0 → 2.0%
+    tp_mult = 1.0 + (tp_pct / 100.0)
+    # Take profit must at least cover fees (breakeven floor)
+    _take_profit_mult = max(_breakeven_mult, tp_mult)
+    _stop_loss_mult   = 1.0 - (sl_pct / 100.0)
+
 
 def _set_cooldown(symbol: str):
     _cooldowns[symbol] = time.time() + config.COOLDOWN_AFTER_LOSS
@@ -663,6 +680,19 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         database.log_activity("Buy check: trading_active=False — bot is paused", "warn")
         return
 
+    # Enforce max_positions (configurable via /api/settings, default 10)
+    max_pos = int(strategy.get("max_positions", 10))
+    with _positions_lock:
+        n_open = len(_positions)
+    if n_open >= max_pos:
+        return  # silently skip — already at capacity
+
+    # Refresh configurable risk params (take profit %, stop loss %) from strategy.json
+    _refresh_risk_params()
+
+    # Enforce configurable min_signals threshold (overrides config.MIN_SIGNALS_TO_BUY)
+    min_sigs = int(strategy.get("min_signals", config.MIN_SIGNALS_TO_BUY))
+
     approved = {
         c["symbol"]: c
         for c in strategy.get("approved_coins", [])
@@ -680,9 +710,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # Log a readable snapshot so the activity log always shows what's happening
     with _signal_cache_lock:
         cache_snapshot = dict(_signal_cache)
-    ready_syms = [s for s, v in cache_snapshot.items() if v["score"] >= config.MIN_SIGNALS_TO_BUY and s in approved]
+    ready_syms = [s for s, v in cache_snapshot.items() if v["score"] >= min_sigs and s in approved]
     database.log_activity(
-        f"Buy scan: USDT={usdt_balance:.2f} | {len(ready_syms)} coin(s) ready: "
+        f"Buy scan: USDT={usdt_balance:.2f} | {len(ready_syms)} coin(s) ready (min {min_sigs}/4 signals): "
         + (", ".join(f"{s}(score={cache_snapshot[s]['score']})" for s in ready_syms[:6]) or "none"),
         "info"
     )
@@ -690,7 +720,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     for sym, cached in cache_snapshot.items():
         if sym not in approved:
             continue
-        if cached["score"] < config.MIN_SIGNALS_TO_BUY:
+        if cached["score"] < min_sigs:
             continue
         if _in_cooldown(sym):
             database.log_activity(f"{sym}: buy skipped — in cooldown", "info")
@@ -746,7 +776,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         except Exception:
             pass
 
-        exit_target = round(fill_price * _breakeven_mult, 8)
+        exit_target = round(fill_price * _take_profit_mult, 8)
         pos_record = {
             "symbol":             sym,
             "entry_price":        fill_price,
@@ -837,9 +867,11 @@ def realtime_monitor(prices: Dict[str, float]):
         if pos is None or price <= 0:
             continue
         entry  = pos["entry_price"]
-        # Always recompute from entry with current multiplier (includes 0.02% buffer)
-        # so stale stored exit_target values from old deploys never cause loss sells.
-        target = entry * _breakeven_mult
+        # Use configurable take-profit multiplier (refreshed from strategy.json every buy cycle).
+        # Must be at least _breakeven_mult so we never sell at a loss via take-profit.
+        target = entry * _take_profit_mult
+        stop   = entry * _stop_loss_mult
+
         if price >= target:
             with _selling_lock:
                 if sym in _selling:
@@ -847,6 +879,13 @@ def realtime_monitor(prices: Dict[str, float]):
                 _selling.add(sym)
                 _selling_ts[sym] = time.time()
             _sell_executor.submit(_execute_sell, pos, price, "take-profit")
+        elif _stop_loss_mult < 1.0 and price <= stop:
+            with _selling_lock:
+                if sym in _selling:
+                    continue
+                _selling.add(sym)
+                _selling_ts[sym] = time.time()
+            _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
 
     # ── Inline signal refresh — throttled to every 30 s per coin ─────────────
     for sym, price in prices.items():
@@ -1018,14 +1057,20 @@ def _sell_monitor_loop():
                     if sym in _selling:
                         continue
                 entry  = pos["entry_price"]
-                target = entry * _breakeven_mult   # always recompute; includes 0.02% buffer
+                target = entry * _take_profit_mult   # configurable take-profit
+                stop   = entry * _stop_loss_mult     # configurable stop-loss
+                reason = None
                 if price >= target:
+                    reason = "take-profit"
+                elif _stop_loss_mult < 1.0 and price <= stop:
+                    reason = "stop-loss"
+                if reason:
                     with _selling_lock:
                         if sym in _selling:
                             continue
                         _selling.add(sym)
                         _selling_ts[sym] = time.time()
-                    _sell_executor.submit(_execute_sell, pos, price, "take-profit")
+                    _sell_executor.submit(_execute_sell, pos, price, reason)
 
         except Exception as exc:
             try:

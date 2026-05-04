@@ -3,7 +3,7 @@ import {
   Play, Square, Brain, TrendingUp, TrendingDown, Zap,
   RotateCcw, ChevronDown, ChevronUp, FlaskConical,
   Pencil, Check, X, BookOpen, Activity, Eye, EyeOff,
-  ShoppingCart, Banknote, RefreshCw,
+  ShoppingCart, Banknote, RefreshCw, Settings2, Shield,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { supabase } from '@/integrations/supabase/client';
@@ -201,6 +201,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [showTradesSection, setShowTradesSection] = useState(true);
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [stopLossPct, setStopLossPct]         = useState(2.0);
+  const [takeProfitPct, setTakeProfitPct]     = useState(0.5);
+  const [maxPositions, setMaxPositions]       = useState(10);
+  const [minSignals, setMinSignals]           = useState(2);
+  const [settingsDraft, setSettingsDraft]     = useState({ stopLossPct: 2.0, takeProfitPct: 0.5, maxPositions: 10, minSignals: 2 });
+  const [savingSettings, setSavingSettings]   = useState(false);
   const [instructions, setInstructions]   = useState(() => localStorage.getItem(INSTRUCTIONS_KEY) ?? '');
   const [editingInstr, setEditingInstr]   = useState(false);
   const [instrDraft, setInstrDraft]       = useState('');
@@ -452,9 +459,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // ── Coin signal scanner (server mode) ────────────────────────────────────
   // In server mode runCycle() never runs, so we scan independently for display.
   // Trading decisions are still made server-side by the Python bot.
+  // Uses recursive setTimeout (not setInterval) so the next scan only starts
+  // AFTER the current one finishes — prevents concurrent scans that reset
+  // the coin list back to "..." mid-way through with many coins selected.
   useEffect(() => {
     if (!selectedCoins.length) return;
     let cancelled = false;
+    let nextTimer: ReturnType<typeof setTimeout> | null = null;
+
     const scan = async () => {
       if (cancelled) return;
       setScanning(true);
@@ -473,11 +485,18 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         if (!cancelled) setCoinSignals([...results]);
         if (i < selectedCoins.length - 1) await new Promise(r => setTimeout(r, 300));
       }
-      if (!cancelled) setScanning(false);
+      if (!cancelled) {
+        setScanning(false);
+        // Schedule next scan only after current one is fully done
+        nextTimer = setTimeout(scan, AGENT_CYCLE_MS);
+      }
     };
+
     scan();
-    const id = setInterval(scan, AGENT_CYCLE_MS);
-    return () => { cancelled = true; clearInterval(id); };
+    return () => {
+      cancelled = true;
+      if (nextTimer) clearTimeout(nextTimer);
+    };
   }, [selectedCoins]); // eslint-disable-line
 
   // ── Sync selectedCoins to Railway so Python bot watches the right coins ──
@@ -536,6 +555,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     setInitialBalance(Number(s.initial_balance ?? bal));
     setAgentStatus(`Railway · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${new Date().toLocaleTimeString()}`);
     if (s.data_persistent !== undefined) setDataPersistent(Boolean(s.data_persistent));
+    if (s.stop_loss_pct   !== undefined) { const v = Number(s.stop_loss_pct);   setStopLossPct(v);   setSettingsDraft(d => ({ ...d, stopLossPct: v })); }
+    if (s.take_profit_pct !== undefined) { const v = Number(s.take_profit_pct); setTakeProfitPct(v); setSettingsDraft(d => ({ ...d, takeProfitPct: v })); }
+    if (s.max_positions   !== undefined) { const v = Number(s.max_positions);   setMaxPositions(v);  setSettingsDraft(d => ({ ...d, maxPositions: v })); }
+    if (s.min_signals     !== undefined) { const v = Number(s.min_signals);     setMinSignals(v);    setSettingsDraft(d => ({ ...d, minSignals: v })); }
 
     // Restore coin selection from Railway's watchlist (survives page refresh)
     if (Array.isArray(s.watched_coins) && s.watched_coins.length > 0) {
@@ -941,8 +964,37 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     toast.success(`Reset · ${startBal.toLocaleString()} USDT restored`);
   };
 
+  // ── Save bot settings to Railway ─────────────────────────────────────────
+  const saveSettings = useCallback(async () => {
+    setSavingSettings(true);
+    try {
+      const res = await fetch(`${railwayUrl}/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          stop_loss_pct:   settingsDraft.stopLossPct,
+          take_profit_pct: settingsDraft.takeProfitPct,
+          max_positions:   settingsDraft.maxPositions,
+          min_signals:     settingsDraft.minSignals,
+        }),
+      });
+      const d = await res.json();
+      if (!d.ok) throw new Error(d.error ?? 'Settings save failed');
+      setStopLossPct(settingsDraft.stopLossPct);
+      setTakeProfitPct(settingsDraft.takeProfitPct);
+      setMaxPositions(settingsDraft.maxPositions);
+      setMinSignals(settingsDraft.minSignals);
+      toast.success('Bot settings saved');
+      setShowSettings(false);
+    } catch (e: any) {
+      toast.error(`Settings error: ${e.message}`);
+    } finally {
+      setSavingSettings(false);
+    }
+  }, [settingsDraft, railwayUrl]);
+
   // ── Computed stats ───────────────────────────────────────────────────────
-  const sellTrades  = trades.filter(t => t.side === 'SELL' && t.pnl !== null);
+  const sellTrades  = trades.filter(t => (t.side === 'SELL' || (t.side as string).toLowerCase() === 'sell') && t.pnl !== null);
   const wins        = sellTrades.filter(t => (t.pnl ?? 0) > 0).length;
   const totalPnl    = sellTrades.reduce((s, t) => s + (t.pnl ?? 0), 0);
   const winRate     = sellTrades.length ? Math.round((wins / sellTrades.length) * 100) : 0;
@@ -999,7 +1051,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           {isRunning && (
             <Button size="sm" variant="outline" className="h-6 text-[10px] px-2"
               onClick={() => isServerMode ? pollRailway() : runCycle()}
-              disabled={scanning}
+              disabled={loading}
               title={isServerMode ? 'Refresh Railway state' : 'Run cycle now'}>
               <Zap className="w-3 h-3 mr-0.5" />{isServerMode ? 'Sync' : 'Now'}
             </Button>
@@ -1147,10 +1199,72 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         )}
       </div>
 
+      {/* ── Bot Settings (collapsible) ── */}
+      <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-2">
+        <button onClick={() => { setShowSettings(p => !p); setSettingsDraft({ stopLossPct, takeProfitPct, maxPositions, minSignals }); }}
+          className="flex items-center justify-between w-full text-left">
+          <div className="flex items-center gap-2">
+            <Shield className="w-3.5 h-3.5 text-accent" />
+            <span className="text-xs font-semibold text-accent">Risk Settings</span>
+          </div>
+          <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+            <span>SL {stopLossPct}% · TP {takeProfitPct}% · Max {maxPositions} pos</span>
+            {showSettings ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+          </div>
+        </button>
+        {showSettings && (
+          <div className="space-y-3 pt-1">
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="text-[10px] text-muted-foreground uppercase tracking-wider">Stop Loss %</label>
+                <input type="number" min="0.1" max="20" step="0.1"
+                  value={settingsDraft.stopLossPct}
+                  onChange={e => setSettingsDraft(d => ({ ...d, stopLossPct: parseFloat(e.target.value) || 2 }))}
+                  className="w-full mt-0.5 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-loss/60" />
+                <p className="text-[9px] text-muted-foreground mt-0.5">Sell if price drops this % below entry</p>
+              </div>
+              <div>
+                <label className="text-[10px] text-muted-foreground uppercase tracking-wider">Take Profit %</label>
+                <input type="number" min="0.1" max="50" step="0.1"
+                  value={settingsDraft.takeProfitPct}
+                  onChange={e => setSettingsDraft(d => ({ ...d, takeProfitPct: parseFloat(e.target.value) || 0.5 }))}
+                  className="w-full mt-0.5 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-gain/60" />
+                <p className="text-[9px] text-muted-foreground mt-0.5">Sell when price rises this % above entry</p>
+              </div>
+              <div>
+                <label className="text-[10px] text-muted-foreground uppercase tracking-wider">Max Positions</label>
+                <input type="number" min="1" max="50" step="1"
+                  value={settingsDraft.maxPositions}
+                  onChange={e => setSettingsDraft(d => ({ ...d, maxPositions: parseInt(e.target.value) || 10 }))}
+                  className="w-full mt-0.5 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-accent/60" />
+                <p className="text-[9px] text-muted-foreground mt-0.5">Max concurrent open positions</p>
+              </div>
+              <div>
+                <label className="text-[10px] text-muted-foreground uppercase tracking-wider">Min Signals (1–4)</label>
+                <input type="number" min="1" max="4" step="1"
+                  value={settingsDraft.minSignals}
+                  onChange={e => setSettingsDraft(d => ({ ...d, minSignals: parseInt(e.target.value) || 2 }))}
+                  className="w-full mt-0.5 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-accent/60" />
+                <p className="text-[9px] text-muted-foreground mt-0.5">Signals needed before buying (EMA+RSI+MACD+Vol)</p>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <Button onClick={saveSettings} disabled={savingSettings}
+                className="flex-1 h-7 text-xs bg-accent hover:bg-accent/90 text-accent-foreground">
+                {savingSettings ? '…' : <><Check className="w-3 h-3 mr-1" />Apply to Bot</>}
+              </Button>
+              <button onClick={() => setShowSettings(false)} className="px-3 text-xs text-muted-foreground hover:text-foreground border border-border rounded">
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* ── Stats ── */}
       <div className="grid grid-cols-4 gap-1.5">
         {[
-          { label: 'Balance', value: `${balance.toFixed(2)} USDT`, color: '' },
+          { label: 'Free Cash', value: `${balance.toFixed(2)} USDT`, color: '' },
           { label: 'Net P&L', value: `${totalPnl>=0?'+':''}${Math.abs(totalPnl).toFixed(2)} USDT`, color: pnlColor },
           { label: 'Return', value: `${totalPnl>=0?'+':''}${pnlPct}%`, color: pnlColor },
           { label: 'Win Rate', value: sellTrades.length ? `${winRate}%` : '—', color: winRate>=50?'text-gain':sellTrades.length?'text-loss':'' },
@@ -1205,7 +1319,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                   {/* 4 signal dots */}
                   <div className="flex gap-0.5">
                     {([['EMA',sig.emaBullish],['RSI',sig.rsiOk],['MACD',sig.macdPos],['Vol',sig.volUp]] as [string,boolean][]).map(([label,on])=>(
-                      <div key={label} className={`flex-1 rounded-full text-center py-0.5 text-[8px] font-bold ${on?'bg-gain/20 text-gain':'bg-loss/10 text-loss/50'}`} title={label}>{label}</div>
+                      <div key={label} className={`flex-1 rounded-full text-center py-0.5 text-[8px] font-bold ${sig.signal==='loading'?'bg-muted/30 text-muted-foreground':on?'bg-gain/20 text-gain':'bg-loss/10 text-loss/50'}`} title={label}>{label}</div>
                     ))}
                   </div>
                   {/* Force buy/sell */}
@@ -1245,7 +1359,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           <div>
             <div className={`space-y-1.5 overflow-y-auto scrollbar-thin ${!showAllPositions && positions.length > ROWS_DEFAULT ? 'max-h-[500px]' : ''}`}>
               {displayedPositions.map(pos => {
-                const live   = parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.avg_entry_price;
+                const live   = pos.current_price || parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.avg_entry_price;
                 const sells  = live * pos.quantity * (1-TAKER_FEE);
                 const cost   = pos.avg_entry_price * pos.quantity / (1-TAKER_FEE);
                 const uPnl   = sells - cost;
@@ -1265,7 +1379,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       </div>
                       <div className="flex items-center gap-2">
                         <span className={`font-mono text-xs font-bold ${uPnl>=0?'text-gain':'text-loss'}`}>{uPnl>=0?'+':''}{uPnl.toFixed(4)} USDT</span>
-                        <button onClick={() => forceSell(pos)} disabled={!!forcingSell}
+                        <button onClick={() => { if (window.confirm(`Sell ${pos.symbol.replace('USDT','')}? This closes the position at market price.`)) forceSell(pos); }} disabled={!!forcingSell}
                           className="text-[10px] px-2 py-1 rounded bg-loss/10 hover:bg-loss/20 text-loss font-semibold disabled:opacity-40 flex items-center gap-1">
                           <Banknote className="w-2.5 h-2.5"/>{forcingSell===pos.symbol?'…':'Sell'}
                         </button>

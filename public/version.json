@@ -1,5 +1,5 @@
 {
-  "version": "4.9.9",
-  "buildTime": "2026-05-04T22:52:09.000Z",
-  "commit": "fix-tdz-crash-hasAgentData"
+  "version": "5.0.0",
+  "buildTime": "2026-05-04T23:45:00.000Z",
+  "commit": "comprehensive-bug-fixes"
 }

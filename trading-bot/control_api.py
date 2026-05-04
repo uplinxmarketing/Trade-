@@ -932,6 +932,44 @@ def api_sell_monitor():
     }
 
 
+@app.get("/api/settings")
+def api_get_settings():
+    """Return current bot risk/strategy settings."""
+    s = _load_strategy()
+    return {
+        "ok":             True,
+        "stop_loss_pct":  s.get("stop_loss_pct",   2.0),
+        "take_profit_pct": s.get("take_profit_pct", 0.5),
+        "max_positions":  s.get("max_positions",    10),
+        "min_signals":    s.get("min_signals",       2),
+    }
+
+
+class SettingsRequest(BaseModel):
+    stop_loss_pct:   Optional[float] = None
+    take_profit_pct: Optional[float] = None
+    max_positions:   Optional[int]   = None
+    min_signals:     Optional[int]   = None
+
+
+@app.post("/api/settings")
+def api_save_settings(req: SettingsRequest):
+    """Save bot risk/strategy settings into strategy.json."""
+    patch: dict = {}
+    if req.stop_loss_pct   is not None: patch["stop_loss_pct"]   = max(0.1, min(20.0, req.stop_loss_pct))
+    if req.take_profit_pct is not None: patch["take_profit_pct"] = max(0.1, min(50.0, req.take_profit_pct))
+    if req.max_positions   is not None: patch["max_positions"]   = max(1,   min(100,  req.max_positions))
+    if req.min_signals     is not None: patch["min_signals"]     = max(1,   min(4,    req.min_signals))
+    if not patch:
+        return {"ok": False, "error": "No valid settings provided"}
+    _write_strategy_patch(patch)
+    database.log_activity(
+        "Settings updated: " + ", ".join(f"{k}={v}" for k, v in patch.items()),
+        "info"
+    )
+    return {"ok": True, **patch}
+
+
 @app.get("/api/ping")
 def api_ping():
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
@@ -967,6 +1005,10 @@ def api_all():
             "watched_coins":   approved or config.WATCHED_COINS,
             "data_persistent": database._DATA_DIR == "/data",
             "data_dir":        database._DATA_DIR,
+            "stop_loss_pct":   strategy.get("stop_loss_pct",   2.0),
+            "take_profit_pct": strategy.get("take_profit_pct", 0.5),
+            "max_positions":   strategy.get("max_positions",    10),
+            "min_signals":     strategy.get("min_signals",      2),
         },
         "positions": _get_positions(),
         "trades":    database.get_recent_trades(limit=200),

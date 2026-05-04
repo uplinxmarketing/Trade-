@@ -216,6 +216,16 @@ def run_strategy_once():
         if not strategy or "approved_coins" not in strategy:
             raise ValueError("Claude returned invalid strategy")
 
+        # Preserve the user's explicit start/stop choice — never let Claude override it.
+        # Claude can recommend trading_active=false but the user's /api/agent/start|stop
+        # always wins. If the user started the bot, we keep it running regardless.
+        try:
+            with open(config.STRATEGY_FILE) as _f:
+                _existing_active = json.load(_f).get("trading_active", True)
+        except Exception:
+            _existing_active = True
+        strategy["trading_active"] = _existing_active
+
         strategy["updated_at"] = datetime.now(timezone.utc).isoformat()
         with open(config.STRATEGY_FILE, "w") as f:
             json.dump(strategy, f, indent=2)
@@ -246,6 +256,9 @@ def run_strategy_once():
 
 async def strategy_loop():
     """Runs strategy_once() every DECISION_INTERVAL_SEC."""
+    # Wait before first run so the bot can fully start and the user's
+    # trading_active setting (set in lifespan) is stable before Claude runs.
+    await asyncio.sleep(60)
     while True:
         # run_strategy_once() may call the Anthropic API synchronously.
         # Run it in a thread so it never blocks the asyncio event loop

@@ -252,7 +252,7 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <div className={`w-2.5 h-2.5 rounded-full animate-pulse ${isRunning ? (mode === 'live' ? 'bg-loss' : 'bg-gain') : 'bg-accent'}`} />
-          <h3 className="text-sm font-semibold">DeepTrade AI Bot</h3>
+          <h3 className="text-sm font-semibold">TradeBot AI</h3>
           <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${mode === 'live' ? 'bg-loss/20 text-loss' : 'bg-accent/20 text-accent'}`}>
             {mode === 'live' ? 'LIVE' : 'PAPER'}
           </span>
