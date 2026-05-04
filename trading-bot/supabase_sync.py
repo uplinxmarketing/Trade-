@@ -256,15 +256,17 @@ def _sync_all_impl(positions: list, usdt: float):
 def restore_from_supabase() -> dict:
     """
     Called on startup when SQLite is empty.  Fetches last known open
-    positions and USDT balance from Supabase.
+    positions, USDT balance, selected coins, AND completed trade history
+    from Supabase so nothing is lost across Railway redeploys.
 
-    Returns {"positions": [...], "usdt_balance": float|None}.
+    Returns {"positions": [...], "usdt_balance": float|None,
+             "selected_coins": [...], "trades": [...]}.
     Returns {} on any network error so callers treat it as a no-op.
     """
     if not _enabled:
         return {}
 
-    result: dict = {"positions": [], "usdt_balance": None}
+    result: dict = {"positions": [], "usdt_balance": None, "trades": []}
 
     try:
         rows = _get("paper_portfolio",
@@ -301,10 +303,105 @@ def restore_from_supabase() -> dict:
     except Exception as e:
         print(f"[SupaSync] restore balance error: {e}")
 
+    # ── Trade history restore ─────────────────────────────────────────────────
+    # Reconstruct completed trade records from bot_trade_history so the SQLite
+    # trades table (and therefore win-rate, P&L stats) survive Railway redeploys.
+    try:
+        import re as _re
+        from datetime import timedelta as _td
+
+        sell_rows = _get(
+            "bot_trade_history",
+            f"user_session=eq.{SESSION}&side=eq.sell"
+            f"&select=symbol,price,quantity,pnl,reason,created_at"
+            f"&order=created_at.desc&limit=500",
+        ) or []
+        buy_rows = _get(
+            "bot_trade_history",
+            f"user_session=eq.{SESSION}&side=eq.buy"
+            f"&select=symbol,price,reason,created_at"
+            f"&order=created_at.desc&limit=500",
+        ) or []
+
+        # Index buy rows: symbol → [(datetime, entry_price), ...]
+        buy_idx: dict = {}
+        for br in buy_rows:
+            sym = br.get("symbol", "")
+            try:
+                ts = datetime.fromisoformat(br["created_at"].replace("Z", "+00:00"))
+                buy_idx.setdefault(sym, []).append((ts, float(br.get("price") or 0)))
+            except Exception:
+                pass
+
+        _fee = 0.00075
+        trades = []
+        for sr in sell_rows:
+            sym = sr.get("symbol", "")
+            if not sym:
+                continue
+            exit_price  = float(sr.get("price")    or 0)
+            quantity    = float(sr.get("quantity")  or 0)
+            net_profit  = float(sr.get("pnl")       or 0)
+            ts_sell_raw = sr.get("created_at", "")
+            reason      = sr.get("reason", "")
+            if exit_price <= 0 or quantity <= 0:
+                continue
+
+            # Parse duration from reason string "duration=NNNs | paper"
+            duration = 0
+            m = _re.search(r"duration=(\d+)s", reason)
+            if m:
+                duration = int(m.group(1))
+
+            try:
+                sell_dt = datetime.fromisoformat(ts_sell_raw.replace("Z", "+00:00"))
+            except Exception:
+                continue
+
+            # Match closest buy row by expected buy timestamp
+            entry_price = exit_price  # fallback if no match
+            ts_buy_raw  = (sell_dt - _td(seconds=max(duration, 1))).isoformat()
+            if sym in buy_idx:
+                expected_buy = sell_dt - _td(seconds=max(duration, 1))
+                best = min(buy_idx[sym],
+                           key=lambda x: abs((x[0] - expected_buy).total_seconds()))
+                tolerance = max(duration, 60) + 120
+                if abs((best[0] - expected_buy).total_seconds()) < tolerance:
+                    entry_price = best[1]
+                    ts_buy_raw  = best[0].isoformat()
+
+            mode = "live" if "live" in reason else "paper"
+            budget_usdt = round(entry_price * quantity, 4)
+            trades.append({
+                "coin":               sym,
+                "mode":               mode,
+                "entry_price":        entry_price,
+                "exit_price":         exit_price,
+                "quantity":           quantity,
+                "budget_usdt":        budget_usdt,
+                "buy_fee":            round(budget_usdt * _fee, 8),
+                "sell_fee":           round(exit_price * quantity * _fee, 8),
+                "net_profit":         net_profit,
+                "profitable":         1 if net_profit > 0 else 0,
+                "duration_seconds":   duration,
+                "entry_rsi":          None,
+                "entry_ma_position":  None,
+                "entry_bb_position":  None,
+                "entry_volume_trend": None,
+                "hour_of_day":        sell_dt.hour,
+                "day_of_week":        sell_dt.weekday(),
+                "timestamp_buy":      ts_buy_raw,
+                "timestamp_sell":     ts_sell_raw,
+            })
+        result["trades"] = trades
+    except Exception as e:
+        print(f"[SupaSync] restore trades error: {e}")
+
     n   = len(result["positions"])
+    t   = len(result["trades"])
     bal = result["usdt_balance"]
-    if n or bal is not None:
-        print(f"[SupaSync] Restored from Supabase: {n} position(s), balance={bal}")
+    if n or t or bal is not None:
+        print(f"[SupaSync] Restored from Supabase: {n} position(s), {t} trade(s), balance={bal}")
     else:
         print("[SupaSync] Nothing to restore from Supabase (first run or no data)")
 

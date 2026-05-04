@@ -73,6 +73,14 @@ def write_default_strategy():
                 n = len(existing["approved_coins"])
                 active = existing.get("trading_active", True)
                 print(f"[StrategyEngine] strategy.json preserved — {n} coins, active={active}.")
+                # Sync coin list to Supabase so it survives Railway redeploys
+                try:
+                    import supabase_sync
+                    syms = [c["symbol"] for c in existing["approved_coins"] if c.get("approved")]
+                    if syms:
+                        supabase_sync.sync_selected_coins(syms)
+                except Exception:
+                    pass
                 return existing
         except Exception as e:
             print(f"[StrategyEngine] strategy.json unreadable ({e}) — writing defaults.")
@@ -215,6 +223,16 @@ def run_strategy_once():
         active  = strategy.get("trading_active", True)
         n_approved = sum(1 for c in strategy.get("approved_coins", []) if c.get("approved"))
         print(f"[StrategyEngine] Claude done — trading={active}, approved={n_approved} coins")
+
+        # Persist selected coins to Supabase so they survive Railway redeploys
+        try:
+            import supabase_sync
+            syms = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
+            if syms:
+                supabase_sync.sync_selected_coins(syms)
+        except Exception:
+            pass
+
         return strategy
 
     except Exception as e:

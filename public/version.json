@@ -1,5 +1,5 @@
 {
-  "version": "4.6.0",
-  "buildTime": "2026-05-04T18:00:00.000Z",
-  "commit": "fix-sell-delay-and-wrong-price-race-condition"
+  "version": "4.7.0",
+  "buildTime": "2026-05-04T19:00:00.000Z",
+  "commit": "fix-full-data-persistence-trade-history-coins-positions"
 }

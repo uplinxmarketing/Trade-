@@ -112,10 +112,10 @@ app.add_middleware(
 # ── Periodic Supabase sync — ensures data survives Railway redeploys ──────────
 
 async def _supabase_periodic_sync():
-    """Every 5 minutes push current balance + open positions to Supabase."""
+    """Every 2 minutes push current balance + open positions to Supabase."""
     import asyncio as _aio
     while True:
-        await _aio.sleep(300)   # 5 minutes
+        await _aio.sleep(120)   # 2 minutes
         try:
             from trade_engine import get_open_positions
             import supabase_sync

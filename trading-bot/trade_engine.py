@@ -198,6 +198,22 @@ def load_positions_from_db():
             rows = database.load_positions()
             print(f"[TradeEngine] Restored {len(rows)} position(s) from Supabase.")
 
+        # ── Trade history: restore when SQLite trades table is empty ────────────
+        # Rebuilds win-rate, P&L stats and trade list from bot_trade_history.
+        try:
+            if not database.get_recent_trades(limit=1) and restored.get("trades"):
+                imported = 0
+                for trade in restored["trades"]:
+                    try:
+                        database.log_trade(trade)
+                        imported += 1
+                    except Exception:
+                        pass
+                if imported:
+                    print(f"[TradeEngine] Imported {imported} trade(s) from Supabase history.")
+        except Exception as te:
+            print(f"[TradeEngine] Trade history restore failed (non-fatal): {te}")
+
         # ── Balance: restore when SQLite paper-state is empty or zero ──────────
         if restored.get("usdt_balance") is not None:
             usdt = restored["usdt_balance"]
