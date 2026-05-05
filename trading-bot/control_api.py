@@ -284,6 +284,7 @@ def get_config():
         "budget_pct_of_free":    strategy.get("budget_pct_of_free",    config.BUDGET_PCT_OF_FREE),
         "budget_total_cap_usdt": strategy.get("budget_total_cap_usdt", config.BUDGET_TOTAL_CAP_USDT),
         "budget_per_coin":       strategy.get("budget_per_coin",       config.BUDGET_PER_COIN),
+        "budget_coin_pct":       strategy.get("budget_coin_pct",       {}),
     }
 
 
@@ -291,7 +292,7 @@ def get_config():
 def update_config(body: dict):
     allowed_keys = {
         "budget_mode", "budget_fixed_usdt", "budget_pct_of_free",
-        "budget_total_cap_usdt", "budget_per_coin",
+        "budget_total_cap_usdt", "budget_per_coin", "budget_coin_pct",
     }
     patch = {k: v for k, v in body.items() if k in allowed_keys}
     if not patch:

@@ -227,7 +227,7 @@ def run_strategy_once():
             "stop_loss_enabled", "stop_loss_pct", "take_profit_pct",
             "max_positions", "min_signals", "strategy_notes",
             "budget_mode", "budget_fixed_usdt", "budget_pct_of_free",
-            "budget_total_cap_usdt", "budget_per_coin",
+            "budget_total_cap_usdt", "budget_per_coin", "budget_coin_pct",
         ]
         try:
             with open(config.STRATEGY_FILE) as _f:

@@ -128,6 +128,11 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
         per_coin = strategy.get("budget_per_coin", config.BUDGET_PER_COIN)
         return float(per_coin.get(symbol, config.BUDGET_FIXED_USDT))
 
+    elif mode == "coin_pct":
+        coin_pct = strategy.get("budget_coin_pct", {})
+        pct = float(coin_pct.get(symbol, 5.0))
+        return round(free_usdt * (pct / 100), 2)
+
     return config.BUDGET_FIXED_USDT
 
 

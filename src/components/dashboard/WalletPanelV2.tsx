@@ -6,7 +6,12 @@ import type { LivePrices } from '@/lib/trading-engine';
 import { toast } from 'sonner';
 import { API_BASE } from '@/config';
 
-const PAPER_CFG_KEY = 'paper_wallet_config';
+const PAPER_CFG_KEY  = 'paper_wallet_config';
+const RAILWAY_URL_KEY = 'railway_bot_url';
+
+function getRailwayUrl(): string {
+  try { return localStorage.getItem(RAILWAY_URL_KEY) ?? API_BASE; } catch { return API_BASE; }
+}
 
 const COIN_COLORS: Record<string, string> = {
   BTC: '#F7931A', ETH: '#627EEA', SOL: '#9945FF', BNB: '#F3BA2F',
@@ -20,7 +25,7 @@ const BREAK_EVEN = 1 / Math.pow(1 - TAKER_FEE, 2);
 interface Position { symbol: string; quantity: number; avg_entry_price: number; }
 interface LiveAsset { asset: string; free: string; locked: string; usdValue: number; }
 
-type BudgetMode = 'fixed' | 'percent' | 'capped' | 'per_coin';
+type BudgetMode = 'fixed' | 'percent' | 'capped' | 'per_coin' | 'coin_pct';
 
 interface WalletCfg {
   startingBalance: number;
@@ -29,6 +34,7 @@ interface WalletCfg {
   budgetPct: number;
   budgetCap: number;
   budgetPerCoin: Record<string, number>;
+  budgetCoinPct: Record<string, number>;
 }
 
 const DEFAULT_CFG: WalletCfg = {
@@ -38,15 +44,17 @@ const DEFAULT_CFG: WalletCfg = {
   budgetPct: 5,
   budgetCap: 500,
   budgetPerCoin: { BTCUSDT: 200, ETHUSDT: 150, SOLUSDT: 100, BNBUSDT: 100, DOGEUSDT: 50 },
+  budgetCoinPct: { BTCUSDT: 10, ETHUSDT: 8, SOLUSDT: 5, BNBUSDT: 5, DOGEUSDT: 3 },
 };
 
 const PRESET_BALANCES = [500, 1000, 5000, 10000];
 
 const BUDGET_MODES: { key: BudgetMode; label: string; icon: React.ReactNode; desc: string }[] = [
-  { key: 'fixed',    label: 'Fixed',   icon: <Lock className="w-3 h-3" />,    desc: 'Same USDT each trade' },
-  { key: 'percent',  label: '% Bal',   icon: <Percent className="w-3 h-3" />, desc: 'Scales with balance' },
-  { key: 'capped',   label: 'Cap',     icon: <Zap className="w-3 h-3" />,     desc: 'Max total deployed' },
-  { key: 'per_coin', label: 'Per Coin',icon: <Layers className="w-3 h-3" />,  desc: 'Per-coin limit' },
+  { key: 'fixed',    label: 'Fixed',      icon: <Lock className="w-3 h-3" />,    desc: 'Same USDT each trade' },
+  { key: 'percent',  label: '% Bal',      icon: <Percent className="w-3 h-3" />, desc: 'Scales with balance' },
+  { key: 'capped',   label: 'Cap',        icon: <Zap className="w-3 h-3" />,     desc: 'Max total deployed' },
+  { key: 'per_coin', label: 'Per Coin',   icon: <Layers className="w-3 h-3" />,  desc: 'Fixed USDT per coin' },
+  { key: 'coin_pct', label: 'Custom %',   icon: <Percent className="w-3 h-3" />, desc: '% of balance per coin' },
 ];
 
 interface Props {
@@ -140,15 +148,18 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
         budget_pct_of_free:    next.budgetPct,
         budget_total_cap_usdt: next.budgetCap,
         budget_per_coin:       next.budgetPerCoin,
+        budget_coin_pct:       next.budgetCoinPct,
       };
-      fetch(`${API_BASE}/config`, {
+      // Use the Railway URL the user configured in the AI Agent panel
+      const url = getRailwayUrl();
+      fetch(`${url}/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(patch),
       }).then(r => r.json()).then(d => {
         if (d.ok) toast.success('Budget settings applied to bot');
-        else toast.error('Server rejected settings: ' + (d.error ?? 'unknown'));
-      }).catch(() => toast.error('Bot unreachable — settings saved locally'));
+        else toast.error('Server rejected: ' + (d.error ?? 'unknown'));
+      }).catch(() => toast.error('Bot unreachable — set Railway URL in the AI Agent panel'));
       return next;
     });
   }, [draftCfg]);
@@ -157,7 +168,8 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     draftCfg.budgetFixed   !== walletCfg.budgetFixed   ||
     draftCfg.budgetPct     !== walletCfg.budgetPct     ||
     draftCfg.budgetCap     !== walletCfg.budgetCap     ||
-    JSON.stringify(draftCfg.budgetPerCoin) !== JSON.stringify(walletCfg.budgetPerCoin);
+    JSON.stringify(draftCfg.budgetPerCoin)  !== JSON.stringify(walletCfg.budgetPerCoin)  ||
+    JSON.stringify(draftCfg.budgetCoinPct)  !== JSON.stringify(walletCfg.budgetCoinPct);
 
   // ── Paper / test mode ────────────────────────────────────────────────────────
   // No dependency on walletCfg state — reads localStorage directly so the callback
@@ -263,7 +275,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     let cancelled = false;
     const poll = async () => {
       try {
-        const res = await fetch(`${API_BASE}/api/wallet`, { cache: 'no-store' });
+        const res = await fetch(`${getRailwayUrl()}/api/wallet`, { cache: 'no-store' });
         if (!res.ok || cancelled) return;
         const d = await res.json();
         if (!cancelled) setServerWallet({
@@ -306,7 +318,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     if (!confirm(`Reset paper wallet to ${resetBal.toLocaleString()} USDT and clear all positions?`)) return;
     setResetting(true);
     try {
-      const res = await fetch(`${API_BASE}/api/reset`, { method: 'POST' }).catch(() => null);
+      const res = await fetch(`${getRailwayUrl()}/api/reset`, { method: 'POST' }).catch(() => null);
       if (!res?.ok) {
         toast.error('Server reset failed — check Railway logs');
         return;
@@ -579,7 +591,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
               {/* Budget mode */}
               <div>
                 <div className="text-[9px] uppercase tracking-widest text-muted-foreground mb-2">Trade Size Mode</div>
-                <div className="grid grid-cols-4 gap-1">
+                <div className="grid grid-cols-5 gap-1">
                   {BUDGET_MODES.map(m => (
                     <button
                       key={m.key}
@@ -644,7 +656,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                 )}
                 {walletCfg.budgetMode === 'per_coin' && (
                   <div className="space-y-1.5">
-                    <div className="text-[9px] text-muted-foreground mb-1">USDT per coin</div>
+                    <div className="text-[9px] text-muted-foreground mb-1">Fixed USDT budget per coin per trade</div>
                     {watchCoins.map(sym => {
                       const ticker = sym.replace('USDT', '');
                       const val = draftCfg.budgetPerCoin[sym] ?? 100;
@@ -664,6 +676,47 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                         </div>
                       );
                     })}
+                  </div>
+                )}
+                {walletCfg.budgetMode === 'coin_pct' && (
+                  <div className="space-y-1.5">
+                    <div className="text-[9px] text-muted-foreground mb-1">
+                      % of free balance per coin — each trade uses that % of your current free USDT
+                    </div>
+                    {(() => {
+                      const totalPct = watchCoins.reduce((s, sym) => s + (draftCfg.budgetCoinPct[sym] ?? 5), 0);
+                      return (
+                        <>
+                          {watchCoins.map(sym => {
+                            const ticker = sym.replace('USDT', '');
+                            const pct = draftCfg.budgetCoinPct[sym] ?? 5;
+                            const usdtEst = effectiveUsdtFree * pct / 100;
+                            return (
+                              <div key={sym} className="flex items-center gap-2">
+                                <span className="text-[10px] font-mono font-bold w-12">{ticker}</span>
+                                <input
+                                  type="range" min={1} max={50} step={1}
+                                  value={pct}
+                                  onChange={e => setDraftCfg(p => ({
+                                    ...p,
+                                    budgetCoinPct: { ...p.budgetCoinPct, [sym]: Number(e.target.value) },
+                                  }))}
+                                  className="flex-1 accent-accent"
+                                />
+                                <span className="text-[10px] font-mono font-bold w-8 text-right text-accent">{pct}%</span>
+                                <span className="text-[9px] text-muted-foreground w-20 text-right">
+                                  ≈ {usdtEst.toFixed(0)} USDT
+                                </span>
+                              </div>
+                            );
+                          })}
+                          <div className={`text-[9px] mt-1 font-mono ${totalPct > 100 ? 'text-loss font-bold' : 'text-muted-foreground'}`}>
+                            Total allocated: {totalPct.toFixed(0)}% of free balance
+                            {totalPct > 100 && ' ⚠ exceeds 100% — reduce some coins'}
+                          </div>
+                        </>
+                      );
+                    })()}
                   </div>
                 )}
               </div>
