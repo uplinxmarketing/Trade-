@@ -16,6 +16,20 @@ import learning
 from data_collector import prices
 
 
+def _atomic_write_strategy(data: dict):
+    """Write strategy.json via temp+rename so concurrent readers never see a
+    half-written or empty file (which would silently reset live trade settings)."""
+    tmp = config.STRATEGY_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    os.replace(tmp, config.STRATEGY_FILE)
+
+
 def _get_usdt_balance() -> float:
     from connection import client, get_mode
     try:
@@ -68,8 +82,7 @@ def write_default_strategy():
             if existing.get("approved_coins"):
                 # Valid file — keep all user settings, just refresh the timestamp
                 existing["updated_at"] = datetime.now(timezone.utc).isoformat()
-                with open(config.STRATEGY_FILE, "w") as f:
-                    json.dump(existing, f, indent=2)
+                _atomic_write_strategy(existing)
                 n = len(existing["approved_coins"])
                 active = existing.get("trading_active", True)
                 print(f"[StrategyEngine] strategy.json preserved — {n} coins, active={active}.")
@@ -108,8 +121,7 @@ def write_default_strategy():
         ],
         "next_review_seconds":  config.DECISION_INTERVAL_SEC,
     }
-    with open(config.STRATEGY_FILE, "w") as f:
-        json.dump(strategy, f, indent=2)
+    _atomic_write_strategy(strategy)
     print(f"[StrategyEngine] strategy.json created — {len(config.WATCHED_COINS)} coins.")
     return strategy
 
@@ -254,8 +266,7 @@ def run_strategy_once():
             strategy["trading_active"] = True
 
         strategy["updated_at"] = datetime.now(timezone.utc).isoformat()
-        with open(config.STRATEGY_FILE, "w") as f:
-            json.dump(strategy, f, indent=2)
+        _atomic_write_strategy(strategy)
 
         active  = strategy.get("trading_active", True)
         n_approved = sum(1 for c in strategy.get("approved_coins", []) if c.get("approved"))

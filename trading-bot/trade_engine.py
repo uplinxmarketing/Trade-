@@ -73,6 +73,7 @@ _signal_cache: Dict[str, dict] = {}
 _signal_cache_lock = threading.Lock()
 _last_buy_check: float = 0.0
 _last_no_signal_log: float = 0.0   # throttle "no coins ready" log to once per 60 s
+_last_buy_scan_log: float = 0.0    # throttle "Buy scan: ..." to once per 30 s
 
 # Per-coin timestamp of last inline tick-driven signal refresh
 _tick_signal_ts: Dict[str, float] = {}
@@ -227,8 +228,15 @@ def _apply_coin_restore(coins: list):
                 for sym in coins
             ]
             strat["updated_at"] = datetime.now(timezone.utc).isoformat()
-            with open(config.STRATEGY_FILE, "w") as f:
+            tmp = config.STRATEGY_FILE + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(strat, f, indent=2)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp, config.STRATEGY_FILE)
             print(f"[TradeEngine] Restored {len(coins)} coins from Supabase → strategy.json.")
     except Exception as ce:
         print(f"[TradeEngine] Coin restore to strategy.json failed: {ce}")
@@ -532,6 +540,10 @@ def _execute_sell(pos: dict, price: float, reason: str):
         with _selling_lock:
             _selling.discard(sym)
             _selling_ts.pop(sym, None)
+        # Always clear the smart-hold peak — even on sell failure — so that a
+        # later position re-opened on the same symbol doesn't inherit a stale
+        # high-water mark and instantly trip its trailing stop.
+        _pos_peaks.pop(sym, None)
 
 
 def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str, mode: str, now: str):
@@ -752,15 +764,21 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     ts_now = datetime.now(_tz.utc).isoformat()
     mode   = get_mode()
 
-    # Log a readable snapshot so the activity log always shows what's happening
+    # Build the cache snapshot but only emit the activity log every 30 s — these
+    # writes hold the global DB lock and previously fired on every WS-tick scan,
+    # serializing the sell monitor and signal scanner behind them.
     with _signal_cache_lock:
         cache_snapshot = dict(_signal_cache)
     ready_syms = [s for s, v in cache_snapshot.items() if v["score"] >= min_sigs and s in approved]
-    database.log_activity(
-        f"Buy scan: USDT={usdt_balance:.2f} | {len(ready_syms)} coin(s) ready (min {min_sigs}/4 signals): "
-        + (", ".join(f"{s}(score={cache_snapshot[s]['score']})" for s in ready_syms[:6]) or "none"),
-        "info"
-    )
+    global _last_buy_scan_log
+    _now_ts = time.time()
+    if ready_syms or (_now_ts - _last_buy_scan_log) >= 30.0:
+        _last_buy_scan_log = _now_ts
+        database.log_activity(
+            f"Buy scan: USDT={usdt_balance:.2f} | {len(ready_syms)} coin(s) ready (min {min_sigs}/4 signals): "
+            + (", ".join(f"{s}(score={cache_snapshot[s]['score']})" for s in ready_syms[:6]) or "none"),
+            "info"
+        )
 
     for sym, cached in cache_snapshot.items():
         # Re-check capacity before every individual buy — the pre-loop check only
@@ -829,6 +847,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             pass
 
         exit_target = round(fill_price * _take_profit_mult, 8)
+        # Fresh position — clear any stale smart-hold peak left over from a prior
+        # sell on this symbol so the trailing stop starts from this entry alone.
+        _pos_peaks.pop(sym, None)
         pos_record = {
             "symbol":             sym,
             "entry_price":        fill_price,

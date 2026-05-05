@@ -531,8 +531,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // into the same React state variables so the UI shows live Railway data.
   const serverPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const fastPollRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  // In-flight guard: serverPollRef (5 s) and fastPollRef (1 s) both call
+  // pollRailway. Without this, an older 5-s response can land AFTER a newer
+  // 1-s response and clobber positions/trades with stale data.
+  const pollInFlightRef = useRef<boolean>(false);
 
   const pollRailway = useCallback(async () => {
+    if (pollInFlightRef.current) return;
+    pollInFlightRef.current = true;
+    try {
     // Single /api/all request (status + positions + trades + activity in one round trip)
     // Retry once with a 2s delay if the first attempt fails.
     const attempt = async () => {
@@ -626,24 +633,25 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         });
       }
     }
-    // Always merge Supabase history so trades survive Railway redeploys.
-    // Bot writes to Supabase with user_session='railway_bot' on every trade.
-    // Deduplicate by created_at+symbol+side (Railway IDs differ from Supabase UUIDs).
-    try {
-      const { data: sbTrades } = await supabase
-        .from('bot_trade_history')
-        .select('*')
-        .eq('user_session', 'railway_bot')
-        .order('created_at', { ascending: false })
-        .limit(200);
-      if (sbTrades && sbTrades.length > 0) {
-        const rwKeys = new Set(railwayTrades.map(t => `${t.created_at}|${t.symbol}|${t.side}`));
-        const deduped = (sbTrades as TradeRow[]).filter(
-          t => !rwKeys.has(`${t.created_at}|${t.symbol}|${t.side}`)
-        );
-        railwayTrades.push(...deduped);
-      }
-    } catch { /* Supabase unavailable — Railway-only data shown */ }
+    // Merge Supabase history only when Railway returned NO trades — this
+    // happens after a fresh Railway redeploy without a persistent volume.
+    // Previously we always merged, but timestamp-format drift between
+    // Railway's ISO strings and Supabase's PostgREST timestamps caused dedup
+    // to silently fail, double-counting every trade and producing P&L
+    // percentages of -200% / -300%.
+    if (railwayTrades.length === 0) {
+      try {
+        const { data: sbTrades } = await supabase
+          .from('bot_trade_history')
+          .select('*')
+          .eq('user_session', 'railway_bot')
+          .order('created_at', { ascending: false })
+          .limit(200);
+        if (sbTrades && sbTrades.length > 0) {
+          railwayTrades.push(...(sbTrades as TradeRow[]));
+        }
+      } catch { /* Supabase unavailable — Railway-only data shown */ }
+    }
 
     const sorted = railwayTrades.sort((a, b) =>
       new Date(b.created_at).getTime() - new Date(a.created_at).getTime()).slice(0, 200);
@@ -676,6 +684,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           setActLog(['[Bot] Waiting for first activity…']);
         }
       } catch { setActLog(['[Bot] Waiting for first activity…']); }
+    }
+    } finally {
+      pollInFlightRef.current = false;
     }
   }, [railwayUrl, addLog]);
 
@@ -1050,7 +1061,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                     : sellTrades.length;
   const winRate     = totalTrades ? Math.round((wins / totalTrades) * 100) : 0;
   const pnlColor    = totalPnl >= 0 ? 'text-gain' : 'text-loss';
-  const pnlPct      = initialBalance > 0 ? ((totalPnl / initialBalance) * 100).toFixed(2) : '0.00';
+  // Guard against NaN / Infinity from a malformed initialBalance, and clamp
+  // unrealistically large values to ±9999% so a stale snapshot can never
+  // display a -300% return.
+  const _rawPct     = initialBalance > 0 ? (totalPnl / initialBalance) * 100 : 0;
+  const _safePct    = Number.isFinite(_rawPct) ? Math.max(-9999, Math.min(9999, _rawPct)) : 0;
+  const pnlPct      = _safePct.toFixed(2);
   const ROWS_DEFAULT = 5;
   const displayedTrades    = showAllTrades    ? trades    : trades.slice(0, ROWS_DEFAULT);
   const displayedPositions = showAllPositions ? positions : positions.slice(0, ROWS_DEFAULT);
@@ -1263,7 +1279,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
       {/* ── Bot Settings (collapsible) ── */}
       <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-2">
-        <button onClick={() => { setShowSettings(p => !p); setSettingsDraft({ stopLossEnabled, stopLossPct, takeProfitEnabled, takeProfitPct, smartHoldEnabled, trailingStopPct, reinvestProfits, maxPositions, minSignals }); }}
+        <button onClick={() => {
+          // Reset draft only when OPENING the panel — closing should preserve
+          // any in-progress edits in case the user reopens to keep editing.
+          // Without this, a background poll could overwrite a draft mid-edit.
+          if (!showSettings) {
+            setSettingsDraft({ stopLossEnabled, stopLossPct, takeProfitEnabled, takeProfitPct, smartHoldEnabled, trailingStopPct, reinvestProfits, maxPositions, minSignals });
+          }
+          setShowSettings(p => !p);
+        }}
           className="flex items-center justify-between w-full text-left">
           <div className="flex items-center gap-2">
             <Shield className="w-3.5 h-3.5 text-accent" />

@@ -333,10 +333,15 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     if (!confirm(`Reset paper wallet to ${resetBal.toLocaleString()} USDT and clear all positions?`)) return;
     setResetting(true);
     try {
-      const res = await fetch(`${getRailwayUrl()}/api/reset`, { method: 'POST' }).catch(() => null);
-      if (!res?.ok) {
-        toast.error('Server reset failed — check Railway logs');
-        return;
+      // Only call Railway when in agent/server mode — pure-paper users without
+      // a Railway URL would otherwise always hit the network error path and
+      // never reach the Supabase reset below.
+      if (hasAgentData) {
+        const res = await fetch(`${getRailwayUrl()}/api/reset`, { method: 'POST' }).catch(() => null);
+        if (!res?.ok) {
+          toast.error('Server reset failed — check Railway logs');
+          return;
+        }
       }
 
       if (!hasAgentData) {
@@ -367,15 +372,27 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   // ── Compute portfolio totals (paper mode) ────────────────────────────────────
   // Number() casts guard against Supabase PostgREST returning NUMERIC columns as strings.
   const positionRows = effectivePositions.map(pos => {
-    const qty        = Number(pos.quantity);
-    const entryPrice = Number(pos.avg_entry_price);
+    // toNum: guarantees a finite, non-negative number — malformed Railway/Supabase
+    // rows (string "abc", null, or NaN-yielding parses) would otherwise propagate
+    // into pnl/pct as NaN and render as "NaN%" / impossibly large losses.
+    const toNum = (v: unknown) => {
+      const n = typeof v === 'number' ? v : parseFloat(String(v ?? ''));
+      return Number.isFinite(n) && n >= 0 ? n : 0;
+    };
+    const qty        = toNum(pos.quantity);
+    const entryPrice = toNum(pos.avg_entry_price);
     const coin       = pos.symbol.replace('USDT','');
-    const wsPrice    = parseFloat(prices[pos.symbol]?.price || '0');
+    const wsPrice    = toNum(prices[pos.symbol]?.price);
     const livePrice  = wsPrice > 0 ? wsPrice : entryPrice;
     const currentValue = qty * livePrice;
     const costBasis    = qty * entryPrice / (1 - TAKER_FEE);
     const pnl          = currentValue - costBasis;
-    const pct          = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
+    // Clamp the displayed % to a sane range — pct cannot mathematically exceed
+    // ±100% with non-negative real prices, but a stale or malformed price can
+    // still produce NaN/Infinity which would render as "-300%" garbage.
+    let pct = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
+    if (!Number.isFinite(pct)) pct = 0;
+    if (pct < -100) pct = -100;
     const breakEven    = entryPrice * BREAK_EVEN;
     return { coin, pos, qty, entryPrice, livePrice, currentValue, costBasis, pnl, pct, breakEven };
   });

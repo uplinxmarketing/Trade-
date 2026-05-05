@@ -142,10 +142,29 @@ def _load_strategy() -> dict:
 
 
 def _write_strategy_patch(patch: dict):
+    """Atomic merge-and-write to strategy.json.
+
+    Without atomicity, concurrent readers (sell monitor, signal scanner) may
+    catch the file mid-truncate and json.load raises — which silently turns
+    every default into the schema fallback (e.g. trading_active drops to True
+    or take_profit_mult resets to breakeven mid-trade)."""
     s = _load_strategy()
     s.update(patch)
-    with open(config.STRATEGY_FILE, "w") as f:
+    tmp_path = config.STRATEGY_FILE + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(s, f, indent=2)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    os.replace(tmp_path, config.STRATEGY_FILE)
+    # Bust the /api/all response cache so a poll right after a write sees the
+    # updated trading_active / settings / approved coins immediately.
+    try:
+        _API_ALL_CACHE["data"] = None
+    except NameError:
+        pass
 
 
 def _get_positions():
@@ -945,7 +964,7 @@ def api_get_settings():
         "take_profit_pct":    s.get("take_profit_pct",    0.5),
         "smart_hold_enabled": s.get("smart_hold_enabled", False),
         "trailing_stop_pct":  s.get("trailing_stop_pct",  0.5),
-        "reinvest_profits":   s.get("reinvest_profits",   True),
+        "reinvest_profits":   s.get("reinvest_profits",   False),
         "max_positions":      s.get("max_positions",       10),
         "min_signals":        s.get("min_signals",          2),
         "strategy_notes":     s.get("strategy_notes",      ""),
@@ -994,27 +1013,41 @@ def api_ping():
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
 
 
+# Tiny response cache — coalesces overlapping polls (the frontend has both a 5 s
+# and a 1 s interval; without this they each issue a full DB sweep, which holds
+# the global SQLite lock and starves the sell monitor for ~50 ms each call).
+_API_ALL_CACHE: dict = {"ts": 0.0, "data": None}
+_API_ALL_TTL = 0.8   # seconds — slightly less than the 1 s fast-poll cadence
+
+
 @app.get("/api/all")
 def api_all():
     """Single endpoint returning status + positions + trades + activity.
     Reduces frontend from 4 concurrent fetches to 1, cutting Railway load 4×."""
+    now_ts = time.time()
+    cached = _API_ALL_CACHE.get("data")
+    if cached is not None and (now_ts - _API_ALL_CACHE["ts"]) < _API_ALL_TTL:
+        return cached
+
     strategy = _load_strategy()
+    # Single 500-row sweep; reuse the slice for the 200-row "trades" payload —
+    # eliminates a second identical query that previously ran on every poll.
     trades   = database.get_recent_trades(limit=500)
     sells    = [t for t in trades if t.get("exit_price") is not None]
     wins     = sum(1 for t in sells if (t.get("net_profit") or 0) > 0)
-    # Realized P&L: SQL SUM — single source of truth matching /api/wallet
     realized = database.get_realized_pnl(mode="paper")
     initial  = float(strategy.get("initial_balance_usdt", 0))
     balance  = round(_get_usdt_balance(), 2)
     approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
-    return {
+    positions = _get_positions()  # also reused below — was called twice
+    payload = {
         "status": {
             "running":         strategy.get("trading_active", False),
             "mode":            get_mode(),
             "balance_usdt":    balance,
             "paper_balance":   balance,
             "initial_balance": initial or balance,
-            "open_positions":  len(_get_positions()),
+            "open_positions":  len(positions),
             "trades_today":    database.get_trades_today_count(),
             "win_rate":        round(wins / len(sells), 3) if sells else 0.0,
             "wins":            wins,
@@ -1030,15 +1063,18 @@ def api_all():
             "take_profit_pct":    strategy.get("take_profit_pct",    0.5),
             "smart_hold_enabled": strategy.get("smart_hold_enabled", False),
             "trailing_stop_pct":  strategy.get("trailing_stop_pct",  0.5),
-            "reinvest_profits":   strategy.get("reinvest_profits",   True),
+            "reinvest_profits":   strategy.get("reinvest_profits",   False),
             "max_positions":      strategy.get("max_positions",       10),
             "min_signals":        strategy.get("min_signals",          2),
             "strategy_notes":     strategy.get("strategy_notes",      ""),
         },
-        "positions": _get_positions(),
-        "trades":    database.get_recent_trades(limit=200),
+        "positions": positions,
+        "trades":    trades[:200],
         "activity":  database.get_activity_log(limit=100),
     }
+    _API_ALL_CACHE["ts"]   = now_ts
+    _API_ALL_CACHE["data"] = payload
+    return payload
 
 
 @app.get("/api/debug")
