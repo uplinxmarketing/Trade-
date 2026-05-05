@@ -1011,7 +1011,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   };
 
   // ── Save bot settings to Railway ─────────────────────────────────────────
-  const saveSettings = useCallback(async () => {
+  const saveSettings = useCallback(async (silent: boolean = false) => {
     setSavingSettings(true);
     try {
       const res = await fetch(`${railwayUrl}/api/settings`, {
@@ -1040,14 +1040,39 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       setReinvestProfits(settingsDraft.reinvestProfits);
       setMaxPositions(settingsDraft.maxPositions);
       setMinSignals(settingsDraft.minSignals);
-      toast.success('Bot settings saved');
-      setShowSettings(false);
+      if (!silent) {
+        toast.success('Bot settings saved');
+        setShowSettings(false);
+      }
     } catch (e: any) {
-      toast.error(`Settings error: ${e.message}`);
+      if (!silent) toast.error(`Settings error: ${e.message}`);
     } finally {
       setSavingSettings(false);
     }
   }, [settingsDraft, railwayUrl]);
+
+  // Auto-save settings — debounced 600 ms after the user stops editing.
+  // Only triggers when (a) the panel is open, (b) at least one field actually
+  // differs from the committed values, and (c) we're in server mode. The
+  // panel stays open during auto-save so the user can keep adjusting.
+  useEffect(() => {
+    if (!showSettings || !isServerMode) return;
+    const dirty =
+      settingsDraft.stopLossEnabled    !== stopLossEnabled    ||
+      settingsDraft.stopLossPct        !== stopLossPct        ||
+      settingsDraft.takeProfitEnabled  !== takeProfitEnabled  ||
+      settingsDraft.takeProfitPct      !== takeProfitPct      ||
+      settingsDraft.smartHoldEnabled   !== smartHoldEnabled   ||
+      settingsDraft.trailingStopPct    !== trailingStopPct    ||
+      settingsDraft.reinvestProfits    !== reinvestProfits    ||
+      settingsDraft.maxPositions       !== maxPositions       ||
+      settingsDraft.minSignals         !== minSignals;
+    if (!dirty) return;
+    const t = setTimeout(() => { saveSettings(true); }, 600);
+    return () => clearTimeout(t);
+  }, [settingsDraft, showSettings, isServerMode, saveSettings,
+      stopLossEnabled, stopLossPct, takeProfitEnabled, takeProfitPct,
+      smartHoldEnabled, trailingStopPct, reinvestProfits, maxPositions, minSignals]);
 
   // ── Computed stats ───────────────────────────────────────────────────────
   const sellTrades  = trades.filter(t => (t.side === 'SELL' || (t.side as string).toLowerCase() === 'sell') && t.pnl !== null);
@@ -1429,13 +1454,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 <p className="text-[9px] text-muted-foreground mt-1">Higher = fewer but more confident buys</p>
               </div>
             </div>
-            <div className="flex gap-2">
-              <Button onClick={saveSettings} disabled={savingSettings}
-                className="flex-1 h-7 text-xs bg-accent hover:bg-accent/90 text-accent-foreground">
-                {savingSettings ? '…' : <><Check className="w-3 h-3 mr-1" />Apply to Bot</>}
-              </Button>
-              <button onClick={() => setShowSettings(false)} className="px-3 text-xs text-muted-foreground hover:text-foreground border border-border rounded">
-                Cancel
+            <div className="flex items-center gap-2">
+              <span className="flex-1 text-[10px] text-muted-foreground italic">
+                {savingSettings
+                  ? <span className="text-accent">Saving…</span>
+                  : <span className="text-gain">✓ Auto-saves while you edit</span>}
+              </span>
+              <button onClick={() => setShowSettings(false)} className="px-3 py-1 text-xs text-muted-foreground hover:text-foreground border border-border rounded">
+                Close
               </button>
             </div>
           </div>

@@ -74,6 +74,7 @@ _signal_cache_lock = threading.Lock()
 _last_buy_check: float = 0.0
 _last_no_signal_log: float = 0.0   # throttle "no coins ready" log to once per 60 s
 _last_buy_scan_log: float = 0.0    # throttle "Buy scan: ..." to once per 30 s
+_last_at_capacity_log: float = 0.0 # throttle "at max capacity" log to once per 60 s
 
 # Per-coin timestamp of last inline tick-driven signal refresh
 _tick_signal_ts: Dict[str, float] = {}
@@ -745,7 +746,19 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     with _positions_lock:
         n_open = len(_positions)
     if n_open >= max_pos:
-        return  # silently skip — already at capacity
+        # Periodic heartbeat so the user sees the bot is still alive at capacity.
+        # Without this, no buy logs are emitted while at max_positions and the
+        # UI looks like it has been paused for no reason.
+        global _last_at_capacity_log
+        _now_cap = time.time()
+        if _now_cap - _last_at_capacity_log >= 60.0:
+            _last_at_capacity_log = _now_cap
+            database.log_activity(
+                f"At max positions ({n_open}/{max_pos}) — bot active, "
+                f"waiting for an exit before opening new trades",
+                "info",
+            )
+        return  # already at capacity — buys resume automatically after a sell
 
     # Enforce configurable min_signals threshold (overrides config.MIN_SIGNALS_TO_BUY)
     min_sigs = int(strategy.get("min_signals", config.MIN_SIGNALS_TO_BUY))

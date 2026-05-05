@@ -169,14 +169,28 @@ def _write_strategy_patch(patch: dict):
 
 def _get_positions():
     try:
-        from trade_engine import get_open_positions, _rest_px
+        from trade_engine import get_open_positions, _rest_px, _signal_cache, _signal_cache_lock
         from data_collector import prices
         pos = get_open_positions()
         out = []
         for p in pos:
             sym    = p["symbol"]
-            # Prefer REST cache (always fresh) over potentially stale WebSocket price
+            # Price priority chain — fall through to the next source whenever
+            # the previous one is missing or 0:
+            #   1. _rest_px  (REST refresh every 2 s — usually freshest)
+            #   2. WebSocket prices dict (sub-second updates when subscribed)
+            #   3. Latest cached signal price (60 s old at worst)
+            #   4. The position's entry price (so display never shows 0)
+            # Without 3 and 4 the frontend was rendering Now == Entry every
+            # time a single source briefly missed the symbol.
             price  = _rest_px.get(sym) or prices.get(sym, 0)
+            if not price:
+                with _signal_cache_lock:
+                    sc_entry = _signal_cache.get(sym)
+                if sc_entry and sc_entry.get("price", 0) > 0:
+                    price = sc_entry["price"]
+            if not price:
+                price = p.get("entry_price", 0)
             entry  = p.get("entry_price", 0)
             qty    = p.get("quantity", 0)
             target = p.get("exit_target") or (entry * (1 + config.FEE_RATE_BNB * 2) if config.BNB_FEE_MODE else entry * 1.002)
