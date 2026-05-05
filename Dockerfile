@@ -6,11 +6,12 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 
-# .buildid changes on every commit — guarantees Docker busts the build cache
-# and npm run build always runs fresh, even if Railway doesn't inject SHA args.
+# CACHE_BUST changes on every push — guarantees Railway runs npm run build fresh
+# even when it tries to serve a cached image layer.
+ARG CACHE_BUST=2026-05-05T20:22:40Z
 COPY .buildid ./
 COPY . .
-RUN npm run build
+RUN echo "Cache bust: $CACHE_BUST" && npm run build
 
 # ── Stage 2: Python trading bot + static file server ──────────────────────────
 FROM python:3.11-slim
