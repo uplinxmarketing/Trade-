@@ -209,12 +209,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [takeProfitPct, setTakeProfitPct]             = useState(0.5);
   const [smartHoldEnabled, setSmartHoldEnabled]       = useState(false);
   const [trailingStopPct, setTrailingStopPct]         = useState(0.5);
+  const [reinvestProfits, setReinvestProfits]         = useState(true);
   const [maxPositions, setMaxPositions]               = useState(10);
   const [minSignals, setMinSignals]                   = useState(2);
   const [settingsDraft, setSettingsDraft]             = useState({
     stopLossEnabled: true, stopLossPct: 2.0,
     takeProfitEnabled: true, takeProfitPct: 0.5,
     smartHoldEnabled: false, trailingStopPct: 0.5,
+    reinvestProfits: true,
     maxPositions: 10, minSignals: 2,
   });
   const [savingSettings, setSavingSettings]       = useState(false);
@@ -574,6 +576,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (s.take_profit_pct     !== undefined) setTakeProfitPct(Number(s.take_profit_pct));
     if (s.smart_hold_enabled  !== undefined) setSmartHoldEnabled(Boolean(s.smart_hold_enabled));
     if (s.trailing_stop_pct   !== undefined) setTrailingStopPct(Number(s.trailing_stop_pct));
+    if (s.reinvest_profits    !== undefined) setReinvestProfits(Boolean(s.reinvest_profits));
     if (s.max_positions       !== undefined) setMaxPositions(Number(s.max_positions));
     if (s.min_signals         !== undefined) setMinSignals(Number(s.min_signals));
     if (s.strategy_notes   !== undefined) { setInstructions(s.strategy_notes as string); localStorage.setItem(INSTRUCTIONS_KEY, s.strategy_notes as string); }
@@ -996,6 +999,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           take_profit_pct:    settingsDraft.takeProfitPct,
           smart_hold_enabled: settingsDraft.smartHoldEnabled,
           trailing_stop_pct:  settingsDraft.trailingStopPct,
+          reinvest_profits:   settingsDraft.reinvestProfits,
           max_positions:      settingsDraft.maxPositions,
           min_signals:        settingsDraft.minSignals,
         }),
@@ -1008,6 +1012,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       setTakeProfitPct(settingsDraft.takeProfitPct);
       setSmartHoldEnabled(settingsDraft.smartHoldEnabled);
       setTrailingStopPct(settingsDraft.trailingStopPct);
+      setReinvestProfits(settingsDraft.reinvestProfits);
       setMaxPositions(settingsDraft.maxPositions);
       setMinSignals(settingsDraft.minSignals);
       toast.success('Bot settings saved');
@@ -1238,7 +1243,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
       {/* ── Bot Settings (collapsible) ── */}
       <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-2">
-        <button onClick={() => { setShowSettings(p => !p); setSettingsDraft({ stopLossEnabled, stopLossPct, takeProfitEnabled, takeProfitPct, smartHoldEnabled, trailingStopPct, maxPositions, minSignals }); }}
+        <button onClick={() => { setShowSettings(p => !p); setSettingsDraft({ stopLossEnabled, stopLossPct, takeProfitEnabled, takeProfitPct, smartHoldEnabled, trailingStopPct, reinvestProfits, maxPositions, minSignals }); }}
           className="flex items-center justify-between w-full text-left">
           <div className="flex items-center gap-2">
             <Shield className="w-3.5 h-3.5 text-accent" />
@@ -1336,6 +1341,26 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                   <span className="text-xs text-muted-foreground">% trailing drop from peak to trigger exit</span>
                 </div>
               )}
+            </div>
+
+            {/* Reinvest Profits toggle */}
+            <div className="bg-muted/30 rounded-md px-3 py-2.5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs font-semibold text-foreground">Reinvest Profits</p>
+                  <p className="text-[9px] text-muted-foreground">
+                    {settingsDraft.reinvestProfits
+                      ? 'Trade sizes grow as balance grows — profits compound automatically'
+                      : 'OFF — fixed trade sizes regardless of profits (flat trading)'}
+                  </p>
+                </div>
+                <button
+                  onClick={() => setSettingsDraft(d => ({ ...d, reinvestProfits: !d.reinvestProfits }))}
+                  className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${settingsDraft.reinvestProfits ? 'bg-gain/80' : 'bg-muted/60'}`}
+                >
+                  <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${settingsDraft.reinvestProfits ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                </button>
+              </div>
             </div>
 
             <div className="grid grid-cols-2 gap-2">

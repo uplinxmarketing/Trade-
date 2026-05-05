@@ -116,12 +116,15 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
     """Return trade size in USDT based on BUDGET_MODE (config defaults or strategy.json overrides)."""
     strategy = _load_strategy()
     mode = strategy.get("budget_mode", config.BUDGET_MODE)
+    reinvest = bool(strategy.get("reinvest_profits", True))
+    initial  = float(strategy.get("initial_balance_usdt", 0) or free_usdt)
 
     if mode == "fixed":
-        return float(strategy.get("budget_fixed_usdt", config.BUDGET_FIXED_USDT))
+        base = float(strategy.get("budget_fixed_usdt", config.BUDGET_FIXED_USDT))
 
     elif mode == "percent":
         pct = float(strategy.get("budget_pct_of_free", config.BUDGET_PCT_OF_FREE))
+        # percent mode already scales with balance — reinvest has no extra effect
         return round(free_usdt * (pct / 100), 2)
 
     elif mode == "capped":
@@ -130,18 +133,29 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
             total_in_positions = sum(p["budget_usdt"] for p in _positions)
         remaining_cap = cap - total_in_positions
         per_trade = cap / config.MAX_OPEN_POSITIONS
-        return min(per_trade, max(0.0, remaining_cap))
+        base = min(per_trade, max(0.0, remaining_cap))
 
     elif mode == "per_coin":
         per_coin = strategy.get("budget_per_coin", config.BUDGET_PER_COIN)
-        return float(per_coin.get(symbol, config.BUDGET_FIXED_USDT))
+        base = float(per_coin.get(symbol, config.BUDGET_FIXED_USDT))
 
     elif mode == "coin_pct":
         coin_pct = strategy.get("budget_coin_pct", {})
         pct = float(coin_pct.get(symbol, 5.0))
+        # coin_pct already scales with balance — no extra reinvest scaling needed
         return round(free_usdt * (pct / 100), 2)
 
-    return config.BUDGET_FIXED_USDT
+    else:
+        base = config.BUDGET_FIXED_USDT
+
+    # Reinvest profits: scale budget proportionally to balance growth.
+    # e.g. started 10 000 USDT, now have 12 000 → budget × 1.2 (20% more per trade).
+    # Clamped to [0.5, 5.0] so extreme losses/wins don't go crazy.
+    if reinvest and initial > 0 and mode in ("fixed", "per_coin", "capped"):
+        scale = max(0.5, min(5.0, free_usdt / initial))
+        base = base * scale
+
+    return base
 
 
 # ── Cooldown helpers ──────────────────────────────────────────────────────────
@@ -739,6 +753,13 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     )
 
     for sym, cached in cache_snapshot.items():
+        # Re-check capacity before every individual buy — the pre-loop check only
+        # guards the entry; without this, all ready coins buy in sequence and blow
+        # past the configured max_positions limit.
+        with _positions_lock:
+            if len(_positions) >= max_pos:
+                break
+
         if sym not in approved:
             continue
         if cached["score"] < min_sigs:
@@ -955,20 +976,19 @@ _REST_PX_TTL = 2.0   # refetch REST prices every 2 s when WebSocket is down
 
 def _fetch_rest_prices(symbols: list) -> Dict[str, float]:
     """
-    Batch-fetch current prices via REST when WebSocket is unavailable.
-    Uses /api/v3/ticker/price?symbols=[...] — only fetches needed symbols.
-    Tries the public CDN first (rarely geo-blocked), then API fallbacks.
-    Returns {} on complete failure.
+    Batch-fetch current prices via REST.
+    Tries public CDN first (rarely geo-blocked from Railway), then API mirrors.
+    Timeout 2 s per URL, max 3 URLs tried — fast-fail so we never block for long.
     """
     import urllib.request as _ur
     import urllib.parse as _up
     result: Dict[str, float] = {}
     syms_param = _up.quote(json.dumps(symbols))
-    for base in _KLINE_BASES:
+    for base in _KLINE_BASES[:3]:   # try at most 3 endpoints; fail fast
         try:
             url = f"{base}/api/v3/ticker/price?symbols={syms_param}"
             req = _ur.Request(url, headers={"User-Agent": "TradingBot/1.0"})
-            with _ur.urlopen(req, timeout=5) as resp:
+            with _ur.urlopen(req, timeout=2) as resp:   # 2 s max — never block sell checks
                 data = json.loads(resp.read())
             if isinstance(data, list):
                 for item in data:
@@ -987,21 +1007,53 @@ def _fetch_rest_prices(symbols: list) -> Dict[str, float]:
     return result
 
 
-def _sell_monitor_loop():
-    """
-    Fallback daemon thread — wakes every 5 s and catches any positions that
-    the realtime_monitor missed (e.g. while WebSocket was reconnecting).
-    Primary sell path is realtime_monitor which fires within ~100 ms of each tick.
+_price_refresher_thread: Optional[threading.Thread] = None
 
-    CRITICAL: When Railway's WebSocket to Binance is geo-blocked, _dc.prices is
-    always empty → realtime_monitor never fires → this loop is the only sell path.
-    The fallback price chain:
-      1. WebSocket prices (_dc.prices) — accurate, updated every ~100 ms
-      2. Signal cache  — in-memory last kline close, refreshed every 60 s by REST
-      3. REST batch ticker fetch — accurate, ~200 ms latency, rate-limited to 8 s
+def _price_refresher_loop():
+    """
+    Dedicated background thread — fetches REST prices for all open positions
+    every 2 s and writes them to _rest_px.  Runs independently of the sell
+    monitor so network I/O NEVER delays a sell check.
     """
     import data_collector as _dc
-    global _sell_diag_ts, _sell_monitor_heartbeat, _rest_px, _rest_px_ts
+    global _rest_px, _rest_px_ts
+
+    while True:
+        try:
+            with _positions_lock:
+                snap = list(_positions)
+            if snap:
+                all_syms = list({p["symbol"] for p in snap})
+                fetched = _fetch_rest_prices(all_syms)
+                if fetched:
+                    _rest_px.update(fetched)
+                    _rest_px_ts = time.time()
+                else:
+                    # REST unavailable — fill gaps from signal cache
+                    with _signal_cache_lock:
+                        for pos in snap:
+                            s = pos["symbol"]
+                            if s not in _rest_px:
+                                sc = _signal_cache.get(s)
+                                if sc and sc.get("price", 0) > 0:
+                                    _rest_px[s] = sc["price"]
+        except Exception:
+            pass
+        time.sleep(2.0)
+
+
+def _sell_monitor_loop():
+    """
+    Fallback daemon thread — wakes every 0.5 s and checks sell conditions.
+    Never does any network I/O — REST prices are fetched by _price_refresher_loop
+    (a separate daemon thread) and written to _rest_px.  Decoupling means sell
+    checks are NEVER delayed by a slow HTTP request.
+
+    Price priority: REST (_rest_px, refreshed every 2 s) > WebSocket (_dc.prices).
+    Both are applied before the sell check so the freshest price is always used.
+    """
+    import data_collector as _dc
+    global _sell_diag_ts, _sell_monitor_heartbeat
 
     try:
         database.log_activity("Sell monitor thread started", "info")
@@ -1009,14 +1061,12 @@ def _sell_monitor_loop():
         pass
 
     while True:
-        _sell_monitor_heartbeat = time.time()   # update at START so alive-check is always fresh
+        _sell_monitor_heartbeat = time.time()
         try:
             with _positions_lock:
                 snap = list(_positions)
 
             # ── Watchdog: force-clear _selling entries stuck > 90 s ──────────
-            # Prevents positions from showing "SELLING NOW" forever when the
-            # executor thread hangs or crashes without clearing the guard.
             now_wd = time.time()
             with _selling_lock:
                 stuck = [s for s, t in list(_selling_ts.items()) if now_wd - t > 90]
@@ -1031,45 +1081,11 @@ def _sell_monitor_loop():
                 except Exception:
                     pass
 
+            # Build price dict: start with WebSocket, then override with REST.
+            # _rest_px is maintained by _price_refresher_loop — no I/O here.
             prices = dict(_dc.prices)
-
-            # ── ALWAYS refresh REST prices for ALL open positions ─────────────
-            # CRITICAL: _dc.prices may contain STALE prices from a WebSocket
-            # that connected briefly then was geo-blocked by Railway/Binance.
-            # A stale price below the exit target means the sell condition is
-            # never met even when the real market price has crossed the target.
-            # REST prices are fetched every 4 s and ALWAYS override WS prices.
-            if snap:
-                now_t2 = time.time()
-                if (now_t2 - _rest_px_ts) >= _REST_PX_TTL:
-                    all_syms = list({p["symbol"] for p in snap})
-                    fetched = _fetch_rest_prices(all_syms)
-                    if fetched:
-                        _rest_px.update(fetched)
-                        _rest_px_ts = now_t2
-                        stale = [
-                            s for s in fetched
-                            if s in prices and prices[s] > 0
-                            and abs(fetched[s] - prices[s]) / max(fetched[s], 1) > 0.001
-                        ]
-                        if stale or not prices:
-                            database.log_activity(
-                                f"Sell monitor REST refresh: {len(fetched)} prices"
-                                + (f" | WS stale override: {stale}" if stale else ""), "info"
-                            )
-                    else:
-                        # REST failed — fall back to signal cache for missing symbols
-                        with _signal_cache_lock:
-                            for pos2 in snap:
-                                s2 = pos2["symbol"]
-                                if not prices.get(s2):
-                                    sc = _signal_cache.get(s2)
-                                    if sc and sc.get("price", 0) > 0:
-                                        prices[s2] = sc["price"]
-
-            # Apply cached REST prices — these ALWAYS override stale WS prices
             for sym2, p2 in _rest_px.items():
-                prices[sym2] = p2
+                prices[sym2] = p2   # REST always overrides stale WS prices
 
             # Diagnostic log every 60 s
             now_t = time.time()
@@ -1139,28 +1155,28 @@ def _sell_monitor_loop():
                 database.log_activity(f"Sell monitor error: {exc}", "error")
             except Exception:
                 pass
-        # Sleep shorter when positions are open so we catch exits faster.
-        # 1 s with open positions; 5 s when idle to avoid unnecessary REST calls.
-        time.sleep(1.0 if snap else 5.0)
+        # No blocking I/O here — 0.5 s gives ~0.5 s worst-case exit delay.
+        time.sleep(0.5)
 
 
 async def position_guardian():
     """
-    Watchdog coroutine — starts the sell monitor thread and restarts it if
-    it ever dies (which should never happen, but belt-and-suspenders).
+    Watchdog coroutine — starts the sell monitor and price refresher threads
+    and restarts them if they ever die (belt-and-suspenders).
     """
-    global _sell_monitor_thread
+    global _sell_monitor_thread, _price_refresher_thread
     while True:
-        alive = (
-            _sell_monitor_thread is not None
-            and _sell_monitor_thread.is_alive()
-        )
-        if not alive:
+        if not (_sell_monitor_thread and _sell_monitor_thread.is_alive()):
             _sell_monitor_thread = threading.Thread(
                 target=_sell_monitor_loop, name="sell-monitor", daemon=True
             )
             _sell_monitor_thread.start()
-        await asyncio.sleep(5.0)   # check every 5 s
+        if not (_price_refresher_thread and _price_refresher_thread.is_alive()):
+            _price_refresher_thread = threading.Thread(
+                target=_price_refresher_loop, name="price-refresher", daemon=True
+            )
+            _price_refresher_thread.start()
+        await asyncio.sleep(5.0)
 
 
 # ── Process 2: signal scanner (async, refreshes cache every SCAN_INTERVAL_SEC) ─

@@ -227,6 +227,7 @@ def run_strategy_once():
             "stop_loss_enabled", "stop_loss_pct",
             "take_profit_enabled", "take_profit_pct",
             "smart_hold_enabled", "trailing_stop_pct",
+            "reinvest_profits",
             "max_positions", "min_signals", "strategy_notes",
             "budget_mode", "budget_fixed_usdt", "budget_pct_of_free",
             "budget_total_cap_usdt", "budget_per_coin", "budget_coin_pct",
