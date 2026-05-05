@@ -1541,15 +1541,27 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             <div className={`space-y-1.5 overflow-y-auto scrollbar-thin ${!showAllPositions && positions.length > ROWS_DEFAULT ? 'max-h-[500px]' : ''}`}>
               {displayedPositions.map(pos => {
                 const live   = pos.current_price || parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.avg_entry_price;
-                const sells  = live * pos.quantity * (1-TAKER_FEE);
-                const cost   = pos.avg_entry_price * pos.quantity / (1-TAKER_FEE);
-                const uPnl   = sells - cost;
-                const pct    = cost > 0 ? (uPnl/cost)*100 : 0;
+                const qty    = Number(pos.quantity);
+                // Mark-to-market P&L: pure price movement since entry. Round-trip
+                // fee accounting (the previous formula) baked the buy+sell fee into
+                // a sunk loss, producing a misleading "-0.2% on every coin" display
+                // even when livePrice == entryPrice. Fees are realised on close;
+                // the exit target shown alongside already factors them in, so the
+                // user can read this row as "did the price move since I bought?"
+                const uPnl   = qty * (live - pos.avg_entry_price);
+                const pct    = pos.avg_entry_price > 0
+                  ? ((live - pos.avg_entry_price) / pos.avg_entry_price) * 100 : 0;
                 const target = pos.exit_target ?? pos.avg_entry_price * BEP_MULT;
                 const prof   = live >= target;
                 const toTarget = Math.min(100, Math.max(0, ((live - pos.avg_entry_price) / (target - pos.avg_entry_price)) * 100));
-                const qty    = Number(pos.quantity);
                 const budget = pos.avg_entry_price * qty / (1 - TAKER_FEE);
+                // Adaptive price precision: 4 decimals for "normal" coins (BTC,
+                // ETH), more for sub-cent tokens (FLOKI, SHIB, PEPE) so the user
+                // can actually see the price change instead of all rows showing
+                // identical "0.0000" values.
+                const pricePrecision = (p: number) =>
+                  p >= 1 ? 4 : p >= 0.01 ? 5 : p >= 0.0001 ? 6 : 8;
+                const fmtP = (p: number) => p.toFixed(pricePrecision(p));
                 return (
                   <div key={pos.symbol} className="bg-muted/20 border border-border/50 rounded-lg px-3 py-2.5 space-y-2">
                     <div className="flex items-center justify-between">
@@ -1567,9 +1579,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       </div>
                     </div>
                     <div className="grid grid-cols-2 gap-x-4 text-[10px] text-muted-foreground font-mono">
-                      <span>Entry <span className="text-foreground">{pos.avg_entry_price.toFixed(4)}</span></span>
-                      <span>Exit target <span className="text-accent font-bold">{target.toFixed(4)}</span></span>
-                      <span>Now <span className={prof?'text-gain':'text-foreground'}>{live.toFixed(4)}</span></span>
+                      <span>Entry <span className="text-foreground">{fmtP(pos.avg_entry_price)}</span></span>
+                      <span>Exit target <span className="text-accent font-bold">{fmtP(target)}</span></span>
+                      <span>Now <span className={prof?'text-gain':'text-foreground'}>{fmtP(live)}</span></span>
                       <span>Qty <span className="text-foreground">{qty.toFixed(6)}</span> · <span className="text-foreground">{budget.toFixed(2)} USDT</span></span>
                     </div>
                     <div className="space-y-1">

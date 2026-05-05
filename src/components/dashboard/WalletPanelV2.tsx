@@ -384,17 +384,22 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     const coin       = pos.symbol.replace('USDT','');
     const wsPrice    = toNum(prices[pos.symbol]?.price);
     const livePrice  = wsPrice > 0 ? wsPrice : entryPrice;
+    // Mark-to-market P&L — pure price movement since entry, NOT including
+    // round-trip fees. Matches the convention every major exchange uses for
+    // open-position display (Binance, Coinbase, Kraken). Fees are only
+    // realised on close, so showing them as a sunk loss on a fresh entry
+    // (which produced a confusing "-0.2% on every coin" display) is wrong.
+    // The exit-target shown alongside already accounts for fees.
+    const buyValue     = qty * entryPrice;
     const currentValue = qty * livePrice;
-    const costBasis    = qty * entryPrice / (1 - TAKER_FEE);
-    const pnl          = currentValue - costBasis;
-    // Clamp the displayed % to a sane range — pct cannot mathematically exceed
-    // ±100% with non-negative real prices, but a stale or malformed price can
-    // still produce NaN/Infinity which would render as "-300%" garbage.
-    let pct = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
+    const pnl          = currentValue - buyValue;
+    let pct = entryPrice > 0 ? ((livePrice - entryPrice) / entryPrice) * 100 : 0;
     if (!Number.isFinite(pct)) pct = 0;
     if (pct < -100) pct = -100;
+    // costBasis kept for the cost-display row (still shown as "10.01 USDT").
+    const costBasis    = qty * entryPrice / (1 - TAKER_FEE);
     const breakEven    = entryPrice * BREAK_EVEN;
-    return { coin, pos, qty, entryPrice, livePrice, currentValue, costBasis, pnl, pct, breakEven };
+    return { coin, pos, qty, entryPrice, livePrice, currentValue, buyValue, costBasis, pnl, pct, breakEven };
   });
 
   const paperPositionTotal = positionRows.reduce((s,r)=>s+r.currentValue, 0);
