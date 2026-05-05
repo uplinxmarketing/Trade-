@@ -209,14 +209,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [takeProfitPct, setTakeProfitPct]             = useState(0.5);
   const [smartHoldEnabled, setSmartHoldEnabled]       = useState(false);
   const [trailingStopPct, setTrailingStopPct]         = useState(0.5);
-  const [reinvestProfits, setReinvestProfits]         = useState(true);
+  const [reinvestProfits, setReinvestProfits]         = useState(false);
   const [maxPositions, setMaxPositions]               = useState(10);
   const [minSignals, setMinSignals]                   = useState(2);
   const [settingsDraft, setSettingsDraft]             = useState({
     stopLossEnabled: true, stopLossPct: 2.0,
     takeProfitEnabled: true, takeProfitPct: 0.5,
     smartHoldEnabled: false, trailingStopPct: 0.5,
-    reinvestProfits: true,
+    reinvestProfits: false,
     maxPositions: 10, minSignals: 2,
   });
   const [savingSettings, setSavingSettings]       = useState(false);
@@ -225,6 +225,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [instrDraft, setInstrDraft]       = useState('');
   const [actLog, setActLog]       = useState<string[]>([]);
   const [dataPersistent, setDataPersistent] = useState<boolean | null>(null);
+  // Server-authoritative P&L stats — avoids Railway+Supabase double-counting
+  const [serverRealizedPnl, setServerRealizedPnl]     = useState<number | null>(null);
+  const [serverWins, setServerWins]                   = useState<number | null>(null);
+  const [serverTotalTrades, setServerTotalTrades]     = useState<number | null>(null);
   const [showLog, setShowLog]     = useState(true);
   // Unified deployment: frontend and API are served from the same Railway URL.
   // railwayUrl defaults to '' (same origin) so all /api/* calls are relative.
@@ -580,6 +584,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (s.max_positions       !== undefined) setMaxPositions(Number(s.max_positions));
     if (s.min_signals         !== undefined) setMinSignals(Number(s.min_signals));
     if (s.strategy_notes   !== undefined) { setInstructions(s.strategy_notes as string); localStorage.setItem(INSTRUCTIONS_KEY, s.strategy_notes as string); }
+    // Server-authoritative stats — use these instead of summing individual trade rows
+    // to avoid double-counting from Railway+Supabase merge.
+    if (s.realized_pnl  !== undefined) setServerRealizedPnl(Number(s.realized_pnl));
+    if (s.wins          !== undefined) setServerWins(Number(s.wins));
+    if (s.total_trades  !== undefined) setServerTotalTrades(Number(s.total_trades));
 
     // Restore coin selection from Railway's watchlist (survives page refresh)
     if (Array.isArray(s.watched_coins) && s.watched_coins.length > 0) {
@@ -802,11 +811,16 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           addLog(`[Railway ERROR] ${msg}`);
           return;
         }
+        // Optimistic update — show new state immediately without waiting for poll.
+        // The regular 5 s poll will reconcile with server truth.
+        const nowRunning = !isRunning;
+        setIsRunning(nowRunning);
+        isRunningRef.current = nowRunning;
         addLog(isRunning ? '=== Railway bot STOPPED ===' : '=== Railway bot STARTED ===');
         toast[isRunning ? 'info' : 'success'](isRunning ? 'Railway bot paused' : 'Railway bot started', {
           description: 'Runs 24/7 on Railway — this browser tab can be closed.',
         });
-        await pollRailway();
+        pollRailway().catch(() => {});  // fire-and-forget; don't block UI
         return;
       }
 
@@ -1026,9 +1040,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
   // ── Computed stats ───────────────────────────────────────────────────────
   const sellTrades  = trades.filter(t => (t.side === 'SELL' || (t.side as string).toLowerCase() === 'sell') && t.pnl !== null);
-  const wins        = sellTrades.filter(t => (t.pnl ?? 0) > 0).length;
-  const totalPnl    = sellTrades.reduce((s, t) => s + (t.pnl ?? 0), 0);
-  const winRate     = sellTrades.length ? Math.round((wins / sellTrades.length) * 100) : 0;
+  // In server mode, always use the backend's SQL-aggregated values to avoid
+  // double-counting that occurs when Railway and Supabase trade rows are merged.
+  const totalPnl    = (isServerMode && serverRealizedPnl !== null) ? serverRealizedPnl
+                    : sellTrades.reduce((s, t) => s + (t.pnl ?? 0), 0);
+  const wins        = (isServerMode && serverWins !== null)        ? serverWins
+                    : sellTrades.filter(t => (t.pnl ?? 0) > 0).length;
+  const totalTrades = (isServerMode && serverTotalTrades !== null) ? serverTotalTrades
+                    : sellTrades.length;
+  const winRate     = totalTrades ? Math.round((wins / totalTrades) * 100) : 0;
   const pnlColor    = totalPnl >= 0 ? 'text-gain' : 'text-loss';
   const pnlPct      = initialBalance > 0 ? ((totalPnl / initialBalance) * 100).toFixed(2) : '0.00';
   const ROWS_DEFAULT = 5;
@@ -1404,7 +1424,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           { label: 'Free Cash', value: `${balance.toFixed(2)} USDT`, color: '' },
           { label: 'Net P&L', value: `${totalPnl>=0?'+':''}${Math.abs(totalPnl).toFixed(2)} USDT`, color: pnlColor },
           { label: 'Return', value: `${totalPnl>=0?'+':''}${pnlPct}%`, color: pnlColor },
-          { label: 'Win Rate', value: sellTrades.length ? `${winRate}%` : '—', color: winRate>=50?'text-gain':sellTrades.length?'text-loss':'' },
+          { label: 'Win Rate', value: totalTrades ? `${winRate}%` : '—', color: winRate>=50?'text-gain':totalTrades?'text-loss':'' },
         ].map(s => (
           <div key={s.label} className="bg-muted/20 rounded-md p-2 text-center">
             <div className="text-[9px] uppercase tracking-widest text-muted-foreground">{s.label}</div>
@@ -1555,9 +1575,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         <button onClick={() => setShowTradesSection(p=>!p)} className="flex items-center gap-1.5 text-[10px] uppercase tracking-widest text-muted-foreground hover:text-foreground w-full mb-2">
           {totalPnl>=0?<TrendingUp className="w-3 h-3 text-gain shrink-0"/>:<TrendingDown className="w-3 h-3 text-loss shrink-0"/>}
           Trade History ({trades.length})
-          {sellTrades.length > 0 && (
+          {totalTrades > 0 && (
             <span className="font-mono font-normal normal-case tracking-normal ml-1 flex items-center gap-2">
-              <span className="text-muted-foreground">{wins}W/{sellTrades.length-wins}L</span>
+              <span className="text-muted-foreground">{wins}W/{totalTrades-wins}L</span>
               <span className={pnlColor}>{totalPnl>=0?'+':''}{totalPnl.toFixed(4)}</span>
             </span>
           )}

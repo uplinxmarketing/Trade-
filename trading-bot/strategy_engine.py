@@ -86,7 +86,10 @@ def write_default_strategy():
             print(f"[StrategyEngine] strategy.json unreadable ({e}) — writing defaults.")
 
     # ── First run or corrupt file — create defaults ───────────────────────────
-    starting_usdt = float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+    # Prefer the DB-persisted starting balance (written at wallet-reset time) so
+    # initial_balance_usdt always matches what the paper client actually started with.
+    starting_str  = database.get_setting("paper_starting_balance")
+    starting_usdt = float(starting_str) if starting_str else float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
     strategy = {
         "updated_at":           datetime.now(timezone.utc).isoformat(),
         "trading_active":       True,

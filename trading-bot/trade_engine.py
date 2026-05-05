@@ -116,8 +116,16 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
     """Return trade size in USDT based on BUDGET_MODE (config defaults or strategy.json overrides)."""
     strategy = _load_strategy()
     mode = strategy.get("budget_mode", config.BUDGET_MODE)
-    reinvest = bool(strategy.get("reinvest_profits", True))
-    initial  = float(strategy.get("initial_balance_usdt", 0) or free_usdt)
+    reinvest = bool(strategy.get("reinvest_profits", False))
+
+    # Authoritative starting balance: DB setting (written at wallet reset) takes priority
+    # over strategy.json so a stale initial_balance_usdt never inflates reinvest scaling.
+    initial_from_strategy = float(strategy.get("initial_balance_usdt", 0))
+    if initial_from_strategy > 0:
+        initial = initial_from_strategy
+    else:
+        starting_str = database.get_setting("paper_starting_balance")
+        initial = float(starting_str) if starting_str else free_usdt
 
     if mode == "fixed":
         base = float(strategy.get("budget_fixed_usdt", config.BUDGET_FIXED_USDT))
@@ -125,7 +133,7 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
     elif mode == "percent":
         pct = float(strategy.get("budget_pct_of_free", config.BUDGET_PCT_OF_FREE))
         # percent mode already scales with balance — reinvest has no extra effect
-        return round(free_usdt * (pct / 100), 2)
+        return round(min(free_usdt * (pct / 100), free_usdt * 0.9), 2)
 
     elif mode == "capped":
         cap = float(strategy.get("budget_total_cap_usdt", config.BUDGET_TOTAL_CAP_USDT))
@@ -143,19 +151,20 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
         coin_pct = strategy.get("budget_coin_pct", {})
         pct = float(coin_pct.get(symbol, 5.0))
         # coin_pct already scales with balance — no extra reinvest scaling needed
-        return round(free_usdt * (pct / 100), 2)
+        return round(min(free_usdt * (pct / 100), free_usdt * 0.9), 2)
 
     else:
         base = config.BUDGET_FIXED_USDT
 
     # Reinvest profits: scale budget proportionally to balance growth.
     # e.g. started 10 000 USDT, now have 12 000 → budget × 1.2 (20% more per trade).
-    # Clamped to [0.5, 5.0] so extreme losses/wins don't go crazy.
+    # Clamped to [0.5, 2.0] — tighter ceiling prevents runaway budget on small initial values.
     if reinvest and initial > 0 and mode in ("fixed", "per_coin", "capped"):
-        scale = max(0.5, min(5.0, free_usdt / initial))
+        scale = max(0.5, min(2.0, free_usdt / initial))
         base = base * scale
 
-    return base
+    # Hard cap: single trade never exceeds 40% of free USDT (prevents wallet wipeout)
+    return round(min(base, free_usdt * 0.4), 2)
 
 
 # ── Cooldown helpers ──────────────────────────────────────────────────────────
