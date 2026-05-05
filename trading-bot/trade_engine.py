@@ -715,15 +715,16 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         database.log_activity("Buy check: trading_active=False — bot is paused", "warn")
         return
 
+    # Always refresh risk params first — even when at capacity, so the sell monitor
+    # uses current TP/SL settings rather than stale cached values.
+    _refresh_risk_params()
+
     # Enforce max_positions (configurable via /api/settings, default 10)
     max_pos = int(strategy.get("max_positions", 10))
     with _positions_lock:
         n_open = len(_positions)
     if n_open >= max_pos:
         return  # silently skip — already at capacity
-
-    # Refresh configurable risk params (take profit %, stop loss %) from strategy.json
-    _refresh_risk_params()
 
     # Enforce configurable min_signals threshold (overrides config.MIN_SIGNALS_TO_BUY)
     min_sigs = int(strategy.get("min_signals", config.MIN_SIGNALS_TO_BUY))
@@ -1081,29 +1082,32 @@ def _sell_monitor_loop():
                 except Exception:
                     pass
 
+            # Always refresh TP/SL multipliers — settings can change at any time.
+            _refresh_risk_params()
+
             # Build price dict: start with WebSocket, then override with REST.
             # _rest_px is maintained by _price_refresher_loop — no I/O here.
             prices = dict(_dc.prices)
             for sym2, p2 in _rest_px.items():
                 prices[sym2] = p2   # REST always overrides stale WS prices
 
-            # Diagnostic log every 60 s
+            # Diagnostic log every 60 s — shows ACTUAL sell target, not just breakeven
             now_t = time.time()
             if now_t - _sell_diag_ts >= 60.0:
                 _sell_diag_ts = now_t
                 lines = []
                 for p in snap:
-                    sym   = p["symbol"]
-                    price = prices.get(sym, 0.0)
-                    entry = p["entry_price"]
-                    bep   = entry * _breakeven_mult
-                    pct   = ((price - entry) / entry * 100) if entry else 0
+                    sym    = p["symbol"]
+                    price  = prices.get(sym, 0.0)
+                    entry  = p["entry_price"]
+                    actual = entry * _take_profit_mult   # real sell threshold
+                    pct    = ((price - entry) / entry * 100) if entry else 0
                     lines.append(
                         f"{sym} entry={entry:.4f} cur={price:.4f}({pct:+.3f}%) "
-                        f"target={bep:.4f}({'SELL' if price >= bep else 'hold'})"
+                        f"target={actual:.4f}({'SELL' if price >= actual else 'hold'})"
                     )
                 database.log_activity(
-                    f"Sell monitor fallback: {len(snap)} open — " + " | ".join(lines), "info"
+                    f"Sell monitor: {len(snap)} open — " + " | ".join(lines), "info"
                 )
 
             for pos in snap:
@@ -1117,38 +1121,33 @@ def _sell_monitor_loop():
                 entry  = pos["entry_price"]
                 target = entry * _take_profit_mult
                 stop   = entry * _stop_loss_mult
+
+                sell_reason3: Optional[str] = None
+
                 if price >= target:
                     if _smart_hold_enabled:
                         _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
                         peak       = _pos_peaks[sym]
                         trail_stop = peak * (1.0 - _trailing_stop_pct / 100.0)
-                        sell_reason2: Optional[str] = None
                         if price <= trail_stop:
-                            sell_reason2 = "smart-hold-trail"
+                            sell_reason3 = "smart-hold-trail"
                         else:
                             with _signal_cache_lock:
                                 score2 = _signal_cache.get(sym, {}).get("score", 0)
                             if score2 < 3:
-                                sell_reason2 = "take-profit"
-                        if sell_reason2:
-                            with _selling_lock:
-                                if sym not in _selling:
-                                    _selling.add(sym)
-                                    _selling_ts[sym] = time.time()
-                            _sell_executor.submit(_execute_sell, pos, price, sell_reason2)
+                                sell_reason3 = "take-profit"
                     else:
-                        with _selling_lock:
-                            if sym not in _selling:
-                                _selling.add(sym)
-                                _selling_ts[sym] = time.time()
-                        _sell_executor.submit(_execute_sell, pos, price, "take-profit")
+                        sell_reason3 = "take-profit"
                 elif _stop_loss_mult < 1.0 and price <= stop:
+                    sell_reason3 = "stop-loss"
+
+                if sell_reason3:
                     with _selling_lock:
                         if sym in _selling:
                             continue
                         _selling.add(sym)
                         _selling_ts[sym] = time.time()
-                    _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
+                    _sell_executor.submit(_execute_sell, pos, price, sell_reason3)
 
         except Exception as exc:
             try:

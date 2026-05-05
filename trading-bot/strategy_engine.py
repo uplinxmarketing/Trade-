@@ -222,8 +222,11 @@ def run_strategy_once():
         # Preserve ALL user-configured fields — Claude's schema only contains
         # approved_coins / trading_active / next_review_seconds; anything else
         # (risk settings, budget, notes) must survive every Claude write.
+        # NOTE: trading_active is intentionally NOT in this list — we always
+        # force it to True below so Claude can never silently stop the bot.
+        # Use /api/stop to pause; that writes False and it is preserved here.
         _PRESERVED_KEYS = [
-            "trading_active", "initial_balance_usdt",
+            "initial_balance_usdt",
             "stop_loss_enabled", "stop_loss_pct",
             "take_profit_enabled", "take_profit_pct",
             "smart_hold_enabled", "trailing_stop_pct",
@@ -238,6 +241,12 @@ def run_strategy_once():
             for key in _PRESERVED_KEYS:
                 if key in _existing:
                     strategy[key] = _existing[key]
+            # Honour an explicit user-initiated stop (trading_active=False written
+            # by /api/stop); ignore Claude's own value either way.
+            if _existing.get("trading_active") is False:
+                strategy["trading_active"] = False
+            else:
+                strategy["trading_active"] = True
         except Exception:
             strategy["trading_active"] = True
 
