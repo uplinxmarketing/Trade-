@@ -219,15 +219,24 @@ def run_strategy_once():
         if not strategy or "approved_coins" not in strategy:
             raise ValueError("Claude returned invalid strategy")
 
-        # Preserve the user's explicit start/stop choice — never let Claude override it.
-        # Claude can recommend trading_active=false but the user's /api/agent/start|stop
-        # always wins. If the user started the bot, we keep it running regardless.
+        # Preserve ALL user-configured fields — Claude's schema only contains
+        # approved_coins / trading_active / next_review_seconds; anything else
+        # (risk settings, budget, notes) must survive every Claude write.
+        _PRESERVED_KEYS = [
+            "trading_active", "initial_balance_usdt",
+            "stop_loss_enabled", "stop_loss_pct", "take_profit_pct",
+            "max_positions", "min_signals", "strategy_notes",
+            "budget_mode", "budget_fixed_usdt", "budget_pct_of_free",
+            "budget_total_cap_usdt", "budget_per_coin",
+        ]
         try:
             with open(config.STRATEGY_FILE) as _f:
-                _existing_active = json.load(_f).get("trading_active", True)
+                _existing = json.load(_f)
+            for key in _PRESERVED_KEYS:
+                if key in _existing:
+                    strategy[key] = _existing[key]
         except Exception:
-            _existing_active = True
-        strategy["trading_active"] = _existing_active
+            strategy["trading_active"] = True
 
         strategy["updated_at"] = datetime.now(timezone.utc).isoformat()
         with open(config.STRATEGY_FILE, "w") as f:

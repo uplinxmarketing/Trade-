@@ -556,11 +556,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     setInitialBalance(Number(s.initial_balance ?? bal));
     setAgentStatus(`Railway · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${new Date().toLocaleTimeString()}`);
     if (s.data_persistent !== undefined) setDataPersistent(Boolean(s.data_persistent));
-    if (s.stop_loss_enabled !== undefined) { const v = Boolean(s.stop_loss_enabled); setStopLossEnabled(v); setSettingsDraft(d => ({ ...d, stopLossEnabled: v })); }
-    if (s.stop_loss_pct    !== undefined) { const v = Number(s.stop_loss_pct);   setStopLossPct(v);   setSettingsDraft(d => ({ ...d, stopLossPct: v })); }
-    if (s.take_profit_pct  !== undefined) { const v = Number(s.take_profit_pct); setTakeProfitPct(v); setSettingsDraft(d => ({ ...d, takeProfitPct: v })); }
-    if (s.max_positions    !== undefined) { const v = Number(s.max_positions);   setMaxPositions(v);  setSettingsDraft(d => ({ ...d, maxPositions: v })); }
-    if (s.min_signals      !== undefined) { const v = Number(s.min_signals);     setMinSignals(v);    setSettingsDraft(d => ({ ...d, minSignals: v })); }
+    // Update committed state from server — never touch settingsDraft here.
+    // The draft is only reset when the user opens the settings panel, so
+    // in-progress edits are never overwritten by a background poll.
+    if (s.stop_loss_enabled !== undefined) setStopLossEnabled(Boolean(s.stop_loss_enabled));
+    if (s.stop_loss_pct    !== undefined) setStopLossPct(Number(s.stop_loss_pct));
+    if (s.take_profit_pct  !== undefined) setTakeProfitPct(Number(s.take_profit_pct));
+    if (s.max_positions    !== undefined) setMaxPositions(Number(s.max_positions));
+    if (s.min_signals      !== undefined) setMinSignals(Number(s.min_signals));
     if (s.strategy_notes   !== undefined && s.strategy_notes) { setInstructions(s.strategy_notes as string); localStorage.setItem(INSTRUCTIONS_KEY, s.strategy_notes as string); }
 
     // Restore coin selection from Railway's watchlist (survives page refresh)

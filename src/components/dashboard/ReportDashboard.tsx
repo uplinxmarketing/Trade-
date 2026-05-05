@@ -291,8 +291,8 @@ const ReportDashboard = () => {
         </div>
       )}
 
-      {/* Coin performance leaderboard */}
-      {coinStats.length > 0 && (() => {
+      {/* Coin performance leaderboard — always visible once hasData */}
+      {hasData && (() => {
         const maxPnl    = Math.max(...coinStats.map(s => Math.abs(s.totalPnl)), 0.01);
         const maxTrades = Math.max(...coinStats.map(s => s.trades), 1);
         return (
@@ -316,6 +316,11 @@ const ReportDashboard = () => {
                 </button>
               </div>
             </div>
+            {coinStats.length === 0 ? (
+              <div className="p-8 text-center text-xs text-muted-foreground">
+                {loading ? 'Loading…' : isActive ? '⏳ Bot is running — coin rankings will appear after the first closed position' : 'No completed trades yet'}
+              </div>
+            ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-[11px]">
                 <thead>
@@ -388,6 +393,7 @@ const ReportDashboard = () => {
                 </tbody>
               </table>
             </div>
+            )}
           </div>
         );
       })()}
