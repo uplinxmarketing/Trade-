@@ -66,7 +66,7 @@ interface Props {
   agentBalance?: number;
   agentInitialBalance?: number;
   agentTrades?: { side: 'BUY' | 'SELL'; pnl: number | null; quantity: number; price: number }[];
-  onReset?: () => void;
+  onReset?: (newBalance: number) => void;
 }
 
 function CoinIcon({ coin }: { coin: string }) {
@@ -240,7 +240,9 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   }, [binanceConnected, prices]);
 
   // ── Use agent-provided state when available (instant sync / server mode) ─────
-  const hasAgentData = agentBalance !== undefined && agentBalance > 0;
+  // Use agentInitialBalance (never reset to 0) as the Railway-mode flag so that
+  // resetting the wallet (which briefly sets agentBalance=0) doesn't flip back to Supabase mode.
+  const hasAgentData = (agentInitialBalance ?? 0) > 0 || (agentBalance ?? 0) > 0;
 
   const isPaper = mode === 'test' || !binanceConnected;
 
@@ -289,8 +291,15 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     const id = setInterval(poll, 5_000);
     return () => { cancelled = true; clearInterval(id); };
   }, [hasAgentData]); // eslint-disable-line
-  const effectivePositions = hasAgentData ? (agentPositions ?? positions) : positions;
-  const effectiveUsdtFree  = hasAgentData ? agentBalance : usdtFree;
+  // In Railway mode keep local `positions` state in sync with parent's agentPositions
+  // so the refresh button (which writes to `positions` directly) and the AITradingAgent
+  // poll both flow through the same variable.
+  useEffect(() => {
+    if (hasAgentData && agentPositions) setPositions(agentPositions);
+  }, [agentPositions, hasAgentData]);
+
+  const effectivePositions = positions;
+  const effectiveUsdtFree  = hasAgentData ? (usdtFree > 0 ? usdtFree : (agentBalance ?? 0)) : usdtFree;
   const effectiveInitBal   = (agentInitialBalance && agentInitialBalance > 0) ? agentInitialBalance : initialBalance;
 
   // Session stats: server wallet (/api/wallet SQL) > agent trades > Supabase fallback
@@ -343,7 +352,8 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
       setInitialBalance(resetBal);
       setSessionGain(0);
       setTotalFees(0);
-      onReset?.();
+      setServerWallet(null);
+      onReset?.(resetBal);
       toast.success(`Paper wallet reset · ${resetBal.toLocaleString()} USDT`);
     } finally { setResetting(false); }
   };
@@ -387,7 +397,26 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
         <span className={`ml-auto text-[9px] px-2 py-0.5 rounded border font-semibold ${isPaper ? 'border-accent/40 text-accent bg-accent/10' : 'border-gain/40 text-gain bg-gain/10'}`}>
           {isPaper ? <><FlaskConical className="w-2.5 h-2.5 inline mr-1" />PAPER</> : <><Wifi className="w-2.5 h-2.5 inline mr-1" />LIVE</>}
         </span>
-        <button onClick={() => isPaper ? loadPaper() : loadLive()}
+        <button onClick={async () => {
+          if (hasAgentData) {
+            // Railway mode — fetch fresh data directly from the bot
+            setLoading(true);
+            try {
+              const [walRes, posRes] = await Promise.all([
+                fetch(`${getRailwayUrl()}/api/wallet`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null).catch(() => null),
+                fetch(`${getRailwayUrl()}/api/positions`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null).catch(() => null),
+              ]);
+              if (walRes) setServerWallet({ realized_pnl: Number(walRes.realized_pnl ?? 0), session_pnl: Number(walRes.session_pnl ?? 0), starting_balance: Number(walRes.starting_balance ?? 0) });
+              if (walRes?.total_usdt !== undefined) setUsdtFree(Number(walRes.total_usdt));
+              if (posRes?.positions) setPositions(posRes.positions as Position[]);
+              setLastUpdated(new Date().toLocaleTimeString());
+            } finally { setLoading(false); }
+          } else if (isPaper) {
+            loadPaper();
+          } else {
+            loadLive();
+          }
+        }}
           className="p-1 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground" title="Refresh">
           {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
         </button>

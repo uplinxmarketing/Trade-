@@ -161,7 +161,7 @@ const Index = () => {
               agentBalance={agentBalance}
               agentInitialBalance={agentInitialBalance}
               agentTrades={agentTrades}
-              onReset={() => { setAgentPositions([]); setAgentBalance(0); }}
+              onReset={(newBal) => { setAgentPositions([]); if (newBal) setAgentBalance(newBal); }}
             />
 
             {/* AI Trading Bot */}
