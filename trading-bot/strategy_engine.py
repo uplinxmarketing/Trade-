@@ -120,6 +120,9 @@ def _call_claude(market_data: dict, recent_trades: list, win_rates: dict,
     if not api_key:
         return {}
 
+    strategy_notes = _load_strategy().get("strategy_notes", "")
+    notes_section = f"\n=== USER STRATEGY NOTES ===\n{strategy_notes}\n" if strategy_notes else ""
+
     prompt = f"""You are a disciplined spot trading analyst for a high-frequency bot.
 Your job: decide which coins to approve for trading in the next 10 minutes.
 The bot buys immediately on approved coins and sells the instant price exceeds breakeven (entry × 1.0015).
@@ -154,7 +157,7 @@ Open details:     {json.dumps(open_positions, indent=2)}
 - Increase budget for coins with win_rate above 0.7 AND confidence pattern present
 - If open positions already exist on a coin, factor in the tied-up USDT
 - Set trading_active to false only if overall market is in sharp decline
-
+{notes_section}
 Respond ONLY with valid JSON matching this exact schema (no text outside JSON):
 
 {{

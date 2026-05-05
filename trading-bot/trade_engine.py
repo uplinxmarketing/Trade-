@@ -134,15 +134,17 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
 # ── Cooldown helpers ──────────────────────────────────────────────────────────
 
 def _refresh_risk_params():
-    """Read stop_loss_pct, take_profit_pct, max_positions, min_signals from strategy.json."""
+    """Read stop_loss_enabled/pct, take_profit_pct from strategy.json and cache as multipliers."""
     global _take_profit_mult, _stop_loss_mult
     strategy = _load_strategy()
     tp_pct = float(strategy.get("take_profit_pct", 0.5))   # e.g. 0.5 → 0.5%
     sl_pct = float(strategy.get("stop_loss_pct",   2.0))   # e.g. 2.0 → 2.0%
+    sl_on  = bool(strategy.get("stop_loss_enabled", True))
     tp_mult = 1.0 + (tp_pct / 100.0)
     # Take profit must at least cover fees (breakeven floor)
     _take_profit_mult = max(_breakeven_mult, tp_mult)
-    _stop_loss_mult   = 1.0 - (sl_pct / 100.0)
+    # Stop loss: set to 0.0 when disabled so the check (price <= 0.0) never fires
+    _stop_loss_mult   = (1.0 - sl_pct / 100.0) if sl_on else 0.0
 
 
 def _set_cooldown(symbol: str):

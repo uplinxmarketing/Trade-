@@ -11,6 +11,7 @@ import ChartPanelV2 from '@/components/dashboard/ChartPanelV2';
 import OrderFormPanel from '@/components/dashboard/OrderFormPanel';
 import WalletPanelV2 from '@/components/dashboard/WalletPanelV2';
 import ReportDashboard from '@/components/dashboard/ReportDashboard';
+import OrderBookPanel from '@/components/dashboard/OrderBookPanel';
 import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
@@ -177,6 +178,9 @@ const Index = () => {
               }}
               onCoinsChange={setSelectedCoins}
             />
+
+            {/* Order Book & 24h Stats */}
+            <OrderBookPanel activeCoin={activeCoin} prices={prices} />
 
             {/* Bot Watch List */}
             <div className="trading-card p-3">

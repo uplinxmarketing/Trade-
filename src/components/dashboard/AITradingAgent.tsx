@@ -202,12 +202,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [stopLossPct, setStopLossPct]         = useState(2.0);
-  const [takeProfitPct, setTakeProfitPct]     = useState(0.5);
-  const [maxPositions, setMaxPositions]       = useState(10);
-  const [minSignals, setMinSignals]           = useState(2);
-  const [settingsDraft, setSettingsDraft]     = useState({ stopLossPct: 2.0, takeProfitPct: 0.5, maxPositions: 10, minSignals: 2 });
-  const [savingSettings, setSavingSettings]   = useState(false);
+  const [stopLossEnabled, setStopLossEnabled]     = useState(true);
+  const [stopLossPct, setStopLossPct]             = useState(2.0);
+  const [takeProfitPct, setTakeProfitPct]         = useState(0.5);
+  const [maxPositions, setMaxPositions]           = useState(10);
+  const [minSignals, setMinSignals]               = useState(2);
+  const [settingsDraft, setSettingsDraft]         = useState({ stopLossEnabled: true, stopLossPct: 2.0, takeProfitPct: 0.5, maxPositions: 10, minSignals: 2 });
+  const [savingSettings, setSavingSettings]       = useState(false);
   const [instructions, setInstructions]   = useState(() => localStorage.getItem(INSTRUCTIONS_KEY) ?? '');
   const [editingInstr, setEditingInstr]   = useState(false);
   const [instrDraft, setInstrDraft]       = useState('');
@@ -555,10 +556,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     setInitialBalance(Number(s.initial_balance ?? bal));
     setAgentStatus(`Railway · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${new Date().toLocaleTimeString()}`);
     if (s.data_persistent !== undefined) setDataPersistent(Boolean(s.data_persistent));
-    if (s.stop_loss_pct   !== undefined) { const v = Number(s.stop_loss_pct);   setStopLossPct(v);   setSettingsDraft(d => ({ ...d, stopLossPct: v })); }
-    if (s.take_profit_pct !== undefined) { const v = Number(s.take_profit_pct); setTakeProfitPct(v); setSettingsDraft(d => ({ ...d, takeProfitPct: v })); }
-    if (s.max_positions   !== undefined) { const v = Number(s.max_positions);   setMaxPositions(v);  setSettingsDraft(d => ({ ...d, maxPositions: v })); }
-    if (s.min_signals     !== undefined) { const v = Number(s.min_signals);     setMinSignals(v);    setSettingsDraft(d => ({ ...d, minSignals: v })); }
+    if (s.stop_loss_enabled !== undefined) { const v = Boolean(s.stop_loss_enabled); setStopLossEnabled(v); setSettingsDraft(d => ({ ...d, stopLossEnabled: v })); }
+    if (s.stop_loss_pct    !== undefined) { const v = Number(s.stop_loss_pct);   setStopLossPct(v);   setSettingsDraft(d => ({ ...d, stopLossPct: v })); }
+    if (s.take_profit_pct  !== undefined) { const v = Number(s.take_profit_pct); setTakeProfitPct(v); setSettingsDraft(d => ({ ...d, takeProfitPct: v })); }
+    if (s.max_positions    !== undefined) { const v = Number(s.max_positions);   setMaxPositions(v);  setSettingsDraft(d => ({ ...d, maxPositions: v })); }
+    if (s.min_signals      !== undefined) { const v = Number(s.min_signals);     setMinSignals(v);    setSettingsDraft(d => ({ ...d, minSignals: v })); }
+    if (s.strategy_notes   !== undefined && s.strategy_notes) { setInstructions(s.strategy_notes as string); localStorage.setItem(INSTRUCTIONS_KEY, s.strategy_notes as string); }
 
     // Restore coin selection from Railway's watchlist (survives page refresh)
     if (Array.isArray(s.watched_coins) && s.watched_coins.length > 0) {
@@ -972,14 +975,16 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          stop_loss_pct:   settingsDraft.stopLossPct,
-          take_profit_pct: settingsDraft.takeProfitPct,
-          max_positions:   settingsDraft.maxPositions,
-          min_signals:     settingsDraft.minSignals,
+          stop_loss_enabled: settingsDraft.stopLossEnabled,
+          stop_loss_pct:     settingsDraft.stopLossPct,
+          take_profit_pct:   settingsDraft.takeProfitPct,
+          max_positions:     settingsDraft.maxPositions,
+          min_signals:       settingsDraft.minSignals,
         }),
       });
       const d = await res.json();
       if (!d.ok) throw new Error(d.error ?? 'Settings save failed');
+      setStopLossEnabled(settingsDraft.stopLossEnabled);
       setStopLossPct(settingsDraft.stopLossPct);
       setTakeProfitPct(settingsDraft.takeProfitPct);
       setMaxPositions(settingsDraft.maxPositions);
@@ -1185,7 +1190,18 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             </button>
           ) : (
             <div className="flex gap-2">
-              <button onClick={() => { setInstructions(instrDraft); setEditingInstr(false); }} className="text-[10px] text-gain flex items-center gap-0.5"><Check className="w-3 h-3" />Save</button>
+              <button onClick={async () => {
+                setInstructions(instrDraft);
+                setEditingInstr(false);
+                // Sync notes to Railway bot so Claude can use them in strategy decisions
+                try {
+                  await fetch(`${railwayUrl}/api/settings`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ strategy_notes: instrDraft }),
+                  });
+                } catch { /* non-fatal — saved to localStorage */ }
+              }} className="text-[10px] text-gain flex items-center gap-0.5"><Check className="w-3 h-3" />Save</button>
               <button onClick={() => setEditingInstr(false)} className="text-[10px] text-muted-foreground flex items-center gap-0.5"><X className="w-3 h-3" />Cancel</button>
             </div>
           )}
@@ -1201,28 +1217,47 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
       {/* ── Bot Settings (collapsible) ── */}
       <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-2">
-        <button onClick={() => { setShowSettings(p => !p); setSettingsDraft({ stopLossPct, takeProfitPct, maxPositions, minSignals }); }}
+        <button onClick={() => { setShowSettings(p => !p); setSettingsDraft({ stopLossEnabled, stopLossPct, takeProfitPct, maxPositions, minSignals }); }}
           className="flex items-center justify-between w-full text-left">
           <div className="flex items-center gap-2">
             <Shield className="w-3.5 h-3.5 text-accent" />
             <span className="text-xs font-semibold text-accent">Risk Settings</span>
           </div>
           <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-            <span>SL {stopLossPct}% · TP {takeProfitPct}% · Max {maxPositions} pos</span>
+            <span className={stopLossEnabled ? 'text-loss' : 'line-through opacity-50'}>SL {stopLossPct}%</span>
+            <span>· TP {takeProfitPct}% · Max {maxPositions} pos</span>
             {showSettings ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
           </div>
         </button>
         {showSettings && (
           <div className="space-y-3 pt-1">
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <label className="text-[10px] text-muted-foreground uppercase tracking-wider">Stop Loss %</label>
-                <input type="number" min="0.1" max="20" step="0.1"
-                  value={settingsDraft.stopLossPct}
-                  onChange={e => setSettingsDraft(d => ({ ...d, stopLossPct: parseFloat(e.target.value) || 2 }))}
-                  className="w-full mt-0.5 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-loss/60" />
-                <p className="text-[9px] text-muted-foreground mt-0.5">Sell if price drops this % below entry</p>
+            {/* Stop Loss — toggle + value */}
+            <div className="bg-muted/30 rounded-md px-3 py-2.5 space-y-2">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs font-semibold text-foreground">Stop Loss</p>
+                  <p className="text-[9px] text-muted-foreground">Sell immediately if price falls this % below entry</p>
+                </div>
+                {/* Toggle switch */}
+                <button
+                  onClick={() => setSettingsDraft(d => ({ ...d, stopLossEnabled: !d.stopLossEnabled }))}
+                  className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${settingsDraft.stopLossEnabled ? 'bg-loss/80' : 'bg-muted/60'}`}
+                >
+                  <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${settingsDraft.stopLossEnabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                </button>
               </div>
+              {settingsDraft.stopLossEnabled && (
+                <div className="flex items-center gap-2">
+                  <input type="number" min="0.1" max="20" step="0.1"
+                    value={settingsDraft.stopLossPct}
+                    onChange={e => setSettingsDraft(d => ({ ...d, stopLossPct: parseFloat(e.target.value) || 2 }))}
+                    className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-loss/60" />
+                  <span className="text-xs text-muted-foreground">% below entry price</span>
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
               <div>
                 <label className="text-[10px] text-muted-foreground uppercase tracking-wider">Take Profit %</label>
                 <input type="number" min="0.1" max="50" step="0.1"
@@ -1239,13 +1274,17 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                   className="w-full mt-0.5 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-accent/60" />
                 <p className="text-[9px] text-muted-foreground mt-0.5">Max concurrent open positions</p>
               </div>
-              <div>
-                <label className="text-[10px] text-muted-foreground uppercase tracking-wider">Min Signals (1–4)</label>
-                <input type="number" min="1" max="4" step="1"
-                  value={settingsDraft.minSignals}
-                  onChange={e => setSettingsDraft(d => ({ ...d, minSignals: parseInt(e.target.value) || 2 }))}
-                  className="w-full mt-0.5 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-accent/60" />
-                <p className="text-[9px] text-muted-foreground mt-0.5">Signals needed before buying (EMA+RSI+MACD+Vol)</p>
+              <div className="col-span-2">
+                <label className="text-[10px] text-muted-foreground uppercase tracking-wider">Min Signals to Buy (1–4)</label>
+                <div className="flex gap-1 mt-1">
+                  {[1,2,3,4].map(n => (
+                    <button key={n} onClick={() => setSettingsDraft(d => ({ ...d, minSignals: n }))}
+                      className={`flex-1 py-1 text-xs font-bold rounded border transition-colors ${settingsDraft.minSignals === n ? 'bg-accent text-accent-foreground border-accent' : 'border-border text-muted-foreground hover:border-accent/50'}`}>
+                      {n}/4
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[9px] text-muted-foreground mt-1">Higher = fewer but more confident buys</p>
               </div>
             </div>
             <div className="flex gap-2">

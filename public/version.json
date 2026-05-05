@@ -1,5 +1,5 @@
 {
-  "version": "5.0.0",
-  "buildTime": "2026-05-04T23:45:00.000Z",
-  "commit": "comprehensive-bug-fixes"
+  "version": "5.1.0",
+  "buildTime": "2026-05-05T00:00:00.000Z",
+  "commit": "stop-loss-toggle-orderbook-strategy-notes"
 }
