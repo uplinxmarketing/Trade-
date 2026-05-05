@@ -3,7 +3,7 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [build.args]
-CACHE_BUST = "2026-05-05T21:19:14Z"
+CACHE_BUST = "2026-05-05T22:05:00Z"
 
 [deploy]
 restartPolicyType = "always"

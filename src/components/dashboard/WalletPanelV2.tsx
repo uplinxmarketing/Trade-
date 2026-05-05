@@ -165,6 +165,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   }, [draftCfg]);
 
   const hasPendingBudget =
+    draftCfg.budgetMode    !== walletCfg.budgetMode    ||
     draftCfg.budgetFixed   !== walletCfg.budgetFixed   ||
     draftCfg.budgetPct     !== walletCfg.budgetPct     ||
     draftCfg.budgetCap     !== walletCfg.budgetCap     ||
@@ -297,6 +298,11 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   useEffect(() => {
     if (hasAgentData && agentPositions) setPositions(agentPositions);
   }, [agentPositions, hasAgentData]);
+
+  // Keep usdtFree in sync with Railway agentBalance polls
+  useEffect(() => {
+    if (hasAgentData && (agentBalance ?? 0) > 0) setUsdtFree(agentBalance!);
+  }, [agentBalance, hasAgentData]);
 
   const effectivePositions = positions;
   const effectiveUsdtFree  = hasAgentData ? (usdtFree > 0 ? usdtFree : (agentBalance ?? 0)) : usdtFree;

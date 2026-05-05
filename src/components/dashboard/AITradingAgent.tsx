@@ -33,6 +33,7 @@ function getAllocation(runBal: number, symbol: string): number {
     case 'percent':  return Math.min(runBal * (cfg.budgetPct ?? 25) / 100, runBal);
     case 'capped':   return Math.min((cfg.budgetCap ?? 500) / MAX_POSITIONS, runBal);
     case 'per_coin': return Math.min(cfg.budgetPerCoin?.[symbol] ?? 100, runBal);
+    case 'coin_pct': return Math.min(runBal * ((cfg.budgetCoinPct?.[symbol] ?? 5) / 100), runBal);
     default:         return Math.min(runBal * 0.25, runBal);
   }
 }
@@ -564,7 +565,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (s.take_profit_pct  !== undefined) setTakeProfitPct(Number(s.take_profit_pct));
     if (s.max_positions    !== undefined) setMaxPositions(Number(s.max_positions));
     if (s.min_signals      !== undefined) setMinSignals(Number(s.min_signals));
-    if (s.strategy_notes   !== undefined && s.strategy_notes) { setInstructions(s.strategy_notes as string); localStorage.setItem(INSTRUCTIONS_KEY, s.strategy_notes as string); }
+    if (s.strategy_notes   !== undefined) { setInstructions(s.strategy_notes as string); localStorage.setItem(INSTRUCTIONS_KEY, s.strategy_notes as string); }
 
     // Restore coin selection from Railway's watchlist (survives page refresh)
     if (Array.isArray(s.watched_coins) && s.watched_coins.length > 0) {
