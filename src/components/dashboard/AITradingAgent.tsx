@@ -1407,7 +1407,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 const prof   = live >= target;
                 const toTarget = Math.min(100, Math.max(0, ((live - pos.avg_entry_price) / (target - pos.avg_entry_price)) * 100));
                 const qty    = Number(pos.quantity);
-                const budget = pos.avg_entry_price * qty;
+                const budget = pos.avg_entry_price * qty / (1 - TAKER_FEE);
                 return (
                   <div key={pos.symbol} className="bg-muted/20 border border-border/50 rounded-lg px-3 py-2.5 space-y-2">
                     <div className="flex items-center justify-between">

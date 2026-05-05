@@ -32,7 +32,7 @@ interface WalletCfg {
 }
 
 const DEFAULT_CFG: WalletCfg = {
-  startingBalance: 1000,
+  startingBalance: 10000,
   budgetMode: 'percent',
   budgetFixed: 100,
   budgetPct: 5,
@@ -299,36 +299,40 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
 
   // ── Reset paper wallet ───────────────────────────────────────────────────────
   const resetWallet = async () => {
-    if (!confirm(`Reset paper wallet to ${walletCfg.startingBalance.toLocaleString()} USDT and clear all positions?`)) return;
+    // Use Railway's authoritative starting balance when available, else local config
+    const resetBal = (serverWallet?.starting_balance ?? 0) > 0
+      ? serverWallet!.starting_balance
+      : walletCfg.startingBalance;
+    if (!confirm(`Reset paper wallet to ${resetBal.toLocaleString()} USDT and clear all positions?`)) return;
     setResetting(true);
     try {
-      // Reset server-side wallet (Railway SQLite).
-      // API_BASE='' means same-origin — always attempt reset.
       const res = await fetch(`${API_BASE}/api/reset`, { method: 'POST' }).catch(() => null);
       if (!res?.ok) {
         toast.error('Server reset failed — check Railway logs');
         return;
       }
 
-      // Always reset Supabase (browser paper wallet)
-      await Promise.all([
-        supabase.from('paper_portfolio').delete().eq('user_session', 'default'),
-        supabase.from('bot_trade_history').delete().eq('user_session', 'default'),
-        supabase.from('bot_config').update({
-          current_balance: walletCfg.startingBalance,
-          initial_balance: walletCfg.startingBalance,
-          is_running: false,
-          updated_at: new Date().toISOString(),
-        }).eq('user_session', 'default'),
-      ]);
+      if (!hasAgentData) {
+        // Pure paper mode (no Railway): sync Supabase too
+        await Promise.all([
+          supabase.from('paper_portfolio').delete().eq('user_session', 'default'),
+          supabase.from('bot_trade_history').delete().eq('user_session', 'default'),
+          supabase.from('bot_config').update({
+            current_balance: resetBal,
+            initial_balance: resetBal,
+            is_running: false,
+            updated_at: new Date().toISOString(),
+          }).eq('user_session', 'default'),
+        ]);
+      }
 
       setPositions([]);
-      setUsdtFree(walletCfg.startingBalance);
-      setInitialBalance(walletCfg.startingBalance);
+      setUsdtFree(resetBal);
+      setInitialBalance(resetBal);
       setSessionGain(0);
       setTotalFees(0);
       onReset?.();
-      toast.success(`Paper wallet reset · ${walletCfg.startingBalance.toLocaleString()} USDT`);
+      toast.success(`Paper wallet reset · ${resetBal.toLocaleString()} USDT`);
     } finally { setResetting(false); }
   };
 
@@ -517,7 +521,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
             className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/10 text-left"
           >
             <span className="text-[9px] uppercase tracking-widest text-muted-foreground font-semibold">
-              Paper Settings · Starting {walletCfg.startingBalance.toLocaleString()} USDT · Mode: {walletCfg.budgetMode}
+              {hasAgentData ? 'Bot' : 'Paper'} Settings · Starting {((serverWallet?.starting_balance ?? 0) > 0 ? serverWallet!.starting_balance : walletCfg.startingBalance).toLocaleString()} USDT · Mode: {walletCfg.budgetMode}
             </span>
             <div className="flex items-center gap-2">
               <button
@@ -539,30 +543,37 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
               {/* Starting balance */}
               <div>
                 <div className="text-[9px] uppercase tracking-widest text-muted-foreground mb-2">Starting Balance (USDT)</div>
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  {PRESET_BALANCES.map(p => (
-                    <button
-                      key={p}
-                      onClick={() => saveCfg({ startingBalance: p })}
-                      className={`text-[10px] px-2.5 py-1 rounded font-mono transition-colors border
-                        ${walletCfg.startingBalance === p
-                          ? 'bg-accent text-accent-foreground border-accent'
-                          : 'bg-muted/30 text-muted-foreground border-border hover:text-foreground hover:border-accent/50'
-                        }`}
-                    >
-                      {p.toLocaleString()} USDT
-                    </button>
-                  ))}
-                  <input
-                    type="number"
-                    min={100}
-                    step={100}
-                    value={walletCfg.startingBalance}
-                    onChange={e => saveCfg({ startingBalance: Math.max(100, Number(e.target.value) || 1000) })}
-                    className="w-28 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-accent"
-                    placeholder="Custom"
-                  />
-                </div>
+                {hasAgentData ? (
+                  <div className="text-[10px] text-muted-foreground bg-muted/30 border border-border rounded px-3 py-2">
+                    <span className="font-mono font-semibold text-foreground">{((serverWallet?.starting_balance ?? 0) > 0 ? serverWallet!.starting_balance : walletCfg.startingBalance).toLocaleString()} USDT</span>
+                    <span className="ml-2 opacity-70">— set by Railway <code>STARTING_PAPER_USDT</code> env var</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {PRESET_BALANCES.map(p => (
+                      <button
+                        key={p}
+                        onClick={() => saveCfg({ startingBalance: p })}
+                        className={`text-[10px] px-2.5 py-1 rounded font-mono transition-colors border
+                          ${walletCfg.startingBalance === p
+                            ? 'bg-accent text-accent-foreground border-accent'
+                            : 'bg-muted/30 text-muted-foreground border-border hover:text-foreground hover:border-accent/50'
+                          }`}
+                      >
+                        {p.toLocaleString()} USDT
+                      </button>
+                    ))}
+                    <input
+                      type="number"
+                      min={100}
+                      step={100}
+                      value={walletCfg.startingBalance}
+                      onChange={e => saveCfg({ startingBalance: Math.max(100, Number(e.target.value) || 10000) })}
+                      className="w-28 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-accent"
+                      placeholder="Custom"
+                    />
+                  </div>
+                )}
               </div>
 
               {/* Budget mode */}
@@ -628,7 +639,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                       onChange={e => setDraftCfg(p => ({ ...p, budgetCap: Math.max(50, Number(e.target.value)) }))}
                       className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-accent"
                     />
-                    <span className="text-[10px] text-muted-foreground">USDT (÷3 slots = {(draftCfg.budgetCap/3).toFixed(0)} USDT/trade)</span>
+                    <span className="text-[10px] text-muted-foreground">USDT total cap (÷ max positions per trade)</span>
                   </div>
                 )}
                 {walletCfg.budgetMode === 'per_coin' && (
