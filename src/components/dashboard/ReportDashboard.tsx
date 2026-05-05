@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import { BarChart3, DollarSign, TrendingUp, Percent, Loader2, RefreshCw, Activity, Lock } from 'lucide-react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { BarChart3, DollarSign, TrendingUp, Percent, Loader2, RefreshCw, Activity, Lock, Trophy, Hash } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
 import { TAKER_FEE } from '@/lib/trading-engine';
 import { API_BASE } from '@/config';
@@ -33,6 +33,11 @@ interface PairTrade {
   netPnl: number; duration: string; closedAt: string;
 }
 
+interface CoinStats {
+  coin: string; trades: number; wins: number; losses: number;
+  totalPnl: number; avgPnl: number; bestTrade: number; worstTrade: number;
+}
+
 function fmt(n: number, d = 2) {
   return n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
 }
@@ -47,6 +52,7 @@ const ReportDashboard = () => {
   const [botStatus, setBotStatus]       = useState<BotStatus | null>(null);
   const [loading, setLoading]           = useState(true);
   const [refreshing, setRefreshing]     = useState(false);
+  const [coinSort, setCoinSort]         = useState<'pnl' | 'trades'>('pnl');
 
   const load = useCallback(async () => {
     const [supabaseRes, railwayRes, statusRes, sbBotRes] = await Promise.all([
@@ -167,6 +173,24 @@ const ReportDashboard = () => {
   const pairTrades: PairTrade[] = [...supabasePairs, ...railwayPairs]
     .sort((a, b) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime());
 
+  const coinStats: CoinStats[] = useMemo(() => {
+    const map: Record<string, CoinStats> = {};
+    for (const p of pairTrades) {
+      const coin = p.pair.split('/')[0];
+      if (!map[coin]) map[coin] = { coin, trades: 0, wins: 0, losses: 0, totalPnl: 0, avgPnl: 0, bestTrade: 0, worstTrade: 0 };
+      const s = map[coin];
+      s.trades++;
+      if (p.netPnl > 0) s.wins++; else s.losses++;
+      s.totalPnl += p.netPnl;
+      if (s.trades === 1) { s.bestTrade = p.netPnl; s.worstTrade = p.netPnl; }
+      else { s.bestTrade = Math.max(s.bestTrade, p.netPnl); s.worstTrade = Math.min(s.worstTrade, p.netPnl); }
+    }
+    const list = Object.values(map).map(s => ({ ...s, avgPnl: s.totalPnl / s.trades }));
+    return coinSort === 'pnl'
+      ? list.sort((a, b) => b.totalPnl - a.totalPnl)
+      : list.sort((a, b) => b.trades - a.trades);
+  }, [pairTrades, coinSort]);
+
   // Always compute from full pairTrades (includes Supabase history); overlay Railway live stats
   const computedPnl  = pairTrades.reduce((s, p) => s + p.netPnl, 0);
   const totalProfit  = botStatus
@@ -266,6 +290,107 @@ const ReportDashboard = () => {
           ))}
         </div>
       )}
+
+      {/* Coin performance leaderboard */}
+      {coinStats.length > 0 && (() => {
+        const maxPnl    = Math.max(...coinStats.map(s => Math.abs(s.totalPnl)), 0.01);
+        const maxTrades = Math.max(...coinStats.map(s => s.trades), 1);
+        return (
+          <div className="trading-card">
+            <div className="p-3 border-b border-border flex items-center gap-2">
+              <Trophy className="w-4 h-4 text-warn" />
+              <span className="text-sm font-medium">Coin Performance</span>
+              <span className="text-[10px] text-muted-foreground ml-1">{coinStats.length} coins traded</span>
+              <div className="ml-auto flex items-center gap-1 bg-muted/30 rounded-md p-0.5">
+                <button
+                  onClick={() => setCoinSort('pnl')}
+                  className={`flex items-center gap-1 text-[10px] px-2 py-1 rounded transition-colors font-semibold ${coinSort === 'pnl' ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                >
+                  <DollarSign className="w-3 h-3" />Most Profit
+                </button>
+                <button
+                  onClick={() => setCoinSort('trades')}
+                  className={`flex items-center gap-1 text-[10px] px-2 py-1 rounded transition-colors font-semibold ${coinSort === 'trades' ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+                >
+                  <Hash className="w-3 h-3" />Most Trades
+                </button>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-[11px]">
+                <thead>
+                  <tr className="border-b border-border text-muted-foreground uppercase tracking-widest text-[9px]">
+                    <th className="text-left px-3 py-2 font-medium w-6">#</th>
+                    <th className="text-left px-3 py-2 font-medium">Coin</th>
+                    <th className="text-center px-2 py-2 font-medium">Trades</th>
+                    <th className="text-center px-2 py-2 font-medium">W / L</th>
+                    <th className="text-center px-2 py-2 font-medium">Win %</th>
+                    <th className="text-right px-2 py-2 font-medium">Avg / trade</th>
+                    <th className="text-right px-2 py-2 font-medium">Best</th>
+                    <th className="text-right px-2 py-2 font-medium">Worst</th>
+                    <th className="text-right px-3 py-2 font-medium w-48">Total P&L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {coinStats.map((s, i) => {
+                    const winPct  = s.trades > 0 ? (s.wins / s.trades) * 100 : 0;
+                    const barPct  = coinSort === 'pnl'
+                      ? (Math.abs(s.totalPnl) / maxPnl) * 100
+                      : (s.trades / maxTrades) * 100;
+                    const isTop   = i === 0;
+                    return (
+                      <tr key={s.coin} className={`border-b border-border/40 hover:bg-muted/10 transition-colors ${isTop ? 'bg-gain/5' : ''}`}>
+                        <td className="px-3 py-2.5 text-muted-foreground font-mono">
+                          {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}`}
+                        </td>
+                        <td className="px-3 py-2.5">
+                          <span className="font-bold text-foreground tracking-wide">{s.coin}</span>
+                        </td>
+                        <td className="px-2 py-2.5 text-center font-mono font-semibold text-foreground">
+                          {s.trades}
+                        </td>
+                        <td className="px-2 py-2.5 text-center font-mono">
+                          <span className="text-gain">{s.wins}W</span>
+                          <span className="text-muted-foreground mx-0.5">/</span>
+                          <span className="text-loss">{s.losses}L</span>
+                        </td>
+                        <td className="px-2 py-2.5 text-center">
+                          <span className={`font-semibold ${winPct >= 60 ? 'text-gain' : winPct >= 40 ? 'text-warn' : 'text-loss'}`}>
+                            {winPct.toFixed(0)}%
+                          </span>
+                        </td>
+                        <td className={`px-2 py-2.5 text-right font-mono tabular-nums ${s.avgPnl >= 0 ? 'text-gain' : 'text-loss'}`}>
+                          {s.avgPnl >= 0 ? '+' : ''}{fmt(s.avgPnl, 4)}
+                        </td>
+                        <td className="px-2 py-2.5 text-right font-mono tabular-nums text-gain">
+                          +{fmt(s.bestTrade, 4)}
+                        </td>
+                        <td className="px-2 py-2.5 text-right font-mono tabular-nums text-loss">
+                          {fmt(s.worstTrade, 4)}
+                        </td>
+                        <td className="px-3 py-2.5 text-right">
+                          <div className="flex items-center justify-end gap-2">
+                            {/* bar */}
+                            <div className="w-24 h-2 bg-muted/30 rounded-full overflow-hidden">
+                              <div
+                                className={`h-full rounded-full transition-all ${s.totalPnl >= 0 ? 'bg-gain' : 'bg-loss'}`}
+                                style={{ width: `${barPct}%` }}
+                              />
+                            </div>
+                            <span className={`font-mono font-bold tabular-nums w-20 text-right ${s.totalPnl >= 0 ? 'text-gain' : 'text-loss'}`}>
+                              {s.totalPnl >= 0 ? '+' : ''}{fmt(s.totalPnl, 4)}
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Trade history table */}
       <div className="trading-card">
