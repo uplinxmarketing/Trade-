@@ -938,35 +938,44 @@ def api_get_settings():
     """Return current bot risk/strategy settings."""
     s = _load_strategy()
     return {
-        "ok":               True,
-        "stop_loss_enabled": s.get("stop_loss_enabled", True),
-        "stop_loss_pct":    s.get("stop_loss_pct",   2.0),
-        "take_profit_pct":  s.get("take_profit_pct", 0.5),
-        "max_positions":    s.get("max_positions",    10),
-        "min_signals":      s.get("min_signals",       2),
-        "strategy_notes":   s.get("strategy_notes",   ""),
+        "ok":                 True,
+        "stop_loss_enabled":  s.get("stop_loss_enabled",  True),
+        "stop_loss_pct":      s.get("stop_loss_pct",      2.0),
+        "take_profit_enabled":s.get("take_profit_enabled", True),
+        "take_profit_pct":    s.get("take_profit_pct",    0.5),
+        "smart_hold_enabled": s.get("smart_hold_enabled", False),
+        "trailing_stop_pct":  s.get("trailing_stop_pct",  0.5),
+        "max_positions":      s.get("max_positions",       10),
+        "min_signals":        s.get("min_signals",          2),
+        "strategy_notes":     s.get("strategy_notes",      ""),
     }
 
 
 class SettingsRequest(BaseModel):
-    stop_loss_enabled: Optional[bool]  = None
-    stop_loss_pct:     Optional[float] = None
-    take_profit_pct:   Optional[float] = None
-    max_positions:     Optional[int]   = None
-    min_signals:       Optional[int]   = None
-    strategy_notes:    Optional[str]   = None
+    stop_loss_enabled:  Optional[bool]  = None
+    stop_loss_pct:      Optional[float] = None
+    take_profit_enabled:Optional[bool]  = None
+    take_profit_pct:    Optional[float] = None
+    smart_hold_enabled: Optional[bool]  = None
+    trailing_stop_pct:  Optional[float] = None
+    max_positions:      Optional[int]   = None
+    min_signals:        Optional[int]   = None
+    strategy_notes:     Optional[str]   = None
 
 
 @app.post("/api/settings")
 def api_save_settings(req: SettingsRequest):
     """Save bot risk/strategy settings into strategy.json."""
     patch: dict = {}
-    if req.stop_loss_enabled is not None: patch["stop_loss_enabled"] = bool(req.stop_loss_enabled)
-    if req.stop_loss_pct   is not None: patch["stop_loss_pct"]   = max(0.1, min(20.0, req.stop_loss_pct))
-    if req.take_profit_pct is not None: patch["take_profit_pct"] = max(0.1, min(50.0, req.take_profit_pct))
-    if req.max_positions   is not None: patch["max_positions"]   = max(1,   min(100,  req.max_positions))
-    if req.min_signals     is not None: patch["min_signals"]     = max(1,   min(4,    req.min_signals))
-    if req.strategy_notes  is not None: patch["strategy_notes"]  = req.strategy_notes[:2000]
+    if req.stop_loss_enabled  is not None: patch["stop_loss_enabled"]  = bool(req.stop_loss_enabled)
+    if req.stop_loss_pct      is not None: patch["stop_loss_pct"]      = max(0.1, min(20.0, req.stop_loss_pct))
+    if req.take_profit_enabled is not None: patch["take_profit_enabled"] = bool(req.take_profit_enabled)
+    if req.take_profit_pct    is not None: patch["take_profit_pct"]    = max(0.1, min(50.0, req.take_profit_pct))
+    if req.smart_hold_enabled is not None: patch["smart_hold_enabled"] = bool(req.smart_hold_enabled)
+    if req.trailing_stop_pct  is not None: patch["trailing_stop_pct"]  = max(0.1, min(10.0, req.trailing_stop_pct))
+    if req.max_positions      is not None: patch["max_positions"]      = max(1,   min(100,  req.max_positions))
+    if req.min_signals        is not None: patch["min_signals"]        = max(1,   min(4,    req.min_signals))
+    if req.strategy_notes     is not None: patch["strategy_notes"]     = req.strategy_notes[:2000]
     if not patch:
         return {"ok": False, "error": "No valid settings provided"}
     _write_strategy_patch(patch)
@@ -1012,12 +1021,15 @@ def api_all():
             "watched_coins":   approved or config.WATCHED_COINS,
             "data_persistent": database._DATA_DIR == "/data",
             "data_dir":        database._DATA_DIR,
-            "stop_loss_enabled": strategy.get("stop_loss_enabled", True),
-            "stop_loss_pct":     strategy.get("stop_loss_pct",   2.0),
-            "take_profit_pct":   strategy.get("take_profit_pct", 0.5),
-            "max_positions":     strategy.get("max_positions",    10),
-            "min_signals":       strategy.get("min_signals",      2),
-            "strategy_notes":    strategy.get("strategy_notes",   ""),
+            "stop_loss_enabled":  strategy.get("stop_loss_enabled",  True),
+            "stop_loss_pct":      strategy.get("stop_loss_pct",      2.0),
+            "take_profit_enabled":strategy.get("take_profit_enabled", True),
+            "take_profit_pct":    strategy.get("take_profit_pct",    0.5),
+            "smart_hold_enabled": strategy.get("smart_hold_enabled", False),
+            "trailing_stop_pct":  strategy.get("trailing_stop_pct",  0.5),
+            "max_positions":      strategy.get("max_positions",       10),
+            "min_signals":        strategy.get("min_signals",          2),
+            "strategy_notes":     strategy.get("strategy_notes",      ""),
         },
         "positions": _get_positions(),
         "trades":    database.get_recent_trades(limit=200),

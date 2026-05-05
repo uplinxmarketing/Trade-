@@ -46,6 +46,14 @@ _breakeven_mult = 1.0 + _fee_rate + _fee_rate + 0.0002
 _take_profit_mult: float = _breakeven_mult   # default: break-even
 _stop_loss_mult:   float = 1.0 - 0.02        # default: -2% stop loss
 
+# New exit-mode flags (strategy.json controlled)
+_take_profit_enabled: bool = True    # False → exit at breakeven (fees covered) only
+_smart_hold_enabled:  bool = False   # True  → hold if signals still bullish; trail then exit
+_trailing_stop_pct:   float = 0.5    # % drop from peak that triggers smart-hold exit
+
+# Per-position high-water mark for smart hold (no lock needed — only written in sell thread)
+_pos_peaks: Dict[str, float] = {}
+
 _cooldowns: dict = {}
 
 # ── Position index — rebuilt on every WebSocket tick for O(1) sell lookups ───
@@ -139,15 +147,20 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
 # ── Cooldown helpers ──────────────────────────────────────────────────────────
 
 def _refresh_risk_params():
-    """Read stop_loss_enabled/pct, take_profit_pct from strategy.json and cache as multipliers."""
-    global _take_profit_mult, _stop_loss_mult
+    """Read stop_loss_enabled/pct, take_profit_pct and new exit flags from strategy.json."""
+    global _take_profit_mult, _stop_loss_mult, _take_profit_enabled, _smart_hold_enabled, _trailing_stop_pct
     strategy = _load_strategy()
     tp_pct = float(strategy.get("take_profit_pct", 0.5))   # e.g. 0.5 → 0.5%
     sl_pct = float(strategy.get("stop_loss_pct",   2.0))   # e.g. 2.0 → 2.0%
     sl_on  = bool(strategy.get("stop_loss_enabled", True))
+    _take_profit_enabled = bool(strategy.get("take_profit_enabled", True))
+    _smart_hold_enabled  = bool(strategy.get("smart_hold_enabled",  False))
+    _trailing_stop_pct   = float(strategy.get("trailing_stop_pct",  0.5))
     tp_mult = 1.0 + (tp_pct / 100.0)
-    # Take profit must at least cover fees (breakeven floor)
-    _take_profit_mult = max(_breakeven_mult, tp_mult)
+    # When TP is disabled → exit exactly at breakeven (fees covered, no extra target).
+    # When TP is enabled  → exit at max(breakeven, entry × (1 + tp_pct/100)).
+    _take_profit_mult = (_breakeven_mult if not _take_profit_enabled
+                         else max(_breakeven_mult, tp_mult))
     # Stop loss: set to 0.0 when disabled so the check (price <= 0.0) never fires
     _stop_loss_mult   = (1.0 - sl_pct / 100.0) if sl_on else 0.0
 
@@ -621,6 +634,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         with _positions_lock:
             _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
         _rebuild_pos_index()
+        _pos_peaks.pop(sym, None)   # clean up smart-hold peak tracker
 
     pnl_sign = "+" if net_profit >= 0 else ""
     sell_msg = (
@@ -881,11 +895,32 @@ def realtime_monitor(prices: Dict[str, float]):
 
         if price >= target:
             with _selling_lock:
-                if sym in _selling:
-                    continue
-                _selling.add(sym)
-                _selling_ts[sym] = time.time()
-            _sell_executor.submit(_execute_sell, pos, price, "take-profit")
+                already = sym in _selling
+            if not already:
+                if _smart_hold_enabled:
+                    _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
+                    peak       = _pos_peaks[sym]
+                    trail_stop = peak * (1.0 - _trailing_stop_pct / 100.0)
+                    sell_reason: Optional[str] = None
+                    if price <= trail_stop:
+                        sell_reason = "smart-hold-trail"
+                    else:
+                        with _signal_cache_lock:
+                            score = _signal_cache.get(sym, {}).get("score", 0)
+                        if score < 3:
+                            sell_reason = "take-profit"
+                    if sell_reason:
+                        with _selling_lock:
+                            if sym not in _selling:
+                                _selling.add(sym)
+                                _selling_ts[sym] = time.time()
+                        _sell_executor.submit(_execute_sell, pos, price, sell_reason)
+                else:
+                    with _selling_lock:
+                        if sym not in _selling:
+                            _selling.add(sym)
+                            _selling_ts[sym] = time.time()
+                    _sell_executor.submit(_execute_sell, pos, price, "take-profit")
         elif _stop_loss_mult < 1.0 and price <= stop:
             with _selling_lock:
                 if sym in _selling:
@@ -915,7 +950,7 @@ _sell_monitor_thread: Optional[threading.Thread] = None
 # REST price fallback cache — populated when WebSocket is geo-blocked on Railway
 _rest_px: Dict[str, float] = {}
 _rest_px_ts: float = 0.0
-_REST_PX_TTL = 4.0   # refetch REST prices every 4 s when WebSocket is down
+_REST_PX_TTL = 2.0   # refetch REST prices every 2 s when WebSocket is down
 
 
 def _fetch_rest_prices(symbols: list) -> Dict[str, float]:
@@ -1064,20 +1099,40 @@ def _sell_monitor_loop():
                     if sym in _selling:
                         continue
                 entry  = pos["entry_price"]
-                target = entry * _take_profit_mult   # configurable take-profit
-                stop   = entry * _stop_loss_mult     # configurable stop-loss
-                reason = None
+                target = entry * _take_profit_mult
+                stop   = entry * _stop_loss_mult
                 if price >= target:
-                    reason = "take-profit"
+                    if _smart_hold_enabled:
+                        _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
+                        peak       = _pos_peaks[sym]
+                        trail_stop = peak * (1.0 - _trailing_stop_pct / 100.0)
+                        sell_reason2: Optional[str] = None
+                        if price <= trail_stop:
+                            sell_reason2 = "smart-hold-trail"
+                        else:
+                            with _signal_cache_lock:
+                                score2 = _signal_cache.get(sym, {}).get("score", 0)
+                            if score2 < 3:
+                                sell_reason2 = "take-profit"
+                        if sell_reason2:
+                            with _selling_lock:
+                                if sym not in _selling:
+                                    _selling.add(sym)
+                                    _selling_ts[sym] = time.time()
+                            _sell_executor.submit(_execute_sell, pos, price, sell_reason2)
+                    else:
+                        with _selling_lock:
+                            if sym not in _selling:
+                                _selling.add(sym)
+                                _selling_ts[sym] = time.time()
+                        _sell_executor.submit(_execute_sell, pos, price, "take-profit")
                 elif _stop_loss_mult < 1.0 and price <= stop:
-                    reason = "stop-loss"
-                if reason:
                     with _selling_lock:
                         if sym in _selling:
                             continue
                         _selling.add(sym)
                         _selling_ts[sym] = time.time()
-                    _sell_executor.submit(_execute_sell, pos, price, reason)
+                    _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
 
         except Exception as exc:
             try:
@@ -1085,8 +1140,8 @@ def _sell_monitor_loop():
             except Exception:
                 pass
         # Sleep shorter when positions are open so we catch exits faster.
-        # 2 s with open positions; 5 s when idle to avoid unnecessary REST calls.
-        time.sleep(2.0 if snap else 5.0)
+        # 1 s with open positions; 5 s when idle to avoid unnecessary REST calls.
+        time.sleep(1.0 if snap else 5.0)
 
 
 async def position_guardian():

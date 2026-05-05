@@ -203,12 +203,20 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [stopLossEnabled, setStopLossEnabled]     = useState(true);
-  const [stopLossPct, setStopLossPct]             = useState(2.0);
-  const [takeProfitPct, setTakeProfitPct]         = useState(0.5);
-  const [maxPositions, setMaxPositions]           = useState(10);
-  const [minSignals, setMinSignals]               = useState(2);
-  const [settingsDraft, setSettingsDraft]         = useState({ stopLossEnabled: true, stopLossPct: 2.0, takeProfitPct: 0.5, maxPositions: 10, minSignals: 2 });
+  const [stopLossEnabled, setStopLossEnabled]         = useState(true);
+  const [stopLossPct, setStopLossPct]                 = useState(2.0);
+  const [takeProfitEnabled, setTakeProfitEnabled]     = useState(true);
+  const [takeProfitPct, setTakeProfitPct]             = useState(0.5);
+  const [smartHoldEnabled, setSmartHoldEnabled]       = useState(false);
+  const [trailingStopPct, setTrailingStopPct]         = useState(0.5);
+  const [maxPositions, setMaxPositions]               = useState(10);
+  const [minSignals, setMinSignals]                   = useState(2);
+  const [settingsDraft, setSettingsDraft]             = useState({
+    stopLossEnabled: true, stopLossPct: 2.0,
+    takeProfitEnabled: true, takeProfitPct: 0.5,
+    smartHoldEnabled: false, trailingStopPct: 0.5,
+    maxPositions: 10, minSignals: 2,
+  });
   const [savingSettings, setSavingSettings]       = useState(false);
   const [instructions, setInstructions]   = useState(() => localStorage.getItem(INSTRUCTIONS_KEY) ?? '');
   const [editingInstr, setEditingInstr]   = useState(false);
@@ -560,11 +568,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     // Update committed state from server — never touch settingsDraft here.
     // The draft is only reset when the user opens the settings panel, so
     // in-progress edits are never overwritten by a background poll.
-    if (s.stop_loss_enabled !== undefined) setStopLossEnabled(Boolean(s.stop_loss_enabled));
-    if (s.stop_loss_pct    !== undefined) setStopLossPct(Number(s.stop_loss_pct));
-    if (s.take_profit_pct  !== undefined) setTakeProfitPct(Number(s.take_profit_pct));
-    if (s.max_positions    !== undefined) setMaxPositions(Number(s.max_positions));
-    if (s.min_signals      !== undefined) setMinSignals(Number(s.min_signals));
+    if (s.stop_loss_enabled   !== undefined) setStopLossEnabled(Boolean(s.stop_loss_enabled));
+    if (s.stop_loss_pct       !== undefined) setStopLossPct(Number(s.stop_loss_pct));
+    if (s.take_profit_enabled !== undefined) setTakeProfitEnabled(Boolean(s.take_profit_enabled));
+    if (s.take_profit_pct     !== undefined) setTakeProfitPct(Number(s.take_profit_pct));
+    if (s.smart_hold_enabled  !== undefined) setSmartHoldEnabled(Boolean(s.smart_hold_enabled));
+    if (s.trailing_stop_pct   !== undefined) setTrailingStopPct(Number(s.trailing_stop_pct));
+    if (s.max_positions       !== undefined) setMaxPositions(Number(s.max_positions));
+    if (s.min_signals         !== undefined) setMinSignals(Number(s.min_signals));
     if (s.strategy_notes   !== undefined) { setInstructions(s.strategy_notes as string); localStorage.setItem(INSTRUCTIONS_KEY, s.strategy_notes as string); }
 
     // Restore coin selection from Railway's watchlist (survives page refresh)
@@ -979,18 +990,24 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          stop_loss_enabled: settingsDraft.stopLossEnabled,
-          stop_loss_pct:     settingsDraft.stopLossPct,
-          take_profit_pct:   settingsDraft.takeProfitPct,
-          max_positions:     settingsDraft.maxPositions,
-          min_signals:       settingsDraft.minSignals,
+          stop_loss_enabled:  settingsDraft.stopLossEnabled,
+          stop_loss_pct:      settingsDraft.stopLossPct,
+          take_profit_enabled:settingsDraft.takeProfitEnabled,
+          take_profit_pct:    settingsDraft.takeProfitPct,
+          smart_hold_enabled: settingsDraft.smartHoldEnabled,
+          trailing_stop_pct:  settingsDraft.trailingStopPct,
+          max_positions:      settingsDraft.maxPositions,
+          min_signals:        settingsDraft.minSignals,
         }),
       });
       const d = await res.json();
       if (!d.ok) throw new Error(d.error ?? 'Settings save failed');
       setStopLossEnabled(settingsDraft.stopLossEnabled);
       setStopLossPct(settingsDraft.stopLossPct);
+      setTakeProfitEnabled(settingsDraft.takeProfitEnabled);
       setTakeProfitPct(settingsDraft.takeProfitPct);
+      setSmartHoldEnabled(settingsDraft.smartHoldEnabled);
+      setTrailingStopPct(settingsDraft.trailingStopPct);
       setMaxPositions(settingsDraft.maxPositions);
       setMinSignals(settingsDraft.minSignals);
       toast.success('Bot settings saved');
@@ -1221,7 +1238,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
       {/* ── Bot Settings (collapsible) ── */}
       <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-2">
-        <button onClick={() => { setShowSettings(p => !p); setSettingsDraft({ stopLossEnabled, stopLossPct, takeProfitPct, maxPositions, minSignals }); }}
+        <button onClick={() => { setShowSettings(p => !p); setSettingsDraft({ stopLossEnabled, stopLossPct, takeProfitEnabled, takeProfitPct, smartHoldEnabled, trailingStopPct, maxPositions, minSignals }); }}
           className="flex items-center justify-between w-full text-left">
           <div className="flex items-center gap-2">
             <Shield className="w-3.5 h-3.5 text-accent" />
@@ -1229,7 +1246,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           </div>
           <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
             <span className={stopLossEnabled ? 'text-loss' : 'line-through opacity-50'}>SL {stopLossPct}%</span>
-            <span>· TP {takeProfitPct}% · Max {maxPositions} pos</span>
+            <span className={takeProfitEnabled ? '' : 'line-through opacity-50'}>· TP {takeProfitPct}%</span>
+            {smartHoldEnabled && <span className="text-gain">· Hold</span>}
+            <span>· Max {maxPositions}</span>
             {showSettings ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
           </div>
         </button>
@@ -1261,15 +1280,65 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               )}
             </div>
 
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <label className="text-[10px] text-muted-foreground uppercase tracking-wider">Take Profit %</label>
-                <input type="number" min="0.1" max="50" step="0.1"
-                  value={settingsDraft.takeProfitPct}
-                  onChange={e => setSettingsDraft(d => ({ ...d, takeProfitPct: parseFloat(e.target.value) || 0.5 }))}
-                  className="w-full mt-0.5 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-gain/60" />
-                <p className="text-[9px] text-muted-foreground mt-0.5">Sell when price rises this % above entry</p>
+            {/* Take Profit — toggle + value */}
+            <div className="bg-muted/30 rounded-md px-3 py-2.5 space-y-2">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs font-semibold text-foreground">Take Profit Target</p>
+                  <p className="text-[9px] text-muted-foreground">
+                    {settingsDraft.takeProfitEnabled
+                      ? 'Sell when price hits target % above entry'
+                      : 'OFF — sell as soon as fees are covered (breakeven exit)'}
+                  </p>
+                </div>
+                <button
+                  onClick={() => setSettingsDraft(d => ({ ...d, takeProfitEnabled: !d.takeProfitEnabled }))}
+                  className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${settingsDraft.takeProfitEnabled ? 'bg-gain/80' : 'bg-muted/60'}`}
+                >
+                  <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${settingsDraft.takeProfitEnabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                </button>
               </div>
+              {settingsDraft.takeProfitEnabled && (
+                <div className="flex items-center gap-2">
+                  <input type="number" min="0.1" max="50" step="0.1"
+                    value={settingsDraft.takeProfitPct}
+                    onChange={e => setSettingsDraft(d => ({ ...d, takeProfitPct: parseFloat(e.target.value) || 0.5 }))}
+                    className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-gain/60" />
+                  <span className="text-xs text-muted-foreground">% above entry price</span>
+                </div>
+              )}
+            </div>
+
+            {/* Smart Hold — toggle + trailing stop */}
+            <div className="bg-muted/30 rounded-md px-3 py-2.5 space-y-2">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs font-semibold text-foreground">Smart Hold</p>
+                  <p className="text-[9px] text-muted-foreground">
+                    {settingsDraft.smartHoldEnabled
+                      ? 'Hold if signals still bullish; sell when they turn or price drops from peak'
+                      : 'OFF — exit immediately when profit target is reached'}
+                  </p>
+                </div>
+                <button
+                  onClick={() => setSettingsDraft(d => ({ ...d, smartHoldEnabled: !d.smartHoldEnabled }))}
+                  className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${settingsDraft.smartHoldEnabled ? 'bg-accent/80' : 'bg-muted/60'}`}
+                >
+                  <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${settingsDraft.smartHoldEnabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                </button>
+              </div>
+              {settingsDraft.smartHoldEnabled && (
+                <div className="flex items-center gap-2">
+                  <input type="number" min="0.1" max="10" step="0.1"
+                    value={settingsDraft.trailingStopPct}
+                    onChange={e => setSettingsDraft(d => ({ ...d, trailingStopPct: parseFloat(e.target.value) || 0.5 }))}
+                    className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-accent/60" />
+                  <span className="text-xs text-muted-foreground">% trailing drop from peak to trigger exit</span>
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
               <div>
                 <label className="text-[10px] text-muted-foreground uppercase tracking-wider">Max Positions</label>
                 <input type="number" min="1" max="50" step="1"
