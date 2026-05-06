@@ -425,6 +425,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // v2 key bumped from 'bot_setup_done' so the new wizard (Trade Size + Allocation
   // + Risk) gates the Start button for users who previously confirmed the v1 flow.
   const [setupComplete, setSetupComplete]     = useState(() => !!localStorage.getItem('bot_setup_v2_done'));
+  // settingsSynced: true once settings were successfully POSTed to Railway.
+  // Starts false so users who had bot_setup_v2_done from a failed-save cycle
+  // are required to re-sync before starting.
+  const [settingsSynced, setSettingsSynced]   = useState(false);
   // Trade Size Mode (per-trade sizing) + per-mode value
   const [setupBudgetMode, setSetupBudgetMode]   = useState<'fixed'|'percent'|'capped'>('fixed');
   const [setupBudgetValue, setSetupBudgetValue] = useState(10);
@@ -476,6 +480,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
   // Pre-populate from backend so returning users see their saved values.
   useEffect(() => {
+    // Load current backend settings to pre-populate wizard and mark as synced
+    // (so users with already-correct Railway settings don't see a false warning).
     fetch(`${railwayUrl}/api/settings`, { cache: 'no-store' })
       .then(r => r.ok ? r.json() : null)
       .then((d: any) => {
@@ -489,6 +495,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         if (d.reinvest_profits    !== undefined) setSetupReinvest(Boolean(d.reinvest_profits));
         if (d.max_positions > 0)   setSetupMaxPositions(d.max_positions);
         if (d.min_signals   > 0)   setSetupMinSignals(d.min_signals);
+        setSettingsSynced(true); // backend is reachable and returned valid settings
       })
       .catch(() => {});
     fetch(`${railwayUrl}/api/config`, { cache: 'no-store' })
@@ -1045,7 +1052,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         min_signals:         setupMinSignals,
       };
 
-      // Mirror all values into the live Risk Settings draft immediately (no network needed).
+      // Mirror all values into the live Risk Settings draft immediately.
       setStopLossEnabled(setupSlEnabled);
       setStopLossPct(setupStopLoss);
       setTakeProfitEnabled(setupTpEnabled);
@@ -1064,24 +1071,22 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         maxPositions: setupMaxPositions, minSignals: setupMinSignals,
       }));
 
-      // POST to backend — non-blocking: settings are already applied locally above.
-      // If Railway is temporarily unavailable (e.g. mid-deploy), warn but don't fail.
-      try {
-        const [cfgRes, setRes] = await Promise.all([
-          fetch(`${railwayUrl}/api/config`,   { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(budgetPayload) }),
-          fetch(`${railwayUrl}/api/settings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settingsPayload) }),
-        ]);
-        if (!cfgRes.ok || !setRes.ok) {
-          toast.warning('Settings saved locally — Railway returned an error, will retry on start');
-        } else if (!opts.silent) {
-          toast.success('Agent trading settings saved');
-        }
-      } catch {
-        toast.warning('Settings saved locally — Railway unreachable, will apply on next connection');
+      // POST to backend — MUST succeed for settings to take effect in the bot.
+      const [cfgRes, setRes] = await Promise.all([
+        fetch(`${railwayUrl}/api/config`,   { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(budgetPayload) }),
+        fetch(`${railwayUrl}/api/settings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settingsPayload) }),
+      ]);
+      if (!cfgRes.ok || !setRes.ok) {
+        const status = !cfgRes.ok ? cfgRes.status : setRes.status;
+        throw new Error(`Railway returned HTTP ${status}`);
       }
+
+      setSettingsSynced(true);
+      if (!opts.silent) toast.success('Settings saved to Railway ✓');
       return true;
     } catch (err: any) {
-      toast.error(`Failed to save settings: ${err?.message ?? 'unknown error'}`);
+      setSettingsSynced(false);
+      if (!opts.silent) toast.error(`Settings not saved to Railway — ${err?.message ?? 'connection error'}. Fix connection and retry.`);
       return false;
     } finally {
       setSavingSetup(false);
@@ -1108,7 +1113,17 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       if (isServerMode) {
         // Re-push settings before starting in case they were saved locally while
         // Railway was unreachable (e.g. during deploy).
-        if (!isRunning) await saveAgentConfig({ silent: true });
+        // Sync settings to Railway before starting. If settings aren't synced yet
+        // (e.g. wizard completed while Railway was restarting), force a sync now
+        // and abort start if it fails — the bot would otherwise trade with stale
+        // defaults (e.g. 5% of balance = 500 USDT instead of the user's 10 USDT).
+        if (!isRunning && !settingsSynced) {
+          const synced = await saveAgentConfig({ silent: true });
+          if (!synced) {
+            toast.error('Cannot start — settings failed to reach Railway. Check connection and retry.');
+            return;
+          }
+        }
         const endpoint = isRunning ? '/api/agent/stop' : '/api/agent/start';
         let res: Response;
         try {
@@ -1857,13 +1872,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 takeProfit={setupTakeProfit} setTakeProfit={setSetupTakeProfit}
               />
               <div className="flex items-center gap-2">
-                <span className="flex-1 text-[10px] text-muted-foreground italic">
-                  Edits apply to both paper and live mode. Allocation min is 5 USDT (0 = unlimited).
+                <span className={`flex-1 text-[10px] italic ${settingsSynced ? 'text-gain' : 'text-warn'}`}>
+                  {settingsSynced ? '✓ Synced to Railway' : '⚠ Not yet synced — click Save'}
                 </span>
                 <button onClick={() => saveAgentConfig()} disabled={savingSetup}
                   className="px-3 py-1 text-xs font-semibold rounded bg-accent text-accent-foreground hover:bg-accent/80 disabled:opacity-50 flex items-center gap-1">
                   {savingSetup ? <span className="animate-spin">⟳</span> : <Check className="w-3 h-3" />}
-                  Save
+                  Save to Railway
                 </button>
               </div>
             </div>
@@ -1871,9 +1886,21 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         </div>
       )}
 
+      {/* ── Not-synced warning banner ── */}
+      {setupComplete && !settingsSynced && !isRunning && (
+        <div className="flex items-center justify-between gap-2 bg-warn/10 border border-warn/40 rounded-md px-3 py-2">
+          <p className="text-[10px] text-warn">⚠ Settings not yet saved to Railway — bot will use old values until synced.</p>
+          <button onClick={() => saveAgentConfig()} disabled={savingSetup}
+            className="shrink-0 px-3 py-1 text-[10px] font-semibold rounded bg-warn/20 border border-warn/50 text-warn hover:bg-warn/30 disabled:opacity-50">
+            {savingSetup ? '…' : 'Sync now'}
+          </button>
+        </div>
+      )}
+
       {/* ── Start / Stop ── */}
-      <Button onClick={toggleBot} disabled={loading || (!isRunning && !setupComplete) || (!isServerMode && !selectedCoins.length)}
-        className={`w-full font-semibold py-5 ${isRunning?'bg-loss/90 hover:bg-loss text-white':setupComplete?'bg-gain/90 hover:bg-gain text-background':'bg-muted/60 text-muted-foreground cursor-not-allowed'}`}>
+      <Button onClick={toggleBot}
+        disabled={loading || (!isRunning && !setupComplete) || (!isServerMode && !selectedCoins.length)}
+        className={`w-full font-semibold py-5 ${isRunning ? 'bg-loss/90 hover:bg-loss text-white' : setupComplete ? 'bg-gain/90 hover:bg-gain text-background' : 'bg-muted/60 text-muted-foreground cursor-not-allowed'}`}>
         {loading ? <span className="animate-spin mr-1.5">⟳</span>
           : isRunning
             ? <><Square className="w-4 h-4 mr-1.5"/>{isServerMode ? 'Pause Railway Bot' : 'Stop Agent'}</>
@@ -1890,9 +1917,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         : <p className="text-[10px] text-center text-muted-foreground -mt-2">
             {!setupComplete
               ? 'Confirm your risk settings above, then start the bot'
-              : isServerMode
-                ? 'Railway bot handles all trading 24/7 — no browser required'
-                : 'Sells on every price tick · Buys checked every 10s · EMA+RSI+MACD+Volume signals · no API key needed'}
+              : !settingsSynced
+                ? 'Sync settings to Railway above before starting'
+                : isServerMode
+                  ? 'Railway bot handles all trading 24/7 — no browser required'
+                  : 'Sells on every price tick · Buys checked every 10s · EMA+RSI+MACD+Volume signals · no API key needed'}
           </p>
       }
 
