@@ -346,10 +346,10 @@ const AgentTradingFields = ({
       <div>
         <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Min Signals to Buy</label>
         <div className="flex gap-1 mt-1">
-          {[1,2,3,4].map(n => (
+          {[1,2,3,4,5,6].map(n => (
             <button key={n} onClick={() => setMinSignals(n)}
               className={`flex-1 py-1.5 text-xs font-bold rounded border transition-colors ${minSignals === n ? 'bg-accent text-accent-foreground border-accent' : 'border-border text-muted-foreground hover:border-accent/50'}`}>
-              {n}/4
+              {n}/6
             </button>
           ))}
         </div>
@@ -632,7 +632,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       addLog(`Signals: ${buySigs.length} BUY · ${holdSigs.length} HOLD · ${signals.filter(s=>s.signal==='error').length} err`);
       signals.forEach(s => {
         const count = [s.emaBullish, s.rsiOk, s.macdPos, s.volUp].filter(Boolean).length;
-        addLog(`[SIGNALS] ${s.symbol}: trend=${s.emaBullish} rsi=${s.rsiOk} macd=${s.macdPos} vol=${s.volUp} count=${count}/4`);
+        addLog(`[SIGNALS] ${s.symbol}: trend=${s.emaBullish} rsi=${s.rsiOk} macd=${s.macdPos} vol=${s.volUp} count=${count}/6`);
       });
 
       // — Execute BUYs — dynamic heldSet check so every iteration sees the latest count
@@ -1795,10 +1795,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               <div className="col-span-2">
                 <label className="text-[10px] text-muted-foreground uppercase tracking-wider">Min Signals to Buy (1–4)</label>
                 <div className="flex gap-1 mt-1">
-                  {[1,2,3,4].map(n => (
+                  {[1,2,3,4,5,6].map(n => (
                     <button key={n} onClick={() => setSettingsDraft(d => ({ ...d, minSignals: n }))}
                       className={`flex-1 py-1 text-xs font-bold rounded border transition-colors ${settingsDraft.minSignals === n ? 'bg-accent text-accent-foreground border-accent' : 'border-border text-muted-foreground hover:border-accent/50'}`}>
-                      {n}/4
+                      {n}/6
                     </button>
                   ))}
                 </div>
