@@ -1,5 +1,5 @@
 {
-  "version": "5.5.0",
-  "buildTime": "2026-05-06T14:10:00.000Z",
-  "commit": "sync-gate"
+  "version": "5.5.1",
+  "buildTime": "2026-05-06T14:30:00.000Z",
+  "commit": "fix-api-config-route"
 }

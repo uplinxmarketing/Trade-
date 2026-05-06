@@ -311,6 +311,7 @@ def set_budget(amount: float):
 
 
 @app.get("/config")
+@app.get("/api/config")
 def get_config():
     strategy = _load_strategy()
     return {
@@ -325,6 +326,7 @@ def get_config():
 
 
 @app.post("/config")
+@app.post("/api/config")
 def update_config(body: dict):
     allowed_keys = {
         "budget_mode", "budget_fixed_usdt", "budget_pct_of_free",
