@@ -1,5 +1,5 @@
 {
-  "version": "5.5.1",
-  "buildTime": "2026-05-06T14:30:00.000Z",
-  "commit": "fix-api-config-route"
+  "version": "5.5.2",
+  "buildTime": "2026-05-06T15:00:00.000Z",
+  "commit": "fix-http500-separate-handler-fns"
 }

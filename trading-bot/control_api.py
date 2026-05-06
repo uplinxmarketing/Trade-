@@ -310,9 +310,7 @@ def set_budget(amount: float):
     return {"ok": True, "new_budget": amount}
 
 
-@app.get("/config")
-@app.get("/api/config")
-def get_config():
+def _config_response():
     strategy = _load_strategy()
     return {
         "budget_mode":           strategy.get("budget_mode",           config.BUDGET_MODE),
@@ -324,10 +322,7 @@ def get_config():
         "bot_allocation_usdt":   strategy.get("bot_allocation_usdt",   config.BOT_ALLOCATION_USDT),
     }
 
-
-@app.post("/config")
-@app.post("/api/config")
-def update_config(body: dict):
+def _config_patch(body: dict):
     allowed_keys = {
         "budget_mode", "budget_fixed_usdt", "budget_pct_of_free",
         "budget_total_cap_usdt", "budget_per_coin", "budget_coin_pct",
@@ -338,6 +333,18 @@ def update_config(body: dict):
         return {"error": "No valid config keys provided"}
     _write_strategy_patch(patch)
     return {"ok": True, "updated": list(patch.keys()), "config": patch}
+
+@app.get("/config")
+def get_config(): return _config_response()
+
+@app.get("/api/config")
+def api_get_config(): return _config_response()
+
+@app.post("/config")
+def post_config(body: dict): return _config_patch(body)
+
+@app.post("/api/config")
+def api_post_config(body: dict): return _config_patch(body)
 
 
 @app.post("/mode/{mode}")
