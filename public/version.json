@@ -1,5 +1,5 @@
 {
-  "version": "5.4.3",
-  "buildTime": "2026-05-06T13:05:00.000Z",
-  "commit": "full-risk-wizard"
+  "version": "5.4.4",
+  "buildTime": "2026-05-06T13:20:00.000Z",
+  "commit": "version-check-fix"
 }

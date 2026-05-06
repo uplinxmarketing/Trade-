@@ -22,7 +22,7 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
         toast.success('Update found — reloading…', { id: toastId });
         await applyUpdate();
       } else {
-        toast.success('You\'re up to date', { id: toastId, description: `v${APP_VERSION} is the latest` });
+        toast.success(`v${APP_VERSION} — up to date`, { id: toastId, description: 'Server is running the same version as your browser.' });
       }
     } catch {
       toast.error('Update check failed', { id: toastId, description: 'Check your connection and try again' });

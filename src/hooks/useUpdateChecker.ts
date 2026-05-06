@@ -61,10 +61,12 @@ export function useUpdateChecker(pollIntervalMs = 30_000) {
         return false;
       }
 
-      // Fallback: fingerprint comparison — auto-reload on mismatch so the user
-      // never has to click anything to receive updates.
-      const remote = `${data.commit}:${data.buildTime}`;
-      if (remote !== LOCAL_FINGERPRINT) {
+      // Version number comparison: fires as soon as the server serves a newer
+      // version.json, regardless of build fingerprint timing.
+      const remoteFingerprint = `${data.commit}:${data.buildTime}`;
+      const versionChanged     = data.version !== LOCAL_VERSION;
+      const fingerprintChanged = remoteFingerprint !== LOCAL_FINGERPRINT;
+      if (versionChanged || fingerprintChanged) {
         setUpdateAvailable(true);
         setUpdating(true);
         toast.loading(`New version v${data.version} deployed — reloading…`, { duration: 3000 });
