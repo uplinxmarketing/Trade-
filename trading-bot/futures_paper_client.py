@@ -89,6 +89,7 @@ class FuturesPaperClient:
         leverage: int,
         tp_pct: float,
         sl_pct: float,
+        sl_enabled: bool = True,
     ) -> Optional[dict]:
         """Reserve margin and persist a new futures position. Returns position dict or None."""
         with self._lock:
@@ -105,12 +106,12 @@ class FuturesPaperClient:
             self._usdt -= (margin_usdt + fee)
 
             if direction == "LONG":
-                take_profit      = entry_price * (1 + tp_pct)
-                stop_loss        = entry_price * (1 - sl_pct)
+                take_profit       = entry_price * (1 + tp_pct)
+                stop_loss         = entry_price * (1 - sl_pct) if sl_enabled else None
                 liquidation_price = entry_price * (1 - 1 / leverage) * 0.99
             else:
-                take_profit      = entry_price * (1 - tp_pct)
-                stop_loss        = entry_price * (1 + sl_pct)
+                take_profit       = entry_price * (1 - tp_pct)
+                stop_loss         = entry_price * (1 + sl_pct) if sl_enabled else None
                 liquidation_price = entry_price * (1 + 1 / leverage) * 1.01
 
             ts = datetime.now(timezone.utc).isoformat()
@@ -123,6 +124,7 @@ class FuturesPaperClient:
                 "leverage": leverage,
                 "take_profit": take_profit,
                 "stop_loss": stop_loss,
+                "sl_enabled": sl_enabled,
                 "liquidation_price": liquidation_price,
                 "funding_paid": 0.0,
                 "timestamp": ts,
@@ -139,9 +141,10 @@ class FuturesPaperClient:
             self._positions[pos_id] = pos
             database.save_futures_state({"USDT": self._usdt})
 
+        sl_display = f"{stop_loss:.4f}" if stop_loss else "OFF"
         print(f"[FuturesPaper] OPEN {direction} {symbol} @ {entry_price:.4f} "
               f"qty={qty:.6f} margin={margin_usdt:.2f} lev={leverage}x "
-              f"TP={take_profit:.4f} SL={stop_loss:.4f}")
+              f"TP={take_profit:.4f} SL={sl_display}")
         return pos
 
     # ── Close position ────────────────────────────────────────────────────────
@@ -204,8 +207,11 @@ class FuturesPaperClient:
 
     # ── TP/SL/Liquidation check ───────────────────────────────────────────────
 
-    def check_positions(self) -> List[dict]:
+    def check_positions(self, sl_enabled: bool = True) -> List[dict]:
         """Check all open positions against current mark prices.
+
+        sl_enabled overrides per-position sl_enabled flag so a settings
+        change takes effect immediately without reopening positions.
 
         Returns list of trade dicts for any positions that were closed.
         """
@@ -218,17 +224,25 @@ class FuturesPaperClient:
             if mp <= 0:
                 continue
 
+            # Respect per-position flag AND the live engine setting
+            pos_sl_on = sl_enabled and pos.get("sl_enabled", True)
+            sl_price  = pos.get("stop_loss")
+
             reason = None
             if pos["direction"] == "LONG":
                 if mp >= pos["take_profit"]:
                     reason = "TP"
-                elif mp <= pos["stop_loss"] or mp <= pos["liquidation_price"]:
-                    reason = "SL" if mp > pos["liquidation_price"] else "LIQ"
+                elif mp <= pos["liquidation_price"]:
+                    reason = "LIQ"
+                elif pos_sl_on and sl_price and mp <= sl_price:
+                    reason = "SL"
             else:  # SHORT
                 if mp <= pos["take_profit"]:
                     reason = "TP"
-                elif mp >= pos["stop_loss"] or mp >= pos["liquidation_price"]:
-                    reason = "SL" if mp < pos["liquidation_price"] else "LIQ"
+                elif mp >= pos["liquidation_price"]:
+                    reason = "LIQ"
+                elif pos_sl_on and sl_price and mp >= sl_price:
+                    reason = "SL"
 
             if reason:
                 trade = self.close_position(pos["id"], mp, reason)

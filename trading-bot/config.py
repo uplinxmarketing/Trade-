@@ -86,6 +86,6 @@ FUTURES_BUDGET_USDT       = 200.0    # margin per position
 FUTURES_LEVERAGE          = 5        # default leverage
 FUTURES_TAKE_PROFIT_PCT   = 0.02     # 2 % price move from entry
 FUTURES_STOP_LOSS_PCT     = 0.01     # 1 % price move from entry
-FUTURES_MIN_SIGNALS       = 4        # of 6 signals needed to open
+FUTURES_MIN_SIGNALS       = 3        # of 6 signals needed to open (3 fires more reliably)
 FUTURES_SCAN_INTERVAL_SEC = 60       # signal scan frequency
 FUTURES_MAX_POSITIONS     = 5        # max concurrent open positions

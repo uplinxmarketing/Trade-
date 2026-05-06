@@ -1407,7 +1407,8 @@ def api_futures_settings(body: dict = Body(...)):
         import futures_engine
         allowed = {
             "leverage", "budget_usdt", "take_profit_pct",
-            "stop_loss_pct", "min_signals", "max_positions",
+            "stop_loss_pct", "stop_loss_enabled",
+            "min_signals", "max_positions",
         }
         patch = {k: v for k, v in body.items() if k in allowed}
         if "leverage" in patch:
