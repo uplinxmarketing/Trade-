@@ -1,5 +1,5 @@
 {
-  "version": "5.7.0",
-  "buildTime": "2026-05-06T18:00:00.000Z",
-  "commit": "fix-wizard-lag-signals-data-restore"
+  "version": "5.7.1",
+  "buildTime": "2026-05-06T18:30:00.000Z",
+  "commit": "fix-http500-settings-save-body-lock"
 }

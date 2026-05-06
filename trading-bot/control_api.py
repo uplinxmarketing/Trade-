@@ -22,7 +22,7 @@ from typing import Optional
 _DEPLOY_ID = str(uuid.uuid4())
 
 import uvicorn
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Response, Body
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -146,24 +146,28 @@ def _load_strategy() -> dict:
         return {}
 
 
+_strategy_write_lock = threading.Lock()
+
+
 def _write_strategy_patch(patch: dict):
-    """Atomic merge-and-write to strategy.json.
+    """Atomic merge-and-write to strategy.json (lock-protected against concurrent saves).
 
     Without atomicity, concurrent readers (sell monitor, signal scanner) may
     catch the file mid-truncate and json.load raises — which silently turns
     every default into the schema fallback (e.g. trading_active drops to True
     or take_profit_mult resets to breakeven mid-trade)."""
-    s = _load_strategy()
-    s.update(patch)
-    tmp_path = config.STRATEGY_FILE + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(s, f, indent=2)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except Exception:
-            pass
-    os.replace(tmp_path, config.STRATEGY_FILE)
+    with _strategy_write_lock:
+        s = _load_strategy()
+        s.update(patch)
+        tmp_path = config.STRATEGY_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(s, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, config.STRATEGY_FILE)
     # Bust the /api/all response cache so a poll right after a write sees the
     # updated trading_active / settings / approved coins immediately.
     try:
@@ -361,11 +365,18 @@ def _config_patch(body: dict):
         "budget_total_cap_usdt", "budget_per_coin", "budget_coin_pct",
         "bot_allocation_usdt",
     }
-    patch = {k: v for k, v in body.items() if k in allowed_keys}
-    if not patch:
-        return {"error": "No valid config keys provided"}
-    _write_strategy_patch(patch)
-    return {"ok": True, "updated": list(patch.keys()), "config": patch}
+    try:
+        patch = {k: v for k, v in body.items() if k in allowed_keys}
+        if not patch:
+            return {"ok": False, "error": "No valid config keys provided"}
+        _write_strategy_patch(patch)
+        return {"ok": True, "updated": list(patch.keys()), "config": patch}
+    except Exception as e:
+        database.log_activity(f"Config save error: {e}", "error")
+        return Response(
+            content=json.dumps({"ok": False, "error": str(e)}),
+            status_code=500, media_type="application/json"
+        )
 
 @app.get("/config")
 def get_config(): return _config_response()
@@ -374,10 +385,10 @@ def get_config(): return _config_response()
 def api_get_config(): return _config_response()
 
 @app.post("/config")
-def post_config(body: dict): return _config_patch(body)
+def post_config(body: dict = Body(...)): return _config_patch(body)
 
 @app.post("/api/config")
-def api_post_config(body: dict): return _config_patch(body)
+def api_post_config(body: dict = Body(...)): return _config_patch(body)
 
 
 @app.post("/mode/{mode}")
@@ -1047,25 +1058,32 @@ class SettingsRequest(BaseModel):
 @app.post("/api/settings")
 def api_save_settings(req: SettingsRequest):
     """Save bot risk/strategy settings into strategy.json."""
-    patch: dict = {}
-    if req.stop_loss_enabled   is not None: patch["stop_loss_enabled"]  = bool(req.stop_loss_enabled)
-    if req.stop_loss_pct       is not None: patch["stop_loss_pct"]      = max(0.1, min(20.0, req.stop_loss_pct))
-    if req.take_profit_enabled is not None: patch["take_profit_enabled"] = bool(req.take_profit_enabled)
-    if req.take_profit_pct     is not None: patch["take_profit_pct"]    = max(0.1, min(50.0, req.take_profit_pct))
-    if req.smart_hold_enabled  is not None: patch["smart_hold_enabled"] = bool(req.smart_hold_enabled)
-    if req.trailing_stop_pct   is not None: patch["trailing_stop_pct"]  = max(0.1, min(10.0, req.trailing_stop_pct))
-    if req.reinvest_profits     is not None: patch["reinvest_profits"]   = bool(req.reinvest_profits)
-    if req.max_positions       is not None: patch["max_positions"]      = max(1,   min(100,  req.max_positions))
-    if req.min_signals         is not None: patch["min_signals"]        = max(1,   min(4,    req.min_signals))
-    if req.strategy_notes      is not None: patch["strategy_notes"]     = req.strategy_notes[:2000]
-    if not patch:
-        return {"ok": False, "error": "No valid settings provided"}
-    _write_strategy_patch(patch)
-    database.log_activity(
-        "Settings updated: " + ", ".join(f"{k}={v}" for k, v in patch.items() if k != "strategy_notes"),
-        "info"
-    )
-    return {"ok": True, **patch}
+    try:
+        patch: dict = {}
+        if req.stop_loss_enabled   is not None: patch["stop_loss_enabled"]  = bool(req.stop_loss_enabled)
+        if req.stop_loss_pct       is not None: patch["stop_loss_pct"]      = max(0.1, min(20.0, req.stop_loss_pct))
+        if req.take_profit_enabled is not None: patch["take_profit_enabled"] = bool(req.take_profit_enabled)
+        if req.take_profit_pct     is not None: patch["take_profit_pct"]    = max(0.1, min(50.0, req.take_profit_pct))
+        if req.smart_hold_enabled  is not None: patch["smart_hold_enabled"] = bool(req.smart_hold_enabled)
+        if req.trailing_stop_pct   is not None: patch["trailing_stop_pct"]  = max(0.1, min(10.0, req.trailing_stop_pct))
+        if req.reinvest_profits    is not None: patch["reinvest_profits"]   = bool(req.reinvest_profits)
+        if req.max_positions       is not None: patch["max_positions"]      = max(1,   min(100,  req.max_positions))
+        if req.min_signals         is not None: patch["min_signals"]        = max(1,   min(6,    req.min_signals))
+        if req.strategy_notes      is not None: patch["strategy_notes"]     = req.strategy_notes[:2000]
+        if not patch:
+            return {"ok": False, "error": "No valid settings provided"}
+        _write_strategy_patch(patch)
+        database.log_activity(
+            "Settings updated: " + ", ".join(f"{k}={v}" for k, v in patch.items() if k != "strategy_notes"),
+            "info"
+        )
+        return {"ok": True, **patch}
+    except Exception as e:
+        database.log_activity(f"Settings save error: {e}", "error")
+        return Response(
+            content=json.dumps({"ok": False, "error": str(e)}),
+            status_code=500, media_type="application/json"
+        )
 
 
 @app.get("/api/ping")
