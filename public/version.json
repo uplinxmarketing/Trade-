@@ -1,5 +1,5 @@
 {
-  "version": "5.4.4",
-  "buildTime": "2026-05-06T13:20:00.000Z",
-  "commit": "version-check-fix"
+  "version": "5.4.5",
+  "buildTime": "2026-05-06T13:30:00.000Z",
+  "commit": "resilient-setup-save"
 }

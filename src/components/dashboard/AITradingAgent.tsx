@@ -1045,13 +1045,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         min_signals:         setupMinSignals,
       };
 
-      const [cfgRes, setRes] = await Promise.all([
-        fetch(`${railwayUrl}/api/config`,   { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(budgetPayload) }),
-        fetch(`${railwayUrl}/api/settings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settingsPayload) }),
-      ]);
-      if (!cfgRes.ok || !setRes.ok) throw new Error('save failed');
-
-      // Mirror all values into the live Risk Settings draft so both panels stay in sync.
+      // Mirror all values into the live Risk Settings draft immediately (no network needed).
       setStopLossEnabled(setupSlEnabled);
       setStopLossPct(setupStopLoss);
       setTakeProfitEnabled(setupTpEnabled);
@@ -1070,10 +1064,24 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         maxPositions: setupMaxPositions, minSignals: setupMinSignals,
       }));
 
-      if (!opts.silent) toast.success('Agent trading settings saved');
+      // POST to backend — non-blocking: settings are already applied locally above.
+      // If Railway is temporarily unavailable (e.g. mid-deploy), warn but don't fail.
+      try {
+        const [cfgRes, setRes] = await Promise.all([
+          fetch(`${railwayUrl}/api/config`,   { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(budgetPayload) }),
+          fetch(`${railwayUrl}/api/settings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settingsPayload) }),
+        ]);
+        if (!cfgRes.ok || !setRes.ok) {
+          toast.warning('Settings saved locally — Railway returned an error, will retry on start');
+        } else if (!opts.silent) {
+          toast.success('Agent trading settings saved');
+        }
+      } catch {
+        toast.warning('Settings saved locally — Railway unreachable, will apply on next connection');
+      }
       return true;
-    } catch {
-      toast.error('Failed to save settings — check Railway connection');
+    } catch (err: any) {
+      toast.error(`Failed to save settings: ${err?.message ?? 'unknown error'}`);
       return false;
     } finally {
       setSavingSetup(false);
@@ -1084,7 +1092,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       railwayUrl]);
 
   const confirmSetup = useCallback(async () => {
-    const ok = await saveAgentConfig();
+    const ok = await saveAgentConfig({ silent: true });
     if (ok) {
       localStorage.setItem('bot_setup_v2_done', '1');
       setSetupComplete(true);
@@ -1098,6 +1106,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     try {
       // ── Server mode: delegate to Railway ──
       if (isServerMode) {
+        // Re-push settings before starting in case they were saved locally while
+        // Railway was unreachable (e.g. during deploy).
+        if (!isRunning) await saveAgentConfig({ silent: true });
         const endpoint = isRunning ? '/api/agent/stop' : '/api/agent/start';
         let res: Response;
         try {
