@@ -422,12 +422,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [liveSetupLoading, setLiveSetupLoading] = useState(false);
 
   // ── Setup wizard / Agent Trading Settings ────────────────────────────────
-  // v2 key bumped from 'bot_setup_done' so the new wizard (Trade Size + Allocation
-  // + Risk) gates the Start button for users who previously confirmed the v1 flow.
-  const [setupComplete, setSetupComplete]     = useState(() => !!localStorage.getItem('bot_setup_v2_done'));
+  // Wizard always appears before every bot start — no localStorage persistence.
+  // Users must confirm settings each time they start the bot.
+  const [setupComplete, setSetupComplete]     = useState(false);
   // settingsSynced: true once settings were successfully POSTed to Railway.
-  // Starts false so users who had bot_setup_v2_done from a failed-save cycle
-  // are required to re-sync before starting.
   const [settingsSynced, setSettingsSynced]   = useState(false);
   // Trade Size Mode (per-trade sizing) + per-mode value
   const [setupBudgetMode, setSetupBudgetMode]   = useState<'fixed'|'percent'|'capped'>('fixed');
@@ -809,6 +807,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
     const s = data.status ?? {};
     const running = Boolean(s.running);
+    // Reset wizard when poll detects bot stopped (handles stop from another tab/session).
+    if (isRunningRef.current && !running) { setSetupComplete(false); setSettingsSynced(false); }
     isRunningRef.current = running;
     setIsRunning(running);
     const bal = Number(s.balance_usdt ?? 0);
@@ -1097,11 +1097,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       railwayUrl]);
 
   const confirmSetup = useCallback(async () => {
-    const ok = await saveAgentConfig({ silent: true });
+    const ok = await saveAgentConfig({ silent: false });
     if (ok) {
-      localStorage.setItem('bot_setup_v2_done', '1');
       setSetupComplete(true);
-      toast.success('Configuration saved — you can now start the bot');
+      toast.success('Settings saved to Railway ✓ — you can now start the bot');
+    } else {
+      toast.error('Could not save settings — check Railway URL is set and bot is reachable');
     }
   }, [saveAgentConfig]);
 
@@ -1160,6 +1161,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         const nowRunning = !isRunning;
         setIsRunning(nowRunning);
         isRunningRef.current = nowRunning;
+        // When bot stops, reset wizard so user must confirm settings again before restarting.
+        if (!nowRunning) { setSetupComplete(false); setSettingsSynced(false); }
         addLog(isRunning ? '=== Railway bot STOPPED ===' : '=== Railway bot STARTED ===');
         toast[isRunning ? 'info' : 'success'](isRunning ? 'Railway bot paused' : 'Railway bot started', {
           description: 'Runs 24/7 on Railway — this browser tab can be closed.',
@@ -1196,6 +1199,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         await supabase.from('bot_config').update({ is_running: false, updated_at: new Date().toISOString() }).eq('user_session', SESSION);
         isRunningRef.current = false;
         setIsRunning(false); setCycleCountdown(0);
+        setSetupComplete(false); setSettingsSynced(false);
         addLog('=== Agent STOPPED ===');
         toast.info('AI Agent stopped');
       }
@@ -1868,8 +1872,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 budgetMode={setupBudgetMode} setBudgetMode={setSetupBudgetMode}
                 budgetValue={setupBudgetValue} setBudgetValue={setSetupBudgetValue}
                 allocation={setupAllocation} setAllocation={setSetupAllocation}
+                slEnabled={setupSlEnabled} setSlEnabled={setSetupSlEnabled}
                 stopLoss={setupStopLoss} setStopLoss={setSetupStopLoss}
+                tpEnabled={setupTpEnabled} setTpEnabled={setSetupTpEnabled}
                 takeProfit={setupTakeProfit} setTakeProfit={setSetupTakeProfit}
+                smartHold={setupSmartHold} setSmartHold={setSetupSmartHold}
+                trailingStop={setupTrailingStop} setTrailingStop={setSetupTrailingStop}
+                reinvest={setupReinvest} setReinvest={setSetupReinvest}
+                maxPositions={setupMaxPositions} setMaxPositions={setSetupMaxPositions}
+                minSignals={setupMinSignals} setMinSignals={setSetupMinSignals}
               />
               <div className="flex items-center gap-2">
                 <span className={`flex-1 text-[10px] italic ${settingsSynced ? 'text-gain' : 'text-warn'}`}>
