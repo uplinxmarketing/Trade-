@@ -1618,7 +1618,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       )}
 
       {/* ── Start / Stop ── */}
-      <Button onClick={toggleBot} disabled={loading || !setupComplete || (!isServerMode && !selectedCoins.length)}
+      <Button onClick={toggleBot} disabled={loading || (!isRunning && !setupComplete) || (!isServerMode && !selectedCoins.length)}
         className={`w-full font-semibold py-5 ${isRunning?'bg-loss/90 hover:bg-loss text-white':setupComplete?'bg-gain/90 hover:bg-gain text-background':'bg-muted/60 text-muted-foreground cursor-not-allowed'}`}>
         {loading ? <span className="animate-spin mr-1.5">⟳</span>
           : isRunning
