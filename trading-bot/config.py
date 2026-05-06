@@ -46,10 +46,15 @@ STRATEGY_FILE = _os.path.join(_DATA_DIR, "strategy.json")
 SCAN_INTERVAL_SEC    = 60      # REST backup cache refresh — WebSocket handles real-time
 STOP_LOSS_PCT        = 0.005   # 0.5% stop-loss
 COOLDOWN_AFTER_LOSS  = 180     # 3 min cooldown after stop-loss
-MIN_SIGNALS_TO_BUY   = 2       # at least 2 of 4 signals must be bullish
+MIN_SIGNALS_TO_BUY   = 4       # at least 4 of 6 signals must be bullish
 RSI_BUY_MIN          = 20
 RSI_BUY_MAX          = 80      # wide window — scalping works across most RSI zones
 VOLUME_RATIO_MIN     = 1.1     # volume must be 1.1× the 20-candle average
+
+# ── ATR filter thresholds ─────────────────────────────────────────────────────
+ATR_MIN_PCT = 0.0015   # ATR must be ≥ 0.15% of price (enough to reach breakeven)
+ATR_MAX_PCT = 0.015    # ATR must be ≤ 1.5% of price (too volatile → skip)
+ATR_PERIOD  = 14       # standard ATR lookback period
 
 # ── Budget allocation settings ────────────────────────────────────────────────
 BUDGET_MODE           = "percent" # fixed | percent | capped | per_coin

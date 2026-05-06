@@ -85,6 +85,32 @@ def _fetch_klines_rest(symbol: str, interval: str, limit: int = 500):
     raise last_err
 
 
+def fetch_5m_candles(symbol: str, limit: int = 30) -> list:
+    """Fetch 5-minute candles for multi-timeframe confirmation.
+    Returns a list of dicts with open/high/low/close/volume keys.
+    Tries each Binance base URL in order; returns [] on total failure.
+    """
+    for base in _BINANCE_BASES:
+        url = f"{base}/api/v3/klines?symbol={symbol}&interval=5m&limit={limit}"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                raw = json.loads(resp.read())
+            return [
+                {
+                    "open_time": int(k[0]),
+                    "open":      float(k[1]),
+                    "high":      float(k[2]),
+                    "low":       float(k[3]),
+                    "close":     float(k[4]),
+                    "volume":    float(k[5]),
+                }
+                for k in raw
+            ]
+        except Exception:
+            continue
+    return []
+
+
 def _compute_and_save(symbol: str, raw_klines: list, save_all: bool = False):
     """Compute indicators and persist candles.
 

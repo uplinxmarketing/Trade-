@@ -470,14 +470,20 @@ def _derive_bb_pos(price: float, candle: dict) -> Optional[str]:
     return "mid_zone"
 
 
-# ── Signal evaluation (Bug 2/3: extracted function, explicit 4-key dict) ─────
+# ── Signal evaluation — 6-signal dict ────────────────────────────────────────
 
-def evaluate_signals(closes: list, volumes: list) -> dict:
+def evaluate_signals(candles: list) -> dict:
     """
-    Evaluate all four technical signals on the last COMPLETED candle (index -2).
-    Returns exactly {"trend": bool, "rsi": bool, "macd": bool, "volume": bool}.
-    RSI bounds are config.RSI_BUY_MIN and config.RSI_BUY_MAX — never hardcoded.
+    Evaluate all six technical signals on the last COMPLETED candle (index -2).
+    Returns {"trend", "rsi", "macd", "volume", "obv", "atr"} — all booleans.
+
+    candles: list of dicts with keys close, volume, high, low.
+    When high/low are unavailable (tick data), pass high=low=close — ATR will
+    return None → atr_is_tradeable returns False → atr signal = False.
     """
+    closes  = [c["close"]  for c in candles]
+    volumes = [c["volume"] for c in candles]
+
     ema9        = indicators.calc_ema(closes, 9)
     ema21       = indicators.calc_ema(closes, 21)
     rsi_vals    = indicators.calc_rsi(closes, 14)
@@ -489,42 +495,63 @@ def evaluate_signals(closes: list, volumes: list) -> dict:
         and ema21[-2] is not None
         and ema9[-2] > ema21[-2]
     )
-    # RSI_BUY_MIN <= rsi <= RSI_BUY_MAX — both constants from config, never hardcoded
     rsi = bool(
         rsi_vals[-2] is not None
         and config.RSI_BUY_MIN <= rsi_vals[-2] <= config.RSI_BUY_MAX
     )
-    # MACD: histogram positive (matches frontend).
-    # Previously required histo[-2] > histo[-3] (rising), which silently blocked
-    # buys whenever histogram was positive but flattening.
+    # MACD: histogram positive AND rising (confirms momentum, not just a positive reading).
     macd = bool(
         histo[-2] is not None
+        and histo[-3] is not None
         and histo[-2] > 0
+        and histo[-2] > histo[-3]
     )
-    # Volume: current candle must exceed VOLUME_RATIO_MIN × 20-candle average.
-    # No OR fallback — volume counts toward 3-of-4 only if the ratio threshold is met.
     volume = bool(
         volumes[-2] is not None
         and vol_ma[-2] is not None
         and vol_ma[-2] > 0
         and volumes[-2] >= vol_ma[-2] * config.VOLUME_RATIO_MIN
     )
+    obv = indicators.obv_is_bullish(candles)
+    atr = indicators.atr_is_tradeable(
+        indicators.calc_atr(candles, config.ATR_PERIOD),
+        candles[-2]["close"],
+        config.ATR_MIN_PCT,
+        config.ATR_MAX_PCT,
+    )
 
-    return {"trend": trend, "rsi": rsi, "macd": macd, "volume": volume}
+    return {"trend": trend, "rsi": rsi, "macd": macd, "volume": volume, "obv": obv, "atr": atr}
 
 
 def update_coin_signals(symbol: str, closes: list, volumes: list):
-    """Update the signal cache on every kline close (WebSocket-driven)."""
-    if len(closes) < 16:  # 16 = minimum for RSI-14 to produce a valid value at [-2]
+    """Update the signal cache on every kline close (WebSocket-driven).
+
+    Builds minimal candle dicts (high=low=close) so OBV works correctly.
+    ATR signal will be False (atr_is_tradeable returns False when ATR=0) —
+    that is safe: the REST scan (_refresh_one) sets accurate ATR/BB/5m values
+    every 60 s and they are preserved here via the prev cache entry.
+    """
+    if len(closes) < 16:  # minimum for RSI-14 to produce a valid value at [-2]
         return
     try:
-        signals = evaluate_signals(closes, volumes)
+        candles = [
+            {"high": c, "low": c, "close": c, "volume": v}
+            for c, v in zip(closes, volumes)
+        ]
+        signals = evaluate_signals(candles)
         score   = sum(signals.values())
+        rsi_list    = indicators.calc_rsi(closes, 14)
+        rsi_display = rsi_list[-2] if rsi_list[-2] is not None else 0.0
+
         with _signal_cache_lock:
+            prev = _signal_cache.get(symbol, {})
             _signal_cache[symbol] = {
-                "signals": signals,
-                "score":   score,
-                "price":   closes[-1],
+                "signals":  signals,
+                "score":    score,
+                "price":    closes[-1],
+                "rsi_val":  rsi_display,
+                "bb_ok":    prev.get("bb_ok",  True),  # preserved from last REST scan
+                "5m_ok":    prev.get("5m_ok",  True),  # preserved from last REST scan
             }
     except Exception as e:
         print(f"[TradeEngine] Signal cache error {symbol}: {e}")
@@ -811,7 +838,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     if ready_syms or (_now_ts - _last_buy_scan_log) >= 30.0:
         _last_buy_scan_log = _now_ts
         database.log_activity(
-            f"Buy scan: USDT={usdt_balance:.2f} | {len(ready_syms)} coin(s) ready (min {min_sigs}/4 signals): "
+            f"Buy scan: USDT={usdt_balance:.2f} | {len(ready_syms)} coin(s) ready (min {min_sigs}/6 signals): "
             + (", ".join(f"{s}(score={cache_snapshot[s]['score']})" for s in ready_syms[:6]) or "none"),
             "info"
         )
@@ -836,6 +863,37 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             already_held = any(p["symbol"] == sym for p in _positions)
 
         if already_held:
+            continue
+
+        # ── Hard veto checks: BB position and 5m trend ────────────────────────
+        # Both are populated by the REST scan (_refresh_one) every 60 s and
+        # preserved across kline-close updates.  Default True = not blocking.
+        sigs    = cached.get("signals", {})
+        bb_ok   = cached.get("bb_ok",  True)
+        five_ok = cached.get("5m_ok",  True)
+        score   = cached["score"]
+        rsi_v   = cached.get("rsi_val", 0.0)
+        sig_str = (
+            f"EMA{'↑' if sigs.get('trend')  else '↓'} "
+            f"RSI:{rsi_v:.0f} "
+            f"MACD{'+'  if sigs.get('macd')   else '-'} "
+            f"Vol{'✓'   if sigs.get('volume') else '✗'} "
+            f"OBV{'✓'   if sigs.get('obv')    else '✗'} "
+            f"ATR{'✓'   if sigs.get('atr')    else '✗'}"
+        )
+        bb_str  = "BB:PASS" if bb_ok   else "BB:FAIL"
+        m5_str  = "5m:PASS" if five_ok else "5m:FAIL"
+        if not bb_ok:
+            database.log_activity(
+                f"[SKIP] {sym}: price near upper Bollinger Band | "
+                f"{sig_str} | {bb_str} | SKIP(upper band)", "info"
+            )
+            continue
+        if not five_ok:
+            database.log_activity(
+                f"[SKIP] {sym}: 5m downtrend | "
+                f"{sig_str} | {bb_str} {m5_str} | SKIP(5m downtrend)", "info"
+            )
             continue
 
         budget = get_budget_for_coin(sym, usdt_balance)
@@ -920,11 +978,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         usdt_balance -= budget + budget * _fee_rate
 
-        score     = cached["score"]
         msg = (
             f"BOUGHT {sym} @ ${fill_price:.4f} "
             f"| qty={qty:.6f} | EXIT TARGET=${exit_target:.4f} "
-            f"| signals={score}/4"
+            f"| {sig_str} | {bb_str} {m5_str} | count:{score}/6"
         )
         print(f"[RealtimeBuy] {msg}")
         database.log_activity(msg, "info")
@@ -1387,13 +1444,18 @@ async def _refresh_signal_cache():
     async def _refresh_one(session, sym: str) -> bool:
         import data_collector as _dc
         MIN = 16          # matches _dc._MIN_CANDLES — enough for RSI to fire
-        closes = volumes = None
+        closes = volumes = candles = None
 
-        # 1. Try Binance REST (fastest, most data)
+        # 1. Try Binance REST (fastest, most data — includes full OHLC for ATR)
         try:
             raw     = await _fetch_klines(session, sym)
             closes  = [float(k[4]) for k in raw]
             volumes = [float(k[5]) for k in raw]
+            candles = [
+                {"high": float(k[2]), "low": float(k[3]),
+                 "close": float(k[4]), "volume": float(k[5])}
+                for k in raw
+            ]
         except Exception:
             pass
 
@@ -1403,6 +1465,13 @@ async def _refresh_signal_cache():
             if len(db_rows) >= MIN:
                 closes  = [float(c["close"])  for c in db_rows]
                 volumes = [float(c["volume"]) for c in db_rows]
+                candles = [
+                    {"high":   float(c.get("high") or c["close"]),
+                     "low":    float(c.get("low")  or c["close"]),
+                     "close":  float(c["close"]),
+                     "volume": float(c["volume"])}
+                    for c in db_rows
+                ]
 
         # 3. Fall back to in-memory WebSocket candle buffer (no REST needed)
         #    This kicks in when Binance REST is geo-blocked from Railway's servers.
@@ -1412,14 +1481,19 @@ async def _refresh_signal_cache():
             if len(buf) >= MIN:
                 closes  = [float(r[4]) for r in buf]
                 volumes = [float(r[5]) for r in buf]
+                candles = [
+                    {"high": float(r[2]), "low": float(r[3]),
+                     "close": float(r[4]), "volume": float(r[5])}
+                    for r in buf
+                ]
 
-        # 4. Time-sampled price buffer (one price per 30 s) — meaningful RSI after 8 min.
-        #    Much better than raw ticks because prices span real time, not one second.
+        # 4. Time-sampled price buffer — meaningful RSI after 8 min; no OHLC.
         if not closes or len(closes) < MIN:
             samples = list(_dc.price_samples.get(sym, []))
             if len(samples) >= _dc._MIN_SAMPLES:
                 closes  = samples
                 volumes = [1.0] * len(samples)
+                candles = [{"high": c, "low": c, "close": c, "volume": 1.0} for c in samples]
 
         # 5. Raw price-tick buffer — available in seconds but RSI quality is poor.
         #    Used only as last resort (first 8 minutes of uptime).
@@ -1428,11 +1502,38 @@ async def _refresh_signal_cache():
             if len(ticks) >= _dc._MIN_TICKS:
                 closes  = ticks
                 volumes = [1.0] * len(ticks)
+                candles = [{"high": c, "low": c, "close": c, "volume": 1.0} for c in ticks]
 
-        if closes and len(closes) >= MIN:
-            update_coin_signals(sym, closes, volumes)
-            return True
-        return False
+        if not (closes and len(closes) >= MIN and candles):
+            return False
+
+        # Evaluate 6 signals (ATR accurate only when real OHLC is available)
+        signals = evaluate_signals(candles)
+        score   = sum(signals.values())
+        rsi_list    = indicators.calc_rsi(closes, 14)
+        rsi_display = rsi_list[-2] if rsi_list[-2] is not None else 0.0
+
+        # BB veto — computed on the last completed candle (index -2)
+        bb_u, bb_m, _ = indicators.calc_bollinger(closes)
+        bb_ok = indicators.bb_buy_allowed(closes[-2], bb_u[-2], bb_m[-2])
+
+        # 5m timeframe veto — fetched once per coin per 60 s scan cycle
+        try:
+            candles_5m = await asyncio.to_thread(_dc.fetch_5m_candles, sym)
+            five_m_ok  = indicators.is_5m_bullish(candles_5m)
+        except Exception:
+            five_m_ok  = True  # don't block trades if 5m fetch fails
+
+        with _signal_cache_lock:
+            _signal_cache[sym] = {
+                "signals":  signals,
+                "score":    score,
+                "price":    closes[-1],
+                "rsi_val":  rsi_display,
+                "bb_ok":    bb_ok,
+                "5m_ok":    five_m_ok,
+            }
+        return True
 
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(
