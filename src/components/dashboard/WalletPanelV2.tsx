@@ -333,10 +333,15 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     if (!confirm(`Reset paper wallet to ${resetBal.toLocaleString()} USDT and clear all positions?`)) return;
     setResetting(true);
     try {
-      const res = await fetch(`${getRailwayUrl()}/api/reset`, { method: 'POST' }).catch(() => null);
-      if (!res?.ok) {
-        toast.error('Server reset failed — check Railway logs');
-        return;
+      // Only call Railway when in agent/server mode — pure-paper users without
+      // a Railway URL would otherwise always hit the network error path and
+      // never reach the Supabase reset below.
+      if (hasAgentData) {
+        const res = await fetch(`${getRailwayUrl()}/api/reset`, { method: 'POST' }).catch(() => null);
+        if (!res?.ok) {
+          toast.error('Server reset failed — check Railway logs');
+          return;
+        }
       }
 
       if (!hasAgentData) {
@@ -367,17 +372,34 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   // ── Compute portfolio totals (paper mode) ────────────────────────────────────
   // Number() casts guard against Supabase PostgREST returning NUMERIC columns as strings.
   const positionRows = effectivePositions.map(pos => {
-    const qty        = Number(pos.quantity);
-    const entryPrice = Number(pos.avg_entry_price);
+    // toNum: guarantees a finite, non-negative number — malformed Railway/Supabase
+    // rows (string "abc", null, or NaN-yielding parses) would otherwise propagate
+    // into pnl/pct as NaN and render as "NaN%" / impossibly large losses.
+    const toNum = (v: unknown) => {
+      const n = typeof v === 'number' ? v : parseFloat(String(v ?? ''));
+      return Number.isFinite(n) && n >= 0 ? n : 0;
+    };
+    const qty        = toNum(pos.quantity);
+    const entryPrice = toNum(pos.avg_entry_price);
     const coin       = pos.symbol.replace('USDT','');
-    const wsPrice    = parseFloat(prices[pos.symbol]?.price || '0');
+    const wsPrice    = toNum(prices[pos.symbol]?.price);
     const livePrice  = wsPrice > 0 ? wsPrice : entryPrice;
+    // Mark-to-market P&L — pure price movement since entry, NOT including
+    // round-trip fees. Matches the convention every major exchange uses for
+    // open-position display (Binance, Coinbase, Kraken). Fees are only
+    // realised on close, so showing them as a sunk loss on a fresh entry
+    // (which produced a confusing "-0.2% on every coin" display) is wrong.
+    // The exit-target shown alongside already accounts for fees.
+    const buyValue     = qty * entryPrice;
     const currentValue = qty * livePrice;
+    const pnl          = currentValue - buyValue;
+    let pct = entryPrice > 0 ? ((livePrice - entryPrice) / entryPrice) * 100 : 0;
+    if (!Number.isFinite(pct)) pct = 0;
+    if (pct < -100) pct = -100;
+    // costBasis kept for the cost-display row (still shown as "10.01 USDT").
     const costBasis    = qty * entryPrice / (1 - TAKER_FEE);
-    const pnl          = currentValue - costBasis;
-    const pct          = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
     const breakEven    = entryPrice * BREAK_EVEN;
-    return { coin, pos, qty, entryPrice, livePrice, currentValue, costBasis, pnl, pct, breakEven };
+    return { coin, pos, qty, entryPrice, livePrice, currentValue, buyValue, costBasis, pnl, pct, breakEven };
   });
 
   const paperPositionTotal = positionRows.reduce((s,r)=>s+r.currentValue, 0);
@@ -623,155 +645,9 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                 )}
               </div>
 
-              {/* Budget mode */}
-              <div>
-                <div className="text-[9px] uppercase tracking-widest text-muted-foreground mb-2">Trade Size Mode</div>
-                <div className="grid grid-cols-5 gap-1">
-                  {BUDGET_MODES.map(m => (
-                    <button
-                      key={m.key}
-                      onClick={() => { saveCfg({ budgetMode: m.key }); }}
-                      className={`flex flex-col items-center gap-0.5 py-2 px-1 rounded text-[9px] font-semibold border transition-colors
-                        ${walletCfg.budgetMode === m.key
-                          ? 'bg-accent text-accent-foreground border-accent'
-                          : 'bg-muted/20 text-muted-foreground border-border hover:border-accent/40 hover:text-foreground'
-                        }`}
-                    >
-                      {m.icon}
-                      <span>{m.label}</span>
-                      <span className="text-[7px] font-normal opacity-70 text-center leading-tight">{m.desc}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Mode-specific input — edits go to draftCfg, committed via Apply */}
-              <div className="bg-muted/20 rounded-md px-3 py-2.5 space-y-2">
-                {walletCfg.budgetMode === 'fixed' && (
-                  <div className="flex items-center gap-3">
-                    <span className="text-[10px] text-muted-foreground w-28">Amount per trade</span>
-                    <input
-                      type="number" min={10} step={10}
-                      value={draftCfg.budgetFixed}
-                      onChange={e => setDraftCfg(p => ({ ...p, budgetFixed: Math.max(10, Number(e.target.value)) }))}
-                      className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-accent"
-                    />
-                    <span className="text-[10px] text-muted-foreground">USDT per trade</span>
-                  </div>
-                )}
-                {walletCfg.budgetMode === 'percent' && (
-                  <div className="space-y-1.5">
-                    <div className="flex items-center gap-3">
-                      <span className="text-[10px] text-muted-foreground w-28">% of free balance</span>
-                      <input
-                        type="range" min={1} max={50} step={1}
-                        value={draftCfg.budgetPct}
-                        onChange={e => setDraftCfg(p => ({ ...p, budgetPct: Number(e.target.value) }))}
-                        className="flex-1 accent-accent"
-                      />
-                      <span className="text-sm font-mono font-bold w-10 text-right">{draftCfg.budgetPct}%</span>
-                    </div>
-                    <div className="text-[9px] text-muted-foreground">
-                      At {effectiveUsdtFree.toFixed(0)} USDT free → <span className="text-accent font-mono">{(effectiveUsdtFree * draftCfg.budgetPct / 100).toFixed(2)} USDT</span> per trade
-                      {hasPendingBudget && <span className="ml-2 text-warn">(pending — click Apply)</span>}
-                    </div>
-                  </div>
-                )}
-                {walletCfg.budgetMode === 'capped' && (
-                  <div className="flex items-center gap-3">
-                    <span className="text-[10px] text-muted-foreground w-28">Max total cap</span>
-                    <input
-                      type="number" min={50} step={50}
-                      value={draftCfg.budgetCap}
-                      onChange={e => setDraftCfg(p => ({ ...p, budgetCap: Math.max(50, Number(e.target.value)) }))}
-                      className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-accent"
-                    />
-                    <span className="text-[10px] text-muted-foreground">USDT total cap (÷ max positions per trade)</span>
-                  </div>
-                )}
-                {walletCfg.budgetMode === 'per_coin' && (
-                  <div className="space-y-1.5">
-                    <div className="text-[9px] text-muted-foreground mb-1">Fixed USDT budget per coin per trade</div>
-                    {watchCoins.map(sym => {
-                      const ticker = sym.replace('USDT', '');
-                      const val = draftCfg.budgetPerCoin[sym] ?? 100;
-                      return (
-                        <div key={sym} className="flex items-center gap-2">
-                          <span className="text-[10px] font-mono font-bold w-12">{ticker}</span>
-                          <input
-                            type="number" min={10} step={10}
-                            value={val}
-                            onChange={e => setDraftCfg(p => ({
-                              ...p,
-                              budgetPerCoin: { ...p.budgetPerCoin, [sym]: Math.max(10, Number(e.target.value)) },
-                            }))}
-                            className="w-20 bg-muted/40 border border-border rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-accent"
-                          />
-                          <span className="text-[9px] text-muted-foreground">USDT</span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-                {walletCfg.budgetMode === 'coin_pct' && (
-                  <div className="space-y-1.5">
-                    <div className="text-[9px] text-muted-foreground mb-1">
-                      % of free balance per coin — each trade uses that % of your current free USDT
-                    </div>
-                    {(() => {
-                      const totalPct = watchCoins.reduce((s, sym) => s + (draftCfg.budgetCoinPct[sym] ?? 5), 0);
-                      return (
-                        <>
-                          {watchCoins.map(sym => {
-                            const ticker = sym.replace('USDT', '');
-                            const pct = draftCfg.budgetCoinPct[sym] ?? 5;
-                            const usdtEst = effectiveUsdtFree * pct / 100;
-                            return (
-                              <div key={sym} className="flex items-center gap-2">
-                                <span className="text-[10px] font-mono font-bold w-12">{ticker}</span>
-                                <input
-                                  type="range" min={1} max={50} step={1}
-                                  value={pct}
-                                  onChange={e => setDraftCfg(p => ({
-                                    ...p,
-                                    budgetCoinPct: { ...p.budgetCoinPct, [sym]: Number(e.target.value) },
-                                  }))}
-                                  className="flex-1 accent-accent"
-                                />
-                                <span className="text-[10px] font-mono font-bold w-8 text-right text-accent">{pct}%</span>
-                                <span className="text-[9px] text-muted-foreground w-20 text-right">
-                                  ≈ {usdtEst.toFixed(0)} USDT
-                                </span>
-                              </div>
-                            );
-                          })}
-                          <div className={`text-[9px] mt-1 font-mono ${totalPct > 100 ? 'text-loss font-bold' : 'text-muted-foreground'}`}>
-                            Total allocated: {totalPct.toFixed(0)}% of free balance
-                            {totalPct > 100 && ' ⚠ exceeds 100% — reduce some coins'}
-                          </div>
-                        </>
-                      );
-                    })()}
-                  </div>
-                )}
-              </div>
-
-              {/* Apply button */}
-              <div className="flex items-center justify-between pt-1">
-                <span className="text-[9px] text-muted-foreground">
-                  {hasPendingBudget ? '● Unsaved changes' : '✓ Settings synced'}
-                </span>
-                <button
-                  onClick={commitDraft}
-                  className={`flex items-center gap-1.5 text-[10px] font-semibold px-3 py-1.5 rounded border transition-colors
-                    ${hasPendingBudget
-                      ? 'bg-accent text-accent-foreground border-accent hover:bg-accent/90'
-                      : 'bg-muted/30 text-muted-foreground border-border hover:border-accent/50'
-                    }`}
-                >
-                  <Check className="w-3 h-3" />
-                  Apply to Bot
-                </button>
+              {/* Trade Size Mode + budget allocation now live in the AI Agent panel */}
+              <div className="text-[9px] text-muted-foreground italic">
+                Trade Size Mode &amp; Bot Allocation moved to the AI Agent panel — configure them there.
               </div>
             </div>
           )}

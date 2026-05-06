@@ -43,6 +43,21 @@ export function useUpdateChecker(pollIntervalMs = 30_000) {
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data: VersionInfo = await resp.json();
 
+      // Always compare version + fingerprint first — this fires immediately when
+      // the server serves a newer version.json, regardless of deployId state.
+      const remoteFingerprint = `${data.commit}:${data.buildTime}`;
+      const versionChanged     = data.version !== LOCAL_VERSION;
+      const fingerprintChanged = remoteFingerprint !== LOCAL_FINGERPRINT;
+      if (versionChanged || fingerprintChanged) {
+        setUpdateAvailable(true);
+        setUpdating(true);
+        toast.loading(`New version v${data.version} deployed — reloading…`, { duration: 3000 });
+        setTimeout(hardReload, 2000);
+        return true;
+      }
+
+      // Same version: use deployId to catch same-version redeploys (e.g. config-only
+      // changes where version string didn't change but Railway restarted).
       if (data.deployId) {
         latestDeployIdRef.current = data.deployId;
         const seenDeploy = localStorage.getItem(SEEN_DEPLOY) ?? '';
@@ -51,22 +66,14 @@ export function useUpdateChecker(pollIntervalMs = 30_000) {
           return false;
         }
         if (data.deployId !== seenDeploy) {
-          // Auto-apply: store new id then reload immediately — no user click needed.
           localStorage.setItem(SEEN_DEPLOY, data.deployId);
           setUpdating(true);
-          toast.loading(`New version deployed — reloading…`, { duration: 3000 });
+          toast.loading('New deployment detected — reloading…', { duration: 3000 });
           setTimeout(hardReload, 2000);
           return true;
         }
-        return false;
       }
 
-      // Fallback: fingerprint comparison
-      const remote = `${data.commit}:${data.buildTime}`;
-      if (remote !== LOCAL_FINGERPRINT) {
-        setUpdateAvailable(true);
-        return true;
-      }
       return false;
     } catch {
       throw new Error('Could not reach server');

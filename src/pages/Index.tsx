@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import TopBar from '@/components/dashboard/TopBar';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import AITradingAgent from '@/components/dashboard/AITradingAgent';
@@ -69,7 +69,28 @@ const Index = () => {
   const [agentInitialBalance, setAgentInitialBalance] = useState(0);
   const [agentTrades, setAgentTrades] = useState<{side:'BUY'|'SELL';pnl:number|null;quantity:number;price:number}[]>([]);
 
-  const { prices, connected: wsConnected } = useBinanceWebSocket(selectedCoins);
+  // WebSocket subscribes to the UNION of user-selected coins AND every open
+  // position's symbol. Without including positions, the bot can hold a coin
+  // (opened by Claude's strategy beyond the user's watchlist) for which the
+  // frontend has no live price — the row then displays Now == Entry forever.
+  // The symbol set is sorted+joined and compared by string so a new
+  // agentPositions array reference (returned by every poll) does NOT cycle
+  // the WebSocket connection — only an actual content change does.
+  const positionSymbolKey = useMemo(
+    () => agentPositions.map(p => p.symbol).filter(Boolean).sort().join(','),
+    [agentPositions],
+  );
+  const selectedKey = useMemo(
+    () => [...selectedCoins].sort().join(','),
+    [selectedCoins],
+  );
+  const wsSymbols = useMemo(() => {
+    const set = new Set<string>(selectedKey ? selectedKey.split(',') : []);
+    if (positionSymbolKey) for (const s of positionSymbolKey.split(',')) set.add(s);
+    return Array.from(set);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedKey, positionSymbolKey]);
+  const { prices, connected: wsConnected } = useBinanceWebSocket(wsSymbols);
 
   useEffect(() => {
     (async () => {

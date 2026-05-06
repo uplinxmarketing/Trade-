@@ -73,6 +73,8 @@ _signal_cache: Dict[str, dict] = {}
 _signal_cache_lock = threading.Lock()
 _last_buy_check: float = 0.0
 _last_no_signal_log: float = 0.0   # throttle "no coins ready" log to once per 60 s
+_last_buy_scan_log: float = 0.0    # throttle "Buy scan: ..." to once per 30 s
+_last_at_capacity_log: float = 0.0 # throttle "at max capacity" log to once per 60 s
 
 # Per-coin timestamp of last inline tick-driven signal refresh
 _tick_signal_ts: Dict[str, float] = {}
@@ -113,10 +115,25 @@ def can_execute_buy(coin_cfg: dict, client) -> tuple[bool, str]:
 
 
 def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
-    """Return trade size in USDT based on BUDGET_MODE (config defaults or strategy.json overrides)."""
+    """Return trade size in USDT based on BUDGET_MODE (config defaults or strategy.json overrides).
+
+    If bot_allocation_usdt > 0, the bot is restricted to that USDT cap across all
+    concurrent positions — works identically in paper and live mode. The
+    "effective free" balance for budget math becomes:
+        min(free_usdt, allocation - sum_of_open_position_usdt)
+    """
     strategy = _load_strategy()
     mode = strategy.get("budget_mode", config.BUDGET_MODE)
     reinvest = bool(strategy.get("reinvest_profits", False))
+    allocation = float(strategy.get("bot_allocation_usdt", config.BOT_ALLOCATION_USDT))
+
+    # Apply allocation cap: subtract value already locked in open positions.
+    if allocation > 0:
+        with _positions_lock:
+            in_positions = sum(p.get("budget_usdt", 0.0) for p in _positions)
+        effective_free = max(0.0, min(free_usdt, allocation - in_positions))
+    else:
+        effective_free = free_usdt
 
     # Authoritative starting balance: DB setting (written at wallet reset) takes priority
     # over strategy.json so a stale initial_balance_usdt never inflates reinvest scaling.
@@ -133,7 +150,7 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
     elif mode == "percent":
         pct = float(strategy.get("budget_pct_of_free", config.BUDGET_PCT_OF_FREE))
         # percent mode already scales with balance — reinvest has no extra effect
-        return round(min(free_usdt * (pct / 100), free_usdt * 0.9), 2)
+        return round(min(effective_free * (pct / 100), effective_free * 0.9), 2)
 
     elif mode == "capped":
         cap = float(strategy.get("budget_total_cap_usdt", config.BUDGET_TOTAL_CAP_USDT))
@@ -151,7 +168,7 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
         coin_pct = strategy.get("budget_coin_pct", {})
         pct = float(coin_pct.get(symbol, 5.0))
         # coin_pct already scales with balance — no extra reinvest scaling needed
-        return round(min(free_usdt * (pct / 100), free_usdt * 0.9), 2)
+        return round(min(effective_free * (pct / 100), effective_free * 0.9), 2)
 
     else:
         base = config.BUDGET_FIXED_USDT
@@ -163,8 +180,8 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
         scale = max(0.5, min(2.0, free_usdt / initial))
         base = base * scale
 
-    # Hard cap: single trade never exceeds 40% of free USDT (prevents wallet wipeout)
-    return round(min(base, free_usdt * 0.4), 2)
+    # Hard cap: single trade never exceeds 40% of effective free USDT (prevents wallet wipeout)
+    return round(min(base, effective_free * 0.4), 2)
 
 
 # ── Cooldown helpers ──────────────────────────────────────────────────────────
@@ -227,8 +244,15 @@ def _apply_coin_restore(coins: list):
                 for sym in coins
             ]
             strat["updated_at"] = datetime.now(timezone.utc).isoformat()
-            with open(config.STRATEGY_FILE, "w") as f:
+            tmp = config.STRATEGY_FILE + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(strat, f, indent=2)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp, config.STRATEGY_FILE)
             print(f"[TradeEngine] Restored {len(coins)} coins from Supabase → strategy.json.")
     except Exception as ce:
         print(f"[TradeEngine] Coin restore to strategy.json failed: {ce}")
@@ -304,8 +328,15 @@ def load_positions_from_db():
             if hasattr(client, "_balances"):
                 with client._lock:
                     current = client._balances.get("USDT", 0.0)
-                # Only overwrite if local balance looks wrong (zero or default)
-                if current <= 0 or not rows:
+                # Restore from Supabase when:
+                #   a) local balance is zero / negative
+                #   b) no open positions in SQLite (fresh deploy / no volume)
+                #   c) balance is at the ENV starting default AND Supabase has a
+                #      meaningfully different value (paper_state was never persisted)
+                _starting_usdt = float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+                _at_default    = abs(current - _starting_usdt) < 0.01
+                _supa_differs  = abs(usdt - current) > 1.0
+                if current <= 0 or not rows or (_at_default and _supa_differs):
                     with client._lock:
                         client._balances["USDT"] = usdt
                         snapshot = dict(client._balances)
@@ -400,8 +431,16 @@ def _get_usdt_balance() -> float:
     return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
 
 
-def _floor_qty(qty: float, decimals: int = 6) -> float:
-    """Floor quantity to avoid Binance LOT_SIZE precision errors."""
+def _floor_qty(qty: float, decimals: int = 8) -> float:
+    """Floor quantity to avoid Binance LOT_SIZE precision errors.
+
+    Default is 8 decimal places — matches PaperClient's buy precision so the
+    sell quantity is never truncated below what was actually purchased.
+    (The old default of 6 dp caused a double-floor: paper buys stored 8 dp,
+    sells re-floored to 6 dp, silently discarding ~$0.04–$0.09 per BTC trade
+    and turning every profitable +0.5% exit into a ~−0.0099 USDT loss.)
+    For live Binance use the symbol-specific LOT_SIZE stepSize instead.
+    """
     factor = 10 ** decimals
     return math.floor(qty * factor) / factor
 
@@ -438,14 +477,20 @@ def _derive_bb_pos(price: float, candle: dict) -> Optional[str]:
     return "mid_zone"
 
 
-# ── Signal evaluation (Bug 2/3: extracted function, explicit 4-key dict) ─────
+# ── Signal evaluation — 6-signal dict ────────────────────────────────────────
 
-def evaluate_signals(closes: list, volumes: list) -> dict:
+def evaluate_signals(candles: list) -> dict:
     """
-    Evaluate all four technical signals on the last COMPLETED candle (index -2).
-    Returns exactly {"trend": bool, "rsi": bool, "macd": bool, "volume": bool}.
-    RSI bounds are config.RSI_BUY_MIN and config.RSI_BUY_MAX — never hardcoded.
+    Evaluate all six technical signals on the last COMPLETED candle (index -2).
+    Returns {"trend", "rsi", "macd", "volume", "obv", "atr"} — all booleans.
+
+    candles: list of dicts with keys close, volume, high, low.
+    When high/low are unavailable (tick data), pass high=low=close — ATR will
+    return None → atr_is_tradeable returns False → atr signal = False.
     """
+    closes  = [c["close"]  for c in candles]
+    volumes = [c["volume"] for c in candles]
+
     ema9        = indicators.calc_ema(closes, 9)
     ema21       = indicators.calc_ema(closes, 21)
     rsi_vals    = indicators.calc_rsi(closes, 14)
@@ -457,42 +502,63 @@ def evaluate_signals(closes: list, volumes: list) -> dict:
         and ema21[-2] is not None
         and ema9[-2] > ema21[-2]
     )
-    # RSI_BUY_MIN <= rsi <= RSI_BUY_MAX — both constants from config, never hardcoded
     rsi = bool(
         rsi_vals[-2] is not None
         and config.RSI_BUY_MIN <= rsi_vals[-2] <= config.RSI_BUY_MAX
     )
-    # MACD: histogram positive (matches frontend).
-    # Previously required histo[-2] > histo[-3] (rising), which silently blocked
-    # buys whenever histogram was positive but flattening.
+    # MACD: histogram positive AND rising (confirms momentum, not just a positive reading).
     macd = bool(
         histo[-2] is not None
+        and histo[-3] is not None
         and histo[-2] > 0
+        and histo[-2] > histo[-3]
     )
-    # Volume: current candle must exceed VOLUME_RATIO_MIN × 20-candle average.
-    # No OR fallback — volume counts toward 3-of-4 only if the ratio threshold is met.
     volume = bool(
         volumes[-2] is not None
         and vol_ma[-2] is not None
         and vol_ma[-2] > 0
         and volumes[-2] >= vol_ma[-2] * config.VOLUME_RATIO_MIN
     )
+    obv = indicators.obv_is_bullish(candles)
+    atr = indicators.atr_is_tradeable(
+        indicators.calc_atr(candles, config.ATR_PERIOD),
+        candles[-2]["close"],
+        config.ATR_MIN_PCT,
+        config.ATR_MAX_PCT,
+    )
 
-    return {"trend": trend, "rsi": rsi, "macd": macd, "volume": volume}
+    return {"trend": trend, "rsi": rsi, "macd": macd, "volume": volume, "obv": obv, "atr": atr}
 
 
 def update_coin_signals(symbol: str, closes: list, volumes: list):
-    """Update the signal cache on every kline close (WebSocket-driven)."""
-    if len(closes) < 16:  # 16 = minimum for RSI-14 to produce a valid value at [-2]
+    """Update the signal cache on every kline close (WebSocket-driven).
+
+    Builds minimal candle dicts (high=low=close) so OBV works correctly.
+    ATR signal will be False (atr_is_tradeable returns False when ATR=0) —
+    that is safe: the REST scan (_refresh_one) sets accurate ATR/BB/5m values
+    every 60 s and they are preserved here via the prev cache entry.
+    """
+    if len(closes) < 16:  # minimum for RSI-14 to produce a valid value at [-2]
         return
     try:
-        signals = evaluate_signals(closes, volumes)
+        candles = [
+            {"high": c, "low": c, "close": c, "volume": v}
+            for c, v in zip(closes, volumes)
+        ]
+        signals = evaluate_signals(candles)
         score   = sum(signals.values())
+        rsi_list    = indicators.calc_rsi(closes, 14)
+        rsi_display = rsi_list[-2] if rsi_list[-2] is not None else 0.0
+
         with _signal_cache_lock:
+            prev = _signal_cache.get(symbol, {})
             _signal_cache[symbol] = {
-                "signals": signals,
-                "score":   score,
-                "price":   closes[-1],
+                "signals":  signals,
+                "score":    score,
+                "price":    closes[-1],
+                "rsi_val":  rsi_display,
+                "bb_ok":    prev.get("bb_ok",  True),  # preserved from last REST scan
+                "5m_ok":    prev.get("5m_ok",  True),  # preserved from last REST scan
             }
     except Exception as e:
         print(f"[TradeEngine] Signal cache error {symbol}: {e}")
@@ -532,6 +598,10 @@ def _execute_sell(pos: dict, price: float, reason: str):
         with _selling_lock:
             _selling.discard(sym)
             _selling_ts.pop(sym, None)
+        # Always clear the smart-hold peak — even on sell failure — so that a
+        # later position re-opened on the same symbol doesn't inherit a stale
+        # high-water mark and instantly trip its trailing stop.
+        _pos_peaks.pop(sym, None)
 
 
 def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str, mode: str, now: str):
@@ -733,7 +803,19 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     with _positions_lock:
         n_open = len(_positions)
     if n_open >= max_pos:
-        return  # silently skip — already at capacity
+        # Periodic heartbeat so the user sees the bot is still alive at capacity.
+        # Without this, no buy logs are emitted while at max_positions and the
+        # UI looks like it has been paused for no reason.
+        global _last_at_capacity_log
+        _now_cap = time.time()
+        if _now_cap - _last_at_capacity_log >= 60.0:
+            _last_at_capacity_log = _now_cap
+            database.log_activity(
+                f"At max positions ({n_open}/{max_pos}) — bot active, "
+                f"waiting for an exit before opening new trades",
+                "info",
+            )
+        return  # already at capacity — buys resume automatically after a sell
 
     # Enforce configurable min_signals threshold (overrides config.MIN_SIGNALS_TO_BUY)
     min_sigs = int(strategy.get("min_signals", config.MIN_SIGNALS_TO_BUY))
@@ -752,15 +834,21 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     ts_now = datetime.now(_tz.utc).isoformat()
     mode   = get_mode()
 
-    # Log a readable snapshot so the activity log always shows what's happening
+    # Build the cache snapshot but only emit the activity log every 30 s — these
+    # writes hold the global DB lock and previously fired on every WS-tick scan,
+    # serializing the sell monitor and signal scanner behind them.
     with _signal_cache_lock:
         cache_snapshot = dict(_signal_cache)
     ready_syms = [s for s, v in cache_snapshot.items() if v["score"] >= min_sigs and s in approved]
-    database.log_activity(
-        f"Buy scan: USDT={usdt_balance:.2f} | {len(ready_syms)} coin(s) ready (min {min_sigs}/4 signals): "
-        + (", ".join(f"{s}(score={cache_snapshot[s]['score']})" for s in ready_syms[:6]) or "none"),
-        "info"
-    )
+    global _last_buy_scan_log
+    _now_ts = time.time()
+    if ready_syms or (_now_ts - _last_buy_scan_log) >= 30.0:
+        _last_buy_scan_log = _now_ts
+        database.log_activity(
+            f"Buy scan: USDT={usdt_balance:.2f} | {len(ready_syms)} coin(s) ready (min {min_sigs}/6 signals): "
+            + (", ".join(f"{s}(score={cache_snapshot[s]['score']})" for s in ready_syms[:6]) or "none"),
+            "info"
+        )
 
     for sym, cached in cache_snapshot.items():
         # Re-check capacity before every individual buy — the pre-loop check only
@@ -782,6 +870,37 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             already_held = any(p["symbol"] == sym for p in _positions)
 
         if already_held:
+            continue
+
+        # ── Hard veto checks: BB position and 5m trend ────────────────────────
+        # Both are populated by the REST scan (_refresh_one) every 60 s and
+        # preserved across kline-close updates.  Default True = not blocking.
+        sigs    = cached.get("signals", {})
+        bb_ok   = cached.get("bb_ok",  True)
+        five_ok = cached.get("5m_ok",  True)
+        score   = cached["score"]
+        rsi_v   = cached.get("rsi_val", 0.0)
+        sig_str = (
+            f"EMA{'↑' if sigs.get('trend')  else '↓'} "
+            f"RSI:{rsi_v:.0f} "
+            f"MACD{'+'  if sigs.get('macd')   else '-'} "
+            f"Vol{'✓'   if sigs.get('volume') else '✗'} "
+            f"OBV{'✓'   if sigs.get('obv')    else '✗'} "
+            f"ATR{'✓'   if sigs.get('atr')    else '✗'}"
+        )
+        bb_str  = "BB:PASS" if bb_ok   else "BB:FAIL"
+        m5_str  = "5m:PASS" if five_ok else "5m:FAIL"
+        if not bb_ok:
+            database.log_activity(
+                f"[SKIP] {sym}: price near upper Bollinger Band | "
+                f"{sig_str} | {bb_str} | SKIP(upper band)", "info"
+            )
+            continue
+        if not five_ok:
+            database.log_activity(
+                f"[SKIP] {sym}: 5m downtrend | "
+                f"{sig_str} | {bb_str} {m5_str} | SKIP(5m downtrend)", "info"
+            )
             continue
 
         budget = get_budget_for_coin(sym, usdt_balance)
@@ -829,6 +948,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             pass
 
         exit_target = round(fill_price * _take_profit_mult, 8)
+        # Fresh position — clear any stale smart-hold peak left over from a prior
+        # sell on this symbol so the trailing stop starts from this entry alone.
+        _pos_peaks.pop(sym, None)
         pos_record = {
             "symbol":             sym,
             "entry_price":        fill_price,
@@ -863,11 +985,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         usdt_balance -= budget + budget * _fee_rate
 
-        score     = cached["score"]
         msg = (
             f"BOUGHT {sym} @ ${fill_price:.4f} "
             f"| qty={qty:.6f} | EXIT TARGET=${exit_target:.4f} "
-            f"| signals={score}/4"
+            f"| {sig_str} | {bb_str} {m5_str} | count:{score}/6"
         )
         print(f"[RealtimeBuy] {msg}")
         database.log_activity(msg, "info")
@@ -988,36 +1109,65 @@ def _fetch_rest_prices(symbols: list) -> Dict[str, float]:
     """
     Batch-fetch current prices via REST.
     Tries public CDN first (rarely geo-blocked from Railway), then API mirrors.
-    Timeout 2 s per URL, max 3 URLs tried — fast-fail so we never block for long.
+    If the multi-symbol batch endpoint fails, falls back to individual symbol
+    fetches so a single invalid/delisted coin can't block all prices.
+    Timeout 2 s per URL — fast-fail so we never block sell checks.
     """
     import urllib.request as _ur
     import urllib.parse as _up
+    if not symbols:
+        return {}
     result: Dict[str, float] = {}
+
+    def _parse_response(data) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        if isinstance(data, list):
+            for item in data:
+                s = item.get("symbol", "")
+                p = float(item.get("price", 0) or 0)
+                if s and p > 0:
+                    out[s] = p
+        elif isinstance(data, dict) and data.get("symbol"):
+            p = float(data.get("price", 0) or 0)
+            if p > 0:
+                out[data["symbol"]] = p
+        return out
+
     syms_param = _up.quote(json.dumps(symbols))
     for base in _KLINE_BASES[:3]:   # try at most 3 endpoints; fail fast
         try:
             url = f"{base}/api/v3/ticker/price?symbols={syms_param}"
             req = _ur.Request(url, headers={"User-Agent": "TradingBot/1.0"})
-            with _ur.urlopen(req, timeout=2) as resp:   # 2 s max — never block sell checks
+            with _ur.urlopen(req, timeout=2) as resp:
                 data = json.loads(resp.read())
-            if isinstance(data, list):
-                for item in data:
-                    s = item.get("symbol", "")
-                    p = float(item.get("price", 0) or 0)
-                    if s and p > 0:
-                        result[s] = p
-            elif isinstance(data, dict) and data.get("symbol"):
-                p = float(data.get("price", 0) or 0)
-                if p > 0:
-                    result[data["symbol"]] = p
+            result = _parse_response(data)
             if result:
                 return result
         except Exception:
             continue
+
+    # Batch endpoint failed on all bases — try individual fetches (slower but
+    # more reliable: a single delisted coin won't break all others).
+    if not result and len(symbols) <= 20:  # cap individual fetches to avoid flooding
+        for sym in symbols:
+            for base in _KLINE_BASES[:2]:
+                try:
+                    url = f"{base}/api/v3/ticker/price?symbol={sym}"
+                    req = _ur.Request(url, headers={"User-Agent": "TradingBot/1.0"})
+                    with _ur.urlopen(req, timeout=2) as resp:
+                        data = json.loads(resp.read())
+                    parsed = _parse_response(data)
+                    if parsed:
+                        result.update(parsed)
+                        break   # got price for this sym — next sym
+                except Exception:
+                    continue
+
     return result
 
 
 _price_refresher_thread: Optional[threading.Thread] = None
+_rest_fail_log_ts: float = 0.0   # throttle REST-failure warning to once per 60 s
 
 def _price_refresher_loop():
     """
@@ -1026,7 +1176,7 @@ def _price_refresher_loop():
     monitor so network I/O NEVER delays a sell check.
     """
     import data_collector as _dc
-    global _rest_px, _rest_px_ts
+    global _rest_px, _rest_px_ts, _rest_fail_log_ts
 
     while True:
         try:
@@ -1038,15 +1188,41 @@ def _price_refresher_loop():
                 if fetched:
                     _rest_px.update(fetched)
                     _rest_px_ts = time.time()
+                    # Inject into _dc.prices for position symbols that aren't in the
+                    # backend WebSocket subscription — ensures realtime_monitor and
+                    # the sell monitor both have prices for all held coins.
+                    for s, p in fetched.items():
+                        if s not in _dc.prices or _dc.prices[s] <= 0:
+                            _dc.prices[s] = p
                 else:
-                    # REST unavailable — fill gaps from signal cache
+                    # REST unavailable — log once per minute so Railway logs show it
+                    now_rf = time.time()
+                    if now_rf - _rest_fail_log_ts >= 60.0:
+                        _rest_fail_log_ts = now_rf
+                        missing = [p["symbol"] for p in snap if _rest_px.get(p["symbol"], 0) <= 0]
+                        try:
+                            database.log_activity(
+                                f"Price refresher: REST fetch returned empty for {all_syms}; "
+                                f"symbols with no price: {missing}", "warn"
+                            )
+                        except Exception:
+                            pass
+
+                    # Fill gaps from signal cache
                     with _signal_cache_lock:
                         for pos in snap:
                             s = pos["symbol"]
-                            if s not in _rest_px:
+                            if _rest_px.get(s, 0) <= 0:
                                 sc = _signal_cache.get(s)
                                 if sc and sc.get("price", 0) > 0:
                                     _rest_px[s] = sc["price"]
+                    # Last resort: carry forward any WS price we already have
+                    for pos in snap:
+                        s = pos["symbol"]
+                        if _rest_px.get(s, 0) <= 0:
+                            ws_p = _dc.prices.get(s, 0)
+                            if ws_p > 0:
+                                _rest_px[s] = ws_p
         except Exception:
             pass
         time.sleep(2.0)
@@ -1098,26 +1274,44 @@ def _sell_monitor_loop():
             # _rest_px is maintained by _price_refresher_loop — no I/O here.
             prices = dict(_dc.prices)
             for sym2, p2 in _rest_px.items():
-                prices[sym2] = p2   # REST always overrides stale WS prices
+                if p2 > 0:
+                    prices[sym2] = p2   # REST always overrides stale WS prices
+
+            # Signal-cache is the final fallback — fills gaps when both WS and
+            # REST are unavailable for a symbol (e.g. first 30 s after redeploy).
+            with _signal_cache_lock:
+                sc_snap = dict(_signal_cache)
+            for pos in snap:
+                s = pos["symbol"]
+                if prices.get(s, 0) <= 0:
+                    sc_p = sc_snap.get(s, {}).get("price", 0)
+                    if sc_p and sc_p > 0:
+                        prices[s] = sc_p
 
             # Diagnostic log every 60 s — shows ACTUAL sell target, not just breakeven
             now_t = time.time()
             if now_t - _sell_diag_ts >= 60.0:
                 _sell_diag_ts = now_t
                 lines = []
+                no_price_syms = []
                 for p in snap:
                     sym    = p["symbol"]
                     price  = prices.get(sym, 0.0)
                     entry  = p["entry_price"]
+                    if price <= 0:
+                        no_price_syms.append(sym)
+                        lines.append(f"{sym} NO_PRICE(entry={entry:.4f})")
+                        continue
                     actual = entry * _take_profit_mult   # real sell threshold
                     pct    = ((price - entry) / entry * 100) if entry else 0
                     lines.append(
                         f"{sym} entry={entry:.4f} cur={price:.4f}({pct:+.3f}%) "
                         f"target={actual:.4f}({'SELL' if price >= actual else 'hold'})"
                     )
-                database.log_activity(
-                    f"Sell monitor: {len(snap)} open — " + " | ".join(lines), "info"
-                )
+                msg = f"Sell monitor: {len(snap)} open — " + " | ".join(lines)
+                if no_price_syms:
+                    msg += f" | WARN: no price for {no_price_syms}"
+                database.log_activity(msg, "info")
 
             for pos in snap:
                 sym   = pos["symbol"]
@@ -1257,13 +1451,18 @@ async def _refresh_signal_cache():
     async def _refresh_one(session, sym: str) -> bool:
         import data_collector as _dc
         MIN = 16          # matches _dc._MIN_CANDLES — enough for RSI to fire
-        closes = volumes = None
+        closes = volumes = candles = None
 
-        # 1. Try Binance REST (fastest, most data)
+        # 1. Try Binance REST (fastest, most data — includes full OHLC for ATR)
         try:
             raw     = await _fetch_klines(session, sym)
             closes  = [float(k[4]) for k in raw]
             volumes = [float(k[5]) for k in raw]
+            candles = [
+                {"high": float(k[2]), "low": float(k[3]),
+                 "close": float(k[4]), "volume": float(k[5])}
+                for k in raw
+            ]
         except Exception:
             pass
 
@@ -1273,6 +1472,13 @@ async def _refresh_signal_cache():
             if len(db_rows) >= MIN:
                 closes  = [float(c["close"])  for c in db_rows]
                 volumes = [float(c["volume"]) for c in db_rows]
+                candles = [
+                    {"high":   float(c.get("high") or c["close"]),
+                     "low":    float(c.get("low")  or c["close"]),
+                     "close":  float(c["close"]),
+                     "volume": float(c["volume"])}
+                    for c in db_rows
+                ]
 
         # 3. Fall back to in-memory WebSocket candle buffer (no REST needed)
         #    This kicks in when Binance REST is geo-blocked from Railway's servers.
@@ -1282,14 +1488,19 @@ async def _refresh_signal_cache():
             if len(buf) >= MIN:
                 closes  = [float(r[4]) for r in buf]
                 volumes = [float(r[5]) for r in buf]
+                candles = [
+                    {"high": float(r[2]), "low": float(r[3]),
+                     "close": float(r[4]), "volume": float(r[5])}
+                    for r in buf
+                ]
 
-        # 4. Time-sampled price buffer (one price per 30 s) — meaningful RSI after 8 min.
-        #    Much better than raw ticks because prices span real time, not one second.
+        # 4. Time-sampled price buffer — meaningful RSI after 8 min; no OHLC.
         if not closes or len(closes) < MIN:
             samples = list(_dc.price_samples.get(sym, []))
             if len(samples) >= _dc._MIN_SAMPLES:
                 closes  = samples
                 volumes = [1.0] * len(samples)
+                candles = [{"high": c, "low": c, "close": c, "volume": 1.0} for c in samples]
 
         # 5. Raw price-tick buffer — available in seconds but RSI quality is poor.
         #    Used only as last resort (first 8 minutes of uptime).
@@ -1298,11 +1509,38 @@ async def _refresh_signal_cache():
             if len(ticks) >= _dc._MIN_TICKS:
                 closes  = ticks
                 volumes = [1.0] * len(ticks)
+                candles = [{"high": c, "low": c, "close": c, "volume": 1.0} for c in ticks]
 
-        if closes and len(closes) >= MIN:
-            update_coin_signals(sym, closes, volumes)
-            return True
-        return False
+        if not (closes and len(closes) >= MIN and candles):
+            return False
+
+        # Evaluate 6 signals (ATR accurate only when real OHLC is available)
+        signals = evaluate_signals(candles)
+        score   = sum(signals.values())
+        rsi_list    = indicators.calc_rsi(closes, 14)
+        rsi_display = rsi_list[-2] if rsi_list[-2] is not None else 0.0
+
+        # BB veto — computed on the last completed candle (index -2)
+        bb_u, bb_m, _ = indicators.calc_bollinger(closes)
+        bb_ok = indicators.bb_buy_allowed(closes[-2], bb_u[-2], bb_m[-2])
+
+        # 5m timeframe veto — fetched once per coin per 60 s scan cycle
+        try:
+            candles_5m = await asyncio.to_thread(_dc.fetch_5m_candles, sym)
+            five_m_ok  = indicators.is_5m_bullish(candles_5m)
+        except Exception:
+            five_m_ok  = True  # don't block trades if 5m fetch fails
+
+        with _signal_cache_lock:
+            _signal_cache[sym] = {
+                "signals":  signals,
+                "score":    score,
+                "price":    closes[-1],
+                "rsi_val":  rsi_display,
+                "bb_ok":    bb_ok,
+                "5m_ok":    five_m_ok,
+            }
+        return True
 
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(

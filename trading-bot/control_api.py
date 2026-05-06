@@ -22,7 +22,7 @@ from typing import Optional
 _DEPLOY_ID = str(uuid.uuid4())
 
 import uvicorn
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Response, Body
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -68,7 +68,12 @@ async def lifespan(app: FastAPI):
 
         # 4. Auto-resume trading — always start trading on deploy so no manual
         #    Start button press is required after a Railway update.
-        _write_strategy_patch({"trading_active": True, "pause_reason": None})
+        # Also anchor initial_balance_usdt on first auto-start so P&L % is correct.
+        _s = _load_strategy()
+        _auto_patch: dict = {"trading_active": True, "pause_reason": None}
+        if not _s.get("initial_balance_usdt"):
+            _auto_patch["initial_balance_usdt"] = _get_usdt_balance() or float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+        _write_strategy_patch(_auto_patch)
         steps.append("trading_active=True")
 
         # 5. History download — daemon thread, never blocks health-check
@@ -149,23 +154,62 @@ def _load_strategy() -> dict:
         return {}
 
 
+_strategy_write_lock = threading.Lock()
+
+
 def _write_strategy_patch(patch: dict):
-    s = _load_strategy()
-    s.update(patch)
-    with open(config.STRATEGY_FILE, "w") as f:
-        json.dump(s, f, indent=2)
+    """Atomic merge-and-write to strategy.json (lock-protected against concurrent saves).
+
+    Without atomicity, concurrent readers (sell monitor, signal scanner) may
+    catch the file mid-truncate and json.load raises — which silently turns
+    every default into the schema fallback (e.g. trading_active drops to True
+    or take_profit_mult resets to breakeven mid-trade)."""
+    with _strategy_write_lock:
+        s = _load_strategy()
+        s.update(patch)
+        tmp_path = config.STRATEGY_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(s, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, config.STRATEGY_FILE)
+    # Bust the /api/all response cache so a poll right after a write sees the
+    # updated trading_active / settings / approved coins immediately.
+    try:
+        _API_ALL_CACHE["data"] = None
+    except NameError:
+        pass
 
 
 def _get_positions():
     try:
-        from trade_engine import get_open_positions, _rest_px
+        from trade_engine import get_open_positions, _rest_px, _signal_cache, _signal_cache_lock
         from data_collector import prices
         pos = get_open_positions()
         out = []
         for p in pos:
             sym    = p["symbol"]
-            # Prefer REST cache (always fresh) over potentially stale WebSocket price
+            # Price priority chain — fall through to the next source whenever
+            # the previous one is missing or 0:
+            #   1. _rest_px  (REST refresh every 2 s — usually freshest)
+            #   2. WebSocket prices dict (sub-second updates when subscribed)
+            #   3. Latest cached signal price (60 s old at worst)
+            #   4. The position's entry price (so display never shows 0)
+            # Without 3 and 4 the frontend was rendering Now == Entry every
+            # time a single source briefly missed the symbol.
             price  = _rest_px.get(sym) or prices.get(sym, 0)
+            if not price:
+                with _signal_cache_lock:
+                    sc_entry = _signal_cache.get(sym)
+                if sc_entry and sc_entry.get("price", 0) > 0:
+                    price = sc_entry["price"]
+            # Do NOT fall back to entry_price here — returning entry_price as
+            # current_price causes the frontend to show 0 P&L change even when
+            # the WebSocket has a live price (the truthy entry_price short-circuits
+            # the || chain in the UI before the WS lookup is ever evaluated).
             entry  = p.get("entry_price", 0)
             qty    = p.get("quantity", 0)
             target = p.get("exit_target") or (entry * (1 + config.FEE_RATE_BNB * 2) if config.BNB_FEE_MODE else entry * 1.002)
@@ -181,6 +225,34 @@ def _get_positions():
                 "profitable":      price >= target if price and target else False,
             })
         return out
+    except Exception:
+        return []
+
+
+def _get_signal_snapshot() -> list:
+    """Return a compact snapshot of the live signal cache for each watched coin."""
+    try:
+        from trade_engine import _signal_cache, _signal_cache_lock
+        with _signal_cache_lock:
+            snap = dict(_signal_cache)
+        result = []
+        for sym, entry in snap.items():
+            sig  = entry.get("signals", {})
+            result.append({
+                "symbol":  sym,
+                "price":   entry.get("price", 0),
+                "score":   entry.get("score", 0),
+                "rsi":     entry.get("rsi_val", 0),
+                "bb_ok":   entry.get("bb_ok", True),
+                "5m_ok":   entry.get("5m_ok", True),
+                "trend":   bool(sig.get("trend")),
+                "rsi_ok":  bool(sig.get("rsi")),
+                "macd":    bool(sig.get("macd")),
+                "volume":  bool(sig.get("volume")),
+                "obv":     bool(sig.get("obv")),
+                "atr":     bool(sig.get("atr")),
+            })
+        return result
     except Exception:
         return []
 
@@ -283,8 +355,7 @@ def set_budget(amount: float):
     return {"ok": True, "new_budget": amount}
 
 
-@app.get("/config")
-def get_config():
+def _config_response():
     strategy = _load_strategy()
     return {
         "budget_mode":           strategy.get("budget_mode",           config.BUDGET_MODE),
@@ -293,20 +364,39 @@ def get_config():
         "budget_total_cap_usdt": strategy.get("budget_total_cap_usdt", config.BUDGET_TOTAL_CAP_USDT),
         "budget_per_coin":       strategy.get("budget_per_coin",       config.BUDGET_PER_COIN),
         "budget_coin_pct":       strategy.get("budget_coin_pct",       {}),
+        "bot_allocation_usdt":   strategy.get("bot_allocation_usdt",   config.BOT_ALLOCATION_USDT),
     }
 
-
-@app.post("/config")
-def update_config(body: dict):
+def _config_patch(body: dict):
     allowed_keys = {
         "budget_mode", "budget_fixed_usdt", "budget_pct_of_free",
         "budget_total_cap_usdt", "budget_per_coin", "budget_coin_pct",
+        "bot_allocation_usdt",
     }
-    patch = {k: v for k, v in body.items() if k in allowed_keys}
-    if not patch:
-        return {"error": "No valid config keys provided"}
-    _write_strategy_patch(patch)
-    return {"ok": True, "updated": list(patch.keys()), "config": patch}
+    try:
+        patch = {k: v for k, v in body.items() if k in allowed_keys}
+        if not patch:
+            return {"ok": False, "error": "No valid config keys provided"}
+        _write_strategy_patch(patch)
+        return {"ok": True, "updated": list(patch.keys()), "config": patch}
+    except Exception as e:
+        database.log_activity(f"Config save error: {e}", "error")
+        return Response(
+            content=json.dumps({"ok": False, "error": str(e)}),
+            status_code=500, media_type="application/json"
+        )
+
+@app.get("/config")
+def get_config(): return _config_response()
+
+@app.get("/api/config")
+def api_get_config(): return _config_response()
+
+@app.post("/config")
+def post_config(body: dict = Body(...)): return _config_patch(body)
+
+@app.post("/api/config")
+def api_post_config(body: dict = Body(...)): return _config_patch(body)
 
 
 @app.post("/mode/{mode}")
@@ -953,9 +1043,9 @@ def api_get_settings():
         "take_profit_pct":    s.get("take_profit_pct",    0.5),
         "smart_hold_enabled": s.get("smart_hold_enabled", False),
         "trailing_stop_pct":  s.get("trailing_stop_pct",  0.5),
-        "reinvest_profits":   s.get("reinvest_profits",   True),
+        "reinvest_profits":   s.get("reinvest_profits",   False),
         "max_positions":      s.get("max_positions",       10),
-        "min_signals":        s.get("min_signals",          2),
+        "min_signals":        s.get("min_signals",          config.MIN_SIGNALS_TO_BUY),
         "strategy_notes":     s.get("strategy_notes",      ""),
     }
 
@@ -976,25 +1066,32 @@ class SettingsRequest(BaseModel):
 @app.post("/api/settings")
 def api_save_settings(req: SettingsRequest):
     """Save bot risk/strategy settings into strategy.json."""
-    patch: dict = {}
-    if req.stop_loss_enabled   is not None: patch["stop_loss_enabled"]  = bool(req.stop_loss_enabled)
-    if req.stop_loss_pct       is not None: patch["stop_loss_pct"]      = max(0.1, min(20.0, req.stop_loss_pct))
-    if req.take_profit_enabled is not None: patch["take_profit_enabled"] = bool(req.take_profit_enabled)
-    if req.take_profit_pct     is not None: patch["take_profit_pct"]    = max(0.1, min(50.0, req.take_profit_pct))
-    if req.smart_hold_enabled  is not None: patch["smart_hold_enabled"] = bool(req.smart_hold_enabled)
-    if req.trailing_stop_pct   is not None: patch["trailing_stop_pct"]  = max(0.1, min(10.0, req.trailing_stop_pct))
-    if req.reinvest_profits     is not None: patch["reinvest_profits"]   = bool(req.reinvest_profits)
-    if req.max_positions       is not None: patch["max_positions"]      = max(1,   min(100,  req.max_positions))
-    if req.min_signals         is not None: patch["min_signals"]        = max(1,   min(4,    req.min_signals))
-    if req.strategy_notes      is not None: patch["strategy_notes"]     = req.strategy_notes[:2000]
-    if not patch:
-        return {"ok": False, "error": "No valid settings provided"}
-    _write_strategy_patch(patch)
-    database.log_activity(
-        "Settings updated: " + ", ".join(f"{k}={v}" for k, v in patch.items() if k != "strategy_notes"),
-        "info"
-    )
-    return {"ok": True, **patch}
+    try:
+        patch: dict = {}
+        if req.stop_loss_enabled   is not None: patch["stop_loss_enabled"]  = bool(req.stop_loss_enabled)
+        if req.stop_loss_pct       is not None: patch["stop_loss_pct"]      = max(0.1, min(20.0, req.stop_loss_pct))
+        if req.take_profit_enabled is not None: patch["take_profit_enabled"] = bool(req.take_profit_enabled)
+        if req.take_profit_pct     is not None: patch["take_profit_pct"]    = max(0.1, min(50.0, req.take_profit_pct))
+        if req.smart_hold_enabled  is not None: patch["smart_hold_enabled"] = bool(req.smart_hold_enabled)
+        if req.trailing_stop_pct   is not None: patch["trailing_stop_pct"]  = max(0.1, min(10.0, req.trailing_stop_pct))
+        if req.reinvest_profits    is not None: patch["reinvest_profits"]   = bool(req.reinvest_profits)
+        if req.max_positions       is not None: patch["max_positions"]      = max(1,   min(100,  req.max_positions))
+        if req.min_signals         is not None: patch["min_signals"]        = max(1,   min(6,    req.min_signals))
+        if req.strategy_notes      is not None: patch["strategy_notes"]     = req.strategy_notes[:2000]
+        if not patch:
+            return {"ok": False, "error": "No valid settings provided"}
+        _write_strategy_patch(patch)
+        database.log_activity(
+            "Settings updated: " + ", ".join(f"{k}={v}" for k, v in patch.items() if k != "strategy_notes"),
+            "info"
+        )
+        return {"ok": True, **patch}
+    except Exception as e:
+        database.log_activity(f"Settings save error: {e}", "error")
+        return Response(
+            content=json.dumps({"ok": False, "error": str(e)}),
+            status_code=500, media_type="application/json"
+        )
 
 
 @app.get("/api/ping")
@@ -1002,27 +1099,41 @@ def api_ping():
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
 
 
+# Tiny response cache — coalesces overlapping polls (the frontend has both a 5 s
+# and a 1 s interval; without this they each issue a full DB sweep, which holds
+# the global SQLite lock and starves the sell monitor for ~50 ms each call).
+_API_ALL_CACHE: dict = {"ts": 0.0, "data": None}
+_API_ALL_TTL = 0.8   # seconds — slightly less than the 1 s fast-poll cadence
+
+
 @app.get("/api/all")
 def api_all():
     """Single endpoint returning status + positions + trades + activity.
     Reduces frontend from 4 concurrent fetches to 1, cutting Railway load 4×."""
+    now_ts = time.time()
+    cached = _API_ALL_CACHE.get("data")
+    if cached is not None and (now_ts - _API_ALL_CACHE["ts"]) < _API_ALL_TTL:
+        return cached
+
     strategy = _load_strategy()
+    # Single 500-row sweep; reuse the slice for the 200-row "trades" payload —
+    # eliminates a second identical query that previously ran on every poll.
     trades   = database.get_recent_trades(limit=500)
     sells    = [t for t in trades if t.get("exit_price") is not None]
     wins     = sum(1 for t in sells if (t.get("net_profit") or 0) > 0)
-    # Realized P&L: SQL SUM — single source of truth matching /api/wallet
     realized = database.get_realized_pnl(mode="paper")
     initial  = float(strategy.get("initial_balance_usdt", 0))
     balance  = round(_get_usdt_balance(), 2)
     approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
-    return {
+    positions = _get_positions()  # also reused below — was called twice
+    payload = {
         "status": {
             "running":         strategy.get("trading_active", False),
             "mode":            get_mode(),
             "balance_usdt":    balance,
             "paper_balance":   balance,
             "initial_balance": initial or balance,
-            "open_positions":  len(_get_positions()),
+            "open_positions":  len(positions),
             "trades_today":    database.get_trades_today_count(),
             "win_rate":        round(wins / len(sells), 3) if sells else 0.0,
             "wins":            wins,
@@ -1038,15 +1149,19 @@ def api_all():
             "take_profit_pct":    strategy.get("take_profit_pct",    0.5),
             "smart_hold_enabled": strategy.get("smart_hold_enabled", False),
             "trailing_stop_pct":  strategy.get("trailing_stop_pct",  0.5),
-            "reinvest_profits":   strategy.get("reinvest_profits",   True),
+            "reinvest_profits":   strategy.get("reinvest_profits",   False),
             "max_positions":      strategy.get("max_positions",       10),
-            "min_signals":        strategy.get("min_signals",          2),
+            "min_signals":        strategy.get("min_signals",          config.MIN_SIGNALS_TO_BUY),
             "strategy_notes":     strategy.get("strategy_notes",      ""),
         },
-        "positions": _get_positions(),
-        "trades":    database.get_recent_trades(limit=200),
+        "positions": positions,
+        "trades":    trades[:200],
         "activity":  database.get_activity_log(limit=100),
+        "signals":   _get_signal_snapshot(),
     }
+    _API_ALL_CACHE["ts"]   = now_ts
+    _API_ALL_CACHE["data"] = payload
+    return payload
 
 
 @app.get("/api/debug")

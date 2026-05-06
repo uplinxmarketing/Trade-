@@ -85,7 +85,41 @@ def _fetch_klines_rest(symbol: str, interval: str, limit: int = 500):
     raise last_err
 
 
-def _compute_and_save(symbol: str, raw_klines: list):
+def fetch_5m_candles(symbol: str, limit: int = 30) -> list:
+    """Fetch 5-minute candles for multi-timeframe confirmation.
+    Returns a list of dicts with open/high/low/close/volume keys.
+    Tries each Binance base URL in order; returns [] on total failure.
+    """
+    for base in _BINANCE_BASES:
+        url = f"{base}/api/v3/klines?symbol={symbol}&interval=5m&limit={limit}"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                raw = json.loads(resp.read())
+            return [
+                {
+                    "open_time": int(k[0]),
+                    "open":      float(k[1]),
+                    "high":      float(k[2]),
+                    "low":       float(k[3]),
+                    "close":     float(k[4]),
+                    "volume":    float(k[5]),
+                }
+                for k in raw
+            ]
+        except Exception:
+            continue
+    return []
+
+
+def _compute_and_save(symbol: str, raw_klines: list, save_all: bool = False):
+    """Compute indicators and persist candles.
+
+    save_all=True:  used by the bulk REST history loader — every row is new
+    save_all=False (default): used by the WebSocket close handler, which passes
+        50 historical DB rows + 1 new row. Only the new row needs to be
+        persisted; the older 50 are already in the DB and re-saving them holds
+        the global SQLite lock for ~50 ms per coin per minute, which serialised
+        the sell monitor and other DB consumers."""
     if not raw_klines:
         return
 
@@ -108,6 +142,7 @@ def _compute_and_save(symbol: str, raw_klines: list):
     bb_u, bb_m, bb_l = indicators.calc_bollinger(closes)
     vol_ma_list  = indicators.calc_volume_ma(volumes, period=20)
 
+    last_idx = len(parsed) - 1
     for i, row in enumerate(parsed):
         price  = row["close"]
         ma20   = ma20_list[i]
@@ -126,7 +161,9 @@ def _compute_and_save(symbol: str, raw_klines: list):
         row["bb_position"]  = indicators.classify_bb_position(price, bb_upper, bb_mid, bb_lower)
         row["volume_trend"] = indicators.classify_volume_trend(volumes[:i+1]) if i >= 6 else "flat"
 
-        database.save_candle(symbol, config.CANDLE_TIMEFRAME, row)
+        # Skip writes for the historical rows — they're already in the DB.
+        if save_all or i == last_idx:
+            database.save_candle(symbol, config.CANDLE_TIMEFRAME, row)
 
 
 def download_history():
@@ -139,7 +176,7 @@ def download_history():
     for coin in config.WATCHED_COINS:
         try:
             raw = _fetch_klines_rest(coin, config.CANDLE_TIMEFRAME, limit=1000)
-            _compute_and_save(coin, raw)
+            _compute_and_save(coin, raw, save_all=True)
             print(f"  {coin}: {len(raw)} candles saved")
             time.sleep(0.3)  # be polite to Binance rate limits
         except Exception as e:
@@ -264,7 +301,7 @@ async def start_websocket():
             try:
                 for coin in active_coins:
                     raw = _fetch_klines_rest(coin, config.CANDLE_TIMEFRAME, limit=10)
-                    _compute_and_save(coin, raw)
+                    _compute_and_save(coin, raw, save_all=True)
             except Exception:
                 pass
 

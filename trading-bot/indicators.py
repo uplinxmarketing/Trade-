@@ -176,3 +176,75 @@ def calc_macd(
             histogram.append(m - s)
 
     return macd_line, sig_padded, histogram
+
+
+def bb_buy_allowed(close: float, bb_upper, bb_mid) -> bool:
+    """Hard veto: block buy when price is within 0.2% of the upper Bollinger Band."""
+    if bb_upper is None or bb_mid is None:
+        return True  # no data — don't block
+    if close >= bb_upper * 0.998:
+        return False  # overbought — skip
+    return True
+
+
+def is_5m_bullish(candles_5m: list) -> bool:
+    """Return True when the 5-minute EMA9 > EMA21 (uptrend on higher timeframe)."""
+    if not candles_5m or len(candles_5m) < 21:
+        return False
+    closes = [c["close"] for c in candles_5m]
+    ema9  = calc_ema(closes, 9)
+    ema21 = calc_ema(closes, 21)
+    if ema9[-1] is None or ema21[-1] is None:
+        return False
+    return ema9[-1] > ema21[-1]
+
+
+def calc_atr(candles: list, period: int = 14) -> Optional[float]:
+    """Average True Range over candles (list of dicts with high/low/close)."""
+    trs = []
+    for i in range(1, len(candles)):
+        high       = candles[i]["high"]
+        low        = candles[i]["low"]
+        prev_close = candles[i - 1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
+
+
+def atr_is_tradeable(
+    atr: Optional[float],
+    current_price: float,
+    min_pct: float = 0.0015,
+    max_pct: float = 0.015,
+) -> bool:
+    """True when ATR is between min_pct and max_pct of price (enough but not too volatile)."""
+    if atr is None or current_price <= 0:
+        return False
+    atr_pct = atr / current_price
+    return min_pct <= atr_pct <= max_pct
+
+
+def calc_obv(candles: list) -> list:
+    """On-Balance Volume — cumulative volume driven by price direction."""
+    obv = 0
+    result = [0]
+    for i in range(1, len(candles)):
+        if candles[i]["close"] > candles[i - 1]["close"]:
+            obv += candles[i]["volume"]
+        elif candles[i]["close"] < candles[i - 1]["close"]:
+            obv -= candles[i]["volume"]
+        result.append(obv)
+    return result
+
+
+def obv_is_bullish(candles: list, lookback: int = 3) -> bool:
+    """True when OBV is higher now than it was `lookback` candles ago (buying pressure)."""
+    obv = calc_obv(candles)
+    if len(obv) < lookback + 1:
+        return False
+    return obv[-1] > obv[-lookback - 1]
