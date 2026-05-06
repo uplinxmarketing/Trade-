@@ -409,8 +409,16 @@ def _get_usdt_balance() -> float:
     return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
 
 
-def _floor_qty(qty: float, decimals: int = 6) -> float:
-    """Floor quantity to avoid Binance LOT_SIZE precision errors."""
+def _floor_qty(qty: float, decimals: int = 8) -> float:
+    """Floor quantity to avoid Binance LOT_SIZE precision errors.
+
+    Default is 8 decimal places — matches PaperClient's buy precision so the
+    sell quantity is never truncated below what was actually purchased.
+    (The old default of 6 dp caused a double-floor: paper buys stored 8 dp,
+    sells re-floored to 6 dp, silently discarding ~$0.04–$0.09 per BTC trade
+    and turning every profitable +0.5% exit into a ~−0.0099 USDT loss.)
+    For live Binance use the symbol-specific LOT_SIZE stepSize instead.
+    """
     factor = 10 ** decimals
     return math.floor(qty * factor) / factor
 
