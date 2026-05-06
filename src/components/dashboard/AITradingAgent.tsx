@@ -246,12 +246,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [liveSetupLoading, setLiveSetupLoading] = useState(false);
 
   // ── Setup wizard ─────────────────────────────────────────────────────────
-  const [setupComplete, setSetupComplete]     = useState(() => !!localStorage.getItem('bot_setup_done'));
-  const [setupBudgetMode, setSetupBudgetMode] = useState<'fixed'|'percent'|'capped'>('fixed');
-  const [setupBudgetValue, setSetupBudgetValue] = useState(10);
-  const [setupStopLoss, setSetupStopLoss]     = useState(2.0);
+  const [setupComplete, setSetupComplete] = useState(() => !!localStorage.getItem('bot_setup_done'));
+  const [setupStopLoss, setSetupStopLoss]   = useState(2.0);
   const [setupTakeProfit, setSetupTakeProfit] = useState(0.5);
-  const [savingSetup, setSavingSetup]         = useState(false);
+  const [savingSetup, setSavingSetup]       = useState(false);
 
   // Always server mode — the Python bot is always running on the same Railway instance.
   const isServerMode    = true;
@@ -283,19 +281,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     setActLog(prev => [`[${ts}] ${msg}`, ...prev].slice(0, 60));
   }, []);
 
-  // Pre-populate setup wizard from backend config (so returning users see their saved values).
+  // Pre-populate setup wizard SL/TP from backend settings (so returning users see their saved values).
   useEffect(() => {
-    fetch(`${railwayUrl}/api/config`, { cache: 'no-store' })
+    fetch(`${railwayUrl}/api/settings`, { cache: 'no-store' })
       .then(r => r.ok ? r.json() : null)
       .then((d: any) => {
         if (!d) return;
-        const modeMap: Record<string, 'fixed'|'percent'|'capped'> = {
-          fixed: 'fixed', percent: 'percent', capped: 'capped',
-        };
-        if (d.budget_mode && modeMap[d.budget_mode]) setSetupBudgetMode(modeMap[d.budget_mode]);
-        if (d.budget_mode === 'fixed'   && d.budget_fixed_usdt)     setSetupBudgetValue(d.budget_fixed_usdt);
-        if (d.budget_mode === 'percent' && d.budget_pct_of_free)    setSetupBudgetValue(d.budget_pct_of_free);
-        if (d.budget_mode === 'capped'  && d.budget_total_cap_usdt) setSetupBudgetValue(d.budget_total_cap_usdt);
         if (d.stop_loss_pct  > 0) setSetupStopLoss(d.stop_loss_pct);
         if (d.take_profit_pct > 0) setSetupTakeProfit(d.take_profit_pct);
       })
@@ -817,37 +808,33 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const confirmSetup = useCallback(async () => {
     setSavingSetup(true);
     try {
-      const budgetPayload: Record<string, unknown> = { budget_mode: setupBudgetMode };
-      if (setupBudgetMode === 'fixed')   budgetPayload.budget_fixed_usdt     = setupBudgetValue;
-      if (setupBudgetMode === 'percent') budgetPayload.budget_pct_of_free    = setupBudgetValue;
-      if (setupBudgetMode === 'capped')  budgetPayload.budget_total_cap_usdt = setupBudgetValue;
-
       const settingsPayload = {
-        stop_loss_enabled:  true,
-        stop_loss_pct:      setupStopLoss,
+        stop_loss_enabled:   true,
+        stop_loss_pct:       setupStopLoss,
         take_profit_enabled: true,
-        take_profit_pct:    setupTakeProfit,
+        take_profit_pct:     setupTakeProfit,
       };
 
-      await Promise.all([
-        fetch(`${railwayUrl}/api/config`,   { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(budgetPayload) }),
-        fetch(`${railwayUrl}/api/settings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settingsPayload) }),
-      ]);
+      await fetch(`${railwayUrl}/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(settingsPayload),
+      });
 
-      // Mirror risk values into the live settings draft so Settings panel is in sync.
+      // Mirror into live settings draft so Risk Settings panel stays in sync.
       setStopLossPct(setupStopLoss);
       setTakeProfitPct(setupTakeProfit);
       setSettingsDraft(d => ({ ...d, stopLossEnabled: true, stopLossPct: setupStopLoss, takeProfitEnabled: true, takeProfitPct: setupTakeProfit }));
 
       localStorage.setItem('bot_setup_done', '1');
       setSetupComplete(true);
-      toast.success('Setup saved — you can now start the bot');
+      toast.success('Risk settings saved — you can now start the bot');
     } catch {
-      toast.error('Failed to save setup — check Railway connection');
+      toast.error('Failed to save settings — check Railway connection');
     } finally {
       setSavingSetup(false);
     }
-  }, [setupBudgetMode, setupBudgetValue, setupStopLoss, setupTakeProfit, railwayUrl]);
+  }, [setupStopLoss, setupTakeProfit, railwayUrl]);
 
   // ── Start / Stop ─────────────────────────────────────────────────────────
   const toggleBot = async () => {
@@ -1547,45 +1534,16 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         ))}
       </div>
 
-      {/* ── Setup wizard (shown when setup not yet completed and bot is stopped) ── */}
+      {/* ── Setup wizard — risk settings only (Trade Size configured in Wallet panel) ── */}
       {!setupComplete && !isRunning && (
         <div className="bg-accent/10 border border-accent/40 rounded-lg px-4 py-3 space-y-3">
           <div className="flex items-center gap-2">
-            <Settings2 className="w-3.5 h-3.5 text-accent shrink-0" />
-            <span className="text-xs font-semibold text-accent">Configure before starting</span>
+            <Shield className="w-3.5 h-3.5 text-accent shrink-0" />
+            <span className="text-xs font-semibold text-accent">Set risk limits before starting</span>
           </div>
+          <p className="text-[10px] text-muted-foreground -mt-1">Trade Size &amp; budget are configured in the Wallet panel above.</p>
 
-          {/* Trade Size Mode */}
-          <div className="space-y-1.5">
-            <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Trade Size Mode</label>
-            <div className="grid grid-cols-3 gap-1">
-              {([['fixed','Fixed USDT'],['percent','% of Balance'],['capped','Capped Total']] as const).map(([val, label]) => (
-                <button key={val} onClick={() => setSetupBudgetMode(val)}
-                  className={`py-1.5 text-[11px] font-semibold rounded border transition-colors ${setupBudgetMode === val ? 'bg-accent text-accent-foreground border-accent' : 'border-border text-muted-foreground hover:border-accent/50'}`}>
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Budget value */}
-          <div className="space-y-1">
-            <label className="text-[10px] uppercase tracking-wider text-muted-foreground">
-              {setupBudgetMode === 'fixed'   ? 'Amount per trade (USDT)'
-               : setupBudgetMode === 'percent' ? '% of free balance per trade'
-               : 'Total capital cap (USDT)'}
-            </label>
-            <div className="flex items-center gap-2">
-              <input type="number" min="1" step={setupBudgetMode === 'percent' ? '1' : '1'}
-                max={setupBudgetMode === 'percent' ? '100' : '100000'}
-                value={setupBudgetValue}
-                onChange={e => setSetupBudgetValue(parseFloat(e.target.value) || 10)}
-                className="w-32 bg-muted/40 border border-border rounded px-2 py-1.5 text-sm font-mono focus:outline-none focus:border-accent/60" />
-              <span className="text-xs text-muted-foreground">{setupBudgetMode === 'percent' ? '%' : 'USDT'}</span>
-            </div>
-          </div>
-
-          {/* Risk: SL + TP */}
+          {/* Stop Loss + Take Profit */}
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1">
               <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Stop Loss %</label>
@@ -1612,7 +1570,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           <button onClick={confirmSetup} disabled={savingSetup}
             className="w-full py-2 text-sm font-semibold rounded bg-accent text-accent-foreground hover:bg-accent/80 disabled:opacity-50 transition-colors flex items-center justify-center gap-1.5">
             {savingSetup ? <span className="animate-spin">⟳</span> : <Check className="w-4 h-4" />}
-            {savingSetup ? 'Saving…' : 'Confirm & Enable Bot'}
+            {savingSetup ? 'Saving…' : 'Confirm Risk Settings & Enable Bot'}
           </button>
         </div>
       )}
@@ -1635,7 +1593,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           </p>
         : <p className="text-[10px] text-center text-muted-foreground -mt-2">
             {!setupComplete
-              ? 'Set trade size, budget, and risk settings above before starting'
+              ? 'Confirm your risk settings above, then start the bot'
               : isServerMode
                 ? 'Railway bot handles all trading 24/7 — no browser required'
                 : 'Sells on every price tick · Buys checked every 10s · EMA+RSI+MACD+Volume signals · no API key needed'}
