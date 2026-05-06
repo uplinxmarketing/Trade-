@@ -189,8 +189,10 @@ def _get_positions():
                     sc_entry = _signal_cache.get(sym)
                 if sc_entry and sc_entry.get("price", 0) > 0:
                     price = sc_entry["price"]
-            if not price:
-                price = p.get("entry_price", 0)
+            # Do NOT fall back to entry_price here — returning entry_price as
+            # current_price causes the frontend to show 0 P&L change even when
+            # the WebSocket has a live price (the truthy entry_price short-circuits
+            # the || chain in the UI before the WS lookup is ever evaluated).
             entry  = p.get("entry_price", 0)
             qty    = p.get("quantity", 0)
             target = p.get("exit_target") or (entry * (1 + config.FEE_RATE_BNB * 2) if config.BNB_FEE_MODE else entry * 1.002)

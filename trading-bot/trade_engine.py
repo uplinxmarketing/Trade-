@@ -1022,36 +1022,65 @@ def _fetch_rest_prices(symbols: list) -> Dict[str, float]:
     """
     Batch-fetch current prices via REST.
     Tries public CDN first (rarely geo-blocked from Railway), then API mirrors.
-    Timeout 2 s per URL, max 3 URLs tried — fast-fail so we never block for long.
+    If the multi-symbol batch endpoint fails, falls back to individual symbol
+    fetches so a single invalid/delisted coin can't block all prices.
+    Timeout 2 s per URL — fast-fail so we never block sell checks.
     """
     import urllib.request as _ur
     import urllib.parse as _up
+    if not symbols:
+        return {}
     result: Dict[str, float] = {}
+
+    def _parse_response(data) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        if isinstance(data, list):
+            for item in data:
+                s = item.get("symbol", "")
+                p = float(item.get("price", 0) or 0)
+                if s and p > 0:
+                    out[s] = p
+        elif isinstance(data, dict) and data.get("symbol"):
+            p = float(data.get("price", 0) or 0)
+            if p > 0:
+                out[data["symbol"]] = p
+        return out
+
     syms_param = _up.quote(json.dumps(symbols))
     for base in _KLINE_BASES[:3]:   # try at most 3 endpoints; fail fast
         try:
             url = f"{base}/api/v3/ticker/price?symbols={syms_param}"
             req = _ur.Request(url, headers={"User-Agent": "TradingBot/1.0"})
-            with _ur.urlopen(req, timeout=2) as resp:   # 2 s max — never block sell checks
+            with _ur.urlopen(req, timeout=2) as resp:
                 data = json.loads(resp.read())
-            if isinstance(data, list):
-                for item in data:
-                    s = item.get("symbol", "")
-                    p = float(item.get("price", 0) or 0)
-                    if s and p > 0:
-                        result[s] = p
-            elif isinstance(data, dict) and data.get("symbol"):
-                p = float(data.get("price", 0) or 0)
-                if p > 0:
-                    result[data["symbol"]] = p
+            result = _parse_response(data)
             if result:
                 return result
         except Exception:
             continue
+
+    # Batch endpoint failed on all bases — try individual fetches (slower but
+    # more reliable: a single delisted coin won't break all others).
+    if not result and len(symbols) <= 20:  # cap individual fetches to avoid flooding
+        for sym in symbols:
+            for base in _KLINE_BASES[:2]:
+                try:
+                    url = f"{base}/api/v3/ticker/price?symbol={sym}"
+                    req = _ur.Request(url, headers={"User-Agent": "TradingBot/1.0"})
+                    with _ur.urlopen(req, timeout=2) as resp:
+                        data = json.loads(resp.read())
+                    parsed = _parse_response(data)
+                    if parsed:
+                        result.update(parsed)
+                        break   # got price for this sym — next sym
+                except Exception:
+                    continue
+
     return result
 
 
 _price_refresher_thread: Optional[threading.Thread] = None
+_rest_fail_log_ts: float = 0.0   # throttle REST-failure warning to once per 60 s
 
 def _price_refresher_loop():
     """
@@ -1060,7 +1089,7 @@ def _price_refresher_loop():
     monitor so network I/O NEVER delays a sell check.
     """
     import data_collector as _dc
-    global _rest_px, _rest_px_ts
+    global _rest_px, _rest_px_ts, _rest_fail_log_ts
 
     while True:
         try:
@@ -1072,15 +1101,41 @@ def _price_refresher_loop():
                 if fetched:
                     _rest_px.update(fetched)
                     _rest_px_ts = time.time()
+                    # Inject into _dc.prices for position symbols that aren't in the
+                    # backend WebSocket subscription — ensures realtime_monitor and
+                    # the sell monitor both have prices for all held coins.
+                    for s, p in fetched.items():
+                        if s not in _dc.prices or _dc.prices[s] <= 0:
+                            _dc.prices[s] = p
                 else:
-                    # REST unavailable — fill gaps from signal cache
+                    # REST unavailable — log once per minute so Railway logs show it
+                    now_rf = time.time()
+                    if now_rf - _rest_fail_log_ts >= 60.0:
+                        _rest_fail_log_ts = now_rf
+                        missing = [p["symbol"] for p in snap if _rest_px.get(p["symbol"], 0) <= 0]
+                        try:
+                            database.log_activity(
+                                f"Price refresher: REST fetch returned empty for {all_syms}; "
+                                f"symbols with no price: {missing}", "warn"
+                            )
+                        except Exception:
+                            pass
+
+                    # Fill gaps from signal cache
                     with _signal_cache_lock:
                         for pos in snap:
                             s = pos["symbol"]
-                            if s not in _rest_px:
+                            if _rest_px.get(s, 0) <= 0:
                                 sc = _signal_cache.get(s)
                                 if sc and sc.get("price", 0) > 0:
                                     _rest_px[s] = sc["price"]
+                    # Last resort: carry forward any WS price we already have
+                    for pos in snap:
+                        s = pos["symbol"]
+                        if _rest_px.get(s, 0) <= 0:
+                            ws_p = _dc.prices.get(s, 0)
+                            if ws_p > 0:
+                                _rest_px[s] = ws_p
         except Exception:
             pass
         time.sleep(2.0)
@@ -1132,26 +1187,44 @@ def _sell_monitor_loop():
             # _rest_px is maintained by _price_refresher_loop — no I/O here.
             prices = dict(_dc.prices)
             for sym2, p2 in _rest_px.items():
-                prices[sym2] = p2   # REST always overrides stale WS prices
+                if p2 > 0:
+                    prices[sym2] = p2   # REST always overrides stale WS prices
+
+            # Signal-cache is the final fallback — fills gaps when both WS and
+            # REST are unavailable for a symbol (e.g. first 30 s after redeploy).
+            with _signal_cache_lock:
+                sc_snap = dict(_signal_cache)
+            for pos in snap:
+                s = pos["symbol"]
+                if prices.get(s, 0) <= 0:
+                    sc_p = sc_snap.get(s, {}).get("price", 0)
+                    if sc_p and sc_p > 0:
+                        prices[s] = sc_p
 
             # Diagnostic log every 60 s — shows ACTUAL sell target, not just breakeven
             now_t = time.time()
             if now_t - _sell_diag_ts >= 60.0:
                 _sell_diag_ts = now_t
                 lines = []
+                no_price_syms = []
                 for p in snap:
                     sym    = p["symbol"]
                     price  = prices.get(sym, 0.0)
                     entry  = p["entry_price"]
+                    if price <= 0:
+                        no_price_syms.append(sym)
+                        lines.append(f"{sym} NO_PRICE(entry={entry:.4f})")
+                        continue
                     actual = entry * _take_profit_mult   # real sell threshold
                     pct    = ((price - entry) / entry * 100) if entry else 0
                     lines.append(
                         f"{sym} entry={entry:.4f} cur={price:.4f}({pct:+.3f}%) "
                         f"target={actual:.4f}({'SELL' if price >= actual else 'hold'})"
                     )
-                database.log_activity(
-                    f"Sell monitor: {len(snap)} open — " + " | ".join(lines), "info"
-                )
+                msg = f"Sell monitor: {len(snap)} open — " + " | ".join(lines)
+                if no_price_syms:
+                    msg += f" | WARN: no price for {no_price_syms}"
+                database.log_activity(msg, "info")
 
             for pos in snap:
                 sym   = pos["symbol"]

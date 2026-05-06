@@ -1566,7 +1566,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           <div>
             <div className={`space-y-1.5 overflow-y-auto scrollbar-thin ${!showAllPositions && positions.length > ROWS_DEFAULT ? 'max-h-[500px]' : ''}`}>
               {displayedPositions.map(pos => {
-                const live   = pos.current_price || parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.avg_entry_price;
+                // WebSocket price is always fresher than the backend's ~2s REST snapshot.
+                // Using wsPrice first means we show live movement even when the backend
+                // returns current_price=0 (price sources temporarily unavailable).
+                const live   = parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.current_price || pos.avg_entry_price;
                 const qty    = Number(pos.quantity);
                 // Mark-to-market P&L: pure price movement since entry. Round-trip
                 // fee accounting (the previous formula) baked the buy+sell fee into
