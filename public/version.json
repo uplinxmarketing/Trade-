@@ -1,5 +1,5 @@
 {
-  "version": "5.6.0",
-  "buildTime": "2026-05-06T17:00:00.000Z",
-  "commit": "add-6-signal-indicators-bb-5m-atr-obv"
+  "version": "5.7.0",
+  "buildTime": "2026-05-06T18:00:00.000Z",
+  "commit": "fix-wizard-lag-signals-data-restore"
 }

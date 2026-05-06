@@ -328,8 +328,15 @@ def load_positions_from_db():
             if hasattr(client, "_balances"):
                 with client._lock:
                     current = client._balances.get("USDT", 0.0)
-                # Only overwrite if local balance looks wrong (zero or default)
-                if current <= 0 or not rows:
+                # Restore from Supabase when:
+                #   a) local balance is zero / negative
+                #   b) no open positions in SQLite (fresh deploy / no volume)
+                #   c) balance is at the ENV starting default AND Supabase has a
+                #      meaningfully different value (paper_state was never persisted)
+                _starting_usdt = float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+                _at_default    = abs(current - _starting_usdt) < 0.01
+                _supa_differs  = abs(usdt - current) > 1.0
+                if current <= 0 or not rows or (_at_default and _supa_differs):
                     with client._lock:
                         client._balances["USDT"] = usdt
                         snapshot = dict(client._balances)

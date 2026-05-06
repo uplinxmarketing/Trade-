@@ -68,7 +68,12 @@ async def lifespan(app: FastAPI):
 
         # 4. Auto-resume trading — always start trading on deploy so no manual
         #    Start button press is required after a Railway update.
-        _write_strategy_patch({"trading_active": True, "pause_reason": None})
+        # Also anchor initial_balance_usdt on first auto-start so P&L % is correct.
+        _s = _load_strategy()
+        _auto_patch: dict = {"trading_active": True, "pause_reason": None}
+        if not _s.get("initial_balance_usdt"):
+            _auto_patch["initial_balance_usdt"] = _get_usdt_balance() or float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+        _write_strategy_patch(_auto_patch)
         steps.append("trading_active=True")
 
         # 5. History download — daemon thread, never blocks health-check
@@ -208,6 +213,34 @@ def _get_positions():
                 "profitable":      price >= target if price and target else False,
             })
         return out
+    except Exception:
+        return []
+
+
+def _get_signal_snapshot() -> list:
+    """Return a compact snapshot of the live signal cache for each watched coin."""
+    try:
+        from trade_engine import _signal_cache, _signal_cache_lock
+        with _signal_cache_lock:
+            snap = dict(_signal_cache)
+        result = []
+        for sym, entry in snap.items():
+            sig  = entry.get("signals", {})
+            result.append({
+                "symbol":  sym,
+                "price":   entry.get("price", 0),
+                "score":   entry.get("score", 0),
+                "rsi":     entry.get("rsi_val", 0),
+                "bb_ok":   entry.get("bb_ok", True),
+                "5m_ok":   entry.get("5m_ok", True),
+                "trend":   bool(sig.get("trend")),
+                "rsi_ok":  bool(sig.get("rsi")),
+                "macd":    bool(sig.get("macd")),
+                "volume":  bool(sig.get("volume")),
+                "obv":     bool(sig.get("obv")),
+                "atr":     bool(sig.get("atr")),
+            })
+        return result
     except Exception:
         return []
 
@@ -1098,6 +1131,7 @@ def api_all():
         "positions": positions,
         "trades":    trades[:200],
         "activity":  database.get_activity_log(limit=100),
+        "signals":   _get_signal_snapshot(),
     }
     _API_ALL_CACHE["ts"]   = now_ts
     _API_ALL_CACHE["data"] = payload

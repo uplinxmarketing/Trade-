@@ -446,6 +446,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // Always-accessible "Agent Trading Settings" panel toggle (post-start editing)
   const [showAgentSettings, setShowAgentSettings]   = useState(false);
 
+  // Railway signal cache snapshot — populated from /api/all; used to show bot's
+  // actual live signal state (6-signal system) separately from the JS-computed signals.
+  const [railwaySignals, setRailwaySignals] = useState<any[]>([]);
+
   // Always server mode — the Python bot is always running on the same Railway instance.
   const isServerMode    = true;
   const isServerModeRef = useRef(true);
@@ -574,6 +578,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         runCycleRef.current?.().then(() => scheduleNextRef.current?.());
       }
     });
+    // In server mode loadData is a no-op — skip realtime subscription to avoid
+    // unnecessary Supabase connections that would fire no-op callbacks.
+    if (isServerMode) return;
     const ch = supabase.channel('ata-rt')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_trade_history' }, loadData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'paper_portfolio' }, loadData)
@@ -780,7 +787,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     // Retry once with a 2s delay if the first attempt fails.
     const attempt = async () => {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 10_000);
+      const timer = setTimeout(() => ctrl.abort(), 5_000);
       try {
         const res = await fetch(`${railwayUrl}/api/all`, { signal: ctrl.signal, cache: 'no-store' });
         clearTimeout(timer);
@@ -796,8 +803,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     try {
       data = await attempt();
     } catch {
-      // one retry after 2 s
-      await new Promise(r => setTimeout(r, 2000));
+      // one immediate retry on failure
       try { data = await attempt(); }
       catch (e: any) {
         if (e.name !== 'AbortError') addLog(`[Railway] poll failed: ${e.message}`);
@@ -809,6 +815,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     const running = Boolean(s.running);
     // Reset wizard when poll detects bot stopped (handles stop from another tab/session).
     if (isRunningRef.current && !running) { setSetupComplete(false); setSettingsSynced(false); }
+    // When bot is already running (auto-started by Railway deploy), mark setup complete
+    // so the settings panel is accessible without requiring a manual wizard confirmation.
+    if (running) { setSetupComplete(true); setSettingsSynced(true); }
     isRunningRef.current = running;
     setIsRunning(running);
     const bal = Number(s.balance_usdt ?? 0);
@@ -898,6 +907,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     const tradePayload = sorted.map(t => ({ side: t.side, pnl: t.pnl, quantity: t.quantity, price: t.price }));
 
     onStateChangeRef.current?.(positionsRef.current, balanceRef.current, initialBalance, tradePayload);
+
+    // Update Railway signal cache snapshot (6-signal system from Python bot)
+    if (Array.isArray(data.signals) && data.signals.length > 0) {
+      setRailwaySignals(data.signals);
+    }
 
     const entries: string[] = (data.activity ?? []).map((e: any) => {
       const ts = new Date(e.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -1852,7 +1866,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       )}
 
       {/* ── Always-editable Agent Trading Settings (after setup, including while running) ── */}
-      {setupComplete && (
+      {(setupComplete || isRunning) && (
         <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-2">
           <button onClick={() => setShowAgentSettings(p => !p)} className="flex items-center justify-between w-full text-left">
             <div className="flex items-center gap-2">
@@ -1898,7 +1912,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       )}
 
       {/* ── Not-synced warning banner ── */}
-      {setupComplete && !settingsSynced && !isRunning && (
+      {(setupComplete || isRunning) && !settingsSynced && !isRunning && (
         <div className="flex items-center justify-between gap-2 bg-warn/10 border border-warn/40 rounded-md px-3 py-2">
           <p className="text-[10px] text-warn">⚠ Settings not yet saved to Railway — bot will use old values until synced.</p>
           <button onClick={() => saveAgentConfig()} disabled={savingSetup}
@@ -1911,7 +1925,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       {/* ── Start / Stop ── */}
       <Button onClick={toggleBot}
         disabled={loading || (!isRunning && !setupComplete) || (!isServerMode && !selectedCoins.length)}
-        className={`w-full font-semibold py-5 ${isRunning ? 'bg-loss/90 hover:bg-loss text-white' : setupComplete ? 'bg-gain/90 hover:bg-gain text-background' : 'bg-muted/60 text-muted-foreground cursor-not-allowed'}`}>
+        className={`w-full font-semibold py-5 ${isRunning ? 'bg-loss/90 hover:bg-loss text-white' : (setupComplete || isRunning) ? 'bg-gain/90 hover:bg-gain text-background' : 'bg-muted/60 text-muted-foreground cursor-not-allowed'}`}>
         {loading ? <span className="animate-spin mr-1.5">⟳</span>
           : isRunning
             ? <><Square className="w-4 h-4 mr-1.5"/>{isServerMode ? 'Pause Railway Bot' : 'Stop Agent'}</>
@@ -1926,7 +1940,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               : <>Every 10s: fetches live candles → checks EMA / RSI / MACD / Volume → buys or holds{agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}</>}
           </p>
         : <p className="text-[10px] text-center text-muted-foreground -mt-2">
-            {!setupComplete
+            {!setupComplete && !isRunning
               ? 'Confirm your risk settings above, then start the bot'
               : !settingsSynced
                 ? 'Sync settings to Railway above before starting'
@@ -1937,7 +1951,51 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       }
 
       {/* ── Live coin signals ── */}
-      {(coinSignals.length > 0 || scanning) && (
+      {/* In server mode: show Railway bot's 6-signal cache if available, else JS scan */}
+      {(isServerMode && railwaySignals.length > 0) ? (
+        <div>
+          <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2 flex items-center gap-1.5">
+            <Activity className="w-3 h-3 text-gain" />Bot Live Signals
+            <span className="text-[9px] text-gain font-mono">Railway · 6-signal</span>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-2">
+            {railwaySignals.map((sig: any) => {
+              const held = positions.some(p => p.symbol === sig.symbol);
+              const wsP  = parseFloat(pricesRef.current[sig.symbol]?.price || '0') || Number(sig.price);
+              const score = Number(sig.score ?? 0);
+              const isBuy = score >= 4 && sig.bb_ok !== false && sig['5m_ok'] !== false;
+              const vetoed = sig.bb_ok === false || sig['5m_ok'] === false;
+              return (
+                <div key={sig.symbol} className={`rounded-lg p-2.5 space-y-1.5 border ${isBuy&&!held?'bg-gain/5 border-gain/30':held?'border-accent/30 bg-accent/5':vetoed?'bg-loss/5 border-loss/20':'bg-secondary/40 border-border'}`}>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold font-mono">{sig.symbol.replace('USDT','')}</span>
+                    <span className={`text-[10px] font-bold ${isBuy&&!held?'text-gain':vetoed?'text-loss':'text-muted-foreground'}`}>
+                      {vetoed ? 'VETO' : `${score}/6`}
+                    </span>
+                  </div>
+                  <div className="text-xs font-mono">{wsP > 1 ? `${wsP.toLocaleString('en-US',{maximumFractionDigits:2})}` : `${wsP.toFixed(5)}`} USDT</div>
+                  {/* 6 signal dots: trend, rsi, macd, vol, obv, atr */}
+                  <div className="flex gap-0.5">
+                    {([['EMA',sig.trend],['RSI',sig.rsi_ok],['MACD',sig.macd],['Vol',sig.volume],['OBV',sig.obv],['ATR',sig.atr]] as [string,boolean][]).map(([label,on])=>(
+                      <div key={label} className={`flex-1 rounded-full text-center py-0.5 text-[8px] font-bold ${on?'bg-gain/20 text-gain':'bg-loss/10 text-loss/50'}`} title={label}>{label}</div>
+                    ))}
+                  </div>
+                  {sig.bb_ok === false && <div className="text-[9px] text-loss text-center">BB upper band</div>}
+                  {sig['5m_ok'] === false && <div className="text-[9px] text-loss text-center">5m downtrend</div>}
+                  {!held ? (
+                    <button onClick={() => forceBuy(sig.symbol)} disabled={!!forcingBuy}
+                      className="w-full text-[10px] py-1 rounded bg-gain/10 hover:bg-gain/20 text-gain font-semibold disabled:opacity-40 flex items-center justify-center gap-1">
+                      <ShoppingCart className="w-2.5 h-2.5" />{forcingBuy===sig.symbol?'…':'Force BUY'}
+                    </button>
+                  ) : (
+                    <div className="text-[10px] text-center text-accent font-semibold">Holding ✓</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : (coinSignals.length > 0 || scanning) ? (
         <div>
           <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2 flex items-center gap-1.5">
             <Activity className="w-3 h-3 text-accent" />Live Signals — last scan
@@ -1955,13 +2013,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                     </span>
                   </div>
                   <div className="text-xs font-mono">{wsP > 1 ? `${wsP.toLocaleString('en-US',{maximumFractionDigits:2})} USDT` : `${wsP.toFixed(5)} USDT`}</div>
-                  {/* 4 signal dots */}
                   <div className="flex gap-0.5">
                     {([['EMA',sig.emaBullish],['RSI',sig.rsiOk],['MACD',sig.macdPos],['Vol',sig.volUp]] as [string,boolean][]).map(([label,on])=>(
                       <div key={label} className={`flex-1 rounded-full text-center py-0.5 text-[8px] font-bold ${sig.signal==='loading'?'bg-muted/30 text-muted-foreground':on?'bg-gain/20 text-gain':'bg-loss/10 text-loss/50'}`} title={label}>{label}</div>
                     ))}
                   </div>
-                  {/* Force buy/sell */}
                   {!held ? (
                     <button onClick={() => forceBuy(sig.symbol)} disabled={!!forcingBuy||sig.signal==='error'}
                       className="w-full text-[10px] py-1 rounded bg-gain/10 hover:bg-gain/20 text-gain font-semibold disabled:opacity-40 flex items-center justify-center gap-1">
@@ -1975,7 +2031,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             })}
           </div>
         </div>
-      )}
+      ) : null}
 
       {/* ── Open positions ── */}
       <div>
