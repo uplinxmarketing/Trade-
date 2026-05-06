@@ -61,10 +61,14 @@ export function useUpdateChecker(pollIntervalMs = 30_000) {
         return false;
       }
 
-      // Fallback: fingerprint comparison
+      // Fallback: fingerprint comparison — auto-reload on mismatch so the user
+      // never has to click anything to receive updates.
       const remote = `${data.commit}:${data.buildTime}`;
       if (remote !== LOCAL_FINGERPRINT) {
         setUpdateAvailable(true);
+        setUpdating(true);
+        toast.loading(`New version v${data.version} deployed — reloading…`, { duration: 3000 });
+        setTimeout(hardReload, 2000);
         return true;
       }
       return false;
