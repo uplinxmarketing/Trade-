@@ -335,7 +335,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [liveSetupLoading, setLiveSetupLoading] = useState(false);
 
   // ── Setup wizard / Agent Trading Settings ────────────────────────────────
-  const [setupComplete, setSetupComplete]     = useState(() => !!localStorage.getItem('bot_setup_done'));
+  // v2 key bumped from 'bot_setup_done' so the new wizard (Trade Size + Allocation
+  // + Risk) gates the Start button for users who previously confirmed the v1 flow.
+  const [setupComplete, setSetupComplete]     = useState(() => !!localStorage.getItem('bot_setup_v2_done'));
   const [setupStopLoss, setSetupStopLoss]     = useState(2.0);
   const [setupTakeProfit, setSetupTakeProfit] = useState(0.5);
   const [savingSetup, setSavingSetup]         = useState(false);
@@ -960,7 +962,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const confirmSetup = useCallback(async () => {
     const ok = await saveAgentConfig();
     if (ok) {
-      localStorage.setItem('bot_setup_done', '1');
+      localStorage.setItem('bot_setup_v2_done', '1');
       setSetupComplete(true);
       toast.success('Configuration saved — you can now start the bot');
     }
