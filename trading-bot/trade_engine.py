@@ -115,10 +115,25 @@ def can_execute_buy(coin_cfg: dict, client) -> tuple[bool, str]:
 
 
 def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
-    """Return trade size in USDT based on BUDGET_MODE (config defaults or strategy.json overrides)."""
+    """Return trade size in USDT based on BUDGET_MODE (config defaults or strategy.json overrides).
+
+    If bot_allocation_usdt > 0, the bot is restricted to that USDT cap across all
+    concurrent positions — works identically in paper and live mode. The
+    "effective free" balance for budget math becomes:
+        min(free_usdt, allocation - sum_of_open_position_usdt)
+    """
     strategy = _load_strategy()
     mode = strategy.get("budget_mode", config.BUDGET_MODE)
     reinvest = bool(strategy.get("reinvest_profits", False))
+    allocation = float(strategy.get("bot_allocation_usdt", config.BOT_ALLOCATION_USDT))
+
+    # Apply allocation cap: subtract value already locked in open positions.
+    if allocation > 0:
+        with _positions_lock:
+            in_positions = sum(p.get("budget_usdt", 0.0) for p in _positions)
+        effective_free = max(0.0, min(free_usdt, allocation - in_positions))
+    else:
+        effective_free = free_usdt
 
     # Authoritative starting balance: DB setting (written at wallet reset) takes priority
     # over strategy.json so a stale initial_balance_usdt never inflates reinvest scaling.
@@ -135,7 +150,7 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
     elif mode == "percent":
         pct = float(strategy.get("budget_pct_of_free", config.BUDGET_PCT_OF_FREE))
         # percent mode already scales with balance — reinvest has no extra effect
-        return round(min(free_usdt * (pct / 100), free_usdt * 0.9), 2)
+        return round(min(effective_free * (pct / 100), effective_free * 0.9), 2)
 
     elif mode == "capped":
         cap = float(strategy.get("budget_total_cap_usdt", config.BUDGET_TOTAL_CAP_USDT))
@@ -153,7 +168,7 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
         coin_pct = strategy.get("budget_coin_pct", {})
         pct = float(coin_pct.get(symbol, 5.0))
         # coin_pct already scales with balance — no extra reinvest scaling needed
-        return round(min(free_usdt * (pct / 100), free_usdt * 0.9), 2)
+        return round(min(effective_free * (pct / 100), effective_free * 0.9), 2)
 
     else:
         base = config.BUDGET_FIXED_USDT
@@ -165,8 +180,8 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
         scale = max(0.5, min(2.0, free_usdt / initial))
         base = base * scale
 
-    # Hard cap: single trade never exceeds 40% of free USDT (prevents wallet wipeout)
-    return round(min(base, free_usdt * 0.4), 2)
+    # Hard cap: single trade never exceeds 40% of effective free USDT (prevents wallet wipeout)
+    return round(min(base, effective_free * 0.4), 2)
 
 
 # ── Cooldown helpers ──────────────────────────────────────────────────────────

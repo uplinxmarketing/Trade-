@@ -56,6 +56,11 @@ BUDGET_MODE           = "percent" # fixed | percent | capped | per_coin
 BUDGET_FIXED_USDT     = 100.0
 BUDGET_PCT_OF_FREE    = 5.0       # 5% of free USDT per trade
 BUDGET_TOTAL_CAP_USDT = 1000.0
+# Total USDT from the wallet that the bot is allowed to use (paper + live).
+# 0 = unlimited (use the entire free USDT balance). Min enforced on the
+# frontend = 5 USDT. The bot will never deploy more than this across all
+# concurrent open positions, so the user can keep the rest of the wallet safe.
+BOT_ALLOCATION_USDT   = 0.0
 BUDGET_PER_COIN = {
     "BTCUSDT":  200.0,
     "ETHUSDT":  150.0,

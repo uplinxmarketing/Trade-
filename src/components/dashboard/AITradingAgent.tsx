@@ -183,6 +183,95 @@ const RAILWAY_URL_KEY   = 'railway_bot_url';
 const AGENT_CYCLE_MS    = 30_000;
 const BEP_MULT          = 1 / Math.pow(1 - TAKER_FEE, 2);
 
+// ── Reusable Trade Size + Allocation + Risk fields ──────────────────────────
+// Shared between the pre-start wizard and the always-editable Agent Trading
+// Settings panel so the two never drift apart.
+interface AgentFieldsProps {
+  budgetMode: 'fixed'|'percent'|'capped';
+  setBudgetMode: (m: 'fixed'|'percent'|'capped') => void;
+  budgetValue: number;
+  setBudgetValue: (n: number) => void;
+  allocation: number;
+  setAllocation: (n: number) => void;
+  stopLoss: number;
+  setStopLoss: (n: number) => void;
+  takeProfit: number;
+  setTakeProfit: (n: number) => void;
+}
+const AgentTradingFields = ({
+  budgetMode, setBudgetMode, budgetValue, setBudgetValue,
+  allocation, setAllocation, stopLoss, setStopLoss, takeProfit, setTakeProfit,
+}: AgentFieldsProps) => (
+  <div className="space-y-3">
+    {/* Trade Size Mode */}
+    <div className="space-y-1.5">
+      <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Trade Size Mode</label>
+      <div className="grid grid-cols-3 gap-1">
+        {([['fixed','Fixed USDT'],['percent','% of Balance'],['capped','Capped Total']] as const).map(([val, label]) => (
+          <button key={val} onClick={() => setBudgetMode(val)}
+            className={`py-1.5 text-[11px] font-semibold rounded border transition-colors ${budgetMode === val ? 'bg-accent text-accent-foreground border-accent' : 'border-border text-muted-foreground hover:border-accent/50'}`}>
+            {label}
+          </button>
+        ))}
+      </div>
+    </div>
+
+    {/* Per-trade size value */}
+    <div className="space-y-1">
+      <label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+        {budgetMode === 'fixed'   ? 'Amount per trade (USDT)'
+         : budgetMode === 'percent' ? '% of free balance per trade'
+         : 'Total capital cap (USDT)'}
+      </label>
+      <div className="flex items-center gap-2">
+        <input type="number" min="1" step="1"
+          max={budgetMode === 'percent' ? '100' : '100000'}
+          value={budgetValue}
+          onChange={e => setBudgetValue(parseFloat(e.target.value) || 10)}
+          className="w-32 bg-muted/40 border border-border rounded px-2 py-1.5 text-sm font-mono focus:outline-none focus:border-accent/60" />
+        <span className="text-xs text-muted-foreground">{budgetMode === 'percent' ? '%' : 'USDT'}</span>
+      </div>
+    </div>
+
+    {/* Bot Allocation */}
+    <div className="space-y-1">
+      <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Bot Allocation from Wallet (USDT)</label>
+      <div className="flex items-center gap-2">
+        <input type="number" min="0" step="1"
+          value={allocation}
+          onChange={e => setAllocation(Math.max(0, parseFloat(e.target.value) || 0))}
+          className="w-32 bg-muted/40 border border-border rounded px-2 py-1.5 text-sm font-mono focus:outline-none focus:border-accent/60" />
+        <span className="text-xs text-muted-foreground">USDT (0 = unlimited · min 5)</span>
+      </div>
+      <p className="text-[9px] text-muted-foreground">Cap on total USDT the bot may deploy across all open positions. Applies to paper and live mode.</p>
+    </div>
+
+    {/* Risk: SL + TP */}
+    <div className="grid grid-cols-2 gap-3">
+      <div className="space-y-1">
+        <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Stop Loss %</label>
+        <div className="flex items-center gap-1.5">
+          <input type="number" min="0.1" max="20" step="0.1"
+            value={stopLoss}
+            onChange={e => setStopLoss(parseFloat(e.target.value) || 2)}
+            className="w-20 bg-muted/40 border border-border rounded px-2 py-1.5 text-sm font-mono focus:outline-none focus:border-loss/60" />
+          <span className="text-xs text-muted-foreground">%</span>
+        </div>
+      </div>
+      <div className="space-y-1">
+        <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Take Profit %</label>
+        <div className="flex items-center gap-1.5">
+          <input type="number" min="0.1" max="50" step="0.1"
+            value={takeProfit}
+            onChange={e => setTakeProfit(parseFloat(e.target.value) || 0.5)}
+            className="w-20 bg-muted/40 border border-border rounded px-2 py-1.5 text-sm font-mono focus:outline-none focus:border-gain/60" />
+          <span className="text-xs text-muted-foreground">%</span>
+        </div>
+      </div>
+    </div>
+  </div>
+);
+
 // ── Component ────────────────────────────────────────────────────────────────
 const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onCoinsChange, onStateChange }: AITradingAgentProps) => {
   const [mode, setMode]           = useState<'test' | 'live'>('test');
@@ -245,11 +334,18 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [showLiveSecret, setShowLiveSecret] = useState(false);
   const [liveSetupLoading, setLiveSetupLoading] = useState(false);
 
-  // ── Setup wizard ─────────────────────────────────────────────────────────
-  const [setupComplete, setSetupComplete] = useState(() => !!localStorage.getItem('bot_setup_done'));
-  const [setupStopLoss, setSetupStopLoss]   = useState(2.0);
+  // ── Setup wizard / Agent Trading Settings ────────────────────────────────
+  const [setupComplete, setSetupComplete]     = useState(() => !!localStorage.getItem('bot_setup_done'));
+  const [setupStopLoss, setSetupStopLoss]     = useState(2.0);
   const [setupTakeProfit, setSetupTakeProfit] = useState(0.5);
-  const [savingSetup, setSavingSetup]       = useState(false);
+  const [savingSetup, setSavingSetup]         = useState(false);
+  // Trade Size Mode (per-trade sizing) + per-mode value
+  const [setupBudgetMode, setSetupBudgetMode]   = useState<'fixed'|'percent'|'capped'>('fixed');
+  const [setupBudgetValue, setSetupBudgetValue] = useState(10);
+  // Bot Allocation: total USDT from wallet that the bot may use across all positions (0 = unlimited)
+  const [setupAllocation, setSetupAllocation]   = useState(0);
+  // Always-accessible "Agent Trading Settings" panel toggle (post-start editing)
+  const [showAgentSettings, setShowAgentSettings] = useState(false);
 
   // Always server mode — the Python bot is always running on the same Railway instance.
   const isServerMode    = true;
@@ -281,7 +377,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     setActLog(prev => [`[${ts}] ${msg}`, ...prev].slice(0, 60));
   }, []);
 
-  // Pre-populate setup wizard SL/TP from backend settings (so returning users see their saved values).
+  // Pre-populate from backend so returning users see their saved values.
   useEffect(() => {
     fetch(`${railwayUrl}/api/settings`, { cache: 'no-store' })
       .then(r => r.ok ? r.json() : null)
@@ -289,6 +385,18 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         if (!d) return;
         if (d.stop_loss_pct  > 0) setSetupStopLoss(d.stop_loss_pct);
         if (d.take_profit_pct > 0) setSetupTakeProfit(d.take_profit_pct);
+      })
+      .catch(() => {});
+    fetch(`${railwayUrl}/api/config`, { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : null)
+      .then((d: any) => {
+        if (!d) return;
+        const allowed: Record<string, 'fixed'|'percent'|'capped'> = { fixed: 'fixed', percent: 'percent', capped: 'capped' };
+        if (d.budget_mode && allowed[d.budget_mode]) setSetupBudgetMode(allowed[d.budget_mode]);
+        if (d.budget_mode === 'fixed'   && d.budget_fixed_usdt > 0)     setSetupBudgetValue(d.budget_fixed_usdt);
+        if (d.budget_mode === 'percent' && d.budget_pct_of_free > 0)    setSetupBudgetValue(d.budget_pct_of_free);
+        if (d.budget_mode === 'capped'  && d.budget_total_cap_usdt > 0) setSetupBudgetValue(d.budget_total_cap_usdt);
+        if (typeof d.bot_allocation_usdt === 'number') setSetupAllocation(d.bot_allocation_usdt);
       })
       .catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -804,10 +912,23 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     }
   }, [liveApiKey, liveApiSecret, railwayUrl, addLog, pollRailway]);
 
-  // ── Setup wizard confirm ──────────────────────────────────────────────────
-  const confirmSetup = useCallback(async () => {
+  // ── Persist agent trading config + risk to backend ─────────────────────────
+  // Used both by the pre-start wizard and the post-start editable panel.
+  const saveAgentConfig = useCallback(async (opts: { silent?: boolean } = {}) => {
+    if (setupAllocation > 0 && setupAllocation < 5) {
+      toast.error('Bot allocation must be at least 5 USDT (or 0 for unlimited)');
+      return false;
+    }
     setSavingSetup(true);
     try {
+      const budgetPayload: Record<string, unknown> = {
+        budget_mode:         setupBudgetMode,
+        bot_allocation_usdt: setupAllocation,
+      };
+      if (setupBudgetMode === 'fixed')   budgetPayload.budget_fixed_usdt     = setupBudgetValue;
+      if (setupBudgetMode === 'percent') budgetPayload.budget_pct_of_free    = setupBudgetValue;
+      if (setupBudgetMode === 'capped')  budgetPayload.budget_total_cap_usdt = setupBudgetValue;
+
       const settingsPayload = {
         stop_loss_enabled:   true,
         stop_loss_pct:       setupStopLoss,
@@ -815,26 +936,35 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         take_profit_pct:     setupTakeProfit,
       };
 
-      await fetch(`${railwayUrl}/api/settings`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(settingsPayload),
-      });
+      const [cfgRes, setRes] = await Promise.all([
+        fetch(`${railwayUrl}/api/config`,   { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(budgetPayload) }),
+        fetch(`${railwayUrl}/api/settings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settingsPayload) }),
+      ]);
+      if (!cfgRes.ok || !setRes.ok) throw new Error('save failed');
 
       // Mirror into live settings draft so Risk Settings panel stays in sync.
       setStopLossPct(setupStopLoss);
       setTakeProfitPct(setupTakeProfit);
       setSettingsDraft(d => ({ ...d, stopLossEnabled: true, stopLossPct: setupStopLoss, takeProfitEnabled: true, takeProfitPct: setupTakeProfit }));
 
-      localStorage.setItem('bot_setup_done', '1');
-      setSetupComplete(true);
-      toast.success('Risk settings saved — you can now start the bot');
+      if (!opts.silent) toast.success('Agent trading settings saved');
+      return true;
     } catch {
       toast.error('Failed to save settings — check Railway connection');
+      return false;
     } finally {
       setSavingSetup(false);
     }
-  }, [setupStopLoss, setupTakeProfit, railwayUrl]);
+  }, [setupBudgetMode, setupBudgetValue, setupAllocation, setupStopLoss, setupTakeProfit, railwayUrl]);
+
+  const confirmSetup = useCallback(async () => {
+    const ok = await saveAgentConfig();
+    if (ok) {
+      localStorage.setItem('bot_setup_done', '1');
+      setSetupComplete(true);
+      toast.success('Configuration saved — you can now start the bot');
+    }
+  }, [saveAgentConfig]);
 
   // ── Start / Stop ─────────────────────────────────────────────────────────
   const toggleBot = async () => {
@@ -1534,44 +1664,66 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         ))}
       </div>
 
-      {/* ── Setup wizard — risk settings only (Trade Size configured in Wallet panel) ── */}
+      {/* ── Pre-start Setup Wizard — Trade Size + Allocation + Risk ── */}
       {!setupComplete && !isRunning && (
         <div className="bg-accent/10 border border-accent/40 rounded-lg px-4 py-3 space-y-3">
           <div className="flex items-center gap-2">
-            <Shield className="w-3.5 h-3.5 text-accent shrink-0" />
-            <span className="text-xs font-semibold text-accent">Set risk limits before starting</span>
+            <Settings2 className="w-3.5 h-3.5 text-accent shrink-0" />
+            <span className="text-xs font-semibold text-accent">Configure agent before starting</span>
           </div>
-          <p className="text-[10px] text-muted-foreground -mt-1">Trade Size &amp; budget are configured in the Wallet panel above.</p>
 
-          {/* Stop Loss + Take Profit */}
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-1">
-              <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Stop Loss %</label>
-              <div className="flex items-center gap-1.5">
-                <input type="number" min="0.1" max="20" step="0.1"
-                  value={setupStopLoss}
-                  onChange={e => setSetupStopLoss(parseFloat(e.target.value) || 2)}
-                  className="w-20 bg-muted/40 border border-border rounded px-2 py-1.5 text-sm font-mono focus:outline-none focus:border-loss/60" />
-                <span className="text-xs text-muted-foreground">%</span>
-              </div>
-            </div>
-            <div className="space-y-1">
-              <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Take Profit %</label>
-              <div className="flex items-center gap-1.5">
-                <input type="number" min="0.1" max="50" step="0.1"
-                  value={setupTakeProfit}
-                  onChange={e => setSetupTakeProfit(parseFloat(e.target.value) || 0.5)}
-                  className="w-20 bg-muted/40 border border-border rounded px-2 py-1.5 text-sm font-mono focus:outline-none focus:border-gain/60" />
-                <span className="text-xs text-muted-foreground">%</span>
-              </div>
-            </div>
-          </div>
+          <AgentTradingFields
+            budgetMode={setupBudgetMode} setBudgetMode={setSetupBudgetMode}
+            budgetValue={setupBudgetValue} setBudgetValue={setSetupBudgetValue}
+            allocation={setupAllocation} setAllocation={setSetupAllocation}
+            stopLoss={setupStopLoss} setStopLoss={setSetupStopLoss}
+            takeProfit={setupTakeProfit} setTakeProfit={setSetupTakeProfit}
+          />
 
           <button onClick={confirmSetup} disabled={savingSetup}
             className="w-full py-2 text-sm font-semibold rounded bg-accent text-accent-foreground hover:bg-accent/80 disabled:opacity-50 transition-colors flex items-center justify-center gap-1.5">
             {savingSetup ? <span className="animate-spin">⟳</span> : <Check className="w-4 h-4" />}
-            {savingSetup ? 'Saving…' : 'Confirm Risk Settings & Enable Bot'}
+            {savingSetup ? 'Saving…' : 'Confirm & Enable Bot'}
           </button>
+        </div>
+      )}
+
+      {/* ── Always-editable Agent Trading Settings (after setup, including while running) ── */}
+      {setupComplete && (
+        <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-2">
+          <button onClick={() => setShowAgentSettings(p => !p)} className="flex items-center justify-between w-full text-left">
+            <div className="flex items-center gap-2">
+              <Banknote className="w-3.5 h-3.5 text-accent" />
+              <span className="text-xs font-semibold text-accent">Agent Trading Settings</span>
+            </div>
+            <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+              <span>Mode <span className="font-mono text-foreground">{setupBudgetMode}</span></span>
+              <span>·</span>
+              <span>Alloc <span className="font-mono text-foreground">{setupAllocation > 0 ? `${setupAllocation} USDT` : 'unlimited'}</span></span>
+              {showAgentSettings ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+            </div>
+          </button>
+          {showAgentSettings && (
+            <div className="space-y-3 pt-2">
+              <AgentTradingFields
+                budgetMode={setupBudgetMode} setBudgetMode={setSetupBudgetMode}
+                budgetValue={setupBudgetValue} setBudgetValue={setSetupBudgetValue}
+                allocation={setupAllocation} setAllocation={setSetupAllocation}
+                stopLoss={setupStopLoss} setStopLoss={setSetupStopLoss}
+                takeProfit={setupTakeProfit} setTakeProfit={setSetupTakeProfit}
+              />
+              <div className="flex items-center gap-2">
+                <span className="flex-1 text-[10px] text-muted-foreground italic">
+                  Edits apply to both paper and live mode. Allocation min is 5 USDT (0 = unlimited).
+                </span>
+                <button onClick={() => saveAgentConfig()} disabled={savingSetup}
+                  className="px-3 py-1 text-xs font-semibold rounded bg-accent text-accent-foreground hover:bg-accent/80 disabled:opacity-50 flex items-center gap-1">
+                  {savingSetup ? <span className="animate-spin">⟳</span> : <Check className="w-3 h-3" />}
+                  Save
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
