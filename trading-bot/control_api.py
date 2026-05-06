@@ -1309,6 +1309,38 @@ def api_update():
 # ── Futures agent endpoints ───────────────────────────────────────────────────
 # All endpoints below are additive only — no existing route is modified.
 
+@app.get("/api/futures/all")
+def api_futures_all():
+    """Single-call response combining status, positions, signals, and recent trades.
+
+    The frontend polls this instead of making 4 separate requests, cutting
+    network round-trips and keeping futures data consistent within a snapshot.
+    """
+    try:
+        import futures_engine
+        status    = futures_engine.get_futures_status()
+        positions = futures_engine.get_futures_positions()
+        signals   = futures_engine.get_futures_signals()
+    except Exception as exc:
+        status    = {"running": False, "balance": 0.0, "equity": 0.0,
+                     "positions": 0, "total_pnl": 0.0, "win_rate": 0.0,
+                     "trade_count": 0, "active": False}
+        positions = []
+        signals   = []
+
+    try:
+        trades = database.get_recent_futures_trades(30)
+    except Exception:
+        trades = []
+
+    return {
+        "status":    status,
+        "positions": positions,
+        "signals":   signals,
+        "trades":    trades,
+    }
+
+
 @app.get("/api/futures/status")
 def api_futures_status():
     try:

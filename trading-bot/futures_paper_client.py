@@ -30,8 +30,9 @@ class FuturesPaperClient:
         self._mark_prices: Dict[str, float] = {}
 
         saved = database.load_futures_state()
-        if saved and saved.get("USDT", 0) > 0:
-            self._usdt = float(saved["USDT"])
+        if saved is not None:
+            # Restore even if USDT is 0 — the user may have lost all margin
+            self._usdt = float(saved.get("USDT", starting_usdt))
             print(f"[FuturesPaper] Restored — USDT: {self._usdt:.2f}")
         else:
             self._usdt = starting_usdt
@@ -261,14 +262,13 @@ class FuturesPaperClient:
             self._positions.clear()
             self._mark_prices.clear()
 
-        # Wipe DB tables
-        import sqlite3
-        import os
-        db_path = database.DB_PATH
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        conn.execute("DELETE FROM futures_positions")
-        conn.execute("DELETE FROM futures_trades")
-        conn.commit()
-        conn.close()
+        # Wipe DB tables via the database module so the shared lock is respected
+        with database._lock:
+            conn = database._conn()
+            conn.execute("DELETE FROM futures_positions")
+            conn.execute("DELETE FROM futures_trades")
+            conn.commit()
+            conn.close()
+
         database.save_futures_state({"USDT": starting_usdt})
         print(f"[FuturesPaper] Reset to {starting_usdt:.2f} USDT")
