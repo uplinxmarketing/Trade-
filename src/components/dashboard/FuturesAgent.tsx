@@ -65,6 +65,8 @@ interface FuturesSignal {
 interface FuturesSettings {
   leverage: number;
   budget_usdt: number;
+  budget_mode: 'fixed' | 'percent';
+  budget_pct: number;
   take_profit_pct: number;
   stop_loss_pct: number;
   stop_loss_enabled: boolean;
@@ -259,8 +261,9 @@ const FuturesAgent = () => {
   const [trades, setTrades]       = useState<FuturesTrade[]>([]);
   const [signals, setSignals]     = useState<FuturesSignal[]>([]);
   const [settings, setSettings]   = useState<FuturesSettings>({
-    leverage: 5, budget_usdt: 200, take_profit_pct: 0.02,
-    stop_loss_pct: 0.01, stop_loss_enabled: true, min_signals: 3, max_positions: 5,
+    leverage: 5, budget_usdt: 200, budget_mode: 'fixed', budget_pct: 10,
+    take_profit_pct: 0.02, stop_loss_pct: 0.01, stop_loss_enabled: true,
+    min_signals: 2, max_positions: 5,
   });
 
   const [showSettings, setShowSettings] = useState(false);
@@ -294,9 +297,14 @@ const FuturesAgent = () => {
         arr.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
         setSignals(arr);
       }
-      // Sync SL toggle from server state
+      // Sync settings toggles from server state
       if (d.status?.stop_loss_enabled !== undefined) {
-        setSettings(s => ({ ...s, stop_loss_enabled: d.status.stop_loss_enabled }));
+        setSettings(s => ({
+          ...s,
+          stop_loss_enabled: d.status.stop_loss_enabled,
+          budget_mode: d.status.budget_mode ?? s.budget_mode,
+          budget_pct:  d.status.budget_pct  ?? s.budget_pct,
+        }));
       }
       setPollError(false);
     } catch {
@@ -370,6 +378,8 @@ const FuturesAgent = () => {
     const res = await postAction('/api/futures/settings', {
       leverage:          settings.leverage,
       budget_usdt:       settings.budget_usdt,
+      budget_mode:       settings.budget_mode,
+      budget_pct:        settings.budget_pct,
       take_profit_pct:   settings.take_profit_pct,
       stop_loss_pct:     settings.stop_loss_pct,
       stop_loss_enabled: settings.stop_loss_enabled,
@@ -514,12 +524,37 @@ const FuturesAgent = () => {
               </div>
             </div>
             <div>
-              <label className="text-[10px] text-muted-foreground">Margin / Trade (USDT)</label>
-              <input type="number" min={10} max={10000} step={10}
-                value={settings.budget_usdt}
-                onChange={e => setSettings(s => ({ ...s, budget_usdt: Number(e.target.value) }))}
-                className="w-full mt-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono"
-              />
+              <label className="text-[10px] text-muted-foreground">Budget Mode</label>
+              <div className="flex gap-1 mt-1">
+                {(['fixed', 'percent'] as const).map(m => (
+                  <button key={m}
+                    onClick={() => setSettings(s => ({ ...s, budget_mode: m }))}
+                    className={`flex-1 px-2 py-0.5 rounded text-[10px] font-medium border transition-colors ${
+                      settings.budget_mode === m
+                        ? 'bg-accent text-accent-foreground border-accent'
+                        : 'border-border text-muted-foreground hover:text-foreground'
+                    }`}
+                  >{m === 'fixed' ? 'Fixed $' : '% Balance'}</button>
+                ))}
+              </div>
+              {settings.budget_mode === 'fixed' ? (
+                <input type="number" min={10} max={10000} step={10}
+                  value={settings.budget_usdt}
+                  onChange={e => setSettings(s => ({ ...s, budget_usdt: Number(e.target.value) }))}
+                  className="w-full mt-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono"
+                  placeholder="USDT per trade"
+                />
+              ) : (
+                <div className="flex items-center gap-1 mt-1">
+                  <input type="number" min={1} max={100} step={1}
+                    value={settings.budget_pct}
+                    onChange={e => setSettings(s => ({ ...s, budget_pct: Number(e.target.value) }))}
+                    className="flex-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono"
+                    placeholder="% of balance"
+                  />
+                  <span className="text-[10px] text-muted-foreground">%</span>
+                </div>
+              )}
             </div>
             <div>
               <label className="text-[10px] text-muted-foreground">Max Open Positions</label>

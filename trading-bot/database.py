@@ -162,6 +162,7 @@ def init_db():
                 leverage          INTEGER NOT NULL DEFAULT 5,
                 take_profit       REAL,
                 stop_loss         REAL,
+                sl_enabled        INTEGER NOT NULL DEFAULT 1,
                 liquidation_price REAL,
                 funding_paid      REAL DEFAULT 0.0,
                 timestamp         TEXT NOT NULL
@@ -194,7 +195,8 @@ def init_db():
             "ALTER TABLE positions ADD COLUMN entry_ma_position  TEXT",
             "ALTER TABLE positions ADD COLUMN entry_bb_position  TEXT",
             "ALTER TABLE positions ADD COLUMN entry_volume_trend TEXT",
-            "ALTER TABLE positions ADD COLUMN exit_target         REAL",
+            "ALTER TABLE positions         ADD COLUMN exit_target  REAL",
+            "ALTER TABLE futures_positions ADD COLUMN sl_enabled   INTEGER NOT NULL DEFAULT 1",
         ]
         for sql in migrations:
             try:
@@ -598,12 +600,13 @@ def save_futures_position(pos: dict) -> Optional[int]:
         conn.execute("""
             INSERT INTO futures_positions
                 (symbol, direction, entry_price, quantity, margin_usdt, leverage,
-                 take_profit, stop_loss, liquidation_price, funding_paid, timestamp)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 take_profit, stop_loss, sl_enabled, liquidation_price, funding_paid, timestamp)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             pos["symbol"], pos["direction"], pos["entry_price"],
             pos["quantity"], pos["margin_usdt"], pos.get("leverage", 5),
             pos.get("take_profit"), pos.get("stop_loss"),
+            1 if pos.get("sl_enabled", True) else 0,
             pos.get("liquidation_price"), pos.get("funding_paid", 0.0),
             pos["timestamp"],
         ))

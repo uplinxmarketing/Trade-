@@ -1,5 +1,5 @@
 {
-  "version": "5.8.2",
-  "buildTime": "2026-05-06T22:00:00.000Z",
-  "commit": "fix-futures-signals-reports-sl-toggle"
+  "version": "5.8.3",
+  "buildTime": "2026-05-06T23:00:00.000Z",
+  "commit": "fix-futures-klines-settings-budget-mode"
 }
