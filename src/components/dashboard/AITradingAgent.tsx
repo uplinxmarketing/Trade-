@@ -1566,41 +1566,39 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           <div>
             <div className={`space-y-1.5 overflow-y-auto scrollbar-thin ${!showAllPositions && positions.length > ROWS_DEFAULT ? 'max-h-[500px]' : ''}`}>
               {displayedPositions.map(pos => {
-                // WebSocket price is always fresher than the backend's ~2s REST snapshot.
-                // Using wsPrice first means we show live movement even when the backend
-                // returns current_price=0 (price sources temporarily unavailable).
-                const live   = parseFloat(pricesRef.current[pos.symbol]?.price||'0') || pos.current_price || pos.avg_entry_price;
+                // WebSocket price takes priority — it's sub-second vs the backend's ~2s REST.
+                // hasLivePrice tracks whether we have a real market price so we can
+                // show a neutral colour when both sources are temporarily unavailable
+                // (e.g. first ~5 s after page load) instead of falsely green at 0%.
+                const wsPrice  = parseFloat(pricesRef.current[pos.symbol]?.price||'0');
+                const hasLivePrice = wsPrice > 0 || (pos.current_price != null && pos.current_price > 0);
+                const live   = wsPrice || pos.current_price || pos.avg_entry_price;
                 const qty    = Number(pos.quantity);
-                // Mark-to-market P&L: pure price movement since entry. Round-trip
-                // fee accounting (the previous formula) baked the buy+sell fee into
-                // a sunk loss, producing a misleading "-0.2% on every coin" display
-                // even when livePrice == entryPrice. Fees are realised on close;
-                // the exit target shown alongside already factors them in, so the
-                // user can read this row as "did the price move since I bought?"
+                // Mark-to-market P&L: pure price movement since entry.
                 const uPnl   = qty * (live - pos.avg_entry_price);
                 const pct    = pos.avg_entry_price > 0
                   ? ((live - pos.avg_entry_price) / pos.avg_entry_price) * 100 : 0;
                 const target = pos.exit_target ?? pos.avg_entry_price * BEP_MULT;
-                const prof   = live >= target;
+                const prof   = hasLivePrice && live >= target;
                 const toTarget = Math.min(100, Math.max(0, ((live - pos.avg_entry_price) / (target - pos.avg_entry_price)) * 100));
                 const budget = pos.avg_entry_price * qty / (1 - TAKER_FEE);
-                // Adaptive price precision: 4 decimals for "normal" coins (BTC,
-                // ETH), more for sub-cent tokens (FLOKI, SHIB, PEPE) so the user
-                // can actually see the price change instead of all rows showing
-                // identical "0.0000" values.
                 const pricePrecision = (p: number) =>
                   p >= 1 ? 4 : p >= 0.01 ? 5 : p >= 0.0001 ? 6 : 8;
                 const fmtP = (p: number) => p.toFixed(pricePrecision(p));
+                // Colour rules: green only when genuinely profitable, red when at a loss,
+                // muted/neutral when no live price has arrived yet (avoids false-green at 0%).
+                const pctColor  = !hasLivePrice ? 'text-muted-foreground' : pct  > 0 ? 'text-gain' : pct  < 0 ? 'text-loss' : 'text-muted-foreground';
+                const uPnlColor = !hasLivePrice ? 'text-muted-foreground' : uPnl > 0 ? 'text-gain' : uPnl < 0 ? 'text-loss' : 'text-muted-foreground';
                 return (
                   <div key={pos.symbol} className="bg-muted/20 border border-border/50 rounded-lg px-3 py-2.5 space-y-2">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
                         <div className={`w-1.5 h-1.5 rounded-full ${prof?'bg-gain animate-pulse':'bg-warn animate-pulse'}`}/>
                         <span className="font-mono font-bold text-sm">{pos.symbol.replace('USDT','')}</span>
-                        <span className={`text-xs font-mono font-bold ${pct>=0?'text-gain':'text-loss'}`}>{pct>=0?'+':''}{pct.toFixed(3)}%</span>
+                        <span className={`text-xs font-mono font-bold ${pctColor}`}>{pct>0?'+':''}{pct.toFixed(3)}%</span>
                       </div>
                       <div className="flex items-center gap-2">
-                        <span className={`font-mono text-xs font-bold ${uPnl>=0?'text-gain':'text-loss'}`}>{uPnl>=0?'+':''}{uPnl.toFixed(4)} USDT</span>
+                        <span className={`font-mono text-xs font-bold ${uPnlColor}`}>{uPnl>0?'+':''}{uPnl.toFixed(4)} USDT</span>
                         <button onClick={() => { if (window.confirm(`Sell ${pos.symbol.replace('USDT','')}? This closes the position at market price.`)) forceSell(pos); }} disabled={!!forcingSell}
                           className="text-[10px] px-2 py-1 rounded bg-loss/10 hover:bg-loss/20 text-loss font-semibold disabled:opacity-40 flex items-center gap-1">
                           <Banknote className="w-2.5 h-2.5"/>{forcingSell===pos.symbol?'…':'Sell'}
