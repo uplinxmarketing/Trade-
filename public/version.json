@@ -1,5 +1,5 @@
 {
-  "version": "5.5.3",
-  "buildTime": "2026-05-06T15:30:00.000Z",
-  "commit": "fix-wizard-always-show-and-error-toasts"
+  "version": "5.5.4",
+  "buildTime": "2026-05-06T16:00:00.000Z",
+  "commit": "fix-update-checker-version-first"
 }
