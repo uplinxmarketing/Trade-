@@ -387,13 +387,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [trailingStopPct, setTrailingStopPct]         = useState(0.5);
   const [reinvestProfits, setReinvestProfits]         = useState(false);
   const [maxPositions, setMaxPositions]               = useState(10);
-  const [minSignals, setMinSignals]                   = useState(2);
+  const [minSignals, setMinSignals]                   = useState(4);
   const [settingsDraft, setSettingsDraft]             = useState({
     stopLossEnabled: true, stopLossPct: 2.0,
     takeProfitEnabled: true, takeProfitPct: 0.5,
     smartHoldEnabled: false, trailingStopPct: 0.5,
     reinvestProfits: false,
-    maxPositions: 10, minSignals: 2,
+    maxPositions: 10, minSignals: 4,
   });
   const [savingSettings, setSavingSettings]       = useState(false);
   const [instructions, setInstructions]   = useState(() => localStorage.getItem(INSTRUCTIONS_KEY) ?? '');
@@ -441,7 +441,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [setupTrailingStop, setSetupTrailingStop]   = useState(0.5);
   const [setupReinvest, setSetupReinvest]           = useState(false);
   const [setupMaxPositions, setSetupMaxPositions]   = useState(10);
-  const [setupMinSignals, setSetupMinSignals]       = useState(2);
+  const [setupMinSignals, setSetupMinSignals]       = useState(4);
   const [savingSetup, setSavingSetup]               = useState(false);
   // Always-accessible "Agent Trading Settings" panel toggle (post-start editing)
   const [showAgentSettings, setShowAgentSettings]   = useState(false);

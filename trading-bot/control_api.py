@@ -1037,7 +1037,7 @@ def api_get_settings():
         "trailing_stop_pct":  s.get("trailing_stop_pct",  0.5),
         "reinvest_profits":   s.get("reinvest_profits",   False),
         "max_positions":      s.get("max_positions",       10),
-        "min_signals":        s.get("min_signals",          2),
+        "min_signals":        s.get("min_signals",          config.MIN_SIGNALS_TO_BUY),
         "strategy_notes":     s.get("strategy_notes",      ""),
     }
 
@@ -1143,7 +1143,7 @@ def api_all():
             "trailing_stop_pct":  strategy.get("trailing_stop_pct",  0.5),
             "reinvest_profits":   strategy.get("reinvest_profits",   False),
             "max_positions":      strategy.get("max_positions",       10),
-            "min_signals":        strategy.get("min_signals",          2),
+            "min_signals":        strategy.get("min_signals",          config.MIN_SIGNALS_TO_BUY),
             "strategy_notes":     strategy.get("strategy_notes",      ""),
         },
         "positions": positions,
