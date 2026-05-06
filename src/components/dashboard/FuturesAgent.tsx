@@ -17,6 +17,10 @@ interface FuturesStatus {
   win_rate: number;
   trade_count: number;
   stop_loss_enabled: boolean;
+  scan_count: number;
+  last_scan_at: string;
+  budget_mode: 'fixed' | 'percent';
+  budget_pct: number;
 }
 
 interface FuturesPosition {
@@ -471,6 +475,16 @@ const FuturesAgent = () => {
             <div className="text-xs font-mono font-semibold tabular-nums">{s.value}</div>
           </div>
         ))}
+      </div>
+
+      {/* ── Scan activity indicator ── */}
+      <div className="bg-muted/10 rounded-md px-2 py-1.5 flex items-center justify-between">
+        <span className="text-[10px] text-muted-foreground uppercase tracking-widest">Scanner</span>
+        <span className="text-[10px] font-mono text-muted-foreground">
+          {status?.scan_count
+            ? `#${status.scan_count} · ${status.last_scan_at ? new Date(status.last_scan_at).toLocaleTimeString() : '—'}`
+            : 'waiting…'}
+        </span>
       </div>
 
       {/* ── Start / Pause ── */}

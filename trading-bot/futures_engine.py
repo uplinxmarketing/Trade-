@@ -1,14 +1,14 @@
 """
-Futures paper-trading engine — v5.8.3
+Futures paper-trading engine — v5.8.4
 
 Two async coroutines:
   Loop A  mark_price_loop()     — WebSocket mark-price feed (best-effort)
   Loop B  signal_scanner_loop() — scores all coins every 60 s, opens/closes positions
 
-Klines are fetched from the spot REST endpoint (api.binance.com/api/v3/klines)
-which is the same format as the futures endpoint and is reliably reachable from
-Railway. When the fstream WebSocket hasn't connected yet, the closing price from
-the most recent 1m candle is used as the mark price so TP/SL checks still fire.
+Candle priority:
+  1. data_collector.ws_candles  — in-memory buffer populated by the spot WS (guaranteed fresh)
+  2. database.get_candles        — persisted 1m candles (filled from REST on startup)
+  3. api.binance.com REST        — fallback when both above are empty
 
 Signal system (6 signals, scored -1 / 0 / +1 each):
   1. trend   — close vs EMA20
@@ -48,6 +48,8 @@ _futures_signal_cache: Dict[str, dict] = {}
 _futures_signal_lock = threading.Lock()
 
 _futures_active = True
+_scan_count   = 0
+_last_scan_at = ""
 _futures_settings: dict = {
     "leverage":          config.FUTURES_LEVERAGE,
     "budget_usdt":       config.FUTURES_BUDGET_USDT,
@@ -118,6 +120,8 @@ def get_futures_status() -> dict:
         "stop_loss_enabled": settings.get("stop_loss_enabled", True),
         "budget_mode":       settings.get("budget_mode", "fixed"),
         "budget_pct":        settings.get("budget_pct", 10.0),
+        "scan_count":        _scan_count,
+        "last_scan_at":      _last_scan_at,
     }
 
 
@@ -277,13 +281,40 @@ def _score_signals(
     return net_score, signals
 
 
-# ── REST kline fetch (spot API — reliable from Railway) ──────────────────────
+# ── Candle fetch — three-tier priority ───────────────────────────────────────
 
-async def _fetch_klines(
-    session: aiohttp.ClientSession, symbol: str, limit: int = 60
+def _candles_from_ws_buffer(symbol: str, limit: int) -> dict:
+    """Pull candles from data_collector.ws_candles (in-memory, always fresh)."""
+    try:
+        import data_collector
+        buf = data_collector.ws_candles.get(symbol, [])
+        if len(buf) >= 26:
+            src     = buf[-limit:]
+            closes  = [float(row[4]) for row in src]
+            volumes = [float(row[5]) for row in src]
+            return {"closes": closes, "volumes": volumes, "source": "ws"}
+    except Exception as exc:
+        print(f"[FuturesEngine] ws_candles error {symbol}: {exc}")
+    return {}
+
+
+def _candles_from_db(symbol: str, limit: int) -> dict:
+    """Pull candles from the SQLite candles table (persisted by data_collector)."""
+    try:
+        rows = database.get_candles(symbol, "1m", limit)
+        if len(rows) >= 26:
+            closes  = [float(r["close"])  for r in rows]
+            volumes = [float(r["volume"]) for r in rows]
+            return {"closes": closes, "volumes": volumes, "source": "db"}
+    except Exception as exc:
+        print(f"[FuturesEngine] db candles error {symbol}: {exc}")
+    return {}
+
+
+async def _candles_from_rest(
+    session: aiohttp.ClientSession, symbol: str, limit: int
 ) -> dict:
-    """Fetch 1m candles using the spot REST endpoint (same format as fapi)."""
-    closes, volumes = [], []
+    """Fetch candles from Binance spot REST (reliable fallback)."""
     try:
         async with session.get(
             f"{SPOT_API_BASE}/api/v3/klines",
@@ -294,12 +325,27 @@ async def _fetch_klines(
                 data    = await resp.json()
                 closes  = [float(row[4]) for row in data]
                 volumes = [float(row[5]) for row in data]
+                if len(closes) >= 26:
+                    return {"closes": closes, "volumes": volumes, "source": "rest"}
+                print(f"[FuturesEngine] REST klines {symbol}: only {len(closes)} rows")
             else:
-                print(f"[FuturesEngine] klines {symbol}: HTTP {resp.status}")
+                print(f"[FuturesEngine] REST klines {symbol}: HTTP {resp.status}")
     except Exception as exc:
-        print(f"[FuturesEngine] klines error {symbol}: {exc}")
+        print(f"[FuturesEngine] REST klines error {symbol}: {exc}")
+    return {}
 
-    return {"closes": closes, "volumes": volumes}
+
+async def _fetch_klines(
+    session: aiohttp.ClientSession, symbol: str, limit: int = 60
+) -> dict:
+    """Return 1m candle closes+volumes from the best available source."""
+    result = _candles_from_ws_buffer(symbol, limit)
+    if result:
+        return result
+    result = _candles_from_db(symbol, limit)
+    if result:
+        return result
+    return await _candles_from_rest(session, symbol, limit)
 
 
 # ── Loop A — mark price WebSocket (best-effort) ───────────────────────────────
@@ -372,6 +418,7 @@ async def signal_scanner_loop():
 
 
 async def _run_scan():
+    global _scan_count, _last_scan_at
     if not _futures_active:
         return
 
@@ -391,6 +438,15 @@ async def _run_scan():
     sl_pct   = float(settings.get("stop_loss_pct",   config.FUTURES_STOP_LOSS_PCT))
     balance  = client.get_balance()
     budget   = _calc_budget(settings, balance)
+    n_open   = client.open_position_count()
+
+    _scan_count += 1
+    _last_scan_at = datetime.now(timezone.utc).isoformat()
+
+    database.log_activity(
+        f"[Futures] Scan #{_scan_count} start — bal={balance:.2f} USDT "
+        f"budget={budget:.0f} open={n_open}/{max_pos} min_sig={min_sig}/6", "info"
+    )
 
     # ── TP/SL/Liquidation check first (uses mark prices updated by scanner) ──
     closed = client.check_positions(sl_enabled=sl_enabled)
@@ -401,17 +457,29 @@ async def _run_scan():
         )
 
     # ── Scan all coins ────────────────────────────────────────────────────────
+    top_scores = []   # collect (score, symbol, direction) for summary log
     async with aiohttp.ClientSession() as session:
         for symbol in config.FUTURES_WATCHED_COINS:
             try:
-                await _scan_symbol(
+                score, direction = await _scan_symbol(
                     session, client, symbol,
                     min_sig, max_pos, leverage, budget,
                     tp_pct, sl_pct, sl_enabled,
                 )
+                if score != 0:
+                    top_scores.append((score, symbol, direction))
             except Exception as exc:
                 print(f"[FuturesEngine] scan error {symbol}: {exc}")
             await asyncio.sleep(0.1)   # rate-limit REST calls
+
+    if top_scores:
+        top_scores.sort(key=lambda x: abs(x[0]), reverse=True)
+        summary = " | ".join(
+            f"{sym}={sc:+d}({d})" for sc, sym, d in top_scores[:8]
+        )
+        database.log_activity(
+            f"[Futures] Scan #{_scan_count} scores — {summary}", "info"
+        )
 
 
 async def _scan_symbol(
@@ -425,13 +493,16 @@ async def _scan_symbol(
     tp_pct: float,
     sl_pct: float,
     sl_enabled: bool,
-):
+) -> tuple:
+    """Returns (score, direction_str) for summary logging."""
     data    = await _fetch_klines(session, symbol)
-    closes  = data["closes"]
-    volumes = data["volumes"]
+    closes  = data.get("closes", [])
+    volumes = data.get("volumes", [])
+    source  = data.get("source", "none")
 
     if len(closes) < 26:
-        return
+        print(f"[FuturesEngine] {symbol}: only {len(closes)} candles from {source}, skipping")
+        return 0, "NONE"
 
     # Mark price: prefer live fstream, fall back to latest kline close.
     # Always push into the client so check_positions() has a non-zero price.
@@ -453,13 +524,19 @@ async def _scan_symbol(
             "score":        score,
             "funding_rate": round(funding_rate * 100, 6),
             "signals":      signals,
+            "candle_source": source,
             "timestamp":    datetime.now(timezone.utc).isoformat(),
         }
 
-    n_open = client.open_position_count()
+    n_open    = client.open_position_count()
+    direction = "LONG" if score >= min_sig else ("SHORT" if score <= -min_sig else "NONE")
 
-    if score >= min_sig and n_open < max_pos:
-        if not client.has_open_position(symbol, "LONG"):
+    if score >= min_sig:
+        if n_open >= max_pos:
+            print(f"[FuturesEngine] {symbol} score={score:+d} LONG signal — max_pos {max_pos} reached")
+        elif client.has_open_position(symbol, "LONG"):
+            print(f"[FuturesEngine] {symbol} score={score:+d} — already long")
+        else:
             pos = client.open_position(
                 symbol, "LONG", mark_price, budget, leverage,
                 tp_pct, sl_pct, sl_enabled,
@@ -467,12 +544,21 @@ async def _scan_symbol(
             if pos:
                 database.log_activity(
                     f"[Futures] OPEN LONG {symbol} @ {mark_price:.4f} "
-                    f"score={score}/{min_sig} margin={budget:.0f} lev={leverage}x "
-                    f"TP={pos['take_profit']:.4f}", "info",
+                    f"score={score:+d}/{min_sig} margin={budget:.0f} lev={leverage}x "
+                    f"src={source} TP={pos['take_profit']:.4f}", "info",
+                )
+            else:
+                database.log_activity(
+                    f"[Futures] OPEN LONG {symbol} FAILED — open_position returned None "
+                    f"(score={score:+d} bal={client.get_balance():.2f})", "warning",
                 )
 
-    elif score <= -min_sig and n_open < max_pos:
-        if not client.has_open_position(symbol, "SHORT"):
+    elif score <= -min_sig:
+        if n_open >= max_pos:
+            print(f"[FuturesEngine] {symbol} score={score:+d} SHORT signal — max_pos {max_pos} reached")
+        elif client.has_open_position(symbol, "SHORT"):
+            print(f"[FuturesEngine] {symbol} score={score:+d} — already short")
+        else:
             pos = client.open_position(
                 symbol, "SHORT", mark_price, budget, leverage,
                 tp_pct, sl_pct, sl_enabled,
@@ -480,6 +566,13 @@ async def _scan_symbol(
             if pos:
                 database.log_activity(
                     f"[Futures] OPEN SHORT {symbol} @ {mark_price:.4f} "
-                    f"score={score}/{min_sig} margin={budget:.0f} lev={leverage}x "
-                    f"TP={pos['take_profit']:.4f}", "info",
+                    f"score={score:+d}/{min_sig} margin={budget:.0f} lev={leverage}x "
+                    f"src={source} TP={pos['take_profit']:.4f}", "info",
                 )
+            else:
+                database.log_activity(
+                    f"[Futures] OPEN SHORT {symbol} FAILED — open_position returned None "
+                    f"(score={score:+d} bal={client.get_balance():.2f})", "warning",
+                )
+
+    return score, direction
