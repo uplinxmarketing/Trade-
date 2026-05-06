@@ -12,6 +12,7 @@ import OrderFormPanel from '@/components/dashboard/OrderFormPanel';
 import WalletPanelV2 from '@/components/dashboard/WalletPanelV2';
 import ReportDashboard from '@/components/dashboard/ReportDashboard';
 import OrderBookPanel from '@/components/dashboard/OrderBookPanel';
+import FuturesAgent from '@/components/dashboard/FuturesAgent';
 import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
@@ -178,6 +179,9 @@ const Index = () => {
               }}
               onCoinsChange={setSelectedCoins}
             />
+
+            {/* Futures Paper-Trading Agent */}
+            <FuturesAgent />
 
             {/* Order Book & 24h Stats */}
             <OrderBookPanel activeCoin={activeCoin} prices={prices} />

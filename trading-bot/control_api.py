@@ -88,6 +88,14 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_supabase_periodic_sync())
         steps.append("async tasks launched")
 
+        # 8. Futures paper-trading agent (completely separate parallel process)
+        if config.FUTURES_ENABLED:
+            import futures_engine
+            futures_engine.init_futures_engine()
+            asyncio.create_task(futures_engine.mark_price_loop())
+            asyncio.create_task(futures_engine.signal_scanner_loop())
+            steps.append("futures tasks launched")
+
         msg = "Bot ready — " + " | ".join(steps)
         print(f"[ControlAPI] {msg}")
         database.log_activity(msg, "info")
@@ -1181,6 +1189,102 @@ def serve_version_json(response: Response):
 def api_update():
     """Railway deployments are handled automatically — the client just needs to reload."""
     return {"success": False, "message": "Reload to pick up the latest build"}
+
+
+# ── Futures agent endpoints ───────────────────────────────────────────────────
+# All endpoints below are additive only — no existing route is modified.
+
+@app.get("/api/futures/status")
+def api_futures_status():
+    try:
+        import futures_engine
+        return futures_engine.get_futures_status()
+    except Exception as exc:
+        return {"error": str(exc), "running": False, "balance": 0.0,
+                "equity": 0.0, "positions": 0, "total_pnl": 0.0,
+                "win_rate": 0.0, "trade_count": 0}
+
+
+@app.get("/api/futures/positions")
+def api_futures_positions():
+    try:
+        import futures_engine
+        return {"positions": futures_engine.get_futures_positions()}
+    except Exception as exc:
+        return {"positions": [], "error": str(exc)}
+
+
+@app.get("/api/futures/trades")
+def api_futures_trades():
+    try:
+        trades = database.get_recent_futures_trades(50)
+        return {"trades": trades}
+    except Exception as exc:
+        return {"trades": [], "error": str(exc)}
+
+
+@app.get("/api/futures/signals")
+def api_futures_signals():
+    try:
+        import futures_engine
+        return {"signals": futures_engine.get_futures_signals()}
+    except Exception as exc:
+        return {"signals": [], "error": str(exc)}
+
+
+@app.post("/api/futures/start")
+def api_futures_start():
+    try:
+        import futures_engine
+        futures_engine.set_futures_active(True)
+        database.log_activity("[Futures] Trading started", "info")
+        return {"success": True, "active": True}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.post("/api/futures/pause")
+def api_futures_pause():
+    try:
+        import futures_engine
+        futures_engine.set_futures_active(False)
+        database.log_activity("[Futures] Trading paused", "info")
+        return {"success": True, "active": False}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.post("/api/futures/settings")
+def api_futures_settings(body: dict = Body(...)):
+    try:
+        import futures_engine
+        allowed = {
+            "leverage", "budget_usdt", "take_profit_pct",
+            "stop_loss_pct", "min_signals", "max_positions",
+        }
+        patch = {k: v for k, v in body.items() if k in allowed}
+        if "leverage" in patch:
+            patch["leverage"] = max(1, min(20, int(patch["leverage"])))
+        if "min_signals" in patch:
+            patch["min_signals"] = max(1, min(6, int(patch["min_signals"])))
+        if "max_positions" in patch:
+            patch["max_positions"] = max(1, min(20, int(patch["max_positions"])))
+        futures_engine.update_futures_settings(patch)
+        return {"success": True, "settings": patch}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.post("/api/futures/reset")
+def api_futures_reset(body: dict = Body(...)):
+    try:
+        import futures_engine
+        starting = float(body.get("starting_usdt", config.FUTURES_STARTING_USDT))
+        futures_engine.reset_futures_wallet(starting)
+        database.log_activity(f"[Futures] Wallet reset to {starting:.2f} USDT", "info")
+        return {"success": True, "balance": starting}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
 
 
 def start_control_api():

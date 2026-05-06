@@ -145,6 +145,44 @@ def init_db():
                 value      TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS futures_state (
+                id         INTEGER PRIMARY KEY DEFAULT 1,
+                balances   TEXT,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS futures_positions (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol            TEXT NOT NULL,
+                direction         TEXT NOT NULL,
+                entry_price       REAL NOT NULL,
+                quantity          REAL NOT NULL,
+                margin_usdt       REAL NOT NULL,
+                leverage          INTEGER NOT NULL DEFAULT 5,
+                take_profit       REAL,
+                stop_loss         REAL,
+                liquidation_price REAL,
+                funding_paid      REAL DEFAULT 0.0,
+                timestamp         TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS futures_trades (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol           TEXT NOT NULL,
+                direction        TEXT NOT NULL,
+                entry_price      REAL NOT NULL,
+                exit_price       REAL,
+                quantity         REAL,
+                margin_usdt      REAL,
+                leverage         INTEGER,
+                net_profit       REAL,
+                profitable       INTEGER,
+                funding_paid     REAL DEFAULT 0.0,
+                duration_seconds INTEGER,
+                timestamp_open   TEXT,
+                timestamp_close  TEXT
+            );
         """)
 
         # ── Schema migrations for existing databases ─────────────────────────
@@ -518,3 +556,108 @@ def log_decision(d: dict):
               d.get("reason"), d.get("pattern_observed")))
         conn.commit()
         conn.close()
+
+
+# ── Futures state ─────────────────────────────────────────────────────────────
+
+def save_futures_state(balances: dict):
+    with _lock:
+        conn = _conn()
+        conn.execute("""
+            INSERT INTO futures_state (id, balances, updated_at)
+            VALUES (1, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                balances=excluded.balances, updated_at=excluded.updated_at
+        """, (json.dumps(balances),))
+        conn.commit()
+        conn.close()
+
+
+def load_futures_state() -> Optional[dict]:
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute("SELECT balances FROM futures_state WHERE id=1").fetchone()
+        except sqlite3.OperationalError:
+            conn.close()
+            return None
+        conn.close()
+    if row:
+        try:
+            return json.loads(row["balances"])
+        except Exception:
+            return None
+    return None
+
+
+# ── Futures positions ─────────────────────────────────────────────────────────
+
+def save_futures_position(pos: dict) -> Optional[int]:
+    with _lock:
+        conn = _conn()
+        conn.execute("""
+            INSERT INTO futures_positions
+                (symbol, direction, entry_price, quantity, margin_usdt, leverage,
+                 take_profit, stop_loss, liquidation_price, funding_paid, timestamp)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            pos["symbol"], pos["direction"], pos["entry_price"],
+            pos["quantity"], pos["margin_usdt"], pos.get("leverage", 5),
+            pos.get("take_profit"), pos.get("stop_loss"),
+            pos.get("liquidation_price"), pos.get("funding_paid", 0.0),
+            pos["timestamp"],
+        ))
+        conn.commit()
+        row = conn.execute("SELECT last_insert_rowid() AS id").fetchone()
+        conn.close()
+        return row["id"] if row else None
+
+
+def delete_futures_position(position_id: int):
+    with _lock:
+        conn = _conn()
+        conn.execute("DELETE FROM futures_positions WHERE id=?", (position_id,))
+        conn.commit()
+        conn.close()
+
+
+def load_futures_positions() -> List[dict]:
+    with _lock:
+        conn = _conn()
+        rows = conn.execute("SELECT * FROM futures_positions").fetchall()
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+# ── Futures trades ────────────────────────────────────────────────────────────
+
+def log_futures_trade(trade: dict):
+    with _lock:
+        conn = _conn()
+        conn.execute("""
+            INSERT INTO futures_trades
+                (symbol, direction, entry_price, exit_price, quantity, margin_usdt,
+                 leverage, net_profit, profitable, funding_paid,
+                 duration_seconds, timestamp_open, timestamp_close)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            trade.get("symbol"), trade.get("direction"),
+            trade.get("entry_price"), trade.get("exit_price"),
+            trade.get("quantity"), trade.get("margin_usdt"),
+            trade.get("leverage"), trade.get("net_profit"),
+            int(trade.get("profitable", 0)), trade.get("funding_paid", 0.0),
+            trade.get("duration_seconds"),
+            trade.get("timestamp_open"), trade.get("timestamp_close"),
+        ))
+        conn.commit()
+        conn.close()
+
+
+def get_recent_futures_trades(limit: int = 20) -> List[dict]:
+    with _lock:
+        conn = _conn()
+        rows = conn.execute("""
+            SELECT * FROM futures_trades ORDER BY id DESC LIMIT ?
+        """, (limit,)).fetchall()
+        conn.close()
+    return [dict(r) for r in rows]
