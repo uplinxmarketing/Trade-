@@ -378,13 +378,18 @@ async def _fetch_klines(
 # ── Loop A — mark price WebSocket (best-effort) ───────────────────────────────
 
 async def mark_price_loop():
-    """Maintain live mark prices + funding rates from Binance fstream.
+    """Maintain live mark prices + funding rates from Binance fstream AND
+    fire real-time TP/SL/liquidation checks (throttled to once every 2s).
 
-    The scanner loop works without this — it falls back to kline close prices.
-    This loop improves TP/SL precision when it can connect.
+    Without this, TP/SL would only trigger every 60s (the scanner interval).
+    With this, the futures bot reacts to price moves with similar latency
+    to the spot bot's WS price callback.
     """
+    import time as _time
     watched = set(config.FUTURES_WATCHED_COINS)
     backoff = 2
+    last_check = 0.0
+    CHECK_INTERVAL = 2.0   # seconds between TP/SL sweeps
 
     while True:
         try:
@@ -409,14 +414,32 @@ async def mark_price_loop():
                                 if mp > 0:
                                     _mark_prices[sym] = mp
                                 _funding_rates[sym] = fr
-                        # Push to client for continuous TP/SL monitoring
+                        # Push freshest prices into the client
                         with _client_lock:
-                            if _client:
-                                with _mark_lock:
-                                    for sym in watched:
-                                        mp = _mark_prices.get(sym, 0)
-                                        if mp > 0:
-                                            _client.update_mark_price(sym, mp)
+                            client = _client
+                        if client:
+                            with _mark_lock:
+                                snapshot = {s: p for s, p in _mark_prices.items() if p > 0}
+                            for sym, mp in snapshot.items():
+                                client.update_mark_price(sym, mp)
+
+                            # Throttled real-time TP/SL/liquidation check.
+                            # Without this, exits would lag up to 60s behind price.
+                            now = _time.time()
+                            if now - last_check >= CHECK_INTERVAL:
+                                last_check = now
+                                with _settings_lock:
+                                    sl_on = _futures_settings.get("stop_loss_enabled", False)
+                                try:
+                                    closed = client.check_positions(sl_enabled=sl_on)
+                                    for t in closed:
+                                        database.log_activity(
+                                            f"[Futures] CLOSE {t['direction']} {t['symbol']} "
+                                            f"@ {t['exit_price']:.4f} pnl={t['net_profit']:+.4f} "
+                                            f"USDT (live WS)", "info"
+                                        )
+                                except Exception as exc:
+                                    print(f"[FuturesEngine] live check_positions error: {exc}")
                     except Exception:
                         pass
         except Exception as exc:

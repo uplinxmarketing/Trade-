@@ -1,5 +1,5 @@
 {
-  "version": "5.8.9",
-  "buildTime": "2026-05-07T05:00:00.000Z",
-  "commit": "audit-fixes-starting-usdt-dist-bep-max-positions"
+  "version": "5.9.0",
+  "buildTime": "2026-05-07T06:00:00.000Z",
+  "commit": "futures-realtime-tp-sl-via-ws-loop"
 }
