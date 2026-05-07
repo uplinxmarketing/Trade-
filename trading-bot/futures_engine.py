@@ -448,15 +448,9 @@ async def _run_scan():
         f"budget={budget:.0f} open={n_open}/{max_pos} min_sig={min_sig}/6", "info"
     )
 
-    # ── TP/SL/Liquidation check first (uses mark prices updated by scanner) ──
-    closed = client.check_positions(sl_enabled=sl_enabled)
-    for t in closed:
-        database.log_activity(
-            f"[Futures] CLOSE {t['direction']} {t['symbol']} "
-            f"@ {t['exit_price']:.4f} pnl={t['net_profit']:+.4f} USDT", "info"
-        )
-
-    # ── Scan all coins ────────────────────────────────────────────────────────
+    # ── Scan all coins (updates mark prices AND opens new positions) ──────────
+    # check_positions runs AFTER so it always has the freshest mark prices,
+    # meaning TP/SL can trigger within the same scan they were last priced.
     top_scores = []   # collect (score, symbol, direction) for summary log
     async with aiohttp.ClientSession() as session:
         for symbol in config.FUTURES_WATCHED_COINS:
@@ -471,6 +465,14 @@ async def _run_scan():
             except Exception as exc:
                 print(f"[FuturesEngine] scan error {symbol}: {exc}")
             await asyncio.sleep(0.1)   # rate-limit REST calls
+
+    # ── TP/SL/Liquidation check — runs with fully updated mark prices ─────────
+    closed = client.check_positions(sl_enabled=sl_enabled)
+    for t in closed:
+        database.log_activity(
+            f"[Futures] CLOSE {t['direction']} {t['symbol']} "
+            f"@ {t['exit_price']:.4f} pnl={t['net_profit']:+.4f} USDT", "info"
+        )
 
     if top_scores:
         top_scores.sort(key=lambda x: abs(x[0]), reverse=True)

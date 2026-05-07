@@ -193,9 +193,10 @@ const ReportDashboard = () => {
 
   // Always compute from full pairTrades (includes Supabase history); overlay Railway live stats
   const computedPnl  = pairTrades.reduce((s, p) => s + p.netPnl, 0);
-  const totalProfit  = botStatus
-    ? Math.max(botStatus.realized_pnl, computedPnl)  // take whichever is larger (more complete)
-    : computedPnl;
+  // In server (Railway) mode, always use the backend's SQL-aggregated P&L as the single
+  // source of truth. Math.max would pick stale Supabase data from a previous session and
+  // show inflated numbers that the current trade history can't explain.
+  const totalProfit  = botStatus ? botStatus.realized_pnl : computedPnl;
 
   const todayProfit = pairTrades.filter(p => {
     const d = new Date(p.closedAt), now = new Date();
@@ -205,10 +206,10 @@ const ReportDashboard = () => {
   const totalFees   = pairTrades.reduce((s, p) => s + p.buyFee + p.sellFee, 0);
   const bnbSavings  = totalFees * BNB_DISCOUNT;
 
-  // Use the larger of Railway SQLite count vs full pairTrades count (Supabase may have more history)
+  // In server mode use Railway SQLite counts (authoritative); fall back to pairTrades for local mode
   const computedWins  = pairTrades.filter(p => p.netPnl > 0).length;
-  const total         = Math.max(botStatus?.total_trades ?? 0, pairTrades.length);
-  const wins          = Math.max(botStatus?.wins ?? 0, computedWins);
+  const total         = botStatus ? (botStatus.total_trades ?? 0) : pairTrades.length;
+  const wins          = botStatus ? (botStatus.wins ?? 0) : computedWins;
   const winRateN      = total > 0 ? (wins / total) * 100 : 0;
   const winRate  = total > 0 ? winRateN.toFixed(1) : '—';
 

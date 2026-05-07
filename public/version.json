@@ -1,5 +1,5 @@
 {
-  "version": "5.8.4",
-  "buildTime": "2026-05-07T00:00:00.000Z",
-  "commit": "fix-futures-ws-candles-logging-scan-status"
+  "version": "5.8.5",
+  "buildTime": "2026-05-07T01:00:00.000Z",
+  "commit": "fix-report-pnl-inflation-futures-tp-timing"
 }
