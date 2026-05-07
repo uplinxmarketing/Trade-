@@ -231,6 +231,7 @@ def _get_positions():
                 "breakeven_price": round(target, 6),
                 "unrealized_pnl":  round(pnl, 4),
                 "dist_to_exit_pct": round(dist, 4),
+                "dist_to_bep_pct":  round(dist, 4),   # alias — embedded dashboard reads this name
                 "profitable":      price >= target if price and target else False,
             })
         return out
@@ -1159,7 +1160,7 @@ def api_all():
             "smart_hold_enabled": strategy.get("smart_hold_enabled", False),
             "trailing_stop_pct":  strategy.get("trailing_stop_pct",  0.5),
             "reinvest_profits":   strategy.get("reinvest_profits",   False),
-            "max_positions":      strategy.get("max_positions",       10),
+            "max_positions":      strategy.get("max_positions",       20),
             "min_signals":        strategy.get("min_signals",          config.MIN_SIGNALS_TO_BUY),
             "strategy_notes":     strategy.get("strategy_notes",      ""),
         },

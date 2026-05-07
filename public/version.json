@@ -1,5 +1,5 @@
 {
-  "version": "5.8.8",
-  "buildTime": "2026-05-07T04:00:00.000Z",
-  "commit": "force-sl-smart-hold-off-on-every-startup"
+  "version": "5.8.9",
+  "buildTime": "2026-05-07T05:00:00.000Z",
+  "commit": "audit-fixes-starting-usdt-dist-bep-max-positions"
 }

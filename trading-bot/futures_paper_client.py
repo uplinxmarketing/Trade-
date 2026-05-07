@@ -148,7 +148,7 @@ class FuturesPaperClient:
         pos["id"] = pos_id
         with self._lock:
             self._positions[pos_id] = pos
-            database.save_futures_state({"USDT": self._usdt})
+            database.save_futures_state({"USDT": self._usdt, "starting_usdt": self._starting_usdt})
 
         sl_display = f"{stop_loss:.4f}" if stop_loss else "OFF"
         print(f"[FuturesPaper] OPEN {direction} {symbol} @ {entry_price:.4f} "
@@ -184,7 +184,7 @@ class FuturesPaperClient:
             del self._positions[pos_id]
 
         database.delete_futures_position(pos_id)
-        database.save_futures_state({"USDT": self._usdt})
+        database.save_futures_state({"USDT": self._usdt, "starting_usdt": self._starting_usdt})
 
         ts_open  = pos["timestamp"]
         ts_close = datetime.now(timezone.utc).isoformat()
@@ -294,5 +294,5 @@ class FuturesPaperClient:
             conn.commit()
             conn.close()
 
-        database.save_futures_state({"USDT": starting_usdt})
+        database.save_futures_state({"USDT": starting_usdt, "starting_usdt": starting_usdt})
         print(f"[FuturesPaper] Reset to {starting_usdt:.2f} USDT")

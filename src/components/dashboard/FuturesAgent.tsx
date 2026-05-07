@@ -375,14 +375,19 @@ const FuturesAgent = () => {
   };
 
   const handleReset = async () => {
-    if (!confirm('Reset futures paper wallet? All positions and trade history will be erased.')) return;
-    const res = await postAction('/api/futures/reset', { starting_usdt: START_BALANCE });
+    // Prefer the server's authoritative starting balance; fall back to the constant
+    const resetTo = status?.starting_balance && status.starting_balance > 0
+      ? status.starting_balance
+      : START_BALANCE;
+    if (!confirm(`Reset futures paper wallet to ${resetTo} USDT? All positions and trade history will be erased.`)) return;
+    const res = await postAction('/api/futures/reset', { starting_usdt: resetTo });
     if (res) {
-      toast.success(`Futures wallet reset to ${START_BALANCE} USDT`);
+      toast.success(`Futures wallet reset to ${resetTo} USDT`);
       setPositions([]); setTrades([]);
       setStatus(s => s ? {
-        ...s, balance: START_BALANCE, equity: START_BALANCE,
+        ...s, balance: resetTo, equity: resetTo,
         total_pnl: 0, win_rate: 0, trade_count: 0, positions: 0,
+        open_margin: 0, session_pnl: 0,
       } : s);
     }
   };
