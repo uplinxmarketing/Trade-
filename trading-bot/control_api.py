@@ -1433,6 +1433,28 @@ def api_futures_settings(body: dict = Body(...)):
         return {"success": False, "error": str(exc)}
 
 
+@app.post("/api/futures/close/{pos_id}")
+def api_futures_close(pos_id: int):
+    try:
+        import futures_engine
+        trade = futures_engine.close_position_by_id(pos_id)
+        if trade is None:
+            return {"success": False, "error": f"Position {pos_id} not found"}
+        return {"success": True, "trade": trade}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.post("/api/futures/close_all")
+def api_futures_close_all():
+    try:
+        import futures_engine
+        trades = futures_engine.close_all_positions()
+        return {"success": True, "closed": len(trades), "trades": trades}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
 @app.post("/api/futures/reset")
 def api_futures_reset(body: dict = Body(...)):
     try:

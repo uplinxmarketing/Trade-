@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   TrendingUp, TrendingDown, Pause, Play, RotateCcw,
   Settings, ChevronDown, ChevronUp, BarChart2, Shield, ShieldOff,
+  X, XCircle, Clock, Zap,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
@@ -42,6 +43,9 @@ interface FuturesPosition {
   sl_enabled: boolean;
   liquidation_price: number;
   unrealized_pnl: number;
+  notional: number;
+  liq_dist_pct: number | null;
+  funding_rate: number;
   timestamp: string;
 }
 
@@ -51,6 +55,7 @@ interface FuturesTrade {
   direction: string;
   entry_price: number;
   exit_price: number;
+  quantity: number;
   margin_usdt: number;
   leverage: number;
   net_profit: number;
@@ -87,11 +92,40 @@ interface FuturesSettings {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const RAILWAY_BASE  = (import.meta.env.VITE_RAILWAY_URL ?? '').replace(/\/$/, '');
-const POLL_MS       = 8_000;
+const POLL_MS       = 6_000;
 const START_BALANCE = 3000;
 
 async function apiFetch(path: string, opts?: RequestInit) {
   return fetch(`${RAILWAY_BASE}${path}`, opts);
+}
+
+// ── Funding countdown ─────────────────────────────────────────────────────────
+
+function getNextFundingMs(): number {
+  const now = new Date();
+  const h = now.getUTCHours();
+  const nextH = (Math.floor(h / 8) + 1) * 8;
+  const next = new Date(now);
+  if (nextH >= 24) {
+    next.setUTCDate(next.getUTCDate() + 1);
+    next.setUTCHours(0, 0, 0, 0);
+  } else {
+    next.setUTCHours(nextH, 0, 0, 0);
+  }
+  next.setUTCMinutes(0, 0, 0);
+  return Math.max(0, next.getTime() - now.getTime());
+}
+
+function useFundingCountdown() {
+  const [ms, setMs] = useState(getNextFundingMs);
+  useEffect(() => {
+    const id = setInterval(() => setMs(getNextFundingMs()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const h = Math.floor(ms / 3_600_000);
+  const m = Math.floor((ms % 3_600_000) / 60_000);
+  const s = Math.floor((ms % 60_000) / 1_000);
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -104,89 +138,114 @@ function SignalDot({ val }: { val: number | undefined }) {
   return <span className="inline-block w-2 h-2 rounded-full bg-muted-foreground/30" title="Neutral" />;
 }
 
-/** Visual range bar: SL ──── Entry ──── Mark ──── TP */
+function LiqRiskBadge({ pct }: { pct: number | null }) {
+  if (pct === null) return null;
+  const color = pct > 50 ? 'text-gain' : pct > 20 ? 'text-yellow-400' : 'text-loss';
+  const label = pct > 50 ? 'Safe' : pct > 20 ? 'Caution' : 'Risk';
+  return (
+    <span className={`text-[9px] font-medium ${color}`} title={`${pct.toFixed(1)}% from liquidation`}>
+      {label} {pct.toFixed(1)}%
+    </span>
+  );
+}
+
+/** Visual SL–Entry–TP range bar */
 function PositionBar({ pos }: { pos: FuturesPosition }) {
   const ep  = pos.entry_price;
   const mp  = pos.mark_price;
   const tp  = pos.take_profit;
-  const sl  = pos.stop_loss ?? (pos.direction === 'LONG' ? pos.liquidation_price : pos.liquidation_price);
+  const sl  = pos.stop_loss ?? pos.liquidation_price;
   const liq = pos.liquidation_price;
 
-  // Range: from sl (or liq) to tp
   const lo = Math.min(sl, liq, ep, mp, tp);
   const hi = Math.max(sl, liq, ep, mp, tp);
   const range = hi - lo || 1;
 
-  const pct = (v: number) => `${((v - lo) / range * 100).toFixed(1)}%`;
-
-  const markPct = ((mp - lo) / range * 100);
-  const entryPct = ((ep - lo) / range * 100);
-  const tpPct   = ((tp - lo) / range * 100);
-  const slPct   = ((sl - lo) / range * 100);
-
-  const isLong  = pos.direction === 'LONG';
+  const pct = (v: number) => ((v - lo) / range * 100);
+  const isLong   = pos.direction === 'LONG';
   const inProfit = isLong ? mp > ep : mp < ep;
 
   return (
     <div className="mt-2 px-0.5">
-      <div className="relative h-3 bg-muted/30 rounded-full overflow-visible">
-        {/* Profit zone fill */}
-        {isLong ? (
-          <div
-            className={`absolute h-full rounded-full transition-all ${inProfit ? 'bg-gain/25' : 'bg-loss/25'}`}
-            style={{
-              left:  pct(Math.min(ep, mp)),
-              width: pct(Math.max(ep, mp)).replace('%','') + '%',
-            }}
-          />
-        ) : (
-          <div
-            className={`absolute h-full rounded-full transition-all ${inProfit ? 'bg-gain/25' : 'bg-loss/25'}`}
-            style={{
-              left:  pct(Math.min(ep, mp)),
-              right: `${100 - ((Math.max(ep,mp) - lo) / range * 100)}%`,
-            }}
-          />
-        )}
-
+      <div className="relative h-2.5 bg-muted/30 rounded-full overflow-visible">
+        {/* Profit/loss zone fill */}
+        <div
+          className={`absolute h-full rounded-full transition-all ${inProfit ? 'bg-gain/25' : 'bg-loss/25'}`}
+          style={{
+            left:  `${pct(Math.min(ep, mp))}%`,
+            width: `${Math.abs(pct(mp) - pct(ep))}%`,
+          }}
+        />
+        {/* Liquidation marker */}
+        <div
+          className="absolute top-0 h-full w-0.5 bg-loss/40"
+          style={{ left: `${pct(liq)}%` }}
+          title={`Liq ${liq.toFixed(4)}`}
+        />
         {/* SL marker */}
         {pos.stop_loss && (
           <div
             className="absolute top-0 h-full w-0.5 bg-loss/70"
-            style={{ left: `${slPct}%` }}
+            style={{ left: `${pct(pos.stop_loss)}%` }}
             title={`SL ${pos.stop_loss.toFixed(4)}`}
           />
         )}
-
         {/* Entry marker */}
         <div
           className="absolute top-0 h-full w-0.5 bg-muted-foreground/60"
-          style={{ left: `${entryPct}%` }}
+          style={{ left: `${pct(ep)}%` }}
           title={`Entry ${ep.toFixed(4)}`}
         />
-
         {/* TP marker */}
         <div
           className="absolute top-0 h-full w-0.5 bg-gain/70"
-          style={{ left: `${tpPct}%` }}
+          style={{ left: `${pct(tp)}%` }}
           title={`TP ${tp.toFixed(4)}`}
         />
-
         {/* Mark price dot */}
         <div
           className={`absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full border-2 border-background transition-all ${
             inProfit ? 'bg-gain' : 'bg-loss'
           }`}
-          style={{ left: `calc(${markPct}% - 6px)` }}
+          style={{ left: `calc(${pct(mp)}% - 6px)` }}
           title={`Mark ${mp.toFixed(4)}`}
         />
       </div>
-
-      {/* Labels */}
       <div className="flex justify-between text-[9px] text-muted-foreground mt-0.5 px-0.5">
-        <span className="text-loss">{pos.stop_loss ? `SL ${pos.stop_loss.toFixed(2)}` : 'No SL'}</span>
+        <span className="text-loss/70">{pos.stop_loss ? `SL ${pos.stop_loss.toFixed(2)}` : `Liq ${liq.toFixed(2)}`}</span>
         <span>Entry {ep.toFixed(2)}</span>
         <span className="text-gain">TP {tp.toFixed(2)}</span>
+      </div>
+    </div>
+  );
+}
+
+/** Allocation usage bar */
+function AllocationBar({ usedMargin, allocation }: { usedMargin: number; allocation: number }) {
+  if (allocation <= 0) return (
+    <div className="bg-muted/10 rounded-md px-2 py-1.5 flex items-center justify-between">
+      <span className="text-[10px] text-muted-foreground">Allocation</span>
+      <span className="text-[10px] font-mono text-muted-foreground">Unlimited</span>
+    </div>
+  );
+  const pct = Math.min(100, (usedMargin / allocation) * 100);
+  const color = pct >= 90 ? 'bg-loss' : pct >= 70 ? 'bg-yellow-400' : 'bg-gain';
+  return (
+    <div className="bg-muted/10 rounded-md px-2 py-1.5 space-y-1">
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] text-muted-foreground uppercase tracking-widest">Allocation</span>
+        <span className="text-[10px] font-mono">
+          <span className={pct >= 90 ? 'text-loss' : pct >= 70 ? 'text-yellow-400' : 'text-gain'}>
+            ${usedMargin.toFixed(0)}
+          </span>
+          <span className="text-muted-foreground"> / ${allocation.toFixed(0)} USDT</span>
+        </span>
+      </div>
+      <div className="h-1 bg-muted/30 rounded-full overflow-hidden">
+        <div
+          className={`h-full rounded-full transition-all ${color}`}
+          style={{ width: `${pct}%` }}
+        />
       </div>
     </div>
   );
@@ -198,15 +257,15 @@ function ReportsPanel({ trades, startBalance }: { trades: FuturesTrade[]; startB
     <p className="text-xs text-muted-foreground text-center py-3">No closed trades yet</p>
   );
 
-  const profits = trades.map(t => t.net_profit ?? 0);
-  const wins    = profits.filter(p => p > 0).length;
-  const losses  = profits.filter(p => p <= 0).length;
-  const totalPnl = profits.reduce((a, b) => a + b, 0);
-  const avgPnl   = totalPnl / trades.length;
+  const profits    = trades.map(t => t.net_profit ?? 0);
+  const wins       = profits.filter(p => p > 0).length;
+  const losses     = profits.filter(p => p <= 0).length;
+  const totalPnl   = profits.reduce((a, b) => a + b, 0);
+  const avgPnl     = totalPnl / trades.length;
   const bestTrade  = Math.max(...profits);
   const worstTrade = Math.min(...profits);
   const winRate    = (wins / trades.length) * 100;
-  const avgDur = trades.reduce((a, t) => a + (t.duration_seconds ?? 0), 0) / trades.length;
+  const avgDur     = trades.reduce((a, t) => a + (t.duration_seconds ?? 0), 0) / trades.length;
 
   const longTrades  = trades.filter(t => t.direction === 'LONG');
   const shortTrades = trades.filter(t => t.direction === 'SHORT');
@@ -217,13 +276,13 @@ function ReportsPanel({ trades, startBalance }: { trades: FuturesTrade[]; startB
 
   return (
     <div className="space-y-3">
-      {/* Summary grid */}
       <div className="grid grid-cols-3 gap-2">
         {[
           { label: 'Total Trades', value: trades.length },
-          { label: 'Wins',  value: wins,   color: 'text-gain' },
+          { label: 'Wins',   value: wins,   color: 'text-gain' },
           { label: 'Losses', value: losses, color: 'text-loss' },
-          { label: 'Win Rate', value: `${winRate.toFixed(1)}%`,
+          { label: 'Win Rate',
+            value: `${winRate.toFixed(1)}%`,
             color: winRate >= 50 ? 'text-gain' : 'text-loss' },
           { label: 'Total P&L',
             value: `${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}`,
@@ -237,12 +296,10 @@ function ReportsPanel({ trades, startBalance }: { trades: FuturesTrade[]; startB
         ].map(s => (
           <div key={s.label} className="bg-muted/20 rounded-md p-2">
             <div className="text-[9px] uppercase tracking-widest text-muted-foreground">{s.label}</div>
-            <div className={`text-xs font-mono font-semibold ${s.color ?? ''}`}>{String(s.value)}</div>
+            <div className={`text-xs font-mono font-semibold ${(s as any).color ?? ''}`}>{String(s.value)}</div>
           </div>
         ))}
       </div>
-
-      {/* Long vs Short breakdown */}
       <div className="grid grid-cols-2 gap-2">
         <div className="bg-gain/10 border border-gain/20 rounded-md p-2">
           <div className="text-[9px] uppercase text-gain font-medium mb-1">LONG</div>
@@ -273,7 +330,7 @@ const FuturesAgent = () => {
   const [settings, setSettings]   = useState<FuturesSettings>({
     leverage: 5, budget_usdt: 100, budget_mode: 'fixed', budget_pct: 10,
     allocation_usdt: 500,
-    take_profit_pct: 0.02, stop_loss_pct: 0.01, stop_loss_enabled: false,
+    take_profit_pct: 0.005, stop_loss_pct: 0.003, stop_loss_enabled: false,
     min_signals: 2, max_positions: 20,
   });
 
@@ -282,11 +339,13 @@ const FuturesAgent = () => {
   const [showTrades, setShowTrades]     = useState(false);
   const [showReports, setShowReports]   = useState(false);
   const [loading, setLoading]           = useState(false);
+  const [closingId, setClosingId]       = useState<number | null>(null);
   const [pollError, setPollError]       = useState(false);
   const pollRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inFlightRef = useRef(false);
+  const fundingCountdown = useFundingCountdown();
 
-  // ── Single combined poll ──────────────────────────────────────────────────
+  // ── Poll ──────────────────────────────────────────────────────────────────
 
   const poll = useCallback(async () => {
     if (inFlightRef.current) return;
@@ -308,7 +367,6 @@ const FuturesAgent = () => {
         arr.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
         setSignals(arr);
       }
-      // Sync all settings from server state on each poll
       if (d.status) {
         setSettings(s => ({
           ...s,
@@ -333,7 +391,7 @@ const FuturesAgent = () => {
     return () => { if (pollRef.current) clearTimeout(pollRef.current); };
   }, [poll]);
 
-  // ── API actions ─────────────────────────────────────────────────────────────
+  // ── Actions ───────────────────────────────────────────────────────────────
 
   const postAction = async (path: string, body?: object) => {
     setLoading(true);
@@ -375,7 +433,6 @@ const FuturesAgent = () => {
   };
 
   const handleReset = async () => {
-    // Prefer the server's authoritative starting balance; fall back to the constant
     const resetTo = status?.starting_balance && status.starting_balance > 0
       ? status.starting_balance
       : START_BALANCE;
@@ -389,6 +446,32 @@ const FuturesAgent = () => {
         total_pnl: 0, win_rate: 0, trade_count: 0, positions: 0,
         open_margin: 0, session_pnl: 0,
       } : s);
+    }
+  };
+
+  const handleClosePosition = async (pos: FuturesPosition) => {
+    if (!confirm(`Close ${pos.direction} ${pos.symbol.replace('USDT','')} at market price?`)) return;
+    setClosingId(pos.id);
+    try {
+      const resp = await apiFetch(`/api/futures/close/${pos.id}`, { method: 'POST' });
+      const data = await resp.json();
+      if (!data.success) throw new Error(data.error);
+      toast.success(`Closed ${pos.symbol.replace('USDT','')} — P&L: ${data.trade?.net_profit >= 0 ? '+' : ''}${Number(data.trade?.net_profit ?? 0).toFixed(3)} USDT`);
+      setPositions(ps => ps.filter(p => p.id !== pos.id));
+    } catch (e: any) {
+      toast.error(e.message ?? 'Close failed');
+    } finally {
+      setClosingId(null);
+    }
+  };
+
+  const handleCloseAll = async () => {
+    if (positions.length === 0) return;
+    if (!confirm(`Close ALL ${positions.length} open positions at market price?`)) return;
+    const res = await postAction('/api/futures/close_all');
+    if (res) {
+      toast.success(`Closed ${res.closed} positions`);
+      setPositions([]);
     }
   };
 
@@ -408,23 +491,28 @@ const FuturesAgent = () => {
     if (res) { toast.success('Futures settings saved'); setShowSettings(false); }
   };
 
-  // ── Derived ──────────────────────────────────────────────────────────────────
+  // ── Derived values ────────────────────────────────────────────────────────
 
-  const isRunning     = status?.running ?? false;
-  const slEnabled     = settings.stop_loss_enabled;
-  const equity        = status?.equity        ?? 0;
-  const balance       = status?.balance       ?? 0;
-  const openMargin    = status?.open_margin   ?? 0;
-  const totalPnl      = status?.total_pnl     ?? 0;
-  const startingBal   = status?.starting_balance ?? START_BALANCE;
-  const sessionPct    = startingBal > 0
+  const isRunning    = status?.running ?? false;
+  const slEnabled    = settings.stop_loss_enabled;
+  const equity       = status?.equity      ?? 0;
+  const balance      = status?.balance     ?? 0;
+  const openMargin   = status?.open_margin ?? 0;
+  const totalPnl     = status?.total_pnl   ?? 0;
+  const startingBal  = status?.starting_balance ?? START_BALANCE;
+  const allocationUsdt = status?.allocation_usdt ?? settings.allocation_usdt;
+  const sessionPct   = startingBal > 0
     ? (((equity - startingBal) / startingBal) * 100).toFixed(2)
     : '0.00';
 
-  // ── Render ──────────────────────────────────────────────────────────────────
+  const avgFunding   = signals.length > 0
+    ? signals.reduce((a, s) => a + (s.funding_rate ?? 0), 0) / signals.length
+    : 0;
+
+  // ── Render ────────────────────────────────────────────────────────────────
 
   return (
-    <div className="trading-card p-4 space-y-4">
+    <div className="trading-card p-4 space-y-3">
 
       {/* ── Header ── */}
       <div className="flex items-center justify-between">
@@ -434,12 +522,11 @@ const FuturesAgent = () => {
           }`} />
           <h3 className="text-sm font-semibold">Futures Agent</h3>
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent/20 text-accent font-medium">
-            USDT-M · Paper
+            USDT-M · Isolated · Paper
           </span>
           {pollError && <span className="text-[10px] text-loss">⚠ offline</span>}
         </div>
         <div className="flex gap-1">
-          {/* Stop-loss quick toggle */}
           <button
             onClick={handleSlToggle}
             disabled={loading}
@@ -464,21 +551,22 @@ const FuturesAgent = () => {
         </div>
       </div>
 
-      {/* ── Stats ── */}
+      {/* ── Wallet stats (4 cols) ── */}
       <div className="grid grid-cols-4 gap-2">
         {[
-          { label: 'Free USDT',  value: `$${balance.toFixed(2)}`,
-            subtitle: openMargin > 0 ? `${openMargin.toFixed(0)} locked` : undefined },
+          { label: 'Wallet Balance', value: `$${balance.toFixed(2)}`,
+            subtitle: openMargin > 0 ? `$${openMargin.toFixed(0)} in margin` : 'No open positions' },
           { label: 'Equity',     value: `$${equity.toFixed(2)}`,
             subtitle: `started $${startingBal.toFixed(0)}` },
           { label: 'Realized P&L', value: `${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}`,
             color: totalPnl >= 0 ? 'text-gain' : 'text-loss' },
-          { label: 'Session',    value: `${Number(sessionPct) >= 0 ? '+' : ''}${sessionPct}%`,
-            color: Number(sessionPct) >= 0 ? 'text-gain' : 'text-loss' },
+          { label: 'ROI',    value: `${Number(sessionPct) >= 0 ? '+' : ''}${sessionPct}%`,
+            color: Number(sessionPct) >= 0 ? 'text-gain' : 'text-loss',
+            subtitle: 'since start' },
         ].map(s => (
           <div key={s.label} className="bg-muted/20 rounded-md p-2">
-            <div className="text-[10px] uppercase tracking-widest text-muted-foreground">{s.label}</div>
-            <div className={`text-xs font-mono font-semibold tabular-nums ${(s as any).color ?? ''}`}>{s.value}</div>
+            <div className="text-[9px] uppercase tracking-widest text-muted-foreground leading-tight">{s.label}</div>
+            <div className={`text-xs font-mono font-semibold tabular-nums mt-0.5 ${(s as any).color ?? ''}`}>{s.value}</div>
             {(s as any).subtitle && (
               <div className="text-[9px] text-muted-foreground font-mono mt-0.5">{(s as any).subtitle}</div>
             )}
@@ -486,27 +574,50 @@ const FuturesAgent = () => {
         ))}
       </div>
 
+      {/* ── Position/trade stats (3 cols) ── */}
       <div className="grid grid-cols-3 gap-2">
         {[
-          { label: 'Open',     value: String(status?.positions ?? 0) },
-          { label: 'Trades',   value: String(status?.trade_count ?? 0) },
-          { label: 'Win Rate', value: `${(status?.win_rate ?? 0).toFixed(1)}%` },
+          { label: 'Open Positions', value: `${status?.positions ?? 0}/${settings.max_positions}` },
+          { label: 'Closed Trades',  value: String(status?.trade_count ?? 0) },
+          { label: 'Win Rate',       value: `${(status?.win_rate ?? 0).toFixed(1)}%`,
+            color: (status?.win_rate ?? 0) >= 50 ? 'text-gain' : (status?.win_rate ?? 0) > 0 ? 'text-loss' : '' },
         ].map(s => (
           <div key={s.label} className="bg-muted/20 rounded-md p-2">
-            <div className="text-[10px] uppercase tracking-widest text-muted-foreground">{s.label}</div>
-            <div className="text-xs font-mono font-semibold tabular-nums">{s.value}</div>
+            <div className="text-[9px] uppercase tracking-widest text-muted-foreground">{s.label}</div>
+            <div className={`text-xs font-mono font-semibold tabular-nums ${(s as any).color ?? ''}`}>{s.value}</div>
           </div>
         ))}
       </div>
 
-      {/* ── Scan activity indicator ── */}
-      <div className="bg-muted/10 rounded-md px-2 py-1.5 flex items-center justify-between">
-        <span className="text-[10px] text-muted-foreground uppercase tracking-widest">Scanner</span>
-        <span className="text-[10px] font-mono text-muted-foreground">
-          {status?.scan_count
-            ? `#${status.scan_count} · ${status.last_scan_at ? new Date(status.last_scan_at).toLocaleTimeString() : '—'}`
-            : 'waiting…'}
-        </span>
+      {/* ── Allocation bar ── */}
+      <AllocationBar usedMargin={openMargin} allocation={allocationUsdt} />
+
+      {/* ── Funding + scanner info ── */}
+      <div className="grid grid-cols-2 gap-2">
+        <div className="bg-muted/10 rounded-md px-2 py-1.5 flex items-center gap-2">
+          <Clock className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+          <div>
+            <div className="text-[9px] text-muted-foreground uppercase tracking-widest">Next Funding</div>
+            <div className="text-[10px] font-mono tabular-nums">{fundingCountdown}</div>
+          </div>
+          <div className="ml-auto text-right">
+            <div className="text-[9px] text-muted-foreground">Avg Rate</div>
+            <div className={`text-[10px] font-mono ${avgFunding > 0 ? 'text-loss' : avgFunding < 0 ? 'text-gain' : ''}`}>
+              {avgFunding >= 0 ? '+' : ''}{avgFunding.toFixed(4)}%
+            </div>
+          </div>
+        </div>
+        <div className="bg-muted/10 rounded-md px-2 py-1.5 flex items-center gap-2">
+          <Zap className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+          <div>
+            <div className="text-[9px] text-muted-foreground uppercase tracking-widest">Scanner</div>
+            <div className="text-[10px] font-mono text-muted-foreground">
+              {status?.scan_count
+                ? `#${status.scan_count} · ${status.last_scan_at ? new Date(status.last_scan_at).toLocaleTimeString() : '—'}`
+                : 'waiting…'}
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* ── Start / Pause ── */}
@@ -527,8 +638,10 @@ const FuturesAgent = () => {
       {/* ── Settings panel ── */}
       {showSettings && (
         <div className="border border-border/50 rounded-md p-3 space-y-3">
-          <div className="text-[10px] uppercase tracking-widest text-muted-foreground">Futures Settings</div>
+          <div className="text-[10px] uppercase tracking-widest text-muted-foreground font-medium">Futures Settings</div>
+
           <div className="grid grid-cols-2 gap-3">
+            {/* Leverage */}
             <div>
               <label className="text-[10px] text-muted-foreground">Leverage</label>
               <div className="flex gap-1 mt-1 flex-wrap">
@@ -544,10 +657,12 @@ const FuturesAgent = () => {
                 ))}
               </div>
             </div>
+
+            {/* Min signals */}
             <div>
               <label className="text-[10px] text-muted-foreground">Min Signals (of 6)</label>
               <div className="flex gap-1 mt-1">
-                {[2, 3, 4, 5, 6].map(n => (
+                {[1, 2, 3, 4, 5, 6].map(n => (
                   <button key={n}
                     onClick={() => setSettings(s => ({ ...s, min_signals: n }))}
                     className={`px-2 py-0.5 rounded text-[10px] font-medium border transition-colors ${
@@ -555,22 +670,28 @@ const FuturesAgent = () => {
                         ? 'bg-accent text-accent-foreground border-accent'
                         : 'border-border text-muted-foreground hover:text-foreground'
                     }`}
-                  >{n}/6</button>
+                  >{n}</button>
                 ))}
               </div>
             </div>
+
+            {/* Allocation cap */}
             <div>
               <label className="text-[10px] text-muted-foreground">Total Allocation (USDT)</label>
               <input type="number" min={0} max={100000} step={50}
                 value={settings.allocation_usdt}
                 onChange={e => setSettings(s => ({ ...s, allocation_usdt: Number(e.target.value) }))}
                 className="w-full mt-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono"
-                placeholder="Max USDT across all positions (0 = unlimited)"
+                placeholder="0 = unlimited"
               />
               <div className="text-[9px] text-muted-foreground mt-0.5">
-                Total margin cap · {settings.allocation_usdt > 0 ? `max ${settings.allocation_usdt} USDT across all open positions` : 'unlimited (uses full balance)'}
+                {settings.allocation_usdt > 0
+                  ? `Max $${settings.allocation_usdt} across all open positions`
+                  : 'Unlimited — uses full balance'}
               </div>
             </div>
+
+            {/* Budget mode */}
             <div>
               <label className="text-[10px] text-muted-foreground">Budget Mode</label>
               <div className="flex gap-1 mt-1">
@@ -604,14 +725,18 @@ const FuturesAgent = () => {
                 </div>
               )}
             </div>
+
+            {/* Max positions */}
             <div>
               <label className="text-[10px] text-muted-foreground">Max Open Positions</label>
-              <input type="number" min={1} max={20}
+              <input type="number" min={1} max={100}
                 value={settings.max_positions}
                 onChange={e => setSettings(s => ({ ...s, max_positions: Number(e.target.value) }))}
                 className="w-full mt-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono"
               />
             </div>
+
+            {/* Take Profit */}
             <div>
               <label className="text-[10px] text-muted-foreground">Take Profit %</label>
               <input type="number" min={0.1} max={50} step={0.1}
@@ -619,7 +744,12 @@ const FuturesAgent = () => {
                 onChange={e => setSettings(s => ({ ...s, take_profit_pct: Number(e.target.value) / 100 }))}
                 className="w-full mt-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono"
               />
+              <div className="text-[9px] text-muted-foreground mt-0.5">
+                ROE ≈ {(settings.take_profit_pct * settings.leverage * 100).toFixed(1)}% at {settings.leverage}x
+              </div>
             </div>
+
+            {/* Stop Loss */}
             <div>
               <label className="text-[10px] text-muted-foreground">Stop Loss %</label>
               <div className="flex gap-2 mt-1 items-center">
@@ -629,7 +759,6 @@ const FuturesAgent = () => {
                   onChange={e => setSettings(s => ({ ...s, stop_loss_pct: Number(e.target.value) / 100 }))}
                   className="flex-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono disabled:opacity-40"
                 />
-                {/* Inline SL toggle */}
                 <button
                   onClick={() => setSettings(s => ({ ...s, stop_loss_enabled: !s.stop_loss_enabled }))}
                   className={`px-2 py-1 rounded text-[10px] font-medium border transition-colors flex-shrink-0 ${
@@ -641,53 +770,97 @@ const FuturesAgent = () => {
               </div>
             </div>
           </div>
+
           <Button onClick={handleSaveSettings} disabled={loading} className="w-full" size="sm">
             Save Settings
           </Button>
         </div>
       )}
 
-      {/* ── Open positions with range bar ── */}
+      {/* ── Open positions ── */}
       {positions.length > 0 && (
-        <div className="space-y-3">
-          <div className="text-[10px] uppercase tracking-widest text-muted-foreground">
-            Open Positions ({positions.length})
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="text-[10px] uppercase tracking-widest text-muted-foreground">
+              Open Positions ({positions.length})
+            </div>
+            <button
+              onClick={handleCloseAll}
+              disabled={loading}
+              className="flex items-center gap-1 text-[10px] text-loss hover:text-loss/70 font-medium transition-colors"
+            >
+              <XCircle className="w-3 h-3" />
+              Close All
+            </button>
           </div>
+
           {positions.map(p => {
-            const pnlColor = p.unrealized_pnl >= 0 ? 'text-gain' : 'text-loss';
+            const pnlColor  = p.unrealized_pnl >= 0 ? 'text-gain' : 'text-loss';
             const roe = p.margin_usdt > 0
-              ? ((p.unrealized_pnl / p.margin_usdt) * 100).toFixed(1)
-              : '0.0';
+              ? ((p.unrealized_pnl / p.margin_usdt) * 100).toFixed(2)
+              : '0.00';
+            const isClosing = closingId === p.id;
+            const age = (() => {
+              try {
+                const sec = (Date.now() - new Date(p.timestamp).getTime()) / 1000;
+                return sec < 60 ? `${sec.toFixed(0)}s` : sec < 3600 ? `${(sec/60).toFixed(0)}m` : `${(sec/3600).toFixed(1)}h`;
+              } catch { return '—'; }
+            })();
+
             return (
-              <div key={p.id} className="bg-muted/20 rounded-md px-3 py-2.5">
-                {/* Row 1: coin + direction + P&L */}
-                <div className="flex items-center justify-between text-xs">
+              <div key={p.id} className="bg-muted/20 rounded-md px-3 py-2.5 border border-border/20">
+                {/* Row 1: symbol + direction + close button */}
+                <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     {p.direction === 'LONG'
                       ? <TrendingUp  className="w-3.5 h-3.5 text-gain flex-shrink-0" />
                       : <TrendingDown className="w-3.5 h-3.5 text-loss flex-shrink-0" />}
-                    <span className="font-mono font-semibold">{p.symbol.replace('USDT', '')}</span>
+                    <span className="font-mono font-semibold text-sm">{p.symbol.replace('USDT', '')}/USDT</span>
                     <span className={`text-[10px] px-1.5 py-0.5 rounded font-semibold ${
                       p.direction === 'LONG' ? 'bg-gain/20 text-gain' : 'bg-loss/20 text-loss'
                     }`}>{p.direction} {p.leverage}x</span>
-                    {!p.stop_loss && (
-                      <span className="text-[9px] text-muted-foreground">No SL</span>
-                    )}
+                    <span className="text-[9px] text-muted-foreground">{age}</span>
                   </div>
-                  <div className={`text-right ${pnlColor}`}>
-                    <span className="font-mono font-semibold">
-                      {p.unrealized_pnl >= 0 ? '+' : ''}{Number(p.unrealized_pnl).toFixed(3)} USDT
-                    </span>
-                    <span className="text-[10px] ml-1">({roe}% ROE)</span>
-                  </div>
+                  <button
+                    onClick={() => handleClosePosition(p)}
+                    disabled={isClosing}
+                    className="flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] text-loss border border-loss/30 hover:bg-loss/10 transition-colors"
+                    title="Close at market price"
+                  >
+                    {isClosing ? '…' : <><X className="w-2.5 h-2.5" />Close</>}
+                  </button>
                 </div>
 
-                {/* Row 2: prices */}
-                <div className="flex gap-4 mt-1.5 text-[10px] text-muted-foreground">
+                {/* Row 2: P&L and ROE */}
+                <div className="flex items-baseline gap-2 mt-1">
+                  <span className={`font-mono font-semibold text-sm ${pnlColor}`}>
+                    {p.unrealized_pnl >= 0 ? '+' : ''}{Number(p.unrealized_pnl).toFixed(3)} USDT
+                  </span>
+                  <span className={`text-[10px] font-mono ${pnlColor}`}>({roe}% ROE)</span>
+                  <span className="text-[9px] text-muted-foreground ml-auto">
+                    Notional: ${Number(p.notional ?? 0).toFixed(2)}
+                  </span>
+                </div>
+
+                {/* Row 3: prices */}
+                <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-1.5 text-[10px] text-muted-foreground">
                   <span>Entry <span className="font-mono text-foreground">{Number(p.entry_price).toFixed(4)}</span></span>
                   <span>Mark <span className={`font-mono ${pnlColor}`}>{p.mark_price > 0 ? Number(p.mark_price).toFixed(4) : '—'}</span></span>
                   <span>TP <span className="font-mono text-gain">{Number(p.take_profit).toFixed(4)}</span></span>
                   {p.stop_loss && <span>SL <span className="font-mono text-loss">{Number(p.stop_loss).toFixed(4)}</span></span>}
+                  <span>Liq <span className="font-mono text-loss/70">{Number(p.liquidation_price).toFixed(4)}</span></span>
+                </div>
+
+                {/* Row 4: margin info + liq risk */}
+                <div className="flex items-center gap-3 mt-1 text-[9px] text-muted-foreground">
+                  <span>Margin: <span className="font-mono text-foreground">${p.margin_usdt.toFixed(2)}</span></span>
+                  <span>Qty: <span className="font-mono text-foreground">{Number(p.quantity).toFixed(6)}</span></span>
+                  {p.funding_rate !== undefined && (
+                    <span>Funding: <span className={`font-mono ${p.funding_rate > 0 ? 'text-loss' : p.funding_rate < 0 ? 'text-gain' : ''}`}>
+                      {p.funding_rate >= 0 ? '+' : ''}{Number(p.funding_rate).toFixed(4)}%
+                    </span></span>
+                  )}
+                  <span className="ml-auto"><LiqRiskBadge pct={p.liq_dist_pct ?? null} /></span>
                 </div>
 
                 {/* Position range bar */}
@@ -709,7 +882,7 @@ const FuturesAgent = () => {
           {showReports ? <ChevronUp className="w-3 h-3 ml-auto" /> : <ChevronDown className="w-3 h-3 ml-auto" />}
         </button>
         {showReports && (
-          <ReportsPanel trades={trades} startBalance={START_BALANCE} />
+          <ReportsPanel trades={trades} startBalance={startingBal} />
         )}
       </div>
 
@@ -729,6 +902,7 @@ const FuturesAgent = () => {
                 <thead>
                   <tr className="text-muted-foreground">
                     <th className="text-left pb-1 pr-2">Coin</th>
+                    <th className="pb-1 pr-1">Mark</th>
                     <th className="pb-1 pr-1">Score</th>
                     <th className="pb-1 pr-1" title="Trend (EMA20)">TR</th>
                     <th className="pb-1 pr-1" title="RSI">RSI</th>
@@ -748,6 +922,9 @@ const FuturesAgent = () => {
                     return (
                       <tr key={sig.symbol} className="border-t border-border/30">
                         <td className="py-0.5 pr-2 font-mono">{sig.symbol.replace('USDT', '')}</td>
+                        <td className="py-0.5 pr-1 font-mono text-muted-foreground">
+                          {sig.mark_price > 0 ? sig.mark_price.toLocaleString(undefined, { maximumFractionDigits: 4 }) : '—'}
+                        </td>
                         <td className={`py-0.5 pr-1 text-center font-mono ${scoreColor}`}>
                           {sig.score > 0 ? '+' : ''}{sig.score}
                         </td>
@@ -788,7 +965,7 @@ const FuturesAgent = () => {
             {showTrades ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
           </button>
           {showTrades && (
-            <div className="space-y-0.5 max-h-52 overflow-y-auto scrollbar-thin">
+            <div className="space-y-0.5 max-h-64 overflow-y-auto scrollbar-thin">
               {trades.map(t => {
                 const pnl      = t.net_profit ?? 0;
                 const pnlColor = pnl >= 0 ? 'text-gain' : 'text-loss';
@@ -797,9 +974,12 @@ const FuturesAgent = () => {
                   : t.duration_seconds < 3600 ? `${Math.round(t.duration_seconds/60)}m`
                   : `${(t.duration_seconds/3600).toFixed(1)}h`
                   : '';
+                const roe = t.margin_usdt > 0
+                  ? ((pnl / t.margin_usdt) * 100).toFixed(1)
+                  : '0.0';
                 return (
                   <div key={t.id}
-                    className="flex items-center justify-between text-xs py-1 border-b border-border/40 last:border-0"
+                    className="flex items-center justify-between text-xs py-1.5 border-b border-border/40 last:border-0"
                   >
                     <div className="flex items-center gap-2">
                       {t.direction === 'LONG'
@@ -811,13 +991,16 @@ const FuturesAgent = () => {
                       </span>
                       {dur && <span className="text-[9px] text-muted-foreground">{dur}</span>}
                     </div>
-                    <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-2 text-right">
                       <span className="font-mono text-muted-foreground text-[10px]">
                         {Number(t.entry_price).toFixed(3)} → {Number(t.exit_price).toFixed(3)}
                       </span>
-                      <span className={`font-mono font-semibold ${pnlColor}`}>
-                        {pnl >= 0 ? '+' : ''}{pnl.toFixed(3)}
-                      </span>
+                      <div>
+                        <div className={`font-mono font-semibold ${pnlColor}`}>
+                          {pnl >= 0 ? '+' : ''}{pnl.toFixed(3)}
+                        </div>
+                        <div className={`text-[9px] font-mono ${pnlColor}`}>{roe}% ROE</div>
+                      </div>
                     </div>
                   </div>
                 );

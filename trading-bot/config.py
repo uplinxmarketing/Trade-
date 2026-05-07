@@ -82,8 +82,8 @@ FUTURES_WATCHED_COINS     = [
 FUTURES_STARTING_USDT     = 3000.0   # paper wallet starting balance
 FUTURES_BUDGET_USDT       = 100.0    # margin per position
 FUTURES_LEVERAGE          = 5        # default leverage
-FUTURES_TAKE_PROFIT_PCT   = 0.02     # 2 % price move from entry
-FUTURES_STOP_LOSS_PCT     = 0.01     # 1 % price move from entry
+FUTURES_TAKE_PROFIT_PCT   = 0.005    # 0.5 % price move from entry (= 2.5% ROE at 5x)
+FUTURES_STOP_LOSS_PCT     = 0.003    # 0.3 % price move from entry
 FUTURES_MIN_SIGNALS       = 3        # of 6 signals needed to open (3 fires more reliably)
 FUTURES_SCAN_INTERVAL_SEC = 60       # signal scan frequency
 FUTURES_MAX_POSITIONS     = 20       # max concurrent open positions

@@ -47,7 +47,7 @@ _mark_lock = threading.Lock()
 _futures_signal_cache: Dict[str, dict] = {}
 _futures_signal_lock = threading.Lock()
 
-_futures_active = True
+_futures_active = False   # OFF by default — user must press Start each session
 _scan_count   = 0
 _last_scan_at = ""
 _futures_settings: dict = {
@@ -56,8 +56,8 @@ _futures_settings: dict = {
     "budget_mode":       "fixed",   # "fixed" | "percent"
     "budget_pct":        10.0,      # % of free balance when mode="percent"
     "allocation_usdt":   500.0,     # total USDT cap across all open positions (0 = unlimited)
-    "take_profit_pct":   config.FUTURES_TAKE_PROFIT_PCT,
-    "stop_loss_pct":     config.FUTURES_STOP_LOSS_PCT,
+    "take_profit_pct":   0.005,     # 0.5% price move (= 2.5% ROE at 5x) — was 2%, too high
+    "stop_loss_pct":     0.003,     # 0.3% price move from entry
     "stop_loss_enabled": False,     # OFF by default — enable in settings
     "min_signals":       2,         # of 6 — lowered for better trade frequency
     "max_positions":     config.FUTURES_MAX_POSITIONS,
@@ -72,7 +72,7 @@ FSTREAM_WS    = "wss://fstream.binance.com/ws/!markPrice@arr@1s"
 # ── Init ──────────────────────────────────────────────────────────────────────
 
 def init_futures_engine():
-    global _client
+    global _client, _futures_active
     with _client_lock:
         if _client is None:
             _client = FuturesPaperClient(
@@ -91,6 +91,15 @@ def init_futures_engine():
             print(f"[FuturesEngine] Settings restored from DB: {saved}")
         except Exception as exc:
             print(f"[FuturesEngine] Settings restore error: {exc}")
+
+    # Restore active state — user must have explicitly pressed Start for this to be True.
+    # Defaults to False so the bot never auto-runs on a fresh deploy.
+    active_str = database.get_setting("futures_active")
+    if active_str is not None:
+        _futures_active = active_str.lower() == "true"
+    else:
+        _futures_active = False
+    print(f"[FuturesEngine] Active restored from DB: {_futures_active}")
 
 
 # ── Public helpers ────────────────────────────────────────────────────────────
@@ -150,7 +159,29 @@ def get_futures_positions() -> List[dict]:
         if mp <= 0:
             mp = p["entry_price"]   # fallback when WS not yet connected
         upnl = _upnl(p, mp)
-        result.append({**p, "mark_price": mp, "unrealized_pnl": round(upnl, 4)})
+        notional = round(p["quantity"] * mp, 4)
+
+        # Distance to liquidation as % of mark price
+        liq = p.get("liquidation_price", 0.0)
+        if mp > 0 and liq > 0:
+            if p["direction"] == "LONG":
+                liq_dist_pct = round((mp - liq) / mp * 100, 2)
+            else:
+                liq_dist_pct = round((liq - mp) / mp * 100, 2)
+        else:
+            liq_dist_pct = None
+
+        with _mark_lock:
+            funding_rate = round(_funding_rates.get(p["symbol"], 0.0) * 100, 6)
+
+        result.append({
+            **p,
+            "mark_price":    mp,
+            "unrealized_pnl": round(upnl, 4),
+            "notional":      notional,
+            "liq_dist_pct":  liq_dist_pct,
+            "funding_rate":  funding_rate,
+        })
     return result
 
 
@@ -170,6 +201,51 @@ def update_futures_settings(patch: dict):
 def set_futures_active(active: bool):
     global _futures_active
     _futures_active = active
+    database.save_setting("futures_active", "true" if active else "false")
+
+
+def close_position_by_id(pos_id: int) -> Optional[dict]:
+    """Manually close a position at the current mark price."""
+    with _client_lock:
+        client = _client
+    if client is None:
+        return None
+    positions = client.get_open_positions()
+    pos = next((p for p in positions if p["id"] == pos_id), None)
+    if pos is None:
+        return None
+    mp = _get_mark(pos["symbol"])
+    if mp <= 0:
+        mp = pos["entry_price"]
+    trade = client.close_position(pos_id, mp, "MANUAL")
+    if trade:
+        database.log_activity(
+            f"[Futures] MANUAL CLOSE {trade['direction']} {trade['symbol']} "
+            f"@ {trade['exit_price']:.4f} pnl={trade['net_profit']:+.4f} USDT", "info"
+        )
+    return trade
+
+
+def close_all_positions() -> List[dict]:
+    """Manually close all open positions at current mark prices."""
+    with _client_lock:
+        client = _client
+    if client is None:
+        return []
+    positions = client.get_open_positions()
+    closed = []
+    for pos in positions:
+        mp = _get_mark(pos["symbol"])
+        if mp <= 0:
+            mp = pos["entry_price"]
+        trade = client.close_position(pos["id"], mp, "MANUAL_ALL")
+        if trade:
+            closed.append(trade)
+            database.log_activity(
+                f"[Futures] MANUAL CLOSE ALL {trade['direction']} {trade['symbol']} "
+                f"@ {trade['exit_price']:.4f} pnl={trade['net_profit']:+.4f} USDT", "info"
+            )
+    return closed
 
 
 def reset_futures_wallet(starting_usdt: float = None):
