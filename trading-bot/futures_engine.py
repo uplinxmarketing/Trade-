@@ -79,13 +79,15 @@ def init_futures_engine():
                 starting_usdt=float(config.FUTURES_STARTING_USDT)
             )
 
-    # Restore persisted settings so budget/leverage/etc survive Railway restarts
+    # Restore persisted settings so budget/leverage/etc survive Railway restarts.
+    # stop_loss_enabled is ALWAYS reset to False on startup — user opts in each session.
     saved_json = database.get_setting("futures_settings")
     if saved_json:
         try:
             saved = json.loads(saved_json)
             with _settings_lock:
                 _futures_settings.update(saved)
+                _futures_settings["stop_loss_enabled"] = False   # always start OFF
             print(f"[FuturesEngine] Settings restored from DB: {saved}")
         except Exception as exc:
             print(f"[FuturesEngine] Settings restore error: {exc}")

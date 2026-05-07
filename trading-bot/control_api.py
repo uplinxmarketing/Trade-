@@ -66,17 +66,20 @@ async def lifespan(app: FastAPI):
         trade_engine.load_positions_from_db()
         steps.append("positions OK")
 
-        # 4. Auto-resume only if the bot was already running before the redeploy.
-        #    Fresh deployments start with trading_active=False so the user must
-        #    explicitly press Start. Redeployments of a running bot resume automatically.
+        # 4. Apply startup defaults and auto-resume logic.
+        #    stop_loss and smart_hold are ALWAYS forced OFF on every deploy —
+        #    the user must explicitly enable them each session.
+        #    trading_active is preserved so a running bot resumes after a redeploy.
         _s = _load_strategy()
-        _auto_patch: dict = {"pause_reason": None}
+        _auto_patch: dict = {
+            "pause_reason":       None,
+            "stop_loss_enabled":  False,   # always OFF — user opts in each session
+            "smart_hold_enabled": False,   # always OFF — user opts in each session
+        }
         if "trading_active" not in _s:
-            # Brand-new deploy — default OFF so user chooses when to start
-            _auto_patch["trading_active"]    = False
-            _auto_patch["stop_loss_enabled"] = False
-            _auto_patch["take_profit_enabled"] = True
-        # else: preserve the existing trading_active value (True or False)
+            # Brand-new deploy — don't auto-start, let user press Start
+            _auto_patch["trading_active"] = False
+        # else: preserve existing trading_active (resumes running bot after redeploy)
         if not _s.get("initial_balance_usdt"):
             _auto_patch["initial_balance_usdt"] = _get_usdt_balance() or float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
         _write_strategy_patch(_auto_patch)

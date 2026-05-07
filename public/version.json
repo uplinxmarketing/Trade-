@@ -1,5 +1,5 @@
 {
-  "version": "5.8.7",
-  "buildTime": "2026-05-07T03:00:00.000Z",
-  "commit": "set-default-budgets-spot-110-futures-100"
+  "version": "5.8.8",
+  "buildTime": "2026-05-07T04:00:00.000Z",
+  "commit": "force-sl-smart-hold-off-on-every-startup"
 }
