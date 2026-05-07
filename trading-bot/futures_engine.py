@@ -52,7 +52,7 @@ _scan_count   = 0
 _last_scan_at = ""
 _futures_settings: dict = {
     "leverage":          config.FUTURES_LEVERAGE,
-    "budget_usdt":       config.FUTURES_BUDGET_USDT,
+    "budget_usdt":       config.FUTURES_BUDGET_USDT,  # 100.0 per trade
     "budget_mode":       "fixed",   # "fixed" | "percent"
     "budget_pct":        10.0,      # % of free balance when mode="percent"
     "allocation_usdt":   500.0,     # total USDT cap across all open positions (0 = unlimited)

@@ -1050,7 +1050,7 @@ def api_get_settings():
         "smart_hold_enabled": s.get("smart_hold_enabled", False),
         "trailing_stop_pct":  s.get("trailing_stop_pct",  0.5),
         "reinvest_profits":   s.get("reinvest_profits",   False),
-        "max_positions":      s.get("max_positions",       10),
+        "max_positions":      s.get("max_positions",       20),
         "min_signals":        s.get("min_signals",          config.MIN_SIGNALS_TO_BUY),
         "strategy_notes":     s.get("strategy_notes",      ""),
     }
@@ -1422,7 +1422,7 @@ def api_futures_settings(body: dict = Body(...)):
         if "min_signals" in patch:
             patch["min_signals"] = max(1, min(6, int(patch["min_signals"])))
         if "max_positions" in patch:
-            patch["max_positions"] = max(1, min(20, int(patch["max_positions"])))
+            patch["max_positions"] = max(1, min(100, int(patch["max_positions"])))
         futures_engine.update_futures_settings(patch)
         return {"success": True, "settings": patch}
     except Exception as exc:

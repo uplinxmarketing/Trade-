@@ -1,5 +1,5 @@
 {
-  "version": "5.8.6",
-  "buildTime": "2026-05-07T02:00:00.000Z",
-  "commit": "fix-futures-balance-allocation-sl-defaults"
+  "version": "5.8.7",
+  "buildTime": "2026-05-07T03:00:00.000Z",
+  "commit": "set-default-budgets-spot-110-futures-100"
 }

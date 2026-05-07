@@ -271,10 +271,10 @@ const FuturesAgent = () => {
   const [trades, setTrades]       = useState<FuturesTrade[]>([]);
   const [signals, setSignals]     = useState<FuturesSignal[]>([]);
   const [settings, setSettings]   = useState<FuturesSettings>({
-    leverage: 5, budget_usdt: 200, budget_mode: 'fixed', budget_pct: 10,
+    leverage: 5, budget_usdt: 100, budget_mode: 'fixed', budget_pct: 10,
     allocation_usdt: 500,
     take_profit_pct: 0.02, stop_loss_pct: 0.01, stop_loss_enabled: false,
-    min_signals: 2, max_positions: 5,
+    min_signals: 2, max_positions: 20,
   });
 
   const [showSettings, setShowSettings] = useState(false);

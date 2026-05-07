@@ -16,8 +16,8 @@ WATCHED_COINS = [
     "ALGOUSDT", "VETUSDT",  "FILUSDT",  "ICPUSDT",  "HBARUSDT",
 ]
 
-BUDGET_PER_TRADE_USDT   = 100.0
-MAX_OPEN_POSITIONS      = 9999   # no hard cap — USDT balance is the only limit
+BUDGET_PER_TRADE_USDT   = 5.0
+MAX_OPEN_POSITIONS      = 20
 DECISION_INTERVAL_SEC   = 600       # Claude strategy runs every 10 minutes
 MIN_CLAUDE_CONFIDENCE   = 0.65
 RSI_OVERBOUGHT          = 75
@@ -57,15 +57,13 @@ ATR_MAX_PCT = 0.015    # ATR must be ≤ 1.5% of price (too volatile → skip)
 ATR_PERIOD  = 14       # standard ATR lookback period
 
 # ── Budget allocation settings ────────────────────────────────────────────────
-BUDGET_MODE           = "percent" # fixed | percent | capped | per_coin
-BUDGET_FIXED_USDT     = 100.0
-BUDGET_PCT_OF_FREE    = 5.0       # 5% of free USDT per trade
-BUDGET_TOTAL_CAP_USDT = 1000.0
-# Total USDT from the wallet that the bot is allowed to use (paper + live).
-# 0 = unlimited (use the entire free USDT balance). Min enforced on the
-# frontend = 5 USDT. The bot will never deploy more than this across all
-# concurrent open positions, so the user can keep the rest of the wallet safe.
-BOT_ALLOCATION_USDT   = 0.0
+BUDGET_MODE           = "fixed"   # fixed | percent | capped | per_coin
+BUDGET_FIXED_USDT     = 5.0       # $5 per trade
+BUDGET_PCT_OF_FREE    = 5.0       # 5% of free USDT per trade (when mode=percent)
+BUDGET_TOTAL_CAP_USDT = 110.0
+# Total USDT the bot is allowed to use across all concurrent open positions.
+# 0 = unlimited. Default $110 cap so the bot stays within the user's allocation.
+BOT_ALLOCATION_USDT   = 110.0
 BUDGET_PER_COIN = {
     "BTCUSDT":  200.0,
     "ETHUSDT":  150.0,
@@ -82,10 +80,10 @@ FUTURES_WATCHED_COINS     = [
     "OPUSDT",  "INJUSDT",  "NEARUSDT", "FETUSDT",   "TIAUSDT",
 ]
 FUTURES_STARTING_USDT     = 3000.0   # paper wallet starting balance
-FUTURES_BUDGET_USDT       = 200.0    # margin per position
+FUTURES_BUDGET_USDT       = 100.0    # margin per position
 FUTURES_LEVERAGE          = 5        # default leverage
 FUTURES_TAKE_PROFIT_PCT   = 0.02     # 2 % price move from entry
 FUTURES_STOP_LOSS_PCT     = 0.01     # 1 % price move from entry
 FUTURES_MIN_SIGNALS       = 3        # of 6 signals needed to open (3 fires more reliably)
 FUTURES_SCAN_INTERVAL_SEC = 60       # signal scan frequency
-FUTURES_MAX_POSITIONS     = 5        # max concurrent open positions
+FUTURES_MAX_POSITIONS     = 20       # max concurrent open positions
