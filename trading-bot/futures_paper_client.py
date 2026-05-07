@@ -31,13 +31,18 @@ class FuturesPaperClient:
 
         saved = database.load_futures_state()
         if saved is not None:
-            # Restore even if USDT is 0 — the user may have lost all margin
             self._usdt = float(saved.get("USDT", starting_usdt))
+            # Backfill starting_usdt if missing from older DB rows
+            if "starting_usdt" not in saved:
+                saved["starting_usdt"] = starting_usdt
+                database.save_futures_state(saved)
+            self._starting_usdt = float(saved.get("starting_usdt", starting_usdt))
             print(f"[FuturesPaper] Restored — USDT: {self._usdt:.2f}")
         else:
             self._usdt = starting_usdt
-            database.save_futures_state({"USDT": self._usdt})
-            print(f"[FuturesPaper] Fresh start — USDT: {self._usdt:.2f}")
+            self._starting_usdt = starting_usdt
+            database.save_futures_state({"USDT": self._usdt, "starting_usdt": starting_usdt})
+            print(f"[FuturesPaper] Fresh start — USDT: {starting_usdt:.2f}")
 
         # In-memory position cache (mirrored from DB on start)
         self._positions: Dict[int, dict] = {}
@@ -59,6 +64,10 @@ class FuturesPaperClient:
     def get_balance(self) -> float:
         with self._lock:
             return self._usdt
+
+    def get_starting_usdt(self) -> float:
+        with self._lock:
+            return self._starting_usdt
 
     def get_equity(self) -> float:
         """USDT + unrealized P&L of all open positions."""
@@ -273,6 +282,7 @@ class FuturesPaperClient:
     def reset(self, starting_usdt: float):
         with self._lock:
             self._usdt = starting_usdt
+            self._starting_usdt = starting_usdt
             self._positions.clear()
             self._mark_prices.clear()
 

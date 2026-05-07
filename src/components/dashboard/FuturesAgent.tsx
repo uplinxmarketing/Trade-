@@ -12,6 +12,9 @@ interface FuturesStatus {
   running: boolean;
   balance: number;
   equity: number;
+  open_margin: number;
+  starting_balance: number;
+  session_pnl: number;
   positions: number;
   total_pnl: number;
   win_rate: number;
@@ -21,6 +24,8 @@ interface FuturesStatus {
   last_scan_at: string;
   budget_mode: 'fixed' | 'percent';
   budget_pct: number;
+  allocation_usdt: number;
+  budget_usdt: number;
 }
 
 interface FuturesPosition {
@@ -71,6 +76,7 @@ interface FuturesSettings {
   budget_usdt: number;
   budget_mode: 'fixed' | 'percent';
   budget_pct: number;
+  allocation_usdt: number;
   take_profit_pct: number;
   stop_loss_pct: number;
   stop_loss_enabled: boolean;
@@ -266,7 +272,8 @@ const FuturesAgent = () => {
   const [signals, setSignals]     = useState<FuturesSignal[]>([]);
   const [settings, setSettings]   = useState<FuturesSettings>({
     leverage: 5, budget_usdt: 200, budget_mode: 'fixed', budget_pct: 10,
-    take_profit_pct: 0.02, stop_loss_pct: 0.01, stop_loss_enabled: true,
+    allocation_usdt: 500,
+    take_profit_pct: 0.02, stop_loss_pct: 0.01, stop_loss_enabled: false,
     min_signals: 2, max_positions: 5,
   });
 
@@ -301,13 +308,15 @@ const FuturesAgent = () => {
         arr.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
         setSignals(arr);
       }
-      // Sync settings toggles from server state
-      if (d.status?.stop_loss_enabled !== undefined) {
+      // Sync all settings from server state on each poll
+      if (d.status) {
         setSettings(s => ({
           ...s,
-          stop_loss_enabled: d.status.stop_loss_enabled,
-          budget_mode: d.status.budget_mode ?? s.budget_mode,
-          budget_pct:  d.status.budget_pct  ?? s.budget_pct,
+          stop_loss_enabled: d.status.stop_loss_enabled ?? s.stop_loss_enabled,
+          budget_mode:       d.status.budget_mode       ?? s.budget_mode,
+          budget_pct:        d.status.budget_pct        ?? s.budget_pct,
+          allocation_usdt:   d.status.allocation_usdt   ?? s.allocation_usdt,
+          budget_usdt:       d.status.budget_usdt       ?? s.budget_usdt,
         }));
       }
       setPollError(false);
@@ -384,6 +393,7 @@ const FuturesAgent = () => {
       budget_usdt:       settings.budget_usdt,
       budget_mode:       settings.budget_mode,
       budget_pct:        settings.budget_pct,
+      allocation_usdt:   settings.allocation_usdt,
       take_profit_pct:   settings.take_profit_pct,
       stop_loss_pct:     settings.stop_loss_pct,
       stop_loss_enabled: settings.stop_loss_enabled,
@@ -395,13 +405,15 @@ const FuturesAgent = () => {
 
   // ── Derived ──────────────────────────────────────────────────────────────────
 
-  const isRunning  = status?.running ?? false;
-  const slEnabled  = settings.stop_loss_enabled;
-  const equity     = status?.equity  ?? 0;
-  const balance    = status?.balance ?? 0;
-  const totalPnl   = status?.total_pnl ?? 0;
-  const sessionPct = START_BALANCE > 0
-    ? (((equity - START_BALANCE) / START_BALANCE) * 100).toFixed(2)
+  const isRunning     = status?.running ?? false;
+  const slEnabled     = settings.stop_loss_enabled;
+  const equity        = status?.equity        ?? 0;
+  const balance       = status?.balance       ?? 0;
+  const openMargin    = status?.open_margin   ?? 0;
+  const totalPnl      = status?.total_pnl     ?? 0;
+  const startingBal   = status?.starting_balance ?? START_BALANCE;
+  const sessionPct    = startingBal > 0
+    ? (((equity - startingBal) / startingBal) * 100).toFixed(2)
     : '0.00';
 
   // ── Render ──────────────────────────────────────────────────────────────────
@@ -450,16 +462,21 @@ const FuturesAgent = () => {
       {/* ── Stats ── */}
       <div className="grid grid-cols-4 gap-2">
         {[
-          { label: 'Balance', value: `$${balance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` },
-          { label: 'Equity',  value: `$${equity.toLocaleString('en-US',  { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` },
-          { label: 'Total P&L', value: `${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}`,
+          { label: 'Free USDT',  value: `$${balance.toFixed(2)}`,
+            subtitle: openMargin > 0 ? `${openMargin.toFixed(0)} locked` : undefined },
+          { label: 'Equity',     value: `$${equity.toFixed(2)}`,
+            subtitle: `started $${startingBal.toFixed(0)}` },
+          { label: 'Realized P&L', value: `${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}`,
             color: totalPnl >= 0 ? 'text-gain' : 'text-loss' },
-          { label: 'Session', value: `${Number(sessionPct) >= 0 ? '+' : ''}${sessionPct}%`,
+          { label: 'Session',    value: `${Number(sessionPct) >= 0 ? '+' : ''}${sessionPct}%`,
             color: Number(sessionPct) >= 0 ? 'text-gain' : 'text-loss' },
         ].map(s => (
           <div key={s.label} className="bg-muted/20 rounded-md p-2">
             <div className="text-[10px] uppercase tracking-widest text-muted-foreground">{s.label}</div>
-            <div className={`text-xs font-mono font-semibold tabular-nums ${s.color ?? ''}`}>{s.value}</div>
+            <div className={`text-xs font-mono font-semibold tabular-nums ${(s as any).color ?? ''}`}>{s.value}</div>
+            {(s as any).subtitle && (
+              <div className="text-[9px] text-muted-foreground font-mono mt-0.5">{(s as any).subtitle}</div>
+            )}
           </div>
         ))}
       </div>
@@ -535,6 +552,18 @@ const FuturesAgent = () => {
                     }`}
                   >{n}/6</button>
                 ))}
+              </div>
+            </div>
+            <div>
+              <label className="text-[10px] text-muted-foreground">Total Allocation (USDT)</label>
+              <input type="number" min={0} max={100000} step={50}
+                value={settings.allocation_usdt}
+                onChange={e => setSettings(s => ({ ...s, allocation_usdt: Number(e.target.value) }))}
+                className="w-full mt-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono"
+                placeholder="Max USDT across all positions (0 = unlimited)"
+              />
+              <div className="text-[9px] text-muted-foreground mt-0.5">
+                Total margin cap · {settings.allocation_usdt > 0 ? `max ${settings.allocation_usdt} USDT across all open positions` : 'unlimited (uses full balance)'}
               </div>
             </div>
             <div>

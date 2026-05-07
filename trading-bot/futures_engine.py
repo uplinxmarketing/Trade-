@@ -55,9 +55,10 @@ _futures_settings: dict = {
     "budget_usdt":       config.FUTURES_BUDGET_USDT,
     "budget_mode":       "fixed",   # "fixed" | "percent"
     "budget_pct":        10.0,      # % of free balance when mode="percent"
+    "allocation_usdt":   500.0,     # total USDT cap across all open positions (0 = unlimited)
     "take_profit_pct":   config.FUTURES_TAKE_PROFIT_PCT,
     "stop_loss_pct":     config.FUTURES_STOP_LOSS_PCT,
-    "stop_loss_enabled": True,
+    "stop_loss_enabled": False,     # OFF by default — enable in settings
     "min_signals":       2,         # of 6 — lowered for better trade frequency
     "max_positions":     config.FUTURES_MAX_POSITIONS,
 }
@@ -97,9 +98,11 @@ def get_futures_status() -> dict:
         if _client is None:
             return {"running": False, "balance": 0.0, "equity": 0.0,
                     "positions": 0, "active": False}
-        bal    = _client.get_balance()
-        equity = _client.get_equity()
-        n_pos  = _client.open_position_count()
+        bal           = _client.get_balance()
+        equity        = _client.get_equity()
+        n_pos         = _client.open_position_count()
+        starting_bal  = _client.get_starting_usdt()
+        open_margin   = sum(p.get("margin_usdt", 0.0) for p in _client.get_open_positions())
 
     trades    = database.get_recent_futures_trades(1000)
     total_pnl = sum(t.get("net_profit") or 0.0 for t in trades)
@@ -109,17 +112,25 @@ def get_futures_status() -> dict:
     with _settings_lock:
         settings = dict(_futures_settings)
 
+    # session_pnl = realized P&L from closed trades only (balance is free USDT, not total)
+    session_pnl = total_pnl   # = SUM(net_profit) of all closed trades
+
     return {
         "running":           _futures_active,
         "balance":           round(bal, 4),
         "equity":            round(equity, 4),
+        "open_margin":       round(open_margin, 4),
+        "starting_balance":  round(starting_bal, 4),
+        "session_pnl":       round(session_pnl, 4),
         "positions":         n_pos,
         "total_pnl":         round(total_pnl, 4),
         "win_rate":          round(win_rate, 1),
         "trade_count":       len(trades),
-        "stop_loss_enabled": settings.get("stop_loss_enabled", True),
+        "stop_loss_enabled": settings.get("stop_loss_enabled", False),
         "budget_mode":       settings.get("budget_mode", "fixed"),
         "budget_pct":        settings.get("budget_pct", 10.0),
+        "allocation_usdt":   settings.get("allocation_usdt", 500.0),
+        "budget_usdt":       settings.get("budget_usdt", config.FUTURES_BUDGET_USDT),
         "scan_count":        _scan_count,
         "last_scan_at":      _last_scan_at,
     }
@@ -185,13 +196,27 @@ def _upnl(pos: dict, mark_price: float) -> float:
     return (ep - mark_price) * qty
 
 
-def _calc_budget(settings: dict, balance: float) -> float:
-    """Compute per-trade margin based on budget_mode setting."""
+def _calc_budget(settings: dict, balance: float, open_margin: float = 0.0) -> float:
+    """Compute per-trade margin respecting budget_mode and allocation cap."""
+    allocation = float(settings.get("allocation_usdt", 0.0))
+
+    # How much of the allocation is still available
+    if allocation > 0:
+        # Free capacity = allocation ceiling minus margin already deployed
+        available = max(0.0, allocation - open_margin)
+        # Also can't exceed the actual free balance
+        effective = min(balance, available)
+    else:
+        effective = balance
+
     if settings.get("budget_mode") == "percent":
         pct = float(settings.get("budget_pct", 10.0))
-        val = balance * (pct / 100.0)
-        return max(5.0, min(val, balance))
-    return float(settings.get("budget_usdt", config.FUTURES_BUDGET_USDT))
+        val = effective * (pct / 100.0)
+        return max(5.0, min(val, effective))
+
+    # Fixed mode: requested USDT, capped by what's actually available
+    requested = float(settings.get("budget_usdt", config.FUTURES_BUDGET_USDT))
+    return min(requested, effective)
 
 
 # ── Signal scoring ─────────────────────────────────────────────────────────────
@@ -429,23 +454,27 @@ async def _run_scan():
 
     with _settings_lock:
         settings   = dict(_futures_settings)
-        sl_enabled = settings.get("stop_loss_enabled", True)
+        sl_enabled = settings.get("stop_loss_enabled", False)
 
-    min_sig  = int(settings.get("min_signals",       2))
-    max_pos  = int(settings.get("max_positions",     config.FUTURES_MAX_POSITIONS))
-    leverage = int(settings.get("leverage",          config.FUTURES_LEVERAGE))
-    tp_pct   = float(settings.get("take_profit_pct", config.FUTURES_TAKE_PROFIT_PCT))
-    sl_pct   = float(settings.get("stop_loss_pct",   config.FUTURES_STOP_LOSS_PCT))
-    balance  = client.get_balance()
-    budget   = _calc_budget(settings, balance)
-    n_open   = client.open_position_count()
+    min_sig     = int(settings.get("min_signals",       2))
+    max_pos     = int(settings.get("max_positions",     config.FUTURES_MAX_POSITIONS))
+    leverage    = int(settings.get("leverage",          config.FUTURES_LEVERAGE))
+    tp_pct      = float(settings.get("take_profit_pct", config.FUTURES_TAKE_PROFIT_PCT))
+    sl_pct      = float(settings.get("stop_loss_pct",   config.FUTURES_STOP_LOSS_PCT))
+    allocation  = float(settings.get("allocation_usdt", 0.0))
+    balance     = client.get_balance()
+    open_margin = sum(p.get("margin_usdt", 0.0) for p in client.get_open_positions())
+    budget      = _calc_budget(settings, balance, open_margin)
+    n_open      = client.open_position_count()
 
     _scan_count += 1
     _last_scan_at = datetime.now(timezone.utc).isoformat()
 
+    alloc_str = f"alloc={allocation:.0f}" if allocation > 0 else "alloc=unlimited"
     database.log_activity(
         f"[Futures] Scan #{_scan_count} start — bal={balance:.2f} USDT "
-        f"budget={budget:.0f} open={n_open}/{max_pos} min_sig={min_sig}/6", "info"
+        f"margin_used={open_margin:.0f} budget={budget:.0f} {alloc_str} "
+        f"open={n_open}/{max_pos} min_sig={min_sig}/6", "info"
     )
 
     # ── Scan all coins (updates mark prices AND opens new positions) ──────────

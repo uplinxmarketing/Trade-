@@ -66,15 +66,21 @@ async def lifespan(app: FastAPI):
         trade_engine.load_positions_from_db()
         steps.append("positions OK")
 
-        # 4. Auto-resume trading — always start trading on deploy so no manual
-        #    Start button press is required after a Railway update.
-        # Also anchor initial_balance_usdt on first auto-start so P&L % is correct.
+        # 4. Auto-resume only if the bot was already running before the redeploy.
+        #    Fresh deployments start with trading_active=False so the user must
+        #    explicitly press Start. Redeployments of a running bot resume automatically.
         _s = _load_strategy()
-        _auto_patch: dict = {"trading_active": True, "pause_reason": None}
+        _auto_patch: dict = {"pause_reason": None}
+        if "trading_active" not in _s:
+            # Brand-new deploy — default OFF so user chooses when to start
+            _auto_patch["trading_active"]    = False
+            _auto_patch["stop_loss_enabled"] = False
+            _auto_patch["take_profit_enabled"] = True
+        # else: preserve the existing trading_active value (True or False)
         if not _s.get("initial_balance_usdt"):
             _auto_patch["initial_balance_usdt"] = _get_usdt_balance() or float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
         _write_strategy_patch(_auto_patch)
-        steps.append("trading_active=True")
+        steps.append(f"trading_active={'resume' if _s.get('trading_active') else 'off'}")
 
         # 5. History download — daemon thread, never blocks health-check
         threading.Thread(target=data_collector.download_history, daemon=True).start()
@@ -1407,8 +1413,8 @@ def api_futures_settings(body: dict = Body(...)):
         import futures_engine
         allowed = {
             "leverage", "budget_usdt", "budget_mode", "budget_pct",
-            "take_profit_pct", "stop_loss_pct", "stop_loss_enabled",
-            "min_signals", "max_positions",
+            "allocation_usdt", "take_profit_pct", "stop_loss_pct",
+            "stop_loss_enabled", "min_signals", "max_positions",
         }
         patch = {k: v for k, v in body.items() if k in allowed}
         if "leverage" in patch:
