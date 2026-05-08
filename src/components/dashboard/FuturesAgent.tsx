@@ -493,19 +493,29 @@ const FuturesAgent = () => {
 
   // ── Derived values ────────────────────────────────────────────────────────
 
-  const isRunning    = status?.running ?? false;
-  const slEnabled    = settings.stop_loss_enabled;
-  const equity       = status?.equity      ?? 0;
-  const balance      = status?.balance     ?? 0;
-  const openMargin   = status?.open_margin ?? 0;
-  const totalPnl     = status?.total_pnl   ?? 0;
-  const startingBal  = status?.starting_balance ?? START_BALANCE;
+  const isRunning      = status?.running ?? false;
+  const slEnabled      = settings.stop_loss_enabled;
+  const equity         = status?.equity      ?? 0;
+  const balance        = status?.balance     ?? 0;
+  const openMargin     = status?.open_margin ?? 0;
+  const totalPnl       = status?.total_pnl   ?? 0;
+  const startingBal    = status?.starting_balance ?? START_BALANCE;
   const allocationUsdt = status?.allocation_usdt ?? settings.allocation_usdt;
-  const sessionPct   = startingBal > 0
-    ? (((equity - startingBal) / startingBal) * 100).toFixed(2)
-    : '0.00';
 
-  const avgFunding   = signals.length > 0
+  // Unrealized P&L = equity minus free balance (equity already includes uPnL)
+  const unrealizedPnl = equity - balance;
+
+  // Equity-based ROI: reflects all open positions + closed P&L
+  const equityRoiPct = startingBal > 0
+    ? (((equity - startingBal) / startingBal) * 100)
+    : 0;
+
+  // Realized-only ROI: just closed trades
+  const realizedRoiPct = startingBal > 0
+    ? ((totalPnl / startingBal) * 100)
+    : 0;
+
+  const avgFunding = signals.length > 0
     ? signals.reduce((a, s) => a + (s.funding_rate ?? 0), 0) / signals.length
     : 0;
 
@@ -553,25 +563,36 @@ const FuturesAgent = () => {
 
       {/* ── Wallet stats (4 cols) ── */}
       <div className="grid grid-cols-4 gap-2">
-        {[
-          { label: 'Wallet Balance', value: `$${balance.toFixed(2)}`,
-            subtitle: openMargin > 0 ? `$${openMargin.toFixed(0)} in margin` : 'No open positions' },
-          { label: 'Equity',     value: `$${equity.toFixed(2)}`,
-            subtitle: `started $${startingBal.toFixed(0)}` },
-          { label: 'Realized P&L', value: `${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}`,
-            color: totalPnl >= 0 ? 'text-gain' : 'text-loss' },
-          { label: 'ROI',    value: `${Number(sessionPct) >= 0 ? '+' : ''}${sessionPct}%`,
-            color: Number(sessionPct) >= 0 ? 'text-gain' : 'text-loss',
-            subtitle: 'since start' },
-        ].map(s => (
-          <div key={s.label} className="bg-muted/20 rounded-md p-2">
-            <div className="text-[9px] uppercase tracking-widest text-muted-foreground leading-tight">{s.label}</div>
-            <div className={`text-xs font-mono font-semibold tabular-nums mt-0.5 ${(s as any).color ?? ''}`}>{s.value}</div>
-            {(s as any).subtitle && (
-              <div className="text-[9px] text-muted-foreground font-mono mt-0.5">{(s as any).subtitle}</div>
-            )}
+        <div className="bg-muted/20 rounded-md p-2">
+          <div className="text-[9px] uppercase tracking-widest text-muted-foreground leading-tight">Wallet Balance</div>
+          <div className="text-xs font-mono font-semibold tabular-nums mt-0.5">${balance.toFixed(2)}</div>
+          <div className="text-[9px] text-muted-foreground font-mono mt-0.5">
+            {openMargin > 0 ? `$${openMargin.toFixed(0)} in margin` : 'No open positions'}
           </div>
-        ))}
+        </div>
+        <div className="bg-muted/20 rounded-md p-2">
+          <div className="text-[9px] uppercase tracking-widest text-muted-foreground leading-tight">Equity</div>
+          <div className="text-xs font-mono font-semibold tabular-nums mt-0.5">${equity.toFixed(2)}</div>
+          <div className="text-[9px] text-muted-foreground font-mono mt-0.5">started ${startingBal.toFixed(0)}</div>
+        </div>
+        <div className="bg-muted/20 rounded-md p-2">
+          <div className="text-[9px] uppercase tracking-widest text-muted-foreground leading-tight">Realized P&L</div>
+          <div className={`text-xs font-mono font-semibold tabular-nums mt-0.5 ${totalPnl >= 0 ? 'text-gain' : 'text-loss'}`}>
+            {totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}
+          </div>
+          <div className={`text-[9px] font-mono mt-0.5 ${realizedRoiPct >= 0 ? 'text-gain' : 'text-loss'}`}>
+            {realizedRoiPct >= 0 ? '+' : ''}{realizedRoiPct.toFixed(2)}% ROI
+          </div>
+        </div>
+        <div className="bg-muted/20 rounded-md p-2">
+          <div className="text-[9px] uppercase tracking-widest text-muted-foreground leading-tight">Unrealized P&L</div>
+          <div className={`text-xs font-mono font-semibold tabular-nums mt-0.5 ${unrealizedPnl >= 0 ? 'text-gain' : 'text-loss'}`}>
+            {unrealizedPnl >= 0 ? '+' : ''}${unrealizedPnl.toFixed(2)}
+          </div>
+          <div className={`text-[9px] font-mono mt-0.5 ${equityRoiPct >= 0 ? 'text-gain' : 'text-loss'}`}>
+            {equityRoiPct >= 0 ? '+' : ''}{equityRoiPct.toFixed(2)}% total
+          </div>
+        </div>
       </div>
 
       {/* ── Position/trade stats (3 cols) ── */}
@@ -579,7 +600,7 @@ const FuturesAgent = () => {
         {[
           { label: 'Open Positions', value: `${status?.positions ?? 0}/${settings.max_positions}` },
           { label: 'Closed Trades',  value: String(status?.trade_count ?? 0) },
-          { label: 'Win Rate',       value: `${(status?.win_rate ?? 0).toFixed(1)}%`,
+          { label: 'Win Rate (closed)', value: `${(status?.win_rate ?? 0).toFixed(1)}%`,
             color: (status?.win_rate ?? 0) >= 50 ? 'text-gain' : (status?.win_rate ?? 0) > 0 ? 'text-loss' : '' },
         ].map(s => (
           <div key={s.label} className="bg-muted/20 rounded-md p-2">

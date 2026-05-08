@@ -1,5 +1,5 @@
 {
-  "version": "5.10.2",
-  "buildTime": "2026-05-07T23:10:00.000Z",
-  "commit": "v5.10.2-buildid-bumped-fresh-rebuild"
+  "version": "5.10.3",
+  "buildTime": "2026-05-08T09:15:00.000Z",
+  "commit": "v5.10.3-hedge-fix-unrealized-pnl-display"
 }

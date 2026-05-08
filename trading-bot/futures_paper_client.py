@@ -273,6 +273,12 @@ class FuturesPaperClient:
                 for p in self._positions.values()
             )
 
+    def has_any_open_position(self, symbol: str) -> bool:
+        """True if the symbol has ANY open position (LONG or SHORT).
+        Used to prevent hedging — opening opposite direction on same coin."""
+        with self._lock:
+            return any(p["symbol"] == symbol for p in self._positions.values())
+
     def open_position_count(self) -> int:
         with self._lock:
             return len(self._positions)

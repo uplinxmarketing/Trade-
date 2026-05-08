@@ -666,8 +666,11 @@ async def _scan_symbol(
     if score >= min_sig:
         if n_open >= max_pos:
             print(f"[FuturesEngine] {symbol} score={score:+d} LONG signal — max_pos {max_pos} reached")
-        elif client.has_open_position(symbol, "LONG"):
-            print(f"[FuturesEngine] {symbol} score={score:+d} — already long")
+        elif client.has_any_open_position(symbol):
+            # Prevent hedging — never open opposite direction on the same coin.
+            # Opening LONG when a SHORT is already open (or vice-versa) wastes
+            # margin and doubles fees for a net-flat position.
+            print(f"[FuturesEngine] {symbol} score={score:+d} LONG — already has position, skipping")
         else:
             pos = client.open_position(
                 symbol, "LONG", mark_price, budget, leverage,
@@ -688,8 +691,8 @@ async def _scan_symbol(
     elif score <= -min_sig:
         if n_open >= max_pos:
             print(f"[FuturesEngine] {symbol} score={score:+d} SHORT signal — max_pos {max_pos} reached")
-        elif client.has_open_position(symbol, "SHORT"):
-            print(f"[FuturesEngine] {symbol} score={score:+d} — already short")
+        elif client.has_any_open_position(symbol):
+            print(f"[FuturesEngine] {symbol} score={score:+d} SHORT — already has position, skipping")
         else:
             pos = client.open_position(
                 symbol, "SHORT", mark_price, budget, leverage,
