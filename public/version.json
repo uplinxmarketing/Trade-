@@ -1,5 +1,5 @@
 {
-  "version": "5.10.3",
-  "buildTime": "2026-05-08T09:15:00.000Z",
-  "commit": "v5.10.3-hedge-fix-unrealized-pnl-display"
+  "version": "5.10.4",
+  "buildTime": "2026-05-09T15:20:00.000Z",
+  "commit": "v5.10.4-fix-trade-stats-sql-aggregation"
 }
