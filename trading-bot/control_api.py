@@ -295,18 +295,10 @@ def _get_usdt_balance() -> float:
     return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
 
 
-def _trades_today() -> int:
-    trades = database.get_recent_trades(limit=200)
-    today  = datetime.now(timezone.utc).date().isoformat()
-    return sum(1 for t in trades if (t.get("timestamp_sell") or "").startswith(today))
-
-
 def _overall_win_rate() -> float:
-    trades = database.get_recent_trades(limit=500)
-    closed = [t for t in trades if t.get("exit_price") is not None]
-    if not closed:
-        return 0.0
-    return sum(1 for t in closed if t.get("profitable")) / len(closed)
+    stats = database.get_trade_stats(mode="paper")
+    total = stats["total"]
+    return stats["wins"] / total if total else 0.0
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -325,7 +317,7 @@ def status():
         "pause_reason":   strategy.get("pause_reason"),
         "open_positions": _get_positions(),
         "usdt_balance":   _get_usdt_balance(),
-        "trades_today":   _trades_today(),
+        "trades_today":   database.get_trade_stats(mode="paper")["trades_today"],
         "win_rate":       round(_overall_win_rate(), 3),
         "strategy_updated_at": strategy.get("updated_at"),
     }
@@ -553,22 +545,22 @@ function renderPositions(positions) {
     const pill = isProfitable
       ? '<span class="pill pill-gain">✅ Profitable</span>'
       : '<span class="pill pill-wait">⏳ Waiting</span>';
-    return \`<tr>
-      <td class="mono">\${p.symbol}</td>
-      <td class="mono">\${fmtP(p.entry_price)}</td>
-      <td class="mono \${isProfitable?'gain':'loss'}">\${fmtP(p.current_price)}</td>
-      <td class="mono accent">\${fmtP(p.breakeven_price)}</td>
-      <td class="mono">\${fmt(p.quantity,6)}</td>
-      <td class="mono">\${fmt(p.budget_usdt,2)} USDT</td>
-      <td class="mono \${pnl>=0?'gain':'loss'}">\${pnl>=0?'+':''}\${fmt(pnl,4)} USDT</td>
+    return `<tr>
+      <td class="mono">${p.symbol}</td>
+      <td class="mono">${fmtP(p.entry_price)}</td>
+      <td class="mono ${isProfitable?'gain':'loss'}">${fmtP(p.current_price)}</td>
+      <td class="mono accent">${fmtP(p.breakeven_price)}</td>
+      <td class="mono">${fmt(p.quantity,6)}</td>
+      <td class="mono">${fmt(p.budget_usdt,2)} USDT</td>
+      <td class="mono ${pnl>=0?'gain':'loss'}">${pnl>=0?'+':''}${fmt(pnl,4)} USDT</td>
       <td>
-        <div class="progress-bar" title="\${fmt(dist,4)}% to BEP">
-          <div class="progress-fill" style="width:\${distPct}%;background:\${barColor}"></div>
+        <div class="progress-bar" title="${fmt(dist,4)}% to BEP">
+          <div class="progress-fill" style="width:${distPct}%;background:${barColor}"></div>
         </div>
-        <div style="font-size:10px;color:#64748b;margin-top:2px">\${dist>=0?'+':''}\${fmt(dist,4)}%</div>
+        <div style="font-size:10px;color:#64748b;margin-top:2px">${dist>=0?'+':''}${fmt(dist,4)}%</div>
       </td>
-      <td>\${pill}</td>
-    </tr>\`;
+      <td>${pill}</td>
+    </tr>`;
   }).join('');
 }
 
@@ -586,18 +578,18 @@ function renderTrades(trades) {
     const pill = t.profitable
       ? '<span class="pill pill-gain">WIN</span>'
       : '<span class="pill pill-loss">LOSS</span>';
-    return \`<tr>
-      <td class="mono">\${t.coin}</td>
-      <td class="mono">\${fmtP(t.entry_price)}</td>
-      <td class="mono">\${fmtP(t.exit_price)}</td>
-      <td class="mono">\${fmt(t.quantity,6)}</td>
-      <td class="mono">\${fmt(t.budget_usdt,2)}</td>
-      <td class="mono warn">\${fmt(t.buy_fee,4)}</td>
-      <td class="mono warn">\${fmt(t.sell_fee,4)}</td>
-      <td class="mono \${pnl>=0?'gain':'loss'}">\${pnl>=0?'+':''}\${fmt(pnl,4)}</td>
-      <td class="mono">\${dur}</td>
-      <td>\${pill}</td>
-    </tr>\`;
+    return `<tr>
+      <td class="mono">${t.coin}</td>
+      <td class="mono">${fmtP(t.entry_price)}</td>
+      <td class="mono">${fmtP(t.exit_price)}</td>
+      <td class="mono">${fmt(t.quantity,6)}</td>
+      <td class="mono">${fmt(t.budget_usdt,2)}</td>
+      <td class="mono warn">${fmt(t.buy_fee,4)}</td>
+      <td class="mono warn">${fmt(t.sell_fee,4)}</td>
+      <td class="mono ${pnl>=0?'gain':'loss'}">${pnl>=0?'+':''}${fmt(pnl,4)}</td>
+      <td class="mono">${dur}</td>
+      <td>${pill}</td>
+    </tr>`;
   }).join('');
 }
 
@@ -610,16 +602,16 @@ function renderPatterns(patterns) {
   tbody.innerHTML = patterns.map(p => {
     const conf = (p.confidence_score || 0) * 100;
     const col = conf >= 65 ? 'gain' : conf >= 40 ? 'warn' : 'loss';
-    return \`<tr>
-      <td class="mono">\${p.coin}</td>
-      <td class="mono">\${p.rsi_range||'—'}</td>
-      <td>\${p.bb_position||'—'}</td>
-      <td>\${p.volume_trend||'—'}</td>
-      <td>\${p.ma_position||'—'}</td>
-      <td class="text-right mono">\${p.occurrence_count}</td>
-      <td class="text-right mono \${col}">\${fmt(conf,1)}%</td>
-      <td class="text-right mono \${(p.avg_profit_pct||0)>=0?'gain':'loss'}">\${(p.avg_profit_pct||0)>=0?'+':''}\${fmt(p.avg_profit_pct,3)}%</td>
-    </tr>\`;
+    return `<tr>
+      <td class="mono">${p.coin}</td>
+      <td class="mono">${p.rsi_range||'—'}</td>
+      <td>${p.bb_position||'—'}</td>
+      <td>${p.volume_trend||'—'}</td>
+      <td>${p.ma_position||'—'}</td>
+      <td class="text-right mono">${p.occurrence_count}</td>
+      <td class="text-right mono ${col}">${fmt(conf,1)}%</td>
+      <td class="text-right mono ${(p.avg_profit_pct||0)>=0?'gain':'loss'}">${(p.avg_profit_pct||0)>=0?'+':''}${fmt(p.avg_profit_pct,3)}%</td>
+    </tr>`;
   }).join('');
 }
 
@@ -718,14 +710,14 @@ def dashboard():
 @app.get("/api/status")
 def api_status():
     strategy = _load_strategy()
-    trades   = database.get_recent_trades(limit=500)
-    sells    = [t for t in trades if t.get("exit_price") is not None]
-    wins     = sum(1 for t in sells if (t.get("net_profit") or 0) > 0)
-    # Realized P&L: single source of truth — SQL SUM directly from trades table
-    realized = database.get_realized_pnl(mode="paper")
+    # Use aggregated SQL so total/wins/losses/pnl/trades_today all cover the
+    # same full dataset — not just the last 500 rows returned by get_recent_trades.
+    stats    = database.get_trade_stats(mode="paper")
     initial  = float(strategy.get("initial_balance_usdt", 0))
     balance  = round(_get_usdt_balance(), 2)
     approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
+    wins     = stats["wins"]
+    total    = stats["total"]
     return {
         "running":          strategy.get("trading_active", False),
         "mode":             get_mode(),
@@ -733,12 +725,12 @@ def api_status():
         "paper_balance":    balance,
         "initial_balance":  initial or balance,
         "open_positions":   len(_get_positions()),
-        "trades_today":     database.get_trades_today_count(),
-        "win_rate":         round(wins / len(sells), 3) if sells else 0.0,
+        "trades_today":     stats["trades_today"],
+        "win_rate":         round(wins / total, 3) if total else 0.0,
         "wins":             wins,
-        "losses":           len(sells) - wins,
-        "total_trades":     len(sells),
-        "realized_pnl":     round(realized, 4),
+        "losses":           stats["losses"],
+        "total_trades":     total,
+        "realized_pnl":     round(stats["realized_pnl"], 4),
         "watched_coins":    approved or config.WATCHED_COINS,
         "data_dir":           database._DATA_DIR,
         "db_path":            database.DB_PATH,
@@ -1126,16 +1118,17 @@ def api_all():
         return cached
 
     strategy = _load_strategy()
-    # Single 500-row sweep; reuse the slice for the 200-row "trades" payload —
-    # eliminates a second identical query that previously ran on every poll.
-    trades   = database.get_recent_trades(limit=500)
-    sells    = [t for t in trades if t.get("exit_price") is not None]
-    wins     = sum(1 for t in sells if (t.get("net_profit") or 0) > 0)
-    realized = database.get_realized_pnl(mode="paper")
-    initial  = float(strategy.get("initial_balance_usdt", 0))
-    balance  = round(_get_usdt_balance(), 2)
-    approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
-    positions = _get_positions()  # also reused below — was called twice
+    # Use aggregated SQL stats — covers ALL trades, not just the last 500.
+    # get_recent_trades(limit=500) was causing total_trades/wins/pnl to
+    # describe different subsets (500 rows vs. full table) making them inconsistent.
+    stats     = database.get_trade_stats(mode="paper")
+    wins      = stats["wins"]
+    total     = stats["total"]
+    initial   = float(strategy.get("initial_balance_usdt", 0))
+    balance   = round(_get_usdt_balance(), 2)
+    approved  = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
+    positions = _get_positions()
+    trades    = database.get_recent_trades(limit=200)   # for the trades list payload only
     payload = {
         "status": {
             "running":         strategy.get("trading_active", False),
@@ -1144,12 +1137,12 @@ def api_all():
             "paper_balance":   balance,
             "initial_balance": initial or balance,
             "open_positions":  len(positions),
-            "trades_today":    database.get_trades_today_count(),
-            "win_rate":        round(wins / len(sells), 3) if sells else 0.0,
+            "trades_today":    stats["trades_today"],
+            "win_rate":        round(wins / total, 3) if total else 0.0,
             "wins":            wins,
-            "losses":          len(sells) - wins,
-            "total_trades":    len(sells),
-            "realized_pnl":    round(realized, 4),
+            "losses":          stats["losses"],
+            "total_trades":    total,
+            "realized_pnl":    round(stats["realized_pnl"], 4),
             "watched_coins":   approved or config.WATCHED_COINS,
             "data_persistent": database._DATA_DIR == "/data",
             "data_dir":        database._DATA_DIR,

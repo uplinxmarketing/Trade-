@@ -462,6 +462,39 @@ def get_realized_pnl(mode: str = "paper") -> float:
     return float(row["total"]) if row else 0.0
 
 
+def get_trade_stats(mode: str = "paper") -> dict:
+    """Return total/wins/losses/realized_pnl from ALL closed trades (no LIMIT).
+
+    Using len(get_recent_trades(limit=500)) for these counts is wrong when
+    the bot has placed >500 trades — the win-rate and total-trades would
+    describe only the last 500 rows while realized_pnl covers everything.
+    This function uses a single aggregated SQL query so all four numbers
+    are always consistent with each other.
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    with _lock:
+        conn = _conn()
+        row = conn.execute("""
+            SELECT
+                COUNT(*)                                            AS total,
+                SUM(CASE WHEN net_profit >  0 THEN 1 ELSE 0 END)  AS wins,
+                SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END)  AS losses,
+                COALESCE(SUM(net_profit), 0.0)                    AS realized_pnl,
+                SUM(CASE WHEN timestamp_sell LIKE ? THEN 1 ELSE 0 END) AS trades_today
+            FROM trades
+            WHERE exit_price IS NOT NULL AND mode = ?
+        """, (f"{today}%", mode)).fetchone()
+        conn.close()
+    if row:
+        return {
+            "total":        int(row["total"]   or 0),
+            "wins":         int(row["wins"]    or 0),
+            "losses":       int(row["losses"]  or 0),
+            "realized_pnl": float(row["realized_pnl"] or 0.0),
+            "trades_today": int(row["trades_today"] or 0),
+        }
+    return {"total": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0, "trades_today": 0}
+
 # ── Activity log ──────────────────────────────────────────────────────────────
 
 def log_activity(message: str, level: str = "info"):
