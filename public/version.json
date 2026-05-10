@@ -1,5 +1,5 @@
 {
-  "version": "5.10.5",
-  "buildTime": "2026-05-10T12:00:00.000Z",
-  "commit": "v5.10.5-fix-report-stats-single-source"
+  "version": "5.10.6",
+  "buildTime": "2026-05-10T13:00:00.000Z",
+  "commit": "v5.10.6-binance-live-connection"
 }
