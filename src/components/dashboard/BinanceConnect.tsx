@@ -1,9 +1,9 @@
-import { useState, useEffect } from 'react';
-import { Key, Eye, EyeOff, CheckCircle2, XCircle, Loader2, X } from 'lucide-react';
+import { useState, useEffect, useCallback } from 'react';
+import { Key, Eye, EyeOff, CheckCircle2, XCircle, Loader2, X, Wifi, FlaskConical, AlertTriangle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
+import { API_BASE } from '@/config';
 
 interface BinanceConnectProps {
   isOpen: boolean;
@@ -11,168 +11,286 @@ interface BinanceConnectProps {
   onConnectionChange: (connected: boolean) => void;
 }
 
+type BotMode = 'paper' | 'live' | 'testnet' | 'unknown';
+
+interface BotStatus {
+  mode: BotMode;
+  running: boolean;
+  balance_usdt: number;
+}
+
 const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectProps) => {
-  const [apiKey, setApiKey] = useState('');
+  const [apiKey, setApiKey]       = useState('');
   const [apiSecret, setApiSecret] = useState('');
   const [showSecret, setShowSecret] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [connectionStatus, setConnectionStatus] = useState<'unknown' | 'connected' | 'failed'>('unknown');
-  const [accountInfo, setAccountInfo] = useState<{ balances: number; canTrade: boolean } | null>(null);
+  const [saving, setSaving]       = useState(false);
+  const [checking, setChecking]   = useState(false);
+  const [botStatus, setBotStatus] = useState<BotStatus | null>(null);
+  const [restartPoll, setRestartPoll] = useState<ReturnType<typeof setInterval> | null>(null);
 
-  useEffect(() => {
-    if (isOpen) testExistingConnection();
-  }, [isOpen]);
-
-  const testExistingConnection = async () => {
-    setTesting(true);
+  const checkStatus = useCallback(async () => {
+    setChecking(true);
     try {
-      const { data, error } = await supabase.functions.invoke('binance-proxy', {
-        body: { action: 'account', params: {} },
-      });
-      if (error || data?.error) {
-        setConnectionStatus('failed');
-        onConnectionChange(false);
-      } else {
-        setConnectionStatus('connected');
-        onConnectionChange(true);
-        const nonZeroBalances = data.balances?.filter((b: any) => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0) || [];
-        setAccountInfo({ balances: nonZeroBalances.length, canTrade: data.canTrade });
-      }
+      const res = await fetch(`${API_BASE}/api/status`, { cache: 'no-store' });
+      if (!res.ok) { setBotStatus(null); onConnectionChange(false); return; }
+      const d = await res.json();
+      const status: BotStatus = {
+        mode:         d.mode ?? 'unknown',
+        running:      Boolean(d.running),
+        balance_usdt: Number(d.balance_usdt ?? 0),
+      };
+      setBotStatus(status);
+      onConnectionChange(status.mode === 'live');
     } catch {
-      setConnectionStatus('failed');
+      setBotStatus(null);
       onConnectionChange(false);
     } finally {
-      setTesting(false);
+      setChecking(false);
     }
-  };
+  }, [onConnectionChange]);
 
-  const saveAndTest = async () => {
+  useEffect(() => {
+    if (isOpen) checkStatus();
+  }, [isOpen, checkStatus]);
+
+  // Poll after switch until the new mode appears (process restarts take ~3 s)
+  const pollUntilMode = useCallback((targetMode: BotMode) => {
+    let attempts = 0;
+    const id = setInterval(async () => {
+      attempts++;
+      try {
+        const res = await fetch(`${API_BASE}/api/status`, { cache: 'no-store' });
+        if (res.ok) {
+          const d = await res.json();
+          if (d.mode === targetMode) {
+            clearInterval(id);
+            setRestartPoll(null);
+            const status: BotStatus = { mode: d.mode, running: d.running, balance_usdt: Number(d.balance_usdt ?? 0) };
+            setBotStatus(status);
+            onConnectionChange(targetMode === 'live');
+            toast.success(targetMode === 'live'
+              ? `Connected to Binance Live — $${status.balance_usdt.toFixed(2)} USDT`
+              : 'Switched to Paper mode');
+            return;
+          }
+        }
+      } catch { /* retry */ }
+      if (attempts >= 20) {
+        clearInterval(id);
+        setRestartPoll(null);
+        toast.error('Timeout waiting for bot restart — check Railway logs');
+        checkStatus();
+      }
+    }, 2000);
+    setRestartPoll(id);
+  }, [onConnectionChange, checkStatus]);
+
+  useEffect(() => {
+    return () => { if (restartPoll) clearInterval(restartPoll); };
+  }, [restartPoll]);
+
+  const connectLive = async () => {
     if (!apiKey.trim() || !apiSecret.trim()) {
       toast.error('Both API Key and Secret are required');
       return;
     }
-    setTesting(true);
+    setSaving(true);
     try {
-      // Save keys via edge function that stores them
-      const { data, error } = await supabase.functions.invoke('binance-proxy', {
-        body: { action: 'save_keys', params: { apiKey: apiKey.trim(), apiSecret: apiSecret.trim() } },
+      const res = await fetch(`${API_BASE}/api/mode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'live', api_key: apiKey.trim(), api_secret: apiSecret.trim() }),
       });
-      if (error) throw error;
-      if (data?.error) throw new Error(data.error);
-
-      // Now test connection
-      await testExistingConnection();
-      toast.success('Binance API connected successfully');
+      const d = await res.json();
+      if (!d.ok) throw new Error(d.error ?? 'Unknown error');
+      toast.info('Credentials saved — bot restarting…');
+      setApiKey('');
+      setApiSecret('');
+      pollUntilMode('live');
     } catch (err: any) {
-      toast.error('Connection failed', { description: err.message });
-      setConnectionStatus('failed');
-      onConnectionChange(false);
+      toast.error('Failed to connect', { description: err.message });
     } finally {
-      setTesting(false);
+      setSaving(false);
     }
   };
+
+  const switchToPaper = async () => {
+    setSaving(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/mode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'paper' }),
+      });
+      const d = await res.json();
+      if (!d.ok) throw new Error(d.error ?? 'Unknown error');
+      toast.info('Switching to Paper mode — bot restarting…');
+      pollUntilMode('paper');
+    } catch (err: any) {
+      toast.error('Switch failed', { description: err.message });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const isRestarting = restartPoll !== null;
+  const isLive       = botStatus?.mode === 'live';
 
   if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
       <div className="bg-card border border-border rounded-lg p-6 w-full max-w-md mx-4 shadow-2xl">
+
+        {/* Header */}
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-2">
             <Key className="w-5 h-5 text-accent" />
-            <h2 className="text-base font-semibold">Binance API Connection</h2>
+            <h2 className="text-base font-semibold">Binance Connection</h2>
           </div>
           <button onClick={onClose} className="text-muted-foreground hover:text-foreground transition-colors">
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        {/* Connection status */}
+        {/* Current status */}
         <div className={`flex items-center gap-2 p-3 rounded-md mb-4 ${
-          connectionStatus === 'connected' ? 'bg-gain/10 border border-gain/20' :
-          connectionStatus === 'failed' ? 'bg-loss/10 border border-loss/20' :
+          isRestarting                  ? 'bg-warn/10 border border-warn/20'  :
+          botStatus?.mode === 'live'    ? 'bg-gain/10 border border-gain/20'  :
+          botStatus?.mode === 'paper'   ? 'bg-accent/10 border border-accent/20' :
+          botStatus === null            ? 'bg-loss/10 border border-loss/20'  :
           'bg-muted/20 border border-border'
         }`}>
-          {testing ? (
-            <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
-          ) : connectionStatus === 'connected' ? (
-            <CheckCircle2 className="w-4 h-4 text-gain" />
-          ) : connectionStatus === 'failed' ? (
-            <XCircle className="w-4 h-4 text-loss" />
+          {isRestarting || checking ? (
+            <Loader2 className="w-4 h-4 animate-spin text-warn" />
+          ) : botStatus?.mode === 'live' ? (
+            <Wifi className="w-4 h-4 text-gain" />
+          ) : botStatus?.mode === 'paper' ? (
+            <FlaskConical className="w-4 h-4 text-accent" />
           ) : (
-            <div className="w-4 h-4 rounded-full bg-muted-foreground/30" />
+            <XCircle className="w-4 h-4 text-loss" />
           )}
           <span className={`text-sm font-medium ${
-            connectionStatus === 'connected' ? 'text-gain' :
-            connectionStatus === 'failed' ? 'text-loss' : 'text-muted-foreground'
+            isRestarting                ? 'text-warn'   :
+            botStatus?.mode === 'live'  ? 'text-gain'   :
+            botStatus?.mode === 'paper' ? 'text-accent'  :
+            'text-loss'
           }`}>
-            {testing ? 'Testing connection...' :
-             connectionStatus === 'connected' ? 'Connected' :
-             connectionStatus === 'failed' ? 'Not connected' : 'Unknown'}
+            {isRestarting ? 'Restarting bot…' :
+             checking     ? 'Checking…' :
+             botStatus?.mode === 'live'    ? 'Live — Binance connected' :
+             botStatus?.mode === 'paper'   ? 'Paper trading mode' :
+             botStatus?.mode === 'testnet' ? 'Testnet mode' :
+             'Bot unreachable'}
           </span>
-          {accountInfo && connectionStatus === 'connected' && (
-            <span className="text-xs text-muted-foreground ml-auto">
-              {accountInfo.balances} assets · {accountInfo.canTrade ? 'Trading enabled' : 'Read-only'}
+          {!isRestarting && botStatus?.mode === 'live' && (
+            <span className="text-xs text-muted-foreground ml-auto font-mono">
+              ${botStatus.balance_usdt.toFixed(2)} USDT
             </span>
+          )}
+          {!isRestarting && botStatus && (
+            <button onClick={checkStatus} className="ml-auto text-[10px] text-muted-foreground hover:text-foreground">
+              {checking ? '' : 'Refresh'}
+            </button>
           )}
         </div>
 
-        {/* API Key inputs */}
-        <div className="space-y-3">
-          <div>
-            <label className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1 block">API Key</label>
-            <Input
-              type="text"
-              placeholder="Enter your Binance API key"
-              value={apiKey}
-              onChange={e => setApiKey(e.target.value)}
-              className="bg-muted/40 border-border text-sm font-mono"
-            />
-          </div>
-          <div>
-            <label className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1 block">API Secret</label>
-            <div className="relative">
-              <Input
-                type={showSecret ? 'text' : 'password'}
-                placeholder="Enter your Binance API secret"
-                value={apiSecret}
-                onChange={e => setApiSecret(e.target.value)}
-                className="bg-muted/40 border-border text-sm font-mono pr-10"
-              />
-              <button
-                type="button"
-                onClick={() => setShowSecret(!showSecret)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-              >
-                {showSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-              </button>
-            </div>
-          </div>
-
-          <p className="text-[10px] text-muted-foreground leading-relaxed">
-            Your keys are stored securely as encrypted secrets and never exposed to the frontend. 
-            Enable "Spot Trading" permission on Binance. Do NOT enable withdrawal permissions.
+        {isRestarting && (
+          <p className="text-xs text-muted-foreground text-center mb-4">
+            Waiting for the bot to restart with new credentials…
           </p>
+        )}
 
-          <div className="flex gap-2">
-            <Button
-              onClick={saveAndTest}
-              disabled={testing || !apiKey.trim() || !apiSecret.trim()}
-              className="flex-1 font-semibold"
-            >
-              {testing ? <Loader2 className="w-4 h-4 animate-spin mr-1.5" /> : null}
-              Save & Connect
-            </Button>
+        {/* Live mode: option to switch back to paper */}
+        {!isRestarting && isLive && (
+          <div className="space-y-3">
+            <div className="flex items-start gap-2 p-3 rounded bg-gain/5 border border-gain/20 text-xs">
+              <CheckCircle2 className="w-4 h-4 text-gain mt-0.5 shrink-0" />
+              <div>
+                <div className="font-semibold text-foreground">Real Binance account connected</div>
+                <div className="text-muted-foreground mt-0.5">
+                  The bot is placing real orders on your Binance spot account. Positions and balances
+                  shown in the wallet panel are your actual Binance holdings.
+                </div>
+              </div>
+            </div>
             <Button
               variant="outline"
-              onClick={testExistingConnection}
-              disabled={testing}
-              className="font-medium"
+              className="w-full text-loss border-loss/30 hover:bg-loss/10"
+              onClick={switchToPaper}
+              disabled={saving}
             >
-              Test
+              {saving ? <Loader2 className="w-4 h-4 animate-spin mr-1.5" /> : null}
+              Switch back to Paper mode
             </Button>
           </div>
-        </div>
+        )}
+
+        {/* Paper/unknown mode: show API key form */}
+        {!isRestarting && !isLive && (
+          <div className="space-y-3">
+            <div className="flex items-start gap-2 p-3 rounded bg-warn/5 border border-warn/20 text-xs mb-1">
+              <AlertTriangle className="w-4 h-4 text-warn mt-0.5 shrink-0" />
+              <div>
+                <div className="font-semibold text-foreground">Live trading uses real money</div>
+                <div className="text-muted-foreground mt-0.5">
+                  Enable Spot Trading on your Binance API key. Do NOT enable Withdrawals or Margin.
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <label className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1 block">API Key</label>
+              <Input
+                type="text"
+                placeholder="Enter your Binance API key"
+                value={apiKey}
+                onChange={e => setApiKey(e.target.value)}
+                className="bg-muted/40 border-border text-sm font-mono"
+                autoComplete="off"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1 block">API Secret</label>
+              <div className="relative">
+                <Input
+                  type={showSecret ? 'text' : 'password'}
+                  placeholder="Enter your Binance API secret"
+                  value={apiSecret}
+                  onChange={e => setApiSecret(e.target.value)}
+                  className="bg-muted/40 border-border text-sm font-mono pr-10"
+                  autoComplete="off"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowSecret(!showSecret)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                >
+                  {showSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+
+            <p className="text-[10px] text-muted-foreground leading-relaxed">
+              Keys are saved to the Railway environment and never sent to Supabase or any third party.
+              The bot restarts automatically after saving — this takes ~5 seconds.
+            </p>
+
+            <div className="flex gap-2">
+              <Button
+                onClick={connectLive}
+                disabled={saving || !apiKey.trim() || !apiSecret.trim()}
+                className="flex-1 font-semibold"
+              >
+                {saving ? <Loader2 className="w-4 h-4 animate-spin mr-1.5" /> : <Wifi className="w-4 h-4 mr-1.5" />}
+                Connect to Binance Live
+              </Button>
+              <Button variant="outline" onClick={checkStatus} disabled={checking}>
+                {checking ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Test'}
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

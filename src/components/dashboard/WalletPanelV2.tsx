@@ -112,7 +112,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   const [lastUpdated, setLastUpdated]   = useState('');
   const [showBudget, setShowBudget]     = useState(true);
 
-  // ── Budget config (localStorage) ────────────────────────────────────────────
+  // ── Budget config (localStorage) ─────────────────────────────────────────────
   const [walletCfg, setWalletCfg] = useState<WalletCfg>(DEFAULT_CFG);
   // draftCfg holds uncommitted budget value edits; synced to server only on Apply
   const [draftCfg, setDraftCfg]   = useState<WalletCfg>(DEFAULT_CFG);
@@ -172,7 +172,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     JSON.stringify(draftCfg.budgetPerCoin)  !== JSON.stringify(walletCfg.budgetPerCoin)  ||
     JSON.stringify(draftCfg.budgetCoinPct)  !== JSON.stringify(walletCfg.budgetCoinPct);
 
-  // ── Paper / test mode ────────────────────────────────────────────────────────
+  // ── Paper / test mode ──────────────────────────────────────────────
   // No dependency on walletCfg state — reads localStorage directly so the callback
   // stays stable and the Supabase realtime subscription is never recreated on cfg changes.
   const loadPaper = useCallback(async () => {
@@ -209,35 +209,38 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     setLastUpdated(new Date().toLocaleTimeString());
   }, []);
 
-  // ── Live mode ────────────────────────────────────────────────────────────────
-  // Intentionally NOT in the subscription effect below — prices changes every WS tick
-  // and would destroy/recreate the paper subscription on every tick if combined.
+  // ── Live mode ──────────────────────────────────────────────────────────────
+  // Reads directly from Railway /api/wallet which calls the real Binance API
+  // when the bot is in live mode (MODE=live env var). No Supabase proxy needed.
   const loadLive = useCallback(async () => {
     if (!binanceConnected) return;
     setLoading(true);
     try {
-      const { data, error } = await supabase.functions.invoke('binance-proxy', {
-        body: { action: 'account', params: {} },
-      });
-      if (error || data?.error) { toast.error('Failed to load live wallet'); return; }
-      const nonZero = (data.balances || []).filter((b:any) => parseFloat(b.free)+parseFloat(b.locked) > 0.0001);
+      const url = getRailwayUrl();
+      const res = await fetch(`${url}/api/wallet`, { cache: 'no-store' });
+      if (!res.ok) { toast.error('Failed to load live wallet'); return; }
+      const data = await res.json();
+      const nonZero = (data.balances || []).filter((b: any) =>
+        parseFloat(String(b.free)) + parseFloat(String(b.locked)) > 0.0001
+      );
       const assets: LiveAsset[] = [];
       for (const b of nonZero) {
         const asset = b.asset as string;
-        const total = parseFloat(b.free)+parseFloat(b.locked);
+        const total = parseFloat(String(b.free)) + parseFloat(String(b.locked));
         let usdValue = 0;
-        if (['USDT','BUSD','USDC'].includes(asset)) {
+        if (['USDT', 'BUSD', 'USDC'].includes(asset)) {
           usdValue = total;
         } else {
           const lp = prices[`${asset}USDT`];
           if (lp) usdValue = total * parseFloat(lp.price);
         }
-        if (usdValue >= 0.01) assets.push({ asset, free: b.free, locked: b.locked, usdValue });
+        if (usdValue >= 0.01) assets.push({ asset, free: String(b.free), locked: String(b.locked), usdValue });
       }
-      assets.sort((a,b)=>b.usdValue-a.usdValue);
+      assets.sort((a, b) => b.usdValue - a.usdValue);
       setLiveAssets(assets);
       setLastUpdated(new Date().toLocaleTimeString());
-    } finally { setLoading(false); }
+    } catch { toast.error('Live wallet load error'); }
+    finally { setLoading(false); }
   }, [binanceConnected, prices]);
 
   // ── Use agent-provided state when available (instant sync / server mode) ─────
@@ -324,7 +327,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
       }, 0) * 10000) / 10000
     : totalFees;
 
-  // ── Reset paper wallet ───────────────────────────────────────────────────────
+  // ── Reset paper wallet ───────────────────────────────────────────────────
   const resetWallet = async () => {
     // Use Railway's authoritative starting balance when available, else local config
     const resetBal = (serverWallet?.starting_balance ?? 0) > 0
@@ -369,7 +372,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     } finally { setResetting(false); }
   };
 
-  // ── Compute portfolio totals (paper mode) ────────────────────────────────────
+  // ── Compute portfolio totals (paper mode) ─────────────────────────────────────────
   // Number() casts guard against Supabase PostgREST returning NUMERIC columns as strings.
   const positionRows = effectivePositions.map(pos => {
     // toNum: guarantees a finite, non-negative number — malformed Railway/Supabase
@@ -384,19 +387,12 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     const coin       = pos.symbol.replace('USDT','');
     const wsPrice    = toNum(prices[pos.symbol]?.price);
     const livePrice  = wsPrice > 0 ? wsPrice : entryPrice;
-    // Mark-to-market P&L — pure price movement since entry, NOT including
-    // round-trip fees. Matches the convention every major exchange uses for
-    // open-position display (Binance, Coinbase, Kraken). Fees are only
-    // realised on close, so showing them as a sunk loss on a fresh entry
-    // (which produced a confusing "-0.2% on every coin" display) is wrong.
-    // The exit-target shown alongside already accounts for fees.
     const buyValue     = qty * entryPrice;
     const currentValue = qty * livePrice;
     const pnl          = currentValue - buyValue;
     let pct = entryPrice > 0 ? ((livePrice - entryPrice) / entryPrice) * 100 : 0;
     if (!Number.isFinite(pct)) pct = 0;
     if (pct < -100) pct = -100;
-    // costBasis kept for the cost-display row (still shown as "10.01 USDT").
     const costBasis    = qty * entryPrice / (1 - TAKER_FEE);
     const breakEven    = entryPrice * BREAK_EVEN;
     return { coin, pos, qty, entryPrice, livePrice, currentValue, buyValue, costBasis, pnl, pct, breakEven };
@@ -412,10 +408,10 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   const displaySessionPnl  = serverWallet ? serverWallet.session_pnl : (totalPortfolio - displayStartingBal);
   const sessionGainPct     = displayStartingBal > 0 ? (displaySessionPnl / displayStartingBal) * 100 : 0;
 
-  // ── Live mode totals ─────────────────────────────────────────────────────────
+  // ── Live mode totals ─────────────────────────────────────────────────────
   const liveTotal = liveAssets.reduce((s,a)=>s+a.usdValue, 0);
 
-  // ── Budget mode description for active mode ──────────────────────────────────
+  // ── Budget mode description for active mode ─────────────────────────────────────────
   const watchCoins = selectedCoins ?? Object.keys(walletCfg.budgetPerCoin);
 
   return (
