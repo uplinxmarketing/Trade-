@@ -74,7 +74,7 @@ def write_default_strategy():
     only touch updated_at so nothing is lost across redeploys.
     Creates a fresh default only when the file is missing or corrupt.
     """
-    # ── Preserve existing strategy across redeploys ───────────────────────────
+    # ── Preserve existing strategy across redeploys ────────────────────────────────────────────
     if os.path.exists(config.STRATEGY_FILE):
         try:
             with open(config.STRATEGY_FILE) as f:
@@ -98,7 +98,7 @@ def write_default_strategy():
         except Exception as e:
             print(f"[StrategyEngine] strategy.json unreadable ({e}) — writing defaults.")
 
-    # ── First run or corrupt file — create defaults ───────────────────────────
+    # ── First run or corrupt file — create defaults ─────────────────────────────────────────────
     # Prefer the DB-persisted starting balance (written at wallet-reset time) so
     # initial_balance_usdt always matches what the paper client actually started with.
     starting_str  = database.get_setting("paper_starting_balance")
@@ -108,6 +108,7 @@ def write_default_strategy():
         "trading_active":       True,
         "pause_reason":         None,
         "initial_balance_usdt": starting_usdt,
+        "min_signals":          config.MIN_SIGNALS_TO_BUY,
         "approved_coins": [
             {
                 "symbol":         coin,

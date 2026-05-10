@@ -42,11 +42,11 @@ def _data_dir() -> str:
 _DATA_DIR     = _data_dir()
 STRATEGY_FILE = _os.path.join(_DATA_DIR, "strategy.json")
 
-# ── Two-speed architecture constants ─────────────────────────────────────────
+# ── Two-speed architecture constants ─────────────────────────────────────────────
 SCAN_INTERVAL_SEC    = 60      # REST backup cache refresh — WebSocket handles real-time
 STOP_LOSS_PCT        = 0.005   # 0.5% stop-loss
 COOLDOWN_AFTER_LOSS  = 180     # 3 min cooldown after stop-loss
-MIN_SIGNALS_TO_BUY   = 4       # at least 4 of 6 signals must be bullish
+MIN_SIGNALS_TO_BUY   = 3       # at least 3 of 6 signals must be bullish
 RSI_BUY_MIN          = 20
 RSI_BUY_MAX          = 80      # wide window — scalping works across most RSI zones
 VOLUME_RATIO_MIN     = 1.1     # volume must be 1.1× the 20-candle average
@@ -72,7 +72,7 @@ BUDGET_PER_COIN = {
     "DOGEUSDT": 50.0,
 }
 
-# ── Futures paper-trading agent ───────────────────────────────────────────────
+# ── Futures paper-trading agent ───────────────────────────────────────────────────
 FUTURES_ENABLED           = True
 FUTURES_WATCHED_COINS     = [
     "BTCUSDT", "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
