@@ -1,5 +1,5 @@
 {
-  "version": "5.10.6",
-  "buildTime": "2026-05-10T13:00:00.000Z",
-  "commit": "v5.10.6-binance-live-connection"
+  "version": "5.10.7",
+  "buildTime": "2026-05-10T13:30:00.000Z",
+  "commit": "v5.10.7-fix-report-stats-missing-fields"
 }

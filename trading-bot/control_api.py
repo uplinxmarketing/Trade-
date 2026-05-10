@@ -296,7 +296,7 @@ def _get_usdt_balance() -> float:
 
 
 def _overall_win_rate() -> float:
-    stats = database.get_trade_stats(mode="paper")
+    stats = database.get_trade_stats(mode=get_mode())
     total = stats["total"]
     return stats["wins"] / total if total else 0.0
 
@@ -317,7 +317,7 @@ def status():
         "pause_reason":   strategy.get("pause_reason"),
         "open_positions": _get_positions(),
         "usdt_balance":   _get_usdt_balance(),
-        "trades_today":   database.get_trade_stats(mode="paper")["trades_today"],
+        "trades_today":   database.get_trade_stats(mode=get_mode())["trades_today"],
         "win_rate":       round(_overall_win_rate(), 3),
         "strategy_updated_at": strategy.get("updated_at"),
     }
@@ -678,7 +678,8 @@ def api_wallet():
             total_value += pos["quantity"] * px
 
         # Realized P&L: single source of truth — SQL SUM from trades table
-        realized_pnl = database.get_realized_pnl(mode="paper")
+        _mode        = get_mode()
+        realized_pnl = database.get_realized_pnl(mode=_mode)
 
         # Session P&L: current total portfolio value minus the balance at last reset
         starting_str  = database.get_setting("paper_starting_balance")
@@ -692,11 +693,11 @@ def api_wallet():
             "realized_pnl":    round(realized_pnl, 4),
             "session_pnl":     session_pnl,
             "starting_balance": round(starting_bal, 4),
-            "mode":            "paper",
+            "mode":            _mode,
         }
     except Exception as e:
         return {"balances": [], "total_usdt": 0.0, "total_value": 0.0,
-                "realized_pnl": 0.0, "session_pnl": 0.0, "mode": "paper", "error": str(e)}
+                "realized_pnl": 0.0, "session_pnl": 0.0, "mode": get_mode(), "error": str(e)}
 
 
 @app.get("/bot-dashboard", response_class=HTMLResponse)
@@ -712,30 +713,33 @@ def api_status():
     strategy = _load_strategy()
     # Use aggregated SQL so total/wins/losses/pnl/trades_today all cover the
     # same full dataset — not just the last 500 rows returned by get_recent_trades.
-    stats    = database.get_trade_stats(mode="paper")
+    stats    = database.get_trade_stats(mode=get_mode())
     initial  = float(strategy.get("initial_balance_usdt", 0))
     balance  = round(_get_usdt_balance(), 2)
     approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
     wins     = stats["wins"]
     total    = stats["total"]
     return {
-        "running":          strategy.get("trading_active", False),
-        "mode":             get_mode(),
-        "balance_usdt":     balance,
-        "paper_balance":    balance,
-        "initial_balance":  initial or balance,
-        "open_positions":   len(_get_positions()),
-        "trades_today":     stats["trades_today"],
-        "win_rate":         round(wins / total, 3) if total else 0.0,
-        "wins":             wins,
-        "losses":           stats["losses"],
-        "total_trades":     total,
-        "realized_pnl":     round(stats["realized_pnl"], 4),
-        "watched_coins":    approved or config.WATCHED_COINS,
-        "data_dir":           database._DATA_DIR,
-        "db_path":            database.DB_PATH,
-        "data_persistent":    database._DATA_DIR == "/data",
-        "sell_monitor_alive": _sell_monitor_alive(),
+        "running":             strategy.get("trading_active", False),
+        "mode":                get_mode(),
+        "balance_usdt":        balance,
+        "paper_balance":       balance,
+        "initial_balance":     initial or balance,
+        "open_positions":      len(_get_positions()),
+        "trades_today":        stats["trades_today"],
+        "win_rate":            round(wins / total, 3) if total else 0.0,
+        "wins":                wins,
+        "losses":              stats["losses"],
+        "total_trades":        total,
+        "realized_pnl":        round(stats["realized_pnl"], 4),
+        "today_realized_pnl":  round(stats["today_realized_pnl"], 4),
+        "locked_profit":       round(stats["locked_profit"], 4),
+        "total_fees":          round(stats["total_fees"], 4),
+        "watched_coins":       approved or config.WATCHED_COINS,
+        "data_dir":            database._DATA_DIR,
+        "db_path":             database.DB_PATH,
+        "data_persistent":     database._DATA_DIR == "/data",
+        "sell_monitor_alive":  _sell_monitor_alive(),
     }
 
 
@@ -1121,7 +1125,7 @@ def api_all():
     # Use aggregated SQL stats — covers ALL trades, not just the last 500.
     # get_recent_trades(limit=500) was causing total_trades/wins/pnl to
     # describe different subsets (500 rows vs. full table) making them inconsistent.
-    stats     = database.get_trade_stats(mode="paper")
+    stats     = database.get_trade_stats(mode=get_mode())
     wins      = stats["wins"]
     total     = stats["total"]
     initial   = float(strategy.get("initial_balance_usdt", 0))
@@ -1131,19 +1135,22 @@ def api_all():
     trades    = database.get_recent_trades(limit=200)   # for the trades list payload only
     payload = {
         "status": {
-            "running":         strategy.get("trading_active", False),
-            "mode":            get_mode(),
-            "balance_usdt":    balance,
-            "paper_balance":   balance,
-            "initial_balance": initial or balance,
-            "open_positions":  len(positions),
-            "trades_today":    stats["trades_today"],
-            "win_rate":        round(wins / total, 3) if total else 0.0,
-            "wins":            wins,
-            "losses":          stats["losses"],
-            "total_trades":    total,
-            "realized_pnl":    round(stats["realized_pnl"], 4),
-            "watched_coins":   approved or config.WATCHED_COINS,
+            "running":            strategy.get("trading_active", False),
+            "mode":               get_mode(),
+            "balance_usdt":       balance,
+            "paper_balance":      balance,
+            "initial_balance":    initial or balance,
+            "open_positions":     len(positions),
+            "trades_today":       stats["trades_today"],
+            "win_rate":           round(wins / total, 3) if total else 0.0,
+            "wins":               wins,
+            "losses":             stats["losses"],
+            "total_trades":       total,
+            "realized_pnl":       round(stats["realized_pnl"], 4),
+            "today_realized_pnl": round(stats["today_realized_pnl"], 4),
+            "locked_profit":      round(stats["locked_profit"], 4),
+            "total_fees":         round(stats["total_fees"], 4),
+            "watched_coins":      approved or config.WATCHED_COINS,
             "data_persistent": database._DATA_DIR == "/data",
             "data_dir":        database._DATA_DIR,
             "stop_loss_enabled":  strategy.get("stop_loss_enabled",  True),
