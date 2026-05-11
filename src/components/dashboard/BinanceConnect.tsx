@@ -272,7 +272,7 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
             </div>
 
             <p className="text-[10px] text-muted-foreground leading-relaxed">
-              Keys are saved to the Railway environment and never sent to Supabase or any third party.
+              Keys are saved securely to the server environment and never sent to Supabase or any third party.
               The bot restarts automatically after saving — this takes ~5 seconds.
             </p>
 
