@@ -125,7 +125,6 @@ def init_db():
                 exit_target        REAL,
                 quantity           REAL,
                 budget_usdt        REAL,
-                buy_fee_usdt       REAL,
                 timestamp          TEXT,
                 mode               TEXT,
                 entry_rsi          REAL,
@@ -199,6 +198,8 @@ def init_db():
             "ALTER TABLE positions         ADD COLUMN exit_target  REAL",
             "ALTER TABLE futures_positions ADD COLUMN sl_enabled   INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE positions         ADD COLUMN buy_fee_usdt REAL",
+            "ALTER TABLE futures_trades    ADD COLUMN buy_fee  REAL DEFAULT 0.0",
+            "ALTER TABLE futures_trades    ADD COLUMN sell_fee REAL DEFAULT 0.0",
         ]
         for sql in migrations:
             try:
@@ -347,14 +348,12 @@ def save_position(pos: dict) -> Optional[int]:
         conn = _conn()
         conn.execute("""
             INSERT INTO positions
-                (symbol, entry_price, exit_target, quantity, budget_usdt, buy_fee_usdt,
-                 timestamp, mode,
+                (symbol, entry_price, exit_target, quantity, budget_usdt, timestamp, mode,
                  entry_rsi, entry_ma_position, entry_bb_position, entry_volume_trend)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (
             pos["symbol"], pos["entry_price"], pos.get("exit_target"),
-            pos["quantity"], pos["budget_usdt"], pos.get("buy_fee_usdt"),
-            pos["timestamp"], pos.get("mode", "paper"),
+            pos["quantity"], pos["budget_usdt"], pos["timestamp"], pos.get("mode", "paper"),
             pos.get("entry_rsi"), pos.get("entry_ma_position"),
             pos.get("entry_bb_position"), pos.get("entry_volume_trend"),
         ))
@@ -511,6 +510,107 @@ def get_trade_stats(mode: str = "paper") -> dict:
         "trades_today": 0, "today_realized_pnl": 0.0,
         "locked_profit": 0.0, "total_fees": 0.0,
     }
+
+def get_stats_for_range(mode: str = "paper", date_from: str = None, date_to: str = None) -> dict:
+    """Return aggregated trade stats for an optional date range.
+    When both params are None, returns all-time stats (same as get_trade_stats totals).
+    """
+    parts = ["exit_price IS NOT NULL", "mode = ?"]
+    params: list = [mode]
+    if date_from:
+        parts.append("DATE(timestamp_sell) >= ?")
+        params.append(date_from)
+    if date_to:
+        parts.append("DATE(timestamp_sell) <= ?")
+        params.append(date_to)
+    where = " AND ".join(parts)
+
+    with _lock:
+        conn = _conn()
+        row = conn.execute(f"""
+            SELECT
+                COUNT(*)                                            AS total,
+                SUM(CASE WHEN net_profit >  0 THEN 1 ELSE 0 END)  AS wins,
+                SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END)  AS losses,
+                COALESCE(SUM(net_profit), 0.0)                    AS realized_pnl,
+                COALESCE(SUM(CASE WHEN net_profit > 0 THEN net_profit ELSE 0 END), 0.0)
+                                                                   AS locked_profit,
+                COALESCE(SUM(COALESCE(buy_fee, 0) + COALESCE(sell_fee, 0)), 0.0)
+                                                                   AS total_fees
+            FROM trades
+            WHERE {where}
+        """, params).fetchone()
+        conn.close()
+
+    if row:
+        total = int(row["total"] or 0)
+        wins  = int(row["wins"]  or 0)
+        return {
+            "total":         total,
+            "wins":          wins,
+            "losses":        int(row["losses"]       or 0),
+            "realized_pnl":  float(row["realized_pnl"]  or 0.0),
+            "locked_profit": float(row["locked_profit"] or 0.0),
+            "total_fees":    float(row["total_fees"]    or 0.0),
+            "win_rate":      round(wins / total, 3) if total else 0.0,
+        }
+    return {"total": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0,
+            "locked_profit": 0.0, "total_fees": 0.0, "win_rate": 0.0}
+
+
+def get_trades_for_range(
+    mode: str = "paper",
+    date_from: str = None,
+    date_to: str = None,
+    limit: int = 500,
+) -> List[dict]:
+    """Return closed trades filtered by date range."""
+    parts = ["exit_price IS NOT NULL", "mode = ?"]
+    params: list = [mode]
+    if date_from:
+        parts.append("DATE(timestamp_sell) >= ?")
+        params.append(date_from)
+    if date_to:
+        parts.append("DATE(timestamp_sell) <= ?")
+        params.append(date_to)
+    params.append(limit)
+    where = " AND ".join(parts)
+
+    with _lock:
+        conn = _conn()
+        rows = conn.execute(f"""
+            SELECT * FROM trades WHERE {where}
+            ORDER BY id DESC LIMIT ?
+        """, params).fetchall()
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_futures_trade_stats() -> dict:
+    """Return aggregated stats for all futures trades."""
+    with _lock:
+        conn = _conn()
+        row = conn.execute("""
+            SELECT
+                COUNT(*)                                           AS total,
+                SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END)  AS wins,
+                COALESCE(SUM(net_profit), 0.0)                   AS total_pnl,
+                COALESCE(SUM(COALESCE(buy_fee, 0) + COALESCE(sell_fee, 0)), 0.0) AS total_fees
+            FROM futures_trades
+        """).fetchone()
+        conn.close()
+    if row:
+        total = int(row["total"] or 0)
+        wins  = int(row["wins"]  or 0)
+        return {
+            "total":      total,
+            "wins":       wins,
+            "total_pnl":  float(row["total_pnl"]  or 0.0),
+            "total_fees": float(row["total_fees"] or 0.0),
+            "win_rate":   round(wins / total * 100, 1) if total else 0.0,
+        }
+    return {"total": 0, "wins": 0, "total_pnl": 0.0, "total_fees": 0.0, "win_rate": 0.0}
+
 
 # ── Activity log ──────────────────────────────────────────────────────────────
 
@@ -690,15 +790,16 @@ def log_futures_trade(trade: dict):
         conn.execute("""
             INSERT INTO futures_trades
                 (symbol, direction, entry_price, exit_price, quantity, margin_usdt,
-                 leverage, net_profit, profitable, funding_paid,
+                 leverage, net_profit, profitable, funding_paid, buy_fee, sell_fee,
                  duration_seconds, timestamp_open, timestamp_close)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             trade.get("symbol"), trade.get("direction"),
             trade.get("entry_price"), trade.get("exit_price"),
             trade.get("quantity"), trade.get("margin_usdt"),
             trade.get("leverage"), trade.get("net_profit"),
             int(trade.get("profitable", 0)), trade.get("funding_paid", 0.0),
+            trade.get("buy_fee", 0.0), trade.get("sell_fee", 0.0),
             trade.get("duration_seconds"),
             trade.get("timestamp_open"), trade.get("timestamp_close"),
         ))

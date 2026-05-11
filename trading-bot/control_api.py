@@ -22,7 +22,7 @@ from typing import Optional
 _DEPLOY_ID = str(uuid.uuid4())
 
 import uvicorn
-from fastapi import FastAPI, Response, Body
+from fastapi import FastAPI, Response, Body, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -671,39 +671,33 @@ def api_wallet():
         usdt_free = sum(b["free"] for b in balances if b["asset"] == "USDT")
 
         # Total portfolio value = free USDT + mark-to-market value of open positions
-        open_pos    = get_open_positions()
-        pos_value   = 0.0
-        for pos in open_pos:
+        total_value = usdt_free
+        for pos in get_open_positions():
             sym = pos["symbol"]
             px  = _rest_px.get(sym) or live_prices.get(sym) or pos["entry_price"]
-            pos_value += pos["quantity"] * px
-        total_value = usdt_free + pos_value
+            total_value += pos["quantity"] * px
 
-        # Single aggregated query covers realized_pnl, total_fees, today_pnl etc.
-        _mode = get_mode()
-        stats = database.get_trade_stats(mode=_mode)
+        # Realized P&L: single source of truth — SQL SUM from trades table
+        _mode        = get_mode()
+        realized_pnl = database.get_realized_pnl(mode=_mode)
 
         # Session P&L: current total portfolio value minus the balance at last reset
-        starting_str = database.get_setting("paper_starting_balance")
-        starting_bal = float(starting_str) if starting_str else float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
-        session_pnl  = round(total_value - starting_bal, 4)
+        starting_str  = database.get_setting("paper_starting_balance")
+        starting_bal  = float(starting_str) if starting_str else float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+        session_pnl   = round(total_value - starting_bal, 4)
 
         return {
-            "balances":          balances,
-            "total_usdt":        round(usdt_free, 4),
-            "open_pos_value":    round(pos_value, 4),
-            "total_value":       round(total_value, 4),
-            "realized_pnl":      round(stats["realized_pnl"], 4),
-            "today_realized_pnl":round(stats["today_realized_pnl"], 4),
-            "total_fees":        round(stats["total_fees"], 4),
-            "session_pnl":       session_pnl,
-            "starting_balance":  round(starting_bal, 4),
-            "mode":              _mode,
+            "balances":        balances,
+            "total_usdt":      round(usdt_free, 4),
+            "total_value":     round(total_value, 4),
+            "realized_pnl":    round(realized_pnl, 4),
+            "session_pnl":     session_pnl,
+            "starting_balance": round(starting_bal, 4),
+            "mode":            _mode,
         }
     except Exception as e:
         return {"balances": [], "total_usdt": 0.0, "total_value": 0.0,
-                "realized_pnl": 0.0, "session_pnl": 0.0, "total_fees": 0.0,
-                "mode": get_mode(), "error": str(e)}
+                "realized_pnl": 0.0, "session_pnl": 0.0, "mode": get_mode(), "error": str(e)}
 
 
 @app.get("/bot-dashboard", response_class=HTMLResponse)
@@ -757,6 +751,28 @@ def api_positions():
 @app.get("/api/trades")
 def api_trades():
     return {"trades": database.get_recent_trades(limit=200)}
+
+
+@app.get("/api/stats")
+def api_stats(
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to:   Optional[str] = Query(None, alias="to"),
+):
+    """Aggregated trade stats + filtered trade list for a date range.
+
+    Query params (both optional, YYYY-MM-DD format):
+      ?from=2026-05-01&to=2026-05-11
+    When omitted, returns all-time stats.
+    """
+    mode   = get_mode()
+    stats  = database.get_stats_for_range(mode=mode, date_from=date_from, date_to=date_to)
+    trades = database.get_trades_for_range(mode=mode, date_from=date_from, date_to=date_to, limit=500)
+    return {
+        **stats,
+        "date_from": date_from,
+        "date_to":   date_to,
+        "trades":    trades,
+    }
 
 
 class CoinsRequest(BaseModel):
