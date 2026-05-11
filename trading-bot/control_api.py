@@ -671,33 +671,39 @@ def api_wallet():
         usdt_free = sum(b["free"] for b in balances if b["asset"] == "USDT")
 
         # Total portfolio value = free USDT + mark-to-market value of open positions
-        total_value = usdt_free
-        for pos in get_open_positions():
+        open_pos    = get_open_positions()
+        pos_value   = 0.0
+        for pos in open_pos:
             sym = pos["symbol"]
             px  = _rest_px.get(sym) or live_prices.get(sym) or pos["entry_price"]
-            total_value += pos["quantity"] * px
+            pos_value += pos["quantity"] * px
+        total_value = usdt_free + pos_value
 
-        # Realized P&L: single source of truth — SQL SUM from trades table
-        _mode        = get_mode()
-        realized_pnl = database.get_realized_pnl(mode=_mode)
+        # Single aggregated query covers realized_pnl, total_fees, today_pnl etc.
+        _mode = get_mode()
+        stats = database.get_trade_stats(mode=_mode)
 
         # Session P&L: current total portfolio value minus the balance at last reset
-        starting_str  = database.get_setting("paper_starting_balance")
-        starting_bal  = float(starting_str) if starting_str else float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
-        session_pnl   = round(total_value - starting_bal, 4)
+        starting_str = database.get_setting("paper_starting_balance")
+        starting_bal = float(starting_str) if starting_str else float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+        session_pnl  = round(total_value - starting_bal, 4)
 
         return {
-            "balances":        balances,
-            "total_usdt":      round(usdt_free, 4),
-            "total_value":     round(total_value, 4),
-            "realized_pnl":    round(realized_pnl, 4),
-            "session_pnl":     session_pnl,
-            "starting_balance": round(starting_bal, 4),
-            "mode":            _mode,
+            "balances":          balances,
+            "total_usdt":        round(usdt_free, 4),
+            "open_pos_value":    round(pos_value, 4),
+            "total_value":       round(total_value, 4),
+            "realized_pnl":      round(stats["realized_pnl"], 4),
+            "today_realized_pnl":round(stats["today_realized_pnl"], 4),
+            "total_fees":        round(stats["total_fees"], 4),
+            "session_pnl":       session_pnl,
+            "starting_balance":  round(starting_bal, 4),
+            "mode":              _mode,
         }
     except Exception as e:
         return {"balances": [], "total_usdt": 0.0, "total_value": 0.0,
-                "realized_pnl": 0.0, "session_pnl": 0.0, "mode": get_mode(), "error": str(e)}
+                "realized_pnl": 0.0, "session_pnl": 0.0, "total_fees": 0.0,
+                "mode": get_mode(), "error": str(e)}
 
 
 @app.get("/bot-dashboard", response_class=HTMLResponse)
