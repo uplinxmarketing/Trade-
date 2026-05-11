@@ -7,10 +7,15 @@ import { toast } from 'sonner';
 import { API_BASE } from '@/config';
 
 const PAPER_CFG_KEY  = 'paper_wallet_config';
-const RAILWAY_URL_KEY = 'railway_bot_url';
+const BOT_URL_KEY    = 'bot_server_url';
 
 function getRailwayUrl(): string {
-  try { return localStorage.getItem(RAILWAY_URL_KEY) ?? API_BASE; } catch { return API_BASE; }
+  try {
+    // Migrate old Railway URL key if present
+    const old = localStorage.getItem('railway_bot_url');
+    if (old !== null) { localStorage.removeItem('railway_bot_url'); localStorage.setItem(BOT_URL_KEY, old); }
+    return localStorage.getItem(BOT_URL_KEY) ?? API_BASE;
+  } catch { return API_BASE; }
 }
 
 const COIN_COLORS: Record<string, string> = {

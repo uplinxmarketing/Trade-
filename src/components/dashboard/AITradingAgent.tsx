@@ -179,7 +179,7 @@ interface AITradingAgentProps {
 }
 
 const INSTRUCTIONS_KEY  = 'ai_agent_instructions';
-const RAILWAY_URL_KEY   = 'railway_bot_url';
+const BOT_URL_KEY       = 'bot_server_url';
 const AGENT_CYCLE_MS    = 30_000;
 const BEP_MULT          = 1 / Math.pow(1 - TAKER_FEE, 2);
 
@@ -406,14 +406,18 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [serverWins, setServerWins]                   = useState<number | null>(null);
   const [serverTotalTrades, setServerTotalTrades]     = useState<number | null>(null);
   const [showLog, setShowLog]     = useState(true);
-  // Unified deployment: frontend and API are served from the same Railway URL.
-  // railwayUrl defaults to '' (same origin) so all /api/* calls are relative.
+  // botUrl defaults to '' (same origin) so all /api/* calls are relative.
   // Users can override via localStorage if they ever need to point at a different backend.
-  const [railwayUrl, setRailwayUrl] = useState(() =>
-    localStorage.getItem(RAILWAY_URL_KEY) ??
-    (import.meta.env.VITE_API_URL as string | undefined) ??
-    ''
-  );
+  // Migration: clear any stale Railway URL stored under the old key.
+  const [railwayUrl, setRailwayUrl] = useState(() => {
+    try {
+      const old = localStorage.getItem('railway_bot_url');
+      if (old !== null) { localStorage.removeItem('railway_bot_url'); localStorage.setItem(BOT_URL_KEY, old); }
+    } catch { /* ignore */ }
+    return localStorage.getItem(BOT_URL_KEY) ??
+      (import.meta.env.VITE_API_URL as string | undefined) ??
+      '';
+  });
   const [showRailwayInput, setShowRailwayInput] = useState(false);
   const [railwayDraft, setRailwayDraft] = useState('');
   const [liveApiKey, setLiveApiKey]         = useState('');
@@ -446,11 +450,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // Always-accessible "Agent Trading Settings" panel toggle (post-start editing)
   const [showAgentSettings, setShowAgentSettings]   = useState(false);
 
-  // Railway signal cache snapshot — populated from /api/all; used to show bot's
+  // Bot signal cache snapshot — populated from /api/all; used to show bot's
   // actual live signal state (6-signal system) separately from the JS-computed signals.
   const [railwaySignals, setRailwaySignals] = useState<any[]>([]);
 
-  // Always server mode — the Python bot is always running on the same Railway instance.
+  // Always server mode — the Python bot is always running on the VPS.
   const isServerMode    = true;
   const isServerModeRef = useRef(true);
   useEffect(() => { isServerModeRef.current = true; }, []);
@@ -883,7 +887,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     // Merge Supabase history only when Railway returned NO trades — this
     // happens after a fresh Railway redeploy without a persistent volume.
     // Previously we always merged, but timestamp-format drift between
-    // Railway's ISO strings and Supabase's PostgREST timestamps caused dedup
+    // the bot's ISO strings and Supabase's PostgREST timestamps caused dedup
     // to silently fail, double-counting every trade and producing P&L
     // percentages of -200% / -300%.
     if (railwayTrades.length === 0) {
@@ -891,7 +895,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         const { data: sbTrades } = await supabase
           .from('bot_trade_history')
           .select('*')
-          .eq('user_session', 'railway_bot')
+          .eq('user_session', 'wolfbot')
           .order('created_at', { ascending: false })
           .limit(200);
         if (sbTrades && sbTrades.length > 0) {
@@ -1592,8 +1596,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               <button onClick={() => {
                 const url = railwayDraft.trim().replace(/\/$/, '');
                 setRailwayUrl(url);
-                if (url) localStorage.setItem(RAILWAY_URL_KEY, url);
-                else localStorage.removeItem(RAILWAY_URL_KEY);
+                if (url) localStorage.setItem(BOT_URL_KEY, url);
+                else localStorage.removeItem(BOT_URL_KEY);
                 setShowRailwayInput(false);
               }} className="text-[10px] text-gain flex items-center gap-0.5"><Check className="w-3 h-3" />Save</button>
               <button onClick={() => setShowRailwayInput(false)} className="text-[10px] text-loss flex items-center gap-0.5"><X className="w-3 h-3" />Cancel</button>
