@@ -1,5 +1,5 @@
 {
-  "version": "5.11.0",
-  "buildTime": "2026-05-11T10:00:00.000Z",
-  "commit": "v5.11.0-fix-wallet-balance-fee-mismatch"
+  "version": "5.12.0",
+  "buildTime": "2026-05-11T11:00:00.000Z",
+  "commit": "v5.12.0-fee-accuracy-date-range-filter"
 }

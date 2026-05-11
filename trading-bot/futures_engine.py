@@ -115,10 +115,12 @@ def get_futures_status() -> dict:
         starting_bal  = _client.get_starting_usdt()
         open_margin   = sum(p.get("margin_usdt", 0.0) for p in _client.get_open_positions())
 
-    trades    = database.get_recent_futures_trades(1000)
-    total_pnl = sum(t.get("net_profit") or 0.0 for t in trades)
-    wins      = sum(1 for t in trades if (t.get("net_profit") or 0) > 0)
-    win_rate  = (wins / len(trades) * 100) if trades else 0.0
+    fstats    = database.get_futures_trade_stats()
+    total_pnl  = fstats["total_pnl"]
+    total_fees = fstats["total_fees"]
+    wins       = fstats["wins"]
+    win_rate   = fstats["win_rate"]
+    trade_count = fstats["total"]
 
     with _settings_lock:
         settings = dict(_futures_settings)
@@ -135,8 +137,9 @@ def get_futures_status() -> dict:
         "session_pnl":       round(session_pnl, 4),
         "positions":         n_pos,
         "total_pnl":         round(total_pnl, 4),
+        "total_fees":        round(total_fees, 4),
         "win_rate":          round(win_rate, 1),
-        "trade_count":       len(trades),
+        "trade_count":       trade_count,
         "stop_loss_enabled": settings.get("stop_loss_enabled", False),
         "budget_mode":       settings.get("budget_mode", "fixed"),
         "budget_pct":        settings.get("budget_pct", 10.0),

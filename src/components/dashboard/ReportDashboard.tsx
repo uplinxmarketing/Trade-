@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import { BarChart3, DollarSign, TrendingUp, Percent, Loader2, RefreshCw, Activity, Lock, Trophy, Hash } from 'lucide-react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { BarChart3, DollarSign, TrendingUp, Percent, Loader2, RefreshCw, Activity, Lock, Trophy, Hash, Calendar, ChevronDown } from 'lucide-react';
 import { API_BASE } from '@/config';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -38,6 +38,19 @@ interface SqliteTrade {
   timestamp_sell: string | null;
 }
 
+interface RangeStats {
+  total: number;
+  wins: number;
+  losses: number;
+  realized_pnl: number;
+  locked_profit: number;
+  total_fees: number;
+  win_rate: number;
+  date_from: string | null;
+  date_to: string | null;
+  trades: SqliteTrade[];
+}
+
 interface DisplayTrade {
   id: string;
   pair: string;
@@ -58,6 +71,10 @@ interface CoinStats {
   totalPnl: number; avgPnl: number; bestTrade: number; worstTrade: number;
 }
 
+type RangePreset = 'all' | 'today' | 'yesterday' | '7d' | '30d' | 'month' | 'custom';
+
+interface DateRange { from: string; to: string; }
+
 function fmt(n: number, d = 2) {
   return n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
 }
@@ -71,48 +88,75 @@ function fmtDur(sec: number) {
   return `${(sec / 3600).toFixed(1)}h`;
 }
 
+function toDateStr(d: Date): string {
+  return d.toISOString().split('T')[0];
+}
+
+function getPresetDates(preset: RangePreset, customFrom: string, customTo: string): DateRange | null {
+  const now = new Date();
+  const today = toDateStr(now);
+  switch (preset) {
+    case 'today':     return { from: today, to: today };
+    case 'yesterday': {
+      const y = new Date(now); y.setDate(y.getDate() - 1);
+      const s = toDateStr(y); return { from: s, to: s };
+    }
+    case '7d': {
+      const d = new Date(now); d.setDate(d.getDate() - 6);
+      return { from: toDateStr(d), to: today };
+    }
+    case '30d': {
+      const d = new Date(now); d.setDate(d.getDate() - 29);
+      return { from: toDateStr(d), to: today };
+    }
+    case 'month': {
+      const d = new Date(now.getFullYear(), now.getMonth(), 1);
+      return { from: toDateStr(d), to: today };
+    }
+    case 'custom':
+      return customFrom && customTo ? { from: customFrom, to: customTo } : null;
+    default:
+      return null;
+  }
+}
+
+function fmtRangeLabel(range: DateRange | null): string {
+  if (!range) return '';
+  if (range.from === range.to) {
+    return new Date(range.from + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+  const f = new Date(range.from + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  const t = new Date(range.to   + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  return `${f} — ${t}`;
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 
 const ReportDashboard = () => {
-  const [botStatus,  setBotStatus]  = useState<BotStatus | null>(null);
-  const [trades,     setTrades]     = useState<DisplayTrade[]>([]);
-  const [coinSort,   setCoinSort]   = useState<'pnl' | 'trades'>('pnl');
-  const [loading,    setLoading]    = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
+  const [botStatus,    setBotStatus]    = useState<BotStatus | null>(null);
+  const [allTrades,    setAllTrades]    = useState<SqliteTrade[]>([]);
+  const [coinSort,     setCoinSort]     = useState<'pnl' | 'trades'>('pnl');
+  const [loading,      setLoading]      = useState(true);
+  const [refreshing,   setRefreshing]   = useState(false);
 
+  // Date range
+  const [rangePreset,  setRangePreset]  = useState<RangePreset>('all');
+  const [customFrom,   setCustomFrom]   = useState('');
+  const [customTo,     setCustomTo]     = useState('');
+  const [showCustom,   setShowCustom]   = useState(false);
+  const [rangeStats,   setRangeStats]   = useState<RangeStats | null>(null);
+  const [rangeLoading, setRangeLoading] = useState(false);
+  const customRef = useRef<HTMLDivElement>(null);
+
+  // ── Base data load ──────────────────────────────────────────────────────────
   const load = useCallback(async () => {
     try {
-      // All data comes from Railway SQLite — single source of truth.
-      // Supabase is intentionally NOT used here because it may contain
-      // trades from a different session (local paper bot) and causes
-      // double-counting when merged with the Railway data.
       const [statusRes, tradesRes] = await Promise.all([
         fetch(`${API_BASE}/api/status`).then(r => r.ok ? r.json() : null).catch(() => null),
         fetch(`${API_BASE}/api/trades`).then(r => r.ok ? r.json() : { trades: [] }).catch(() => ({ trades: [] })),
       ]);
-
       if (statusRes) setBotStatus(statusRes as BotStatus);
-
-      const raw: SqliteTrade[] = (tradesRes.trades ?? []) as SqliteTrade[];
-      const display: DisplayTrade[] = raw
-        .filter(t => t.exit_price != null && t.net_profit != null)
-        .map(t => ({
-          id:         `rw-${t.id}`,
-          pair:       String(t.coin).replace('USDT', '/USDT'),
-          direction:  'LONG' as const,
-          entryPrice: Number(t.entry_price),
-          exitPrice:  Number(t.exit_price),
-          qty:        Number(t.quantity),
-          budget:     Number(t.budget_usdt ?? 0),
-          buyFee:     Number(t.buy_fee ?? 0),
-          sellFee:    Number(t.sell_fee ?? 0),
-          netPnl:     Number(t.net_profit ?? 0),
-          duration:   fmtDur(Number(t.duration_seconds ?? 0)),
-          closedAt:   t.timestamp_sell ?? t.timestamp_buy ?? '',
-        }))
-        .sort((a, b) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime());
-
-      setTrades(display);
+      setAllTrades((tradesRes.trades ?? []) as SqliteTrade[]);
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -125,12 +169,118 @@ const ReportDashboard = () => {
     return () => clearInterval(iv);
   }, [load]);
 
-  // ── Coin stats — computed from trade history table (display slice only) ───
-  // Note: these percentages are from the last 200 trades (display limit),
-  // not the full history. Use the backend-provided win_rate for the headline.
+  // ── Range stats fetch ───────────────────────────────────────────────────────
+  const fetchRange = useCallback(async (range: DateRange) => {
+    setRangeLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/stats?from=${range.from}&to=${range.to}`);
+      if (res.ok) setRangeStats(await res.json() as RangeStats);
+    } catch {
+      setRangeStats(null);
+    } finally {
+      setRangeLoading(false);
+    }
+  }, []);
+
+  const applyPreset = useCallback((preset: RangePreset, cf = customFrom, ct = customTo) => {
+    setRangePreset(preset);
+    if (preset === 'all') {
+      setRangeStats(null);
+      setShowCustom(false);
+      return;
+    }
+    if (preset === 'custom') {
+      setShowCustom(true);
+      if (cf && ct) fetchRange({ from: cf, to: ct });
+      return;
+    }
+    setShowCustom(false);
+    const dates = getPresetDates(preset, cf, ct);
+    if (dates) fetchRange(dates);
+  }, [customFrom, customTo, fetchRange]);
+
+  // Re-fetch range stats every 10s when a range is active
+  useEffect(() => {
+    if (rangePreset === 'all') return;
+    const range = getPresetDates(rangePreset, customFrom, customTo);
+    if (!range) return;
+    const iv = setInterval(() => fetchRange(range), 10_000);
+    return () => clearInterval(iv);
+  }, [rangePreset, customFrom, customTo, fetchRange]);
+
+  // Close custom panel on outside click
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (customRef.current && !customRef.current.contains(e.target as Node)) {
+        if (rangePreset === 'custom' && !(customFrom && customTo)) {
+          setShowCustom(false);
+        }
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [rangePreset, customFrom, customTo]);
+
+  // ── Determine active data ───────────────────────────────────────────────────
+  const isRangeActive = rangePreset !== 'all';
+  const activeRange   = isRangeActive ? getPresetDates(rangePreset, customFrom, customTo) : null;
+
+  // Trades to display: range-filtered when range active, else all
+  const activeTrades: SqliteTrade[] = (() => {
+    if (!isRangeActive || !activeRange) return allTrades;
+    return (rangeStats?.trades ?? allTrades.filter(t => {
+      const ds = (t.timestamp_sell ?? t.timestamp_buy ?? '').slice(0, 10);
+      return ds >= activeRange.from && ds <= activeRange.to;
+    }));
+  })();
+
+  const displayTrades: DisplayTrade[] = activeTrades
+    .filter(t => t.exit_price != null && t.net_profit != null)
+    .map(t => ({
+      id:         `rw-${t.id}`,
+      pair:       String(t.coin).replace('USDT', '/USDT'),
+      direction:  'LONG' as const,
+      entryPrice: Number(t.entry_price),
+      exitPrice:  Number(t.exit_price),
+      qty:        Number(t.quantity),
+      budget:     Number(t.budget_usdt ?? 0),
+      buyFee:     Number(t.buy_fee ?? 0),
+      sellFee:    Number(t.sell_fee ?? 0),
+      netPnl:     Number(t.net_profit ?? 0),
+      duration:   fmtDur(Number(t.duration_seconds ?? 0)),
+      closedAt:   t.timestamp_sell ?? t.timestamp_buy ?? '',
+    }))
+    .sort((a, b) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime());
+
+  // ── Metric values ───────────────────────────────────────────────────────────
+  const isActive = botStatus?.running ?? false;
+
+  // When range active, use rangeStats for everything; otherwise use botStatus
+  const totalProfit  = isRangeActive ? (rangeStats?.realized_pnl  ?? 0) : (botStatus?.realized_pnl   ?? 0);
+  const todayProfit  = isRangeActive ? (rangeStats?.realized_pnl  ?? 0) : (botStatus?.today_realized_pnl ?? 0);
+  const lockedProfit = isRangeActive ? (rangeStats?.locked_profit ?? 0) : (botStatus?.locked_profit   ?? 0);
+  const totalFees    = isRangeActive ? (rangeStats?.total_fees    ?? 0) : (botStatus?.total_fees      ?? 0);
+  // BNB saves ~33.3% vs standard 0.1% rate (BNB discount brings it to 0.075%)
+  const bnbSavings   = totalFees * (0.001 / 0.00075 - 1);   // ≈ totalFees / 3
+  const total        = isRangeActive ? (rangeStats?.total   ?? 0) : (botStatus?.total_trades ?? 0);
+  const wins         = isRangeActive ? (rangeStats?.wins    ?? 0) : (botStatus?.wins         ?? 0);
+  const losses       = isRangeActive ? (rangeStats?.losses  ?? 0) : (botStatus?.losses       ?? 0);
+  const winRateN     = total > 0 ? (wins / total) * 100 : 0;
+  const winRate      = total > 0 ? winRateN.toFixed(1) : '—';
+  const initBal      = Number(botStatus?.initial_balance ?? 0);
+  const lockedPct    = initBal > 0 && lockedProfit > 0 ? (lockedProfit / initBal) * 100 : 0;
+  const hasData      = botStatus !== null || displayTrades.length > 0;
+
+  const todayLabel   = isRangeActive ? 'Period P&L' : "Today's Profit";
+  const todaySubCount = isRangeActive ? total : (botStatus?.trades_today ?? 0);
+  const todaySubLabel = isRangeActive
+    ? `${todaySubCount} trade${todaySubCount !== 1 ? 's' : ''} in period`
+    : `${todaySubCount} trade${todaySubCount !== 1 ? 's' : ''} today`;
+
+  // ── Coin stats ──────────────────────────────────────────────────────────────
   const coinStats: CoinStats[] = (() => {
     const map: Record<string, CoinStats> = {};
-    for (const p of trades) {
+    for (const p of displayTrades) {
       const coin = p.pair.split('/')[0];
       if (!map[coin]) map[coin] = { coin, trades: 0, wins: 0, losses: 0, totalPnl: 0, avgPnl: 0, bestTrade: -Infinity, worstTrade: Infinity };
       const s = map[coin];
@@ -142,29 +292,13 @@ const ReportDashboard = () => {
     }
     return Object.values(map)
       .map(s => ({ ...s, avgPnl: s.totalPnl / s.trades,
-        bestTrade: s.bestTrade  === -Infinity ? 0 : s.bestTrade,
+        bestTrade:  s.bestTrade  === -Infinity ? 0 : s.bestTrade,
         worstTrade: s.worstTrade === Infinity  ? 0 : s.worstTrade,
       }))
       .sort(coinSort === 'pnl'
         ? (a, b) => b.totalPnl - a.totalPnl
         : (a, b) => b.trades   - a.trades);
   })();
-
-  // ── Authoritative numbers — all from botStatus (SQL-aggregated, full history)
-  const isActive       = botStatus?.running      ?? false;
-  const totalProfit    = botStatus?.realized_pnl ?? 0;
-  const todayProfit    = botStatus?.today_realized_pnl ?? 0;
-  const lockedProfit   = botStatus?.locked_profit  ?? 0;
-  const totalFees      = botStatus?.total_fees     ?? 0;
-  const bnbSavings     = totalFees * 0.25;
-  const total          = botStatus?.total_trades   ?? 0;
-  const wins           = botStatus?.wins           ?? 0;
-  const losses         = botStatus?.losses         ?? 0;
-  const winRateN       = total > 0 ? (wins / total) * 100 : 0;
-  const winRate        = total > 0 ? winRateN.toFixed(1) : '—';
-  const initBal        = Number(botStatus?.initial_balance ?? 0);
-  const lockedPct      = initBal > 0 && lockedProfit > 0 ? (lockedProfit / initBal) * 100 : 0;
-  const hasData        = botStatus !== null || trades.length > 0;
 
   const cards = [
     {
@@ -176,9 +310,9 @@ const ReportDashboard = () => {
       Icon: DollarSign,
     },
     {
-      label: "Today's Profit",
+      label: todayLabel,
       value: `${todayProfit >= 0 ? '+' : ''}$${fmt(Math.abs(todayProfit))}`,
-      sub:   `${botStatus?.trades_today ?? 0} trade${(botStatus?.trades_today ?? 0) !== 1 ? 's' : ''} today`,
+      sub:   todaySubLabel,
       color: todayProfit > 0 ? 'text-gain' : todayProfit < 0 ? 'text-loss' : 'text-muted-foreground',
       bg:    todayProfit > 0 ? 'bg-gain/10 border-gain/20' : 'bg-muted/20 border-border',
       Icon: TrendingUp,
@@ -213,14 +347,82 @@ const ReportDashboard = () => {
     },
   ];
 
+  // ── Preset button list ──────────────────────────────────────────────────────
+  const presets: { id: RangePreset; label: string }[] = [
+    { id: 'today',     label: 'Today'     },
+    { id: 'yesterday', label: 'Yesterday' },
+    { id: '7d',        label: 'Last 7 Days' },
+    { id: '30d',       label: 'Last 30 Days' },
+    { id: 'month',     label: 'This Month' },
+    { id: 'all',       label: 'All Time'  },
+    { id: 'custom',    label: 'Custom'    },
+  ];
+
   return (
     <div className="space-y-4">
-      {isActive && total === 0 && !loading && (
+      {isActive && total === 0 && !loading && !isRangeActive && (
         <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-accent/10 border border-accent/20 text-xs text-accent">
           <Activity className="w-3.5 h-3.5 animate-pulse" />
           Bot is active — trade results will appear here after the first closed position
         </div>
       )}
+
+      {/* Date range picker */}
+      <div className="flex flex-wrap items-center gap-1.5 relative">
+        <Calendar className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+        {presets.map(p => (
+          <button
+            key={p.id}
+            onClick={() => applyPreset(p.id)}
+            className={`flex items-center gap-1 text-[10px] px-2.5 py-1 rounded-md font-semibold transition-colors border
+              ${rangePreset === p.id
+                ? 'bg-accent text-accent-foreground border-accent'
+                : 'bg-muted/20 text-muted-foreground border-border hover:text-foreground hover:bg-muted/40'}`}
+          >
+            {p.label}
+            {p.id === 'custom' && <ChevronDown className="w-2.5 h-2.5" />}
+          </button>
+        ))}
+
+        {/* Custom date range flyout */}
+        {showCustom && (
+          <div ref={customRef}
+            className="absolute top-7 right-0 z-20 bg-popover border border-border rounded-lg shadow-lg p-3 flex items-center gap-2">
+            <div className="flex flex-col gap-1">
+              <label className="text-[9px] uppercase tracking-widest text-muted-foreground">From</label>
+              <input
+                type="date"
+                value={customFrom}
+                onChange={e => {
+                  setCustomFrom(e.target.value);
+                  if (e.target.value && customTo) fetchRange({ from: e.target.value, to: customTo });
+                }}
+                className="text-xs bg-muted/30 border border-border rounded px-2 py-1 text-foreground"
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[9px] uppercase tracking-widest text-muted-foreground">To</label>
+              <input
+                type="date"
+                value={customTo}
+                onChange={e => {
+                  setCustomTo(e.target.value);
+                  if (customFrom && e.target.value) fetchRange({ from: customFrom, to: e.target.value });
+                }}
+                className="text-xs bg-muted/30 border border-border rounded px-2 py-1 text-foreground"
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Range label + loading spinner */}
+        {isRangeActive && activeRange && (
+          <span className="ml-1 text-[10px] text-muted-foreground">
+            {fmtRangeLabel(activeRange)}
+          </span>
+        )}
+        {rangeLoading && <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />}
+      </div>
 
       {/* Metric cards */}
       {hasData && (
@@ -238,7 +440,7 @@ const ReportDashboard = () => {
         </div>
       )}
 
-      {/* Coin leaderboard — from last 200 trades only, noted in header */}
+      {/* Coin leaderboard */}
       {hasData && coinStats.length > 0 && (() => {
         const maxPnl    = Math.max(...coinStats.map(s => Math.abs(s.totalPnl)), 0.01);
         const maxTrades = Math.max(...coinStats.map(s => s.trades), 1);
@@ -248,7 +450,7 @@ const ReportDashboard = () => {
               <Trophy className="w-4 h-4 text-warn" />
               <span className="text-sm font-medium">Coin Performance</span>
               <span className="text-[10px] text-muted-foreground ml-1">
-                {coinStats.length} coins · last {trades.length} trades shown
+                {coinStats.length} coins · {displayTrades.length} trades shown
               </span>
               <div className="ml-auto flex items-center gap-1 bg-muted/30 rounded-md p-0.5">
                 <button
@@ -335,7 +537,7 @@ const ReportDashboard = () => {
         );
       })()}
 
-      {/* Trade history — Railway SQLite only, last 200 */}
+      {/* Trade history */}
       <div className="trading-card">
         <div className="p-3 border-b border-border flex items-center gap-2">
           <BarChart3 className="w-4 h-4 text-primary" />
@@ -345,9 +547,14 @@ const ReportDashboard = () => {
               {botStatus.running ? `● ${botStatus.mode?.toUpperCase() ?? 'PAPER'}` : '○ Stopped'}
             </span>
           )}
-          {total > trades.length && (
+          {isRangeActive && activeRange && (
+            <span className="text-[10px] text-accent px-1.5 py-0.5 rounded bg-accent/10 border border-accent/20">
+              {fmtRangeLabel(activeRange)}
+            </span>
+          )}
+          {!isRangeActive && total > displayTrades.length && (
             <span className="text-[10px] text-muted-foreground">
-              showing last {trades.length} of {total}
+              showing last {displayTrades.length} of {total}
             </span>
           )}
           <button onClick={() => { setRefreshing(true); load(); }}
@@ -357,11 +564,13 @@ const ReportDashboard = () => {
           {loading && <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground" />}
         </div>
 
-        {trades.length === 0 ? (
+        {displayTrades.length === 0 ? (
           <div className="p-8 text-center text-xs text-muted-foreground">
-            {loading ? 'Loading…' : isActive
-              ? '⏳ Bot is running — first trade will appear here after a position closes'
-              : 'No completed trades yet — start the bot to begin trading'}
+            {loading ? 'Loading…' : isRangeActive
+              ? `No trades found for ${activeRange ? fmtRangeLabel(activeRange) : 'selected period'}`
+              : isActive
+                ? '⏳ Bot is running — first trade will appear here after a position closes'
+                : 'No completed trades yet — start the bot to begin trading'}
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -381,7 +590,7 @@ const ReportDashboard = () => {
                 </tr>
               </thead>
               <tbody>
-                {trades.map(p => (
+                {displayTrades.map(p => (
                   <tr key={p.id} className="border-b border-border/50 hover:bg-muted/10 transition-colors">
                     <td className="px-3 py-2 text-muted-foreground whitespace-nowrap">{fmtDate(p.closedAt)}</td>
                     <td className="px-3 py-2 font-semibold text-foreground whitespace-nowrap">{p.pair}</td>

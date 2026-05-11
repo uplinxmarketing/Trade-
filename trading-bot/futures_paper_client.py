@@ -114,6 +114,10 @@ class FuturesPaperClient:
             fee = margin_usdt * leverage * FEE_RATE
             self._usdt -= (margin_usdt + fee)
 
+            # Store open_fee in position dict so close_position can include it
+            # in net_profit reporting (it was already deducted from balance above).
+            open_fee = fee
+
             if direction == "LONG":
                 take_profit       = entry_price * (1 + tp_pct)
                 stop_loss         = entry_price * (1 - sl_pct) if sl_enabled else None
@@ -131,6 +135,7 @@ class FuturesPaperClient:
                 "quantity": qty,
                 "margin_usdt": margin_usdt,
                 "leverage": leverage,
+                "open_fee": open_fee,
                 "take_profit": take_profit,
                 "stop_loss": stop_loss,
                 "sl_enabled": sl_enabled,
@@ -173,10 +178,15 @@ class FuturesPaperClient:
             else:
                 gross_pnl = (ep - exit_price) * qty
 
-            fee       = qty * exit_price * FEE_RATE
-            net_pnl   = gross_pnl - fee
+            # open_fee was already deducted from balance at entry; include it in
+            # net_profit for correct P&L reporting but NOT in margin_returned.
+            open_fee  = pos.get("open_fee", pos["margin_usdt"] * pos.get("leverage", 1) * FEE_RATE)
+            close_fee = qty * exit_price * FEE_RATE
+            net_pnl   = gross_pnl - open_fee - close_fee
 
-            margin_returned = pos["margin_usdt"] + net_pnl
+            # Balance: return margin + gross profit − close fee only
+            # (open_fee was already deducted when opening; don't deduct it again)
+            margin_returned = pos["margin_usdt"] + gross_pnl - close_fee
             if margin_returned < 0:
                 margin_returned = 0.0    # liquidated — lose entire margin
 
@@ -194,18 +204,20 @@ class FuturesPaperClient:
             dur = 0
 
         trade = {
-            "symbol": pos["symbol"],
-            "direction": pos["direction"],
-            "entry_price": ep,
-            "exit_price": exit_price,
-            "quantity": qty,
-            "margin_usdt": pos["margin_usdt"],
-            "leverage": pos["leverage"],
-            "net_profit": round(net_pnl, 6),
-            "profitable": 1 if net_pnl > 0 else 0,
-            "funding_paid": pos.get("funding_paid", 0.0),
+            "symbol":          pos["symbol"],
+            "direction":       pos["direction"],
+            "entry_price":     ep,
+            "exit_price":      exit_price,
+            "quantity":        qty,
+            "margin_usdt":     pos["margin_usdt"],
+            "leverage":        pos["leverage"],
+            "buy_fee":         round(open_fee,  6),
+            "sell_fee":        round(close_fee, 6),
+            "net_profit":      round(net_pnl,   6),
+            "profitable":      1 if net_pnl > 0 else 0,
+            "funding_paid":    pos.get("funding_paid", 0.0),
             "duration_seconds": dur,
-            "timestamp_open": ts_open,
+            "timestamp_open":  ts_open,
             "timestamp_close": ts_close,
         }
         database.log_futures_trade(trade)
