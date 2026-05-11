@@ -274,6 +274,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   // Replaces Supabase-derived P&L when Railway is the backend.
   const [serverWallet, setServerWallet] = useState<{
     realized_pnl: number; session_pnl: number; starting_balance: number;
+    total_fees: number; open_pos_value: number;
   } | null>(null);
 
   useEffect(() => {
@@ -288,6 +289,8 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
           realized_pnl:     Number(d.realized_pnl     ?? 0),
           session_pnl:      Number(d.session_pnl      ?? 0),
           starting_balance: Number(d.starting_balance ?? 0),
+          total_fees:       Number(d.total_fees        ?? 0),
+          open_pos_value:   Number(d.open_pos_value    ?? 0),
         });
       } catch {}
     };
@@ -320,12 +323,17 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     : sessionGain;
   // Authoritative realized P&L: prefer /api/wallet SQL sum
   const effectiveSessionGain = serverWallet ? serverWallet.realized_pnl : tradesRealizedPnl;
-  const effectiveFees = effectiveSells.length > 0
-    ? Math.round(effectiveSells.reduce((s, t) => {
-        const qty = Number(t.quantity), price = Number(t.price);
-        return s + qty * price * TAKER_FEE;
-      }, 0) * 10000) / 10000
-    : totalFees;
+  // Server total_fees covers both buy AND sell fees from the trades table.
+  // Fallback: estimate from agentTrades sell side only (misses buy fees).
+  const effectiveFees = serverWallet
+    ? serverWallet.total_fees
+    : effectiveSells.length > 0
+      ? Math.round(effectiveSells.reduce((s, t) => {
+          const qty = Number(t.quantity), price = Number(t.price);
+          // Both sides: buy fee ≈ qty*price*rate, sell fee = qty*price*rate
+          return s + qty * price * TAKER_FEE;
+        }, 0) * 2 * 10000) / 10000  // ×2 approximates buy+sell fees
+      : totalFees;
 
   // ── Reset paper wallet ───────────────────────────────────────────────────
   const resetWallet = async () => {
@@ -430,7 +438,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                 fetch(`${getRailwayUrl()}/api/wallet`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null).catch(() => null),
                 fetch(`${getRailwayUrl()}/api/positions`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null).catch(() => null),
               ]);
-              if (walRes) setServerWallet({ realized_pnl: Number(walRes.realized_pnl ?? 0), session_pnl: Number(walRes.session_pnl ?? 0), starting_balance: Number(walRes.starting_balance ?? 0) });
+              if (walRes) setServerWallet({ realized_pnl: Number(walRes.realized_pnl ?? 0), session_pnl: Number(walRes.session_pnl ?? 0), starting_balance: Number(walRes.starting_balance ?? 0), total_fees: Number(walRes.total_fees ?? 0), open_pos_value: Number(walRes.open_pos_value ?? 0) });
               if (walRes?.total_usdt !== undefined) setUsdtFree(Number(walRes.total_usdt));
               if (posRes?.positions) setPositions(posRes.positions as Position[]);
               setLastUpdated(new Date().toLocaleTimeString());
@@ -462,15 +470,20 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
           {isPaper && (
             <>
               <div className={`text-xs font-mono font-semibold ${effectiveSessionGain >= 0 ? 'text-gain' : 'text-loss'}`}>
-                {effectiveSessionGain >= 0 ? '+' : ''}{effectiveSessionGain.toFixed(2)} USDT realized
+                {effectiveSessionGain >= 0 ? '+' : ''}{effectiveSessionGain.toFixed(2)} USDT realized P&L
               </div>
               <div className={`text-[10px] font-mono ${displaySessionPnl >= 0 ? 'text-gain' : 'text-loss'}`}>
                 {displaySessionPnl >= 0 ? '+' : ''}{displaySessionPnl.toFixed(2)} USDT
-                {' '}({sessionGainPct >= 0 ? '+' : ''}{sessionGainPct.toFixed(2)}%) session
+                {' '}({sessionGainPct >= 0 ? '+' : ''}{sessionGainPct.toFixed(2)}%) total session
               </div>
               <div className="text-[10px] text-muted-foreground">
-                Fees paid: <span className="font-mono text-foreground">{effectiveFees.toFixed(4)} USDT</span>
+                Fees (buy+sell): <span className="font-mono text-foreground">{effectiveFees.toFixed(4)} USDT</span>
               </div>
+              {(serverWallet?.open_pos_value ?? 0) > 0 && (
+                <div className="text-[10px] text-muted-foreground">
+                  Open positions: <span className="font-mono text-foreground">{(serverWallet!.open_pos_value).toFixed(2)} USDT</span>
+                </div>
+              )}
             </>
           )}
         </div>

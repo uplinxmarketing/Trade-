@@ -1,5 +1,5 @@
 {
-  "version": "5.10.9",
-  "buildTime": "2026-05-10T15:00:00.000Z",
-  "commit": "v5.10.9-lower-signal-threshold-fix-deploy"
+  "version": "5.11.0",
+  "buildTime": "2026-05-11T10:00:00.000Z",
+  "commit": "v5.11.0-fix-wallet-balance-fee-mismatch"
 }
