@@ -7,10 +7,15 @@ import { toast } from 'sonner';
 import { API_BASE } from '@/config';
 
 const PAPER_CFG_KEY  = 'paper_wallet_config';
-const RAILWAY_URL_KEY = 'railway_bot_url';
+const BOT_URL_KEY    = 'bot_server_url';
 
 function getRailwayUrl(): string {
-  try { return localStorage.getItem(RAILWAY_URL_KEY) ?? API_BASE; } catch { return API_BASE; }
+  try {
+    // Migrate old Railway URL key if present
+    const old = localStorage.getItem('railway_bot_url');
+    if (old !== null) { localStorage.removeItem('railway_bot_url'); localStorage.setItem(BOT_URL_KEY, old); }
+    return localStorage.getItem(BOT_URL_KEY) ?? API_BASE;
+  } catch { return API_BASE; }
 }
 
 const COIN_COLORS: Record<string, string> = {
@@ -159,7 +164,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
       }).then(r => r.json()).then(d => {
         if (d.ok) toast.success('Budget settings applied to bot');
         else toast.error('Server rejected: ' + (d.error ?? 'unknown'));
-      }).catch(() => toast.error('Bot unreachable — set Railway URL in the AI Agent panel'));
+      }).catch(() => toast.error('Bot unreachable — check bot connection'));
       return next;
     });
   }, [draftCfg]);
@@ -350,7 +355,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
       if (hasAgentData) {
         const res = await fetch(`${getRailwayUrl()}/api/reset`, { method: 'POST' }).catch(() => null);
         if (!res?.ok) {
-          toast.error('Server reset failed — check Railway logs');
+          toast.error('Server reset failed — check bot logs');
           return;
         }
       }
@@ -624,7 +629,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                 {hasAgentData ? (
                   <div className="text-[10px] text-muted-foreground bg-muted/30 border border-border rounded px-3 py-2">
                     <span className="font-mono font-semibold text-foreground">{((serverWallet?.starting_balance ?? 0) > 0 ? serverWallet!.starting_balance : walletCfg.startingBalance).toLocaleString()} USDT</span>
-                    <span className="ml-2 opacity-70">— set by Railway <code>STARTING_PAPER_USDT</code> env var</span>
+                    <span className="ml-2 opacity-70">— set by <code>STARTING_PAPER_USDT</code> server env var</span>
                   </div>
                 ) : (
                   <div className="flex items-center gap-1.5 flex-wrap">

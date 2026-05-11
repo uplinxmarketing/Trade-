@@ -1,5 +1,5 @@
 {
-  "version": "5.12.0",
-  "buildTime": "2026-05-11T11:00:00.000Z",
-  "commit": "v5.12.0-fee-accuracy-date-range-filter"
+  "version": "5.12.2",
+  "buildTime": "2026-05-11T23:30:00.000Z",
+  "commit": "v5.12.2-remove-railway-functional-references"
 }

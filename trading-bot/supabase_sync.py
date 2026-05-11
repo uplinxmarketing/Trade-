@@ -38,7 +38,7 @@ SUPABASE_KEY = (
     or os.getenv("VITE_SUPABASE_PUBLISHABLE_KEY")
     or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZybW5tZWRyd3NkZHhvdnFjdW5zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3MjYwNTIsImV4cCI6MjA5MzMwMjA1Mn0.sV_iJu0CYQwQ9aQGWgFfusqH92QhPKgThOWrCmKKXJo"
 )
-SESSION = "railway_bot"
+SESSION = "wolfbot"
 
 _enabled = bool(SUPABASE_URL and SUPABASE_KEY)
 _pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="supa-sync")

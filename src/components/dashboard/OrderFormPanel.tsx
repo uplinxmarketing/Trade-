@@ -6,8 +6,15 @@ import { toast } from 'sonner';
 
 const BREAK_EVEN_MULT = 1 / Math.pow(1 - TAKER_FEE, 2);
 const MAKER_FEE = 0.001 * 0.075 / 0.1; // ~0.075% maker
-const RAILWAY_URL_KEY = 'railway_bot_url';
-const apiBase = () => localStorage.getItem(RAILWAY_URL_KEY) ?? (import.meta.env.VITE_API_URL as string | undefined) ?? '';
+const BOT_URL_KEY = 'bot_server_url';
+const apiBase = () => {
+  // Migrate old Railway URL key if present
+  try {
+    const old = localStorage.getItem('railway_bot_url');
+    if (old !== null) { localStorage.removeItem('railway_bot_url'); localStorage.setItem(BOT_URL_KEY, old); }
+  } catch { /* ignore */ }
+  return localStorage.getItem(BOT_URL_KEY) ?? (import.meta.env.VITE_API_URL as string | undefined) ?? '';
+};
 
 type TradingMode = 'spot' | 'futures';
 type Side        = 'buy' | 'sell';

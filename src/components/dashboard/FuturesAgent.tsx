@@ -91,12 +91,12 @@ interface FuturesSettings {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const RAILWAY_BASE  = (import.meta.env.VITE_RAILWAY_URL ?? '').replace(/\/$/, '');
+const API_BASE_URL  = ((import.meta.env.VITE_API_URL ?? '') as string).replace(/\/$/, '');
 const POLL_MS       = 6_000;
 const START_BALANCE = 3000;
 
 async function apiFetch(path: string, opts?: RequestInit) {
-  return fetch(`${RAILWAY_BASE}${path}`, opts);
+  return fetch(`${API_BASE_URL}${path}`, opts);
 }
 
 // ── Funding countdown ─────────────────────────────────────────────────────────
@@ -1039,7 +1039,7 @@ const FuturesAgent = () => {
       )}
       {!status && pollError && (
         <p className="text-xs text-loss text-center py-2">
-          Could not reach the Railway API — check the bot is deployed and running.
+          Could not reach the bot API — check the bot is deployed and running.
         </p>
       )}
     </div>

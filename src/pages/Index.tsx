@@ -43,7 +43,7 @@ const Index = () => {
     catch { /* storage quota */ }
   }, [selectedCoins]);
 
-  // If localStorage was empty (new browser / cleared), try Supabase railway_bot session
+  // If localStorage was empty (new browser / cleared), try Supabase wolfbot session
   useEffect(() => {
     const saved = localStorage.getItem(COINS_KEY);
     if (saved) return; // localStorage already has data — no need to fetch
@@ -52,7 +52,7 @@ const Index = () => {
         const { data } = await supabase
           .from('bot_config')
           .select('selected_coins')
-          .eq('user_session', 'railway_bot')
+          .eq('user_session', 'wolfbot')
           .maybeSingle();
         const coins = data?.selected_coins;
         if (Array.isArray(coins) && coins.length > 0) {
