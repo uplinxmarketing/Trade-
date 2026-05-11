@@ -78,7 +78,7 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
       if (attempts >= 20) {
         clearInterval(id);
         setRestartPoll(null);
-        toast.error('Timeout waiting for bot restart — check Railway logs');
+        toast.error('Timeout waiting for bot restart — check bot logs');
         checkStatus();
       }
     }, 2000);

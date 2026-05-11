@@ -1039,7 +1039,7 @@ const FuturesAgent = () => {
       )}
       {!status && pollError && (
         <p className="text-xs text-loss text-center py-2">
-          Could not reach the Railway API — check the bot is deployed and running.
+          Could not reach the bot API — check the bot is deployed and running.
         </p>
       )}
     </div>

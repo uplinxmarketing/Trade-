@@ -983,9 +983,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             body: JSON.stringify({ mode: 'paper' }),
           });
           const data = await res.json();
-          if (data.ok) { setMode('test'); toast.info('Railway bot set to Paper mode'); }
+          if (data.ok) { setMode('test'); toast.info('Bot set to Paper mode'); }
           else toast.error(data.warning ?? 'Mode switch failed');
-        } catch { toast.error('Could not reach Railway to switch mode'); }
+        } catch { toast.error('Could not reach bot to switch mode'); }
       }
     } else {
       if (newMode === 'live' && !binanceConnected) { toast.error('Connect Binance API first'); onConnectBinance?.(); return; }
@@ -997,7 +997,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const submitLiveMode = useCallback(async () => {
     if (!liveApiKey.trim() || !liveApiSecret.trim()) return;
     setLiveSetupLoading(true);
-    const toastId = toast.loading('Switching Railway bot to Live mode…');
+    const toastId = toast.loading('Switching bot to Live mode…');
     try {
       const res = await fetch(`${railwayUrl}/api/mode`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1006,8 +1006,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       const data = await res.json();
       if (!data.ok) throw new Error(data.error ?? 'Mode switch failed');
 
-      toast.loading('Railway restarting with Live mode…', { id: toastId });
-      addLog('=== Switching to LIVE mode — Railway restarting ===');
+      toast.loading('Bot restarting with Live mode…', { id: toastId });
+      addLog('=== Switching to LIVE mode — bot restarting ===');
 
       // Poll /api/ping until the server comes back after restart
       let attempts = 0;
@@ -1015,7 +1015,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         attempts++;
         if (attempts > 60) {
           clearInterval(poll);
-          toast.error('Restart timed out — check Railway logs', { id: toastId });
+          toast.error('Restart timed out — check bot logs', { id: toastId });
           setLiveSetupLoading(false);
           return;
         }
@@ -1025,7 +1025,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             clearInterval(poll);
             toast.success('Live mode active — bot restarted!', { id: toastId });
             setLiveApiKey(''); setLiveApiSecret('');
-            addLog('=== Railway bot is now in LIVE mode ===');
+            addLog('=== Bot is now in LIVE mode ===');
             await pollRailway();
             setLiveSetupLoading(false);
           }
@@ -1092,15 +1092,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       ]);
       if (!cfgRes.ok || !setRes.ok) {
         const status = !cfgRes.ok ? cfgRes.status : setRes.status;
-        throw new Error(`Railway returned HTTP ${status}`);
+        throw new Error(`Server returned HTTP ${status}`);
       }
 
       setSettingsSynced(true);
-      if (!opts.silent) toast.success('Settings saved to Railway ✓');
+      if (!opts.silent) toast.success('Settings saved ✓');
       return true;
     } catch (err: any) {
       setSettingsSynced(false);
-      if (!opts.silent) toast.error(`Settings not saved to Railway — ${err?.message ?? 'connection error'}. Fix connection and retry.`);
+      if (!opts.silent) toast.error(`Settings not saved — ${err?.message ?? 'connection error'}. Fix connection and retry.`);
       return false;
     } finally {
       setSavingSetup(false);
@@ -1114,9 +1114,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     const ok = await saveAgentConfig({ silent: false });
     if (ok) {
       setSetupComplete(true);
-      toast.success('Settings saved to Railway ✓ — you can now start the bot');
+      toast.success('Settings saved ✓ — you can now start the bot');
     } else {
-      toast.error('Could not save settings — check Railway URL is set and bot is reachable');
+      toast.error('Could not save settings — check bot is reachable');
     }
   }, [saveAgentConfig]);
 
@@ -1135,7 +1135,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         if (!isRunning && !settingsSynced) {
           const synced = await saveAgentConfig({ silent: true });
           if (!synced) {
-            toast.error('Cannot start — settings failed to reach Railway. Check connection and retry.');
+            toast.error('Cannot start — settings failed to reach bot. Check connection and retry.');
             return;
           }
         }
@@ -1144,30 +1144,30 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         try {
           res = await fetch(`${railwayUrl}${endpoint}`, { method: 'POST' });
         } catch (networkErr: any) {
-          const msg = `Cannot reach Railway (${networkErr.message ?? 'network error'})`;
+          const msg = `Cannot reach bot (${networkErr.message ?? 'network error'})`;
           toast.error(msg);
-          addLog(`[Railway ERROR] ${msg}`);
+          addLog(`[Bot ERROR] ${msg}`);
           return;
         }
         if (!res.ok) {
-          const msg = `Railway returned HTTP ${res.status}: ${res.statusText}`;
+          const msg = `Server returned HTTP ${res.status}: ${res.statusText}`;
           toast.error(msg);
-          addLog(`[Railway ERROR] ${msg}`);
+          addLog(`[Bot ERROR] ${msg}`);
           return;
         }
         let data: any;
         try {
           data = await res.json();
         } catch {
-          const msg = 'Railway response was not valid JSON';
+          const msg = 'Bot response was not valid JSON';
           toast.error(msg);
-          addLog(`[Railway ERROR] ${msg}`);
+          addLog(`[Bot ERROR] ${msg}`);
           return;
         }
         if (data.ok === false) {
-          const msg = data.error ?? 'Railway call failed';
-          toast.error(`Railway: ${msg}`);
-          addLog(`[Railway ERROR] ${msg}`);
+          const msg = data.error ?? 'Bot call failed';
+          toast.error(msg);
+          addLog(`[Bot ERROR] ${msg}`);
           return;
         }
         // Optimistic update — show new state immediately without waiting for poll.
@@ -1177,9 +1177,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         isRunningRef.current = nowRunning;
         // When bot stops, reset wizard so user must confirm settings again before restarting.
         if (!nowRunning) { setSetupComplete(false); setSettingsSynced(false); }
-        addLog(isRunning ? '=== Railway bot STOPPED ===' : '=== Railway bot STARTED ===');
-        toast[isRunning ? 'info' : 'success'](isRunning ? 'Railway bot paused' : 'Railway bot started', {
-          description: 'Runs 24/7 on Railway — this browser tab can be closed.',
+        addLog(isRunning ? '=== Bot STOPPED ===' : '=== Bot STARTED ===');
+        toast[isRunning ? 'info' : 'success'](isRunning ? 'Bot paused' : 'Bot started', {
+          description: 'Runs 24/7 — this browser tab can be closed.',
         });
         pollRailway().catch(() => {});  // fire-and-forget; don't block UI
         return;
@@ -1454,13 +1454,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       {dataPersistent === false && (
         <div className="bg-loss/10 border border-loss/40 rounded-md px-3 py-2.5 space-y-1">
           <div className="text-xs font-bold text-loss flex items-center gap-1.5">
-            ⚠️ Trade history will be lost on next Railway deploy
+            ⚠️ Trade history may not be persistent
           </div>
           <p className="text-[10px] text-muted-foreground leading-relaxed">
-            The database is stored inside the container (no persistent volume).
-            Every redeploy wipes all trades, positions, and wallet history.
-            To fix: add a Railway Volume mounted at <code className="bg-muted px-1 rounded text-foreground">/data</code> and set{' '}
-            <code className="bg-muted px-1 rounded text-foreground">DATA_DIR=/data</code> in your Railway environment variables.
+            The database may be stored in a temporary location.
+            To fix: ensure <code className="bg-muted px-1 rounded text-foreground">DATA_DIR</code> points to a persistent directory (e.g. <code className="bg-muted px-1 rounded text-foreground">/opt/tradebot/data</code>) in your server environment.
           </p>
         </div>
       )}
@@ -1477,9 +1475,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           {isServerMode
             ? isRunning
               ? <span className="text-[9px] text-gain font-mono flex items-center gap-1">
-                  <span className="animate-pulse">●</span>Railway 24/7 · {agentStatus ? agentStatus.split('·').slice(-1)[0]?.trim() : 'live'}
+                  <span className="animate-pulse">●</span>Bot 24/7 · {agentStatus ? agentStatus.split('·').slice(-1)[0]?.trim() : 'live'}
                 </span>
-              : <span className="text-[9px] text-muted-foreground font-mono">Railway · paused</span>
+              : <span className="text-[9px] text-muted-foreground font-mono">Bot · paused</span>
             : scanning
               ? <span className="text-[9px] text-accent font-mono flex items-center gap-1"><RefreshCw className="w-2.5 h-2.5 animate-spin" />Checking signals…</span>
               : isRunning && cycleCountdown > 0
@@ -1495,7 +1493,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             <Button size="sm" variant="outline" className="h-6 text-[10px] px-2"
               onClick={() => isServerMode ? pollRailway() : runCycle()}
               disabled={loading}
-              title={isServerMode ? 'Refresh Railway state' : 'Run cycle now'}>
+              title={isServerMode ? 'Refresh bot state' : 'Run cycle now'}>
               <Zap className="w-3 h-3 mr-0.5" />{isServerMode ? 'Sync' : 'Now'}
             </Button>
           )}
@@ -1529,7 +1527,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             </button>
           </div>
           <p className="text-[10px] text-muted-foreground leading-relaxed">
-            Enter your Binance API credentials. They are sent to the Railway bot and stored in its environment — the bot will restart and connect to your real account.
+            Enter your Binance API credentials. They are saved securely on the server — the bot will restart and connect to your real account.
           </p>
           <div className="space-y-1.5">
             <input
@@ -1561,8 +1559,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             className="w-full bg-loss/80 hover:bg-loss text-white text-xs py-2 h-auto"
           >
             {liveSetupLoading
-              ? <><span className="animate-spin mr-1.5">⟳</span>Restarting Railway in Live mode…</>
-              : '⚡ Enable Live Trading on Railway'}
+              ? <><span className="animate-spin mr-1.5">⟳</span>Restarting bot in Live mode…</>
+              : '⚡ Enable Live Trading'}
           </Button>
           <p className="text-[9px] text-muted-foreground">Bot will be offline ~30s during restart. Make sure your API key has Spot Trading enabled.</p>
         </div>
@@ -1576,12 +1574,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         </div>
       )}
 
-      {/* ── Railway bot URL ── */}
+      {/* ── Bot Server URL ── */}
       <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-1.5">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Activity className="w-3.5 h-3.5 text-accent" />
-            <span className="text-xs font-semibold text-accent">Railway Bot</span>
+            <span className="text-xs font-semibold text-accent">Bot Server</span>
             {isServerMode && <span className="text-[9px] px-1.5 py-0.5 rounded bg-gain/20 text-gain font-bold">CONNECTED</span>}
           </div>
           {!showRailwayInput ? (
@@ -1604,7 +1602,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         </div>
         {showRailwayInput ? (
           <input value={railwayDraft} onChange={e => setRailwayDraft(e.target.value)}
-            placeholder="Leave empty for same-origin (Railway unified deployment)"
+            placeholder="Leave empty for same-origin (e.g. wolfbot.tech)"
             className="w-full text-xs bg-background border border-border rounded px-2 py-1.5 font-mono outline-none focus:border-accent" />
         ) : (
           <p className="text-[10px] text-muted-foreground font-mono break-all">
@@ -1898,12 +1896,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               />
               <div className="flex items-center gap-2">
                 <span className={`flex-1 text-[10px] italic ${settingsSynced ? 'text-gain' : 'text-warn'}`}>
-                  {settingsSynced ? '✓ Synced to Railway' : '⚠ Not yet synced — click Save'}
+                  {settingsSynced ? '✓ Synced to bot' : '⚠ Not yet synced — click Save'}
                 </span>
                 <button onClick={() => saveAgentConfig()} disabled={savingSetup}
                   className="px-3 py-1 text-xs font-semibold rounded bg-accent text-accent-foreground hover:bg-accent/80 disabled:opacity-50 flex items-center gap-1">
                   {savingSetup ? <span className="animate-spin">⟳</span> : <Check className="w-3 h-3" />}
-                  Save to Railway
+                  Save Settings
                 </button>
               </div>
             </div>
@@ -1914,7 +1912,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       {/* ── Not-synced warning banner ── */}
       {(setupComplete || isRunning) && !settingsSynced && !isRunning && (
         <div className="flex items-center justify-between gap-2 bg-warn/10 border border-warn/40 rounded-md px-3 py-2">
-          <p className="text-[10px] text-warn">⚠ Settings not yet saved to Railway — bot will use old values until synced.</p>
+          <p className="text-[10px] text-warn">⚠ Settings not yet saved — bot will use old values until synced.</p>
           <button onClick={() => saveAgentConfig()} disabled={savingSetup}
             className="shrink-0 px-3 py-1 text-[10px] font-semibold rounded bg-warn/20 border border-warn/50 text-warn hover:bg-warn/30 disabled:opacity-50">
             {savingSetup ? '…' : 'Sync now'}
@@ -1928,24 +1926,24 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         className={`w-full font-semibold py-5 ${isRunning ? 'bg-loss/90 hover:bg-loss text-white' : (setupComplete || isRunning) ? 'bg-gain/90 hover:bg-gain text-background' : 'bg-muted/60 text-muted-foreground cursor-not-allowed'}`}>
         {loading ? <span className="animate-spin mr-1.5">⟳</span>
           : isRunning
-            ? <><Square className="w-4 h-4 mr-1.5"/>{isServerMode ? 'Pause Railway Bot' : 'Stop Agent'}</>
+            ? <><Square className="w-4 h-4 mr-1.5"/>{isServerMode ? 'Pause Bot' : 'Stop Agent'}</>
             : !setupComplete
               ? <><Settings2 className="w-4 h-4 mr-1.5"/>Configure above to start</>
-              : <><Play className="w-4 h-4 mr-1.5"/>{isServerMode ? 'Start Railway Bot (24/7)' : 'Start AI Agent — Paper Test'}</>}
+              : <><Play className="w-4 h-4 mr-1.5"/>{isServerMode ? 'Start Bot (24/7)' : 'Start AI Agent — Paper Test'}</>}
       </Button>
       {isRunning
         ? <p className="text-[10px] text-center text-muted-foreground -mt-2">
             {isServerMode
-              ? <>Railway bot running 24/7 · real-time prices · sells in &lt;1s · UI syncs every 5s{agentStatus && <> · <span className="text-gain font-mono">{agentStatus}</span></>}</>
+              ? <>Bot running 24/7 · real-time prices · sells in &lt;1s · UI syncs every 5s{agentStatus && <> · <span className="text-gain font-mono">{agentStatus}</span></>}</>
               : <>Every 10s: fetches live candles → checks EMA / RSI / MACD / Volume → buys or holds{agentStatus && <> · <span className="text-accent font-mono">{agentStatus}</span></>}</>}
           </p>
         : <p className="text-[10px] text-center text-muted-foreground -mt-2">
             {!setupComplete && !isRunning
               ? 'Confirm your risk settings above, then start the bot'
               : !settingsSynced
-                ? 'Sync settings to Railway above before starting'
+                ? 'Sync settings above before starting'
                 : isServerMode
-                  ? 'Railway bot handles all trading 24/7 — no browser required'
+                  ? 'Bot handles all trading 24/7 — no browser required'
                   : 'Sells on every price tick · Buys checked every 10s · EMA+RSI+MACD+Volume signals · no API key needed'}
           </p>
       }
@@ -1956,7 +1954,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         <div>
           <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2 flex items-center gap-1.5">
             <Activity className="w-3 h-3 text-gain" />Bot Live Signals
-            <span className="text-[9px] text-gain font-mono">Railway · 6-signal</span>
+            <span className="text-[9px] text-gain font-mono">Bot · 6-signal</span>
           </div>
           <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-2">
             {railwaySignals.map((sig: any) => {
@@ -2042,7 +2040,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             {positions.length}
           </span>
           {isServerMode && positions.length > 0 && (
-            <span className="text-[9px] text-muted-foreground font-normal normal-case tracking-normal ml-1">live from Railway</span>
+            <span className="text-[9px] text-muted-foreground font-normal normal-case tracking-normal ml-1">live from bot</span>
           )}
           {showPositionsSection?<ChevronUp className="w-3 h-3 ml-auto"/>:<ChevronDown className="w-3 h-3 ml-auto"/>}
         </button>
