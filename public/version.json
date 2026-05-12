@@ -1,5 +1,5 @@
 {
-  "version": "5.12.23",
-  "buildTime": "2026-05-12T17:00:00.000Z",
-  "commit": "v5.12.23-persist-live-mode-localStorage"
+  "version": "5.12.24",
+  "buildTime": "2026-05-12T18:00:00.000Z",
+  "commit": "v5.12.24-preserve-settings-on-restart"
 }
