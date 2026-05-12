@@ -237,9 +237,21 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
           usdValue = total;
         } else {
           const lp = prices[`${asset}USDT`];
-          if (lp) usdValue = total * parseFloat(lp.price);
+          if (lp) {
+            usdValue = total * parseFloat(lp.price);
+          } else {
+            // Coin not in watched list — fetch price from Binance REST
+            try {
+              const pr = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${asset}USDT`);
+              if (pr.ok) {
+                const pd = await pr.json();
+                if (pd.price) usdValue = total * parseFloat(pd.price);
+              }
+            } catch { /* skip — show with $0 value */ }
+          }
         }
-        if (usdValue >= 0.01) assets.push({ asset, free: String(b.free), locked: String(b.locked), usdValue });
+        // Show all coins with meaningful quantity, even if price unavailable
+        if (total > 0.0001) assets.push({ asset, free: String(b.free), locked: String(b.locked), usdValue });
       }
       assets.sort((a, b) => b.usdValue - a.usdValue);
       setLiveAssets(assets);

@@ -1,5 +1,5 @@
 {
-  "version": "5.12.19",
-  "buildTime": "2026-05-12T12:00:00.000Z",
-  "commit": "v5.12.19-fix-mode-persistence-position-isolation"
+  "version": "5.12.20",
+  "buildTime": "2026-05-12T14:00:00.000Z",
+  "commit": "v5.12.20-fix-wallet-shows-all-coins"
 }
