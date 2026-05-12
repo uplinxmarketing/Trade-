@@ -188,9 +188,10 @@ def bb_buy_allowed(close: float, bb_upper, bb_mid) -> bool:
 
 
 def is_5m_bullish(candles_5m: list) -> bool:
-    """Return True when the 5-minute EMA9 > EMA21 (uptrend on higher timeframe)."""
+    """Return True when the 5-minute EMA9 > EMA21 (uptrend on higher timeframe).
+    Returns True when insufficient data — don't block trades on missing data."""
     if not candles_5m or len(candles_5m) < 21:
-        return False
+        return True  # insufficient data — don't block
     closes = [c["close"] for c in candles_5m]
     ema9  = calc_ema(closes, 9)
     ema21 = calc_ema(closes, 21)

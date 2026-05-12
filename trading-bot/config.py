@@ -45,14 +45,14 @@ STRATEGY_FILE = _os.path.join(_DATA_DIR, "strategy.json")
 # ── Two-speed architecture constants ────────────────────────────────────────────
 SCAN_INTERVAL_SEC    = 60      # REST backup cache refresh — WebSocket handles real-time
 STOP_LOSS_PCT        = 0.005   # 0.5% stop-loss
-COOLDOWN_AFTER_LOSS  = 180     # 3 min cooldown after stop-loss
+COOLDOWN_AFTER_LOSS  = 30      # 30s cooldown after stop-loss — scalping needs fast re-entry
 MIN_SIGNALS_TO_BUY   = 3       # at least 3 of 6 signals must be bullish
 RSI_BUY_MIN          = 20
 RSI_BUY_MAX          = 80      # wide window — scalping works across most RSI zones
 VOLUME_RATIO_MIN     = 1.1     # volume must be 1.1× the 20-candle average
 
 # ── ATR filter thresholds ─────────────────────────────────────────────────────
-ATR_MIN_PCT = 0.0015   # ATR must be ≥ 0.15% of price (enough to reach breakeven)
+ATR_MIN_PCT = 0.0005   # ATR must be ≥ 0.05% of price (lowered — scalping works on small moves)
 ATR_MAX_PCT = 0.015    # ATR must be ≤ 1.5% of price (too volatile → skip)
 ATR_PERIOD  = 14       # standard ATR lookback period
 
@@ -63,7 +63,7 @@ BUDGET_PCT_OF_FREE    = 5.0       # 5% of free USDT per trade (when mode=percent
 BUDGET_TOTAL_CAP_USDT = 110.0
 # Total USDT the bot is allowed to use across all concurrent open positions.
 # 0 = unlimited. Default $110 cap so the bot stays within the user's allocation.
-BOT_ALLOCATION_USDT   = 110.0
+BOT_ALLOCATION_USDT   = 0        # 0 = unlimited — don't cap concurrent positions
 BUDGET_PER_COIN = {
     "BTCUSDT":  200.0,
     "ETHUSDT":  150.0,
