@@ -1,5 +1,5 @@
 {
-  "version": "5.12.14",
-  "buildTime": "2026-05-12T07:00:00.000Z",
-  "commit": "v5.12.14-fix-usdt-display-balance"
+  "version": "5.12.15",
+  "buildTime": "2026-05-12T08:00:00.000Z",
+  "commit": "v5.12.15-fix-budget-cap"
 }

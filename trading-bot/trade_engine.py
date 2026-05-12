@@ -226,8 +226,12 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
         scale = max(0.5, min(2.0, free_usdt / initial))
         base = base * scale
 
-    # Hard cap: single trade never exceeds 40% of effective free USDT (prevents wallet wipeout)
-    return round(min(base, effective_free * 0.4), 2)
+    # In fixed/per_coin mode the user chose an explicit amount — honour it as long as funds exist.
+    # The 40% cap only applies to capped mode where base is derived from a rolling total.
+    if mode in ("fixed", "per_coin"):
+        return round(min(base, effective_free), 2)
+    # For capped mode cap to 90% so a tiny buffer remains for fees.
+    return round(min(base, effective_free * 0.9), 2)
 
 
 # ── Cooldown helpers ──────────────────────────────────────────────────────────
