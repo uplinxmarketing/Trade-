@@ -128,7 +128,7 @@ const Index = () => {
         const res = await fetch(`${API_BASE}/api/status`, { cache: 'no-store' });
         if (!res.ok) return;
         const d = await res.json();
-        if (d.mode === 'live' && !d.live_error) setBinanceConnected(true);
+        if (d.mode === 'live') setBinanceConnected(true);
       } catch { /* bot unreachable — stay disconnected */ }
     })();
   }, []);
