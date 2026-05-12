@@ -67,15 +67,10 @@ async def lifespan(app: FastAPI):
         steps.append("positions OK")
 
         # 4. Apply startup defaults and auto-resume logic.
-        #    stop_loss and smart_hold are ALWAYS forced OFF on every deploy —
-        #    the user must explicitly enable them each session.
-        #    trading_active is preserved so a running bot resumes after a redeploy.
+        #    All user settings (stop_loss, smart_hold, etc.) are preserved across
+        #    restarts so the 24/7 bot resumes exactly as the user left it.
         _s = _load_strategy()
-        _auto_patch: dict = {
-            "pause_reason":       None,
-            "stop_loss_enabled":  False,   # always OFF — user opts in each session
-            "smart_hold_enabled": False,   # always OFF — user opts in each session
-        }
+        _auto_patch: dict = {"pause_reason": None}
         if "trading_active" not in _s:
             # Brand-new deploy — don't auto-start, let user press Start
             _auto_patch["trading_active"] = False

@@ -41,9 +41,7 @@ def _build_client():
                 _live_error = f"Binance API connection failed: {exc}"
                 print(f"[Connection] {_live_error} — using paper client for this session")
                 MODE = "paper"
-                # Do NOT revert .env — keep MODE=live so next restart retries.
-                # _revert_to_paper() was the root cause of mode silently switching to
-                # paper after a temporary network hiccup and never recovering.
+                # Do NOT revert .env — keep MODE=live so next restart retries live.
 
     elif MODE == "testnet":
         api_key    = (os.getenv("TESTNET_API_KEY")    or "").strip()
@@ -67,21 +65,6 @@ def _build_client():
         starting_usdt=float(os.getenv("STARTING_PAPER_USDT", "10000.0")),
         fee_rate=0.00075,
     )
-
-
-def _revert_to_paper():
-    env_path = _ENV_PATH
-    if not os.path.exists(env_path):
-        return
-    with open(env_path) as f:
-        lines = f.readlines()
-    for i, line in enumerate(lines):
-        if line.startswith("MODE="):
-            lines[i] = "MODE=paper\n"
-            break
-    with open(env_path, "w") as f:
-        f.writelines(lines)
-    os.environ["MODE"] = "paper"
 
 
 client = _build_client()
