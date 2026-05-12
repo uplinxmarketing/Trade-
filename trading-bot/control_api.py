@@ -274,17 +274,43 @@ def _sell_monitor_alive() -> bool:
         return False
 
 
+# Cache Binance account balance — refreshed at most every 5 s so we don't
+# hammer the REST API on every frontend poll.
+_acct_cache: dict = {}
+_acct_cache_ts: float = 0.0
+_ACCT_CACHE_TTL = 5.0
+_acct_cache_lock = threading.Lock()
+
+def _get_cached_account() -> dict:
+    """Return cached Binance account dict, refreshing at most every 5 s."""
+    global _acct_cache, _acct_cache_ts
+    now = time.time()
+    with _acct_cache_lock:
+        if now - _acct_cache_ts < _ACCT_CACHE_TTL and _acct_cache:
+            return _acct_cache
+    try:
+        from connection import client
+        acc = client.get_account()
+        with _acct_cache_lock:
+            _acct_cache = acc
+            _acct_cache_ts = now
+        return acc
+    except Exception:
+        with _acct_cache_lock:
+            return _acct_cache  # return stale on error
+
+
 def _get_usdt_balance() -> float:
     """Returns free USDT only — used for trade budget calculations."""
     try:
-        from connection import client, get_mode
+        from connection import get_mode
         if get_mode() != "live":
-            # Fast path: read directly from PaperClient._balances
+            from connection import client
             if hasattr(client, "_balances"):
                 with client._lock:
                     return float(client._balances.get("USDT", 0.0))
-        acc = client.get_account()
-        for b in acc["balances"]:
+        acc = _get_cached_account()
+        for b in acc.get("balances", []):
             if b["asset"] == "USDT":
                 return float(b["free"])
     except Exception:
@@ -295,14 +321,15 @@ def _get_usdt_balance() -> float:
 def _get_usdt_display_balance() -> float:
     """Returns free+locked USDT — matches what Binance UI shows."""
     try:
-        from connection import client, get_mode
+        from connection import get_mode
         if get_mode() != "live":
+            from connection import client
             if hasattr(client, "_balances"):
                 with client._lock:
                     return float(client._balances.get("USDT", 0.0))
             return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
-        acc = client.get_account()
-        for b in acc["balances"]:
+        acc = _get_cached_account()
+        for b in acc.get("balances", []):
             if b["asset"] == "USDT":
                 return float(b["free"]) + float(b["locked"])
     except Exception:
@@ -678,7 +705,7 @@ def api_wallet():
         from trade_engine import get_open_positions, _rest_px
         from data_collector import prices as live_prices
 
-        acc = client.get_account()
+        acc = _get_cached_account()
         balances = [
             {
                 "asset":  b["asset"],
@@ -686,7 +713,7 @@ def api_wallet():
                 "locked": float(b["locked"]),
                 "total":  float(b["free"]) + float(b["locked"]),
             }
-            for b in acc["balances"]
+            for b in acc.get("balances", [])
             if float(b["free"]) + float(b["locked"]) > 0
         ]
         # Trading uses only free USDT; display shows free+locked to match Binance UI
