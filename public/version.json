@@ -1,5 +1,5 @@
 {
-  "version": "5.12.15",
-  "buildTime": "2026-05-12T08:00:00.000Z",
-  "commit": "v5.12.15-fix-budget-cap"
+  "version": "5.12.16",
+  "buildTime": "2026-05-12T09:00:00.000Z",
+  "commit": "v5.12.16-fix-budget-orphan-scan"
 }
