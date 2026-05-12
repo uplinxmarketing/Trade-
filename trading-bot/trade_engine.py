@@ -317,7 +317,10 @@ def load_positions_from_db():
     watchlist and wallet survive every redeploy regardless of SQLite state.
     """
     global _positions
-    rows = database.load_positions()
+    # Filter by current mode so live positions never load into a paper session
+    # and vice versa — cross-loading caused paper client to "sell" live positions.
+    _current_mode = get_mode()
+    rows = database.load_positions(mode=_current_mode)
 
     # Always fetch from Supabase so coins + balance are current even when
     # SQLite still has stale data from a previous deploy.
@@ -335,7 +338,7 @@ def load_positions_from_db():
             for pos in restored["positions"]:
                 pos_id = database.save_position(pos)
                 pos["id"] = pos_id
-            rows = database.load_positions()
+            rows = database.load_positions(mode=_current_mode)
             n_pos = len(rows)
             print(f"[TradeEngine] Restored {n_pos} position(s) from Supabase.")
             database.log_activity(
