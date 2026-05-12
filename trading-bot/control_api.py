@@ -416,10 +416,10 @@ def set_mode(mode: str):
 # ── HTML Dashboard ───────────────────────────────────────────────────────────
 
 DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en">
+<html lang=\"en\">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset=\"UTF-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
 <title>Trading Bot Dashboard</title>
 <style>
   :root { --gain:#22c55e; --loss:#ef4444; --warn:#f59e0b; --accent:#6366f1; }
@@ -461,55 +461,55 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<div id="banner" class="banner paper">PAPER MODE — simulated trading only, no real money</div>
+<div id=\"banner\" class=\"banner paper\">PAPER MODE — simulated trading only, no real money</div>
 
-<div class="container">
-  <div class="controls">
-    <span class="live-dot"></span>
-    <span id="last-update" style="color:#64748b;font-size:12px;">Connecting…</span>
-    <button class="btn btn-pause"   onclick="pause()">⏸ Pause</button>
-    <button class="btn btn-resume"  onclick="resume()">▶ Resume</button>
-    <button class="btn btn-refresh" onclick="refresh()">↻ Refresh</button>
+<div class=\"container\">
+  <div class=\"controls\">
+    <span class=\"live-dot\"></span>
+    <span id=\"last-update\" style=\"color:#64748b;font-size:12px;\">Connecting…</span>
+    <button class=\"btn btn-pause\"   onclick=\"pause()\">⏸ Pause</button>
+    <button class=\"btn btn-resume\"  onclick=\"resume()\">▶ Resume</button>
+    <button class=\"btn btn-refresh\" onclick=\"refresh()\">↻ Refresh</button>
   </div>
 
-  <div class="grid-4" id="metrics">
-    <div class="card"><div class="label">USDT Balance</div><div class="value" id="m-balance">—</div></div>
-    <div class="card"><div class="label">Open Positions</div><div class="value accent" id="m-open">—</div></div>
-    <div class="card"><div class="label">Trades Today</div><div class="value" id="m-today">—</div></div>
-    <div class="card"><div class="label">Win Rate</div><div class="value" id="m-winrate">—</div></div>
+  <div class=\"grid-4\" id=\"metrics\">
+    <div class=\"card\"><div class=\"label\">USDT Balance</div><div class=\"value\" id=\"m-balance\">—</div></div>
+    <div class=\"card\"><div class=\"label\">Open Positions</div><div class=\"value accent\" id=\"m-open\">—</div></div>
+    <div class=\"card\"><div class=\"label\">Trades Today</div><div class=\"value\" id=\"m-today\">—</div></div>
+    <div class=\"card\"><div class=\"label\">Win Rate</div><div class=\"value\" id=\"m-winrate\">—</div></div>
   </div>
 
-  <div class="section">
+  <div class=\"section\">
     <h2>Open Positions</h2>
-    <table id="positions-table">
+    <table id=\"positions-table\">
       <thead><tr>
         <th>Symbol</th><th>Entry $</th><th>Current $</th><th>BEP $</th>
         <th>Qty</th><th>Budget</th><th>Unrealised P&L</th><th>Dist to BEP</th><th>Status</th>
       </tr></thead>
-      <tbody id="positions-body"><tr><td colspan="9" style="color:#64748b;text-align:center">Loading…</td></tr></tbody>
+      <tbody id=\"positions-body\"><tr><td colspan=\"9\" style=\"color:#64748b;text-align:center\">Loading…</td></tr></tbody>
     </table>
   </div>
 
-  <div class="section">
+  <div class=\"section\">
     <h2>Recent Trades</h2>
-    <table id="trades-table">
+    <table id=\"trades-table\">
       <thead><tr>
         <th>Coin</th><th>Entry $</th><th>Exit $</th><th>Qty</th>
         <th>Budget</th><th>Buy Fee</th><th>Sell Fee</th>
         <th>Net P&L</th><th>Duration</th><th>Result</th>
       </tr></thead>
-      <tbody id="trades-body"><tr><td colspan="10" style="color:#64748b;text-align:center">Loading…</td></tr></tbody>
+      <tbody id=\"trades-body\"><tr><td colspan=\"10\" style=\"color:#64748b;text-align:center\">Loading…</td></tr></tbody>
     </table>
   </div>
 
-  <div class="section">
+  <div class=\"section\">
     <h2>Learned Patterns</h2>
-    <table id="patterns-table">
+    <table id=\"patterns-table\">
       <thead><tr>
         <th>Coin</th><th>RSI Range</th><th>BB Position</th><th>Volume</th>
         <th>MA</th><th>Occurrences</th><th>Confidence</th><th>Avg Profit %</th>
       </tr></thead>
-      <tbody id="patterns-body"><tr><td colspan="8" style="color:#64748b;text-align:center">Loading…</td></tr></tbody>
+      <tbody id=\"patterns-body\"><tr><td colspan=\"8\" style=\"color:#64748b;text-align:center\">Loading…</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -534,7 +534,7 @@ async function fetchPatterns() {
 function renderPositions(positions) {
   const tbody = document.getElementById('positions-body');
   if (!positions.length) {
-    tbody.innerHTML = '<tr><td colspan="9" style="color:#64748b;text-align:center">No open positions</td></tr>';
+    tbody.innerHTML = '<tr><td colspan=\"9\" style=\"color:#64748b;text-align:center\">No open positions</td></tr>';
     return;
   }
   tbody.innerHTML = positions.map(p => {
@@ -544,21 +544,21 @@ function renderPositions(positions) {
     const distPct = Math.min(100, Math.max(0, 50 + dist * 25));
     const barColor = isProfitable ? '#22c55e' : '#ef4444';
     const pill = isProfitable
-      ? '<span class="pill pill-gain">✅ Profitable</span>'
-      : '<span class="pill pill-wait">⏳ Waiting</span>';
+      ? '<span class=\"pill pill-gain\">✅ Profitable</span>'
+      : '<span class=\"pill pill-wait\">⏳ Waiting</span>';
     return `<tr>
-      <td class="mono">${p.symbol}</td>
-      <td class="mono">${fmtP(p.entry_price)}</td>
-      <td class="mono ${isProfitable?'gain':'loss'}">${fmtP(p.current_price)}</td>
-      <td class="mono accent">${fmtP(p.breakeven_price)}</td>
-      <td class="mono">${fmt(p.quantity,6)}</td>
-      <td class="mono">${fmt(p.budget_usdt,2)} USDT</td>
-      <td class="mono ${pnl>=0?'gain':'loss'}">${pnl>=0?'+':''}${fmt(pnl,4)} USDT</td>
+      <td class=\"mono\">${p.symbol}</td>
+      <td class=\"mono\">${fmtP(p.entry_price)}</td>
+      <td class=\"mono ${isProfitable?'gain':'loss'}\">${fmtP(p.current_price)}</td>
+      <td class=\"mono accent\">${fmtP(p.breakeven_price)}</td>
+      <td class=\"mono\">${fmt(p.quantity,6)}</td>
+      <td class=\"mono\">${fmt(p.budget_usdt,2)} USDT</td>
+      <td class=\"mono ${pnl>=0?'gain':'loss'}\">${pnl>=0?'+':''}${fmt(pnl,4)} USDT</td>
       <td>
-        <div class="progress-bar" title="${fmt(dist,4)}% to BEP">
-          <div class="progress-fill" style="width:${distPct}%;background:${barColor}"></div>
+        <div class=\"progress-bar\" title=\"${fmt(dist,4)}% to BEP\">
+          <div class=\"progress-fill\" style=\"width:${distPct}%;background:${barColor}\"></div>
         </div>
-        <div style="font-size:10px;color:#64748b;margin-top:2px">${dist>=0?'+':''}${fmt(dist,4)}%</div>
+        <div style=\"font-size:10px;color:#64748b;margin-top:2px\">${dist>=0?'+':''}${fmt(dist,4)}%</div>
       </td>
       <td>${pill}</td>
     </tr>`;
@@ -568,7 +568,7 @@ function renderPositions(positions) {
 function renderTrades(trades) {
   const tbody = document.getElementById('trades-body');
   if (!trades.length) {
-    tbody.innerHTML = '<tr><td colspan="10" style="color:#64748b;text-align:center">No completed trades yet</td></tr>';
+    tbody.innerHTML = '<tr><td colspan=\"10\" style=\"color:#64748b;text-align:center\">No completed trades yet</td></tr>';
     return;
   }
   tbody.innerHTML = trades.map(t => {
@@ -577,18 +577,18 @@ function renderTrades(trades) {
       ? fmt(t.duration_seconds/3600,1)+'h'
       : Math.round(t.duration_seconds/60)+'m') : '—';
     const pill = t.profitable
-      ? '<span class="pill pill-gain">WIN</span>'
-      : '<span class="pill pill-loss">LOSS</span>';
+      ? '<span class=\"pill pill-gain\">WIN</span>'
+      : '<span class=\"pill pill-loss\">LOSS</span>';
     return `<tr>
-      <td class="mono">${t.coin}</td>
-      <td class="mono">${fmtP(t.entry_price)}</td>
-      <td class="mono">${fmtP(t.exit_price)}</td>
-      <td class="mono">${fmt(t.quantity,6)}</td>
-      <td class="mono">${fmt(t.budget_usdt,2)}</td>
-      <td class="mono warn">${fmt(t.buy_fee,4)}</td>
-      <td class="mono warn">${fmt(t.sell_fee,4)}</td>
-      <td class="mono ${pnl>=0?'gain':'loss'}">${pnl>=0?'+':''}${fmt(pnl,4)}</td>
-      <td class="mono">${dur}</td>
+      <td class=\"mono\">${t.coin}</td>
+      <td class=\"mono\">${fmtP(t.entry_price)}</td>
+      <td class=\"mono\">${fmtP(t.exit_price)}</td>
+      <td class=\"mono\">${fmt(t.quantity,6)}</td>
+      <td class=\"mono\">${fmt(t.budget_usdt,2)}</td>
+      <td class=\"mono warn\">${fmt(t.buy_fee,4)}</td>
+      <td class=\"mono warn\">${fmt(t.sell_fee,4)}</td>
+      <td class=\"mono ${pnl>=0?'gain':'loss'}\">${pnl>=0?'+':''}${fmt(pnl,4)}</td>
+      <td class=\"mono\">${dur}</td>
       <td>${pill}</td>
     </tr>`;
   }).join('');
@@ -597,21 +597,21 @@ function renderTrades(trades) {
 function renderPatterns(patterns) {
   const tbody = document.getElementById('patterns-body');
   if (!patterns.length) {
-    tbody.innerHTML = '<tr><td colspan="8" style="color:#64748b;text-align:center">No patterns yet — patterns build after 3+ trades</td></tr>';
+    tbody.innerHTML = '<tr><td colspan=\"8\" style=\"color:#64748b;text-align:center\">No patterns yet — patterns build after 3+ trades</td></tr>';
     return;
   }
   tbody.innerHTML = patterns.map(p => {
     const conf = (p.confidence_score || 0) * 100;
     const col = conf >= 65 ? 'gain' : conf >= 40 ? 'warn' : 'loss';
     return `<tr>
-      <td class="mono">${p.coin}</td>
-      <td class="mono">${p.rsi_range||'—'}</td>
+      <td class=\"mono\">${p.coin}</td>
+      <td class=\"mono\">${p.rsi_range||'—'}</td>
       <td>${p.bb_position||'—'}</td>
       <td>${p.volume_trend||'—'}</td>
       <td>${p.ma_position||'—'}</td>
-      <td class="text-right mono">${p.occurrence_count}</td>
-      <td class="text-right mono ${col}">${fmt(conf,1)}%</td>
-      <td class="text-right mono ${(p.avg_profit_pct||0)>=0?'gain':'loss'}">${(p.avg_profit_pct||0)>=0?'+':''}${fmt(p.avg_profit_pct,3)}%</td>
+      <td class=\"text-right mono\">${p.occurrence_count}</td>
+      <td class=\"text-right mono ${col}\">${fmt(conf,1)}%</td>
+      <td class=\"text-right mono ${(p.avg_profit_pct||0)>=0?'gain':'loss'}\">${(p.avg_profit_pct||0)>=0?'+':''}${fmt(p.avg_profit_pct,3)}%</td>
     </tr>`;
   }).join('');
 }
@@ -760,7 +760,8 @@ def api_stats(
     date_from: Optional[str] = Query(None, alias="from"),
     date_to:   Optional[str] = Query(None, alias="to"),
 ):
-    """Aggregated trade stats + filtered trade list for a date range.
+    """
+    Aggregated trade stats + filtered trade list for a date range.
 
     Query params (both optional, YYYY-MM-DD format):
       ?from=2026-05-01&to=2026-05-11
@@ -1143,7 +1144,7 @@ _API_ALL_TTL = 0.8   # seconds — slightly less than the 1 s fast-poll cadence
 @app.get("/api/all")
 def api_all():
     """Single endpoint returning status + positions + trades + activity.
-    Reduces frontend from 4 concurrent fetches to 1, cutting Railway load 4×."""
+    Reduces frontend from 4 concurrent fetches to 1, cutting Railway load 4x."""
     now_ts = time.time()
     cached = _API_ALL_CACHE.get("data")
     if cached is not None and (now_ts - _API_ALL_CACHE["ts"]) < _API_ALL_TTL:
@@ -1151,7 +1152,7 @@ def api_all():
 
     strategy = _load_strategy()
     # Use aggregated SQL stats — covers ALL trades, not just the last 500.
-    # get_recent_trades(limit=500) was causing total_trades/wins/pnl to
+    # get_recent_trades(limit=500) was causing total_trades/wins/pnl/trades_today to
     # describe different subsets (500 rows vs. full table) making them inconsistent.
     stats     = database.get_trade_stats(mode=get_mode())
     wins      = stats["wins"]
