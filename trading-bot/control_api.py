@@ -1375,19 +1375,24 @@ def api_version():
 @app.get("/version.json")
 def serve_version_json(response: Response):
     """
-    Dynamic version endpoint — includes deployId (UUID generated at process
-    start) so the browser can detect a new Railway deployment without relying
-    on Docker build-cache or bundle fingerprint matching.
+    Dynamic version endpoint — reads public/version.json (git-managed, always
+    up to date after git pull) then falls back to dist/version.json.
+    Includes deployId so the browser can detect a new deployment.
     """
     import pathlib, json as _json
     response.headers["Cache-Control"] = "no-store"
-    vf = pathlib.Path(__file__).parent / "dist" / "version.json"
-    try:
-        data = _json.loads(vf.read_text())
-    except Exception:
-        data = {"version": "3.8.0", "buildTime": "unknown", "commit": "unknown"}
-    data["deployId"] = _DEPLOY_ID
-    return data
+    base = pathlib.Path(__file__).parent
+    # Prefer the git-managed source file — updated by git pull without a rebuild
+    for candidate in [base.parent / "public" / "version.json",
+                      base / "dist" / "version.json"]:
+        if candidate.exists():
+            try:
+                data = _json.loads(candidate.read_text())
+                data["deployId"] = _DEPLOY_ID
+                return data
+            except Exception:
+                pass
+    return {"version": "unknown", "deployId": _DEPLOY_ID}
 
 
 @app.post("/api/update")
