@@ -660,7 +660,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
 
     # Paper mode: self-heal coin balance if it went missing after a restart.
     # open position record is the source of truth for what we own.
-    if hasattr(client, "_balances"):
+    if mode != "live" and hasattr(client, "_balances"):
         coin = sym[:-4]
         with client._lock:
             current_coin_bal = client._balances.get(coin, 0.0)
@@ -677,11 +677,11 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
                 "warn",
             )
 
+    _is_paper = (mode != "live")
     try:
-        # For paper mode: pass the trigger price directly so any concurrent
-        # WebSocket/REST update to _prices cannot cause the sell to execute
-        # at the wrong (potentially lower) price between now and order execution.
-        if hasattr(client, "_balances"):
+        # Paper mode: pass the trigger price directly so concurrent WebSocket/REST
+        # updates cannot cause the sell to execute at the wrong price.
+        if _is_paper:
             result = client.order_market_sell(symbol=sym, quantity=qty, price=price)
         else:
             result = client.order_market_sell(symbol=sym, quantity=qty)
@@ -702,6 +702,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
                 _positions[:] = [p for p in _positions if p.get("symbol") != sym]
                 if len(_positions) < before:
                     database.log_activity(f"{sym}: position force-closed (market closed)", "warn")
+            _rebuild_pos_index()  # keep O(1) index consistent with _positions
         return
 
     # ── Fee-aware fill parsing ─────────────────────────────────────────────────
@@ -1005,6 +1006,15 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         if sym in _bad_symbols:
             database.log_activity(f"{sym}: buy skipped — market closed/delisted (blacklisted this session)", "warn")
+            continue
+
+        # Binance minimum notional is $10 for most spot pairs — reject early
+        # so we don't waste an API call and get a cryptic -1013 error.
+        if mode == "live" and budget < 10.0:
+            database.log_activity(
+                f"{sym}: buy skipped — budget ${budget:.2f} < $10 Binance minimum notional "
+                f"(increase trade size in Settings)", "warn"
+            )
             continue
 
         try:
