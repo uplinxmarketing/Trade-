@@ -226,10 +226,11 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
         scale = max(0.5, min(2.0, free_usdt / initial))
         base = base * scale
 
-    # In fixed/per_coin mode the user chose an explicit amount — honour it as long as funds exist.
-    # The 40% cap only applies to capped mode where base is derived from a rolling total.
+    # In fixed/per_coin mode return the full configured amount.
+    # _check_balance / can_execute_buy will reject the buy if free USDT is insufficient —
+    # that gives a clean "have X, need Y" message rather than silently trading a partial amount.
     if mode in ("fixed", "per_coin"):
-        return round(min(base, effective_free), 2)
+        return round(base, 2)
     # For capped mode cap to 90% so a tiny buffer remains for fees.
     return round(min(base, effective_free * 0.9), 2)
 
