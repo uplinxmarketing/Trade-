@@ -275,6 +275,7 @@ def _sell_monitor_alive() -> bool:
 
 
 def _get_usdt_balance() -> float:
+    """Returns free USDT only — used for trade budget calculations."""
     try:
         from connection import client, get_mode
         if get_mode() != "live":
@@ -286,6 +287,24 @@ def _get_usdt_balance() -> float:
         for b in acc["balances"]:
             if b["asset"] == "USDT":
                 return float(b["free"])
+    except Exception:
+        pass
+    return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+
+
+def _get_usdt_display_balance() -> float:
+    """Returns free+locked USDT — matches what Binance UI shows."""
+    try:
+        from connection import client, get_mode
+        if get_mode() != "live":
+            if hasattr(client, "_balances"):
+                with client._lock:
+                    return float(client._balances.get("USDT", 0.0))
+            return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+        acc = client.get_account()
+        for b in acc["balances"]:
+            if b["asset"] == "USDT":
+                return float(b["free"]) + float(b["locked"])
     except Exception:
         pass
     return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
@@ -313,7 +332,7 @@ def status():
         "trading_active": strategy.get("trading_active", False),
         "pause_reason":   strategy.get("pause_reason"),
         "open_positions": _get_positions(),
-        "usdt_balance":   _get_usdt_balance(),
+        "usdt_balance":   _get_usdt_display_balance(),
         "trades_today":   database.get_trade_stats(mode=get_mode())["trades_today"],
         "win_rate":       round(_overall_win_rate(), 3),
         "strategy_updated_at": strategy.get("updated_at"),
@@ -1163,7 +1182,7 @@ def api_all():
     wins      = stats["wins"]
     total     = stats["total"]
     initial   = float(strategy.get("initial_balance_usdt", 0))
-    balance   = round(_get_usdt_balance(), 2)
+    balance   = round(_get_usdt_display_balance(), 2)
     approved  = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
     positions = _get_positions()
     trades    = database.get_recent_trades(limit=200)   # for the trades list payload only
