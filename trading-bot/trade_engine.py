@@ -851,14 +851,22 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         "timestamp_buy":      buy_ts,
         "timestamp_sell":     sell_ts,
     }
-    # Position cleanup runs in finally so it always executes even if logging raises.
-    # The sell already completed — we must never leave a ghost position in memory.
+    # Remove position from memory and DB immediately — sell is confirmed on Binance.
+    # Supabase sync and learning run after so a slow network never delays cleanup.
+    if pos.get("id"):
+        try:
+            database.delete_position(pos["id"])
+        except Exception:
+            pass
+    with _positions_lock:
+        _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
+    _rebuild_pos_index()
+    _pos_peaks.pop(sym, None)
+
     try:
         database.log_trade(trade_record)
         try:
             import supabase_sync
-            # Parallel sync to Supabase — all 3 calls run concurrently, max 4 s total.
-            # Synchronous here (not background) so data is never lost on Railway restart.
             usdt_now = _get_usdt_balance()
             supabase_sync.sync_sell_result_sync(trade_record, sym, usdt_now)
         except Exception as se:
@@ -874,16 +882,6 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             database.log_activity(f"learn_from_trade error ({sym}): {le}", "warn")
     except Exception as te:
         database.log_activity(f"log_trade error ({sym}): {te}", "warn")
-    finally:
-        if pos.get("id"):
-            try:
-                database.delete_position(pos["id"])
-            except Exception:
-                pass
-        with _positions_lock:
-            _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
-        _rebuild_pos_index()
-        _pos_peaks.pop(sym, None)   # clean up smart-hold peak tracker
 
     pnl_sign = "+" if net_profit >= 0 else ""
     sell_msg = (
@@ -1442,10 +1440,10 @@ def _sell_monitor_loop():
             with _positions_lock:
                 snap = list(_positions)
 
-            # ── Watchdog: force-clear _selling entries stuck > 90 s ──────────
+            # ── Watchdog: force-clear _selling entries stuck > 20 s ──────────
             now_wd = time.time()
             with _selling_lock:
-                stuck = [s for s, t in list(_selling_ts.items()) if now_wd - t > 90]
+                stuck = [s for s, t in list(_selling_ts.items()) if now_wd - t > 20]
             for s in stuck:
                 with _selling_lock:
                     _selling.discard(s)
