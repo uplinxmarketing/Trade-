@@ -1375,24 +1375,21 @@ def api_version():
 @app.get("/version.json")
 def serve_version_json(response: Response):
     """
-    Dynamic version endpoint — reads public/version.json (git-managed, always
-    up to date after git pull) then falls back to dist/version.json.
-    Includes deployId so the browser can detect a new deployment.
+    Dynamic version endpoint — always reads from dist/version.json so the
+    version matches the built frontend bundle. The update checker compares
+    this against LOCAL_VERSION baked into the JS — serving a newer version
+    here would trigger an infinite reload loop if the frontend wasn't rebuilt.
+    Includes deployId so the browser can detect a new Railway deployment.
     """
     import pathlib, json as _json
     response.headers["Cache-Control"] = "no-store"
-    base = pathlib.Path(__file__).parent
-    # Prefer the git-managed source file — updated by git pull without a rebuild
-    for candidate in [base.parent / "public" / "version.json",
-                      base / "dist" / "version.json"]:
-        if candidate.exists():
-            try:
-                data = _json.loads(candidate.read_text())
-                data["deployId"] = _DEPLOY_ID
-                return data
-            except Exception:
-                pass
-    return {"version": "unknown", "deployId": _DEPLOY_ID}
+    vf = pathlib.Path(__file__).parent / "dist" / "version.json"
+    try:
+        data = _json.loads(vf.read_text())
+    except Exception:
+        data = {"version": "3.8.0", "buildTime": "unknown", "commit": "unknown"}
+    data["deployId"] = _DEPLOY_ID
+    return data
 
 
 @app.post("/api/update")
