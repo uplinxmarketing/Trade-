@@ -338,7 +338,7 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
         <div className="text-[10px] text-muted-foreground">
           Selected: <span className="font-mono text-foreground font-semibold">${totalBudget.toLocaleString()} USDT</span>
           {isRunning && <span className="text-warn ml-2">· Stop bot to change budget</span>}
-          {!isRunning && <span className="text-muted-foreground ml-2">· Fee: 0.1%/trade · Break-even: +0.20% per position</span>}
+          {!isRunning && <span className="text-muted-foreground ml-2">· Fee: 0.075%/trade (BNB) · Break-even: +0.15% per position</span>}
         </div>
 
         {/* Per-coin allocation (expandable) */}
@@ -453,7 +453,7 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
       </Button>
       {!isRunning && (
         <p className="text-[10px] text-center text-muted-foreground -mt-2">
-          {totalBudget.toLocaleString()} USDT · {selectedCoins.length} coins · 0.1%/trade fee · instant execution
+          {totalBudget.toLocaleString()} USDT · {selectedCoins.length} coins · 0.075%/trade fee (BNB) · instant execution
         </p>
       )}
 

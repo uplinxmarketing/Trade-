@@ -5,7 +5,7 @@ import type { LivePrices } from '@/lib/trading-engine';
 import { toast } from 'sonner';
 
 const BREAK_EVEN_MULT = 1 / Math.pow(1 - TAKER_FEE, 2);
-const MAKER_FEE = 0.001 * 0.075 / 0.1; // ~0.075% maker
+const MAKER_FEE = TAKER_FEE * 0.6; // maker ~60% of taker ≈ 0.045%
 const BOT_URL_KEY = 'bot_server_url';
 const apiBase = () => {
   // Migrate old Railway URL key if present
