@@ -1,9 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { toast } from 'sonner';
-import { API_BASE } from '@/config';
 
 const LOCAL_VERSION     = __APP_VERSION__;
 const LOCAL_FINGERPRINT = `${__APP_COMMIT__}:${__APP_BUILD_TIME__}`;
+
+// Fetch the latest published version directly from GitHub so the check works
+// even before the bot has been restarted with new code.
+const GITHUB_VERSION_URL =
+  'https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/public/version.json';
 
 const SEEN_VERSION = 'tradebot_seen_version';
 const SEEN_DEPLOY  = 'tradebot_deploy_id';
@@ -14,19 +18,18 @@ function hardReload() {
   window.location.href = `${window.location.pathname}?_cb=${Date.now()}`;
 }
 
-export function useUpdateChecker(pollIntervalMs = 30_000) {
+export function useUpdateChecker(pollIntervalMs = 60_000) {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [checking, setChecking]               = useState(false);
   const [updating, setUpdating]               = useState(false);
-  const latestDeployIdRef = useRef<string>('');
+  const latestVersionRef = useRef<string>('');
 
-  // On first load: if bundle fingerprint changed, clear stored deployId so the
-  // next poll re-establishes baseline (prevents "no update" when new code is running).
+  // On first load: if bundle fingerprint changed, announce it.
   useEffect(() => {
     const lastSeen = localStorage.getItem(SEEN_VERSION) ?? '';
     if (lastSeen !== LOCAL_FINGERPRINT) {
       localStorage.setItem(SEEN_VERSION, LOCAL_FINGERPRINT);
-      localStorage.removeItem(SEEN_DEPLOY); // force baseline re-establish on next poll
+      localStorage.removeItem(SEEN_DEPLOY);
       if (lastSeen) {
         toast.success(`Updated to v${LOCAL_VERSION}`, {
           description: 'New fixes are now active.',
@@ -39,39 +42,27 @@ export function useUpdateChecker(pollIntervalMs = 30_000) {
   const checkForUpdates = useCallback(async (): Promise<boolean> => {
     setChecking(true);
     try {
-      const resp = await fetch(`/version.json?t=${Date.now()}`, { cache: 'no-store' });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const data: VersionInfo = await resp.json();
+      // Primary: check GitHub directly — works regardless of bot version.
+      let data: VersionInfo | null = null;
+      try {
+        const ghResp = await fetch(`${GITHUB_VERSION_URL}?t=${Date.now()}`, {
+          cache: 'no-store',
+        });
+        if (ghResp.ok) data = await ghResp.json();
+      } catch { /* GitHub unreachable — fall back to bot */ }
 
-      // Always compare version + fingerprint first — this fires immediately when
-      // the server serves a newer version.json, regardless of deployId state.
-      const remoteFingerprint = `${data.commit}:${data.buildTime}`;
-      const versionChanged     = data.version !== LOCAL_VERSION;
-      const fingerprintChanged = remoteFingerprint !== LOCAL_FINGERPRINT;
-      if (versionChanged || fingerprintChanged) {
-        setUpdateAvailable(true);
-        setUpdating(true);
-        toast.loading(`New version v${data.version} deployed — reloading…`, { duration: 3000 });
-        setTimeout(hardReload, 2000);
-        return true;
+      // Fallback: ask the bot's /version.json endpoint.
+      if (!data) {
+        const resp = await fetch(`/version.json?t=${Date.now()}`, { cache: 'no-store' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        data = await resp.json();
       }
 
-      // Same version: use deployId to catch same-version redeploys (e.g. config-only
-      // changes where version string didn't change but Railway restarted).
-      if (data.deployId) {
-        latestDeployIdRef.current = data.deployId;
-        const seenDeploy = localStorage.getItem(SEEN_DEPLOY) ?? '';
-        if (!seenDeploy) {
-          localStorage.setItem(SEEN_DEPLOY, data.deployId);
-          return false;
-        }
-        if (data.deployId !== seenDeploy) {
-          localStorage.setItem(SEEN_DEPLOY, data.deployId);
-          setUpdating(true);
-          toast.loading('New deployment detected — reloading…', { duration: 3000 });
-          setTimeout(hardReload, 2000);
-          return true;
-        }
+      const versionChanged = data.version !== LOCAL_VERSION;
+      if (versionChanged) {
+        latestVersionRef.current = data.version;
+        setUpdateAvailable(true);
+        return true;
       }
 
       return false;
@@ -82,7 +73,7 @@ export function useUpdateChecker(pollIntervalMs = 30_000) {
     }
   }, []);
 
-  // Check 1 s after mount, then every 30 s.
+  // Check 2 s after mount, then every 60 s.
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>;
     let interval: ReturnType<typeof setInterval>;
@@ -101,35 +92,40 @@ export function useUpdateChecker(pollIntervalMs = 30_000) {
       }
     };
 
-    timer = setTimeout(() => tryCheck(5_000), 1_000);
+    timer = setTimeout(() => tryCheck(5_000), 2_000);
     return () => { clearTimeout(timer); clearInterval(interval); };
   }, [checkForUpdates, pollIntervalMs]);
 
   const applyUpdate = useCallback(async () => {
     setUpdating(true);
-    if (latestDeployIdRef.current) localStorage.setItem(SEEN_DEPLOY, latestDeployIdRef.current);
+    localStorage.removeItem(SEEN_DEPLOY);
     try {
-      const res = await fetch('/api/update', { method: 'POST', cache: 'no-store' });
+      // Ask the bot to pull latest code, rebuild, and restart itself.
+      const res  = await fetch('/api/update', { method: 'POST', cache: 'no-store' });
       const body = await res.json().catch(() => ({}));
       if (body.success) {
-        toast.loading('Updating — bot will restart in ~30 s…', { duration: 35_000 });
-        // Poll until the server returns the new version, then reload.
+        const newVer = latestVersionRef.current || 'new version';
+        toast.loading(`Applying v${newVer} — bot will restart in ~30 s…`, { duration: 40_000 });
+        // Poll until the bot comes back with the new version, then reload.
         const start = Date.now();
         const poll = setInterval(async () => {
           try {
-            const vr = await fetch(`/version.json?t=${Date.now()}`, { cache: 'no-store' });
+            const vr = await fetch(`${GITHUB_VERSION_URL}?t=${Date.now()}`, { cache: 'no-store' });
             const vd = await vr.json();
-            if (vd.version !== LOCAL_VERSION || Date.now() - start > 60_000) {
+            const botVer = await fetch(`/version.json?t=${Date.now()}`, { cache: 'no-store' })
+              .then(r => r.json()).catch(() => ({}));
+            if (botVer.version === vd.version || Date.now() - start > 60_000) {
               clearInterval(poll);
               hardReload();
             }
-          } catch { /* server still restarting */ }
-        }, 3_000);
+          } catch { /* bot still restarting */ }
+        }, 4_000);
         return;
       }
-    } catch { /* fall through to simple reload */ }
-    toast.loading('Reloading…');
-    setTimeout(hardReload, 400);
+    } catch { /* fall through */ }
+    // Bot didn't support auto-update — just reload so the new static files are served.
+    toast.loading('Reloading to apply update…');
+    setTimeout(hardReload, 600);
   }, []);
 
   const dismiss = () => setUpdateAvailable(false);
