@@ -1,5 +1,5 @@
 {
-  "version": "5.12.30",
-  "buildTime": "2026-05-12T23:30:00.000Z",
-  "commit": "v5.12.30-fix-fee-rate-bnb-0.00075-align-frontend-backend"
+  "version": "5.12.31",
+  "buildTime": "2026-05-13T00:30:00.000Z",
+  "commit": "v5.12.31-fix-positions-trades-display-sell-breakeven"
 }
