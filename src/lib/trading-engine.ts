@@ -4,11 +4,12 @@ import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcATR, calcSMA, calcE
 const B = 'https://api.binance.com/api/v3';
 
 // ── Binance fee constants ────────────────────────────────────────────────────
-// Spot taker fee: 0.1% per trade.
+// BNB fee discount mode (BNB_FEE_MODE=True in config.py): 0.075% per leg.
+// Matches backend: FEE_RATE_BNB = 0.00075, breakeven_mult ≈ 1 + 2×0.00075 + 0.0002 = 1.0017
 // BUY:  fee taken from coins received  → coins_out = (usdt_in / price) × (1 − FEE)
 // SELL: fee taken from USDT received  → usdt_out  = coins_in × price × (1 − FEE)
-// Break-even: price must rise ≈ +0.2005% to cover both legs.
-export const TAKER_FEE = 0.001;     // 0.1%
+// Break-even: price must rise ≈ +0.15% to cover both legs.
+export const TAKER_FEE = 0.00075;   // 0.075% — BNB discount rate (matches bot config)
 const MIN_NOTIONAL_USDT = 11;        // Binance minimum is $10; we add $1 buffer
 
 // Minimum score to place an entry trade.
@@ -236,7 +237,7 @@ export async function checkEntries(
     const allocation = Math.min(budget, balance);
     if (allocation < MIN_NOTIONAL_USDT) continue;
 
-    // Coins received after Binance takes 0.1% buy fee from the coin amount
+    // Coins received after Binance takes 0.075% buy fee (BNB discount) from the coin amount
     const quantity = (allocation / price) * (1 - TAKER_FEE);
     const feeUSDT  = allocation * TAKER_FEE;
 
