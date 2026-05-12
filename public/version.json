@@ -1,5 +1,5 @@
 {
-  "version": "5.12.31",
-  "buildTime": "2026-05-13T00:30:00.000Z",
-  "commit": "v5.12.31-fix-positions-trades-display-sell-breakeven"
+  "version": "5.12.32",
+  "buildTime": "2026-05-13T01:00:00.000Z",
+  "commit": "v5.12.32-push-all-fixes-positions-trades-sell-breakeven"
 }
