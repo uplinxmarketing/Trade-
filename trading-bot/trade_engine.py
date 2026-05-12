@@ -322,6 +322,21 @@ def load_positions_from_db():
     _current_mode = get_mode()
     rows = database.load_positions(mode=_current_mode)
 
+    # ── Startup migration: fix positions saved with wrong/missing mode tag ──────
+    # Positions created before the mode-isolation fix default to mode='paper'
+    # even when bought in live mode. If we're in live mode and find no positions
+    # but the unfiltered table has rows, migrate them rather than losing them.
+    if not rows:
+        all_rows = database.load_positions()  # unfiltered
+        if all_rows:
+            database.migrate_positions_mode(_current_mode)
+            rows = database.load_positions(mode=_current_mode)
+            if rows:
+                database.log_activity(
+                    f"Startup: migrated {len(rows)} position(s) to mode='{_current_mode}' "
+                    f"(were stored with wrong/missing mode tag)", "warn"
+                )
+
     # Always fetch from Supabase so coins + balance are current even when
     # SQLite still has stale data from a previous deploy.
     supa_ok = False

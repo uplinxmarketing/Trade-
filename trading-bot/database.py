@@ -398,6 +398,22 @@ def load_positions(mode: str = None) -> List[dict]:
     return [dict(r) for r in rows]
 
 
+def migrate_positions_mode(mode: str):
+    """Set mode on all positions that have a wrong/missing mode tag.
+    Called once on startup when the filtered query returns nothing but the
+    unfiltered table has rows — happens when positions were saved before the
+    mode-isolation fix (they default to 'paper' regardless of actual mode).
+    """
+    with _lock:
+        conn = _conn()
+        conn.execute(
+            "UPDATE positions SET mode=? WHERE mode IS NULL OR mode != ?",
+            (mode, mode)
+        )
+        conn.commit()
+        conn.close()
+
+
 # ── Paper state ───────────────────────────────────────────────────────────────
 
 def save_paper_state(balances: dict):
