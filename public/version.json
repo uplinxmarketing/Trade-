@@ -1,5 +1,5 @@
 {
-  "version": "5.12.24",
-  "buildTime": "2026-05-12T18:00:00.000Z",
-  "commit": "v5.12.24-preserve-settings-on-restart"
+  "version": "5.12.25",
+  "buildTime": "2026-05-12T19:00:00.000Z",
+  "commit": "v5.12.25-fix-mode-never-flips-on-connection-failure"
 }
