@@ -1,8 +1,7 @@
 """
-FastAPI control server — binds to $PORT on the main thread so Railway's
-health-check can reach it immediately.  All trading-bot logic (DB init,
-history download, WebSocket feed, strategy loop) starts in the FastAPI
-lifespan as async background tasks — nothing blocks the HTTP server.
+FastAPI control server — binds to $PORT (default 8000) on the main thread.
+All trading-bot logic (DB init, history download, WebSocket feed, strategy
+loop) starts in the FastAPI lifespan as async background tasks.
 """
 
 import asyncio
@@ -16,10 +15,17 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-# Unique ID generated once per process start.  Railway restarts the process on
-# every deploy, so this changes on every deployment — the browser can compare
-# the stored value against the polled value to detect new deploys reliably.
+# Unique ID generated once per process start — changes on every restart so the
+# browser can detect new deployments even when the version string is unchanged.
 _DEPLOY_ID = str(uuid.uuid4())
+
+# GitHub raw version URL — bot polls this to detect available updates.
+_GITHUB_VERSION_URL = (
+    "https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/public/version.json"
+)
+_github_ver_cache: dict = {}
+_github_ver_cache_ts: float = 0.0
+_GITHUB_VER_TTL = 120  # re-fetch at most every 2 minutes
 
 import uvicorn
 from fastapi import FastAPI, Response, Body, Query
@@ -1464,27 +1470,70 @@ def api_version():
 @app.get("/version.json")
 def serve_version_json(response: Response):
     """
-    Dynamic version endpoint — always reads from dist/version.json so the
-    version matches the built frontend bundle. The update checker compares
-    this against LOCAL_VERSION baked into the JS — serving a newer version
-    here would trigger an infinite reload loop if the frontend wasn't rebuilt.
-    Includes deployId so the browser can detect a new Railway deployment.
+    Returns the latest version available on GitHub so the browser can detect
+    when new code has been pushed. Falls back to the local dist/version.json
+    when GitHub is unreachable.
     """
-    import pathlib, json as _json
+    import pathlib, json as _json, urllib.request as _req, time as _t
+    global _github_ver_cache, _github_ver_cache_ts
     response.headers["Cache-Control"] = "no-store"
-    vf = pathlib.Path(__file__).parent / "dist" / "version.json"
-    try:
-        data = _json.loads(vf.read_text())
-    except Exception:
-        data = {"version": "3.8.0", "buildTime": "unknown", "commit": "unknown"}
+
+    now = _t.time()
+    if now - _github_ver_cache_ts > _GITHUB_VER_TTL or not _github_ver_cache:
+        try:
+            url = _GITHUB_VERSION_URL + "?t=" + str(int(now))
+            with _req.urlopen(url, timeout=4) as r:
+                _github_ver_cache = _json.loads(r.read())
+                _github_ver_cache_ts = now
+        except Exception:
+            pass  # keep stale cache or fall through to local
+
+    if _github_ver_cache:
+        data = dict(_github_ver_cache)
+    else:
+        # Fallback: local dist/version.json (try trading-bot/dist then project root dist)
+        for candidate in [
+            pathlib.Path(__file__).parent / "dist" / "version.json",
+            pathlib.Path(__file__).parent.parent / "dist" / "version.json",
+        ]:
+            if candidate.exists():
+                try:
+                    data = _json.loads(candidate.read_text())
+                    break
+                except Exception:
+                    pass
+        else:
+            data = {"version": "3.8.0", "buildTime": "unknown", "commit": "unknown"}
+
     data["deployId"] = _DEPLOY_ID
     return data
 
 
 @app.post("/api/update")
 def api_update():
-    """Railway deployments are handled automatically — the client just needs to reload."""
-    return {"success": False, "message": "Reload to pick up the latest build"}
+    """Pull latest code from GitHub, rebuild the frontend, and restart the bot."""
+    import pathlib, subprocess, threading, time as _t
+
+    def _do_update():
+        _t.sleep(0.6)  # let HTTP response reach the client first
+        app_dir = pathlib.Path(__file__).parent.parent
+        try:
+            subprocess.run(["git", "fetch", "origin", "main"],
+                           cwd=str(app_dir), check=True, timeout=30)
+            subprocess.run(["git", "reset", "--hard", "origin/main"],
+                           cwd=str(app_dir), check=True, timeout=30)
+            subprocess.run(["npm", "run", "build"],
+                           cwd=str(app_dir), check=True, timeout=300)
+            print("[Update] Rebuild complete — restarting bot", flush=True)
+        except Exception as exc:
+            print(f"[Update] ERROR: {exc}", flush=True)
+            return
+        # Restart the current Python process in-place
+        import os
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=_do_update, daemon=True).start()
+    return {"success": True, "message": "Update started — bot will restart in ~30 s"}
 
 
 # ── Futures agent endpoints ────────────────────────────────────────────────────────

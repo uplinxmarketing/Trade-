@@ -56,7 +56,8 @@ export function useUpdateChecker(pollIntervalMs = 30_000) {
         return true;
       }
 
-      // Same version: use deployId to catch same-version redeploys.
+      // Same version: use deployId to catch same-version redeploys (e.g. config-only
+      // changes where version string didn't change but Railway restarted).
       if (data.deployId) {
         latestDeployIdRef.current = data.deployId;
         const seenDeploy = localStorage.getItem(SEEN_DEPLOY) ?? '';
