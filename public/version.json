@@ -1,5 +1,5 @@
 {
-  "version": "5.12.17",
-  "buildTime": "2026-05-12T10:00:00.000Z",
-  "commit": "v5.12.17-cache-binance-account"
+  "version": "5.12.18",
+  "buildTime": "2026-05-12T11:00:00.000Z",
+  "commit": "v5.12.18-fix-ws-reconnect-blocking"
 }
