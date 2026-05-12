@@ -592,7 +592,11 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
           })}
           {liveAssets.length === 0 && (
             <div className="px-4 py-6 text-center text-xs text-muted-foreground">
-              {binanceConnected ? 'Loading live balances…' : 'Connect Binance API to see live wallet'}
+              {!binanceConnected
+                ? 'Connect Binance API to see live wallet'
+                : loading
+                ? 'Fetching live balances…'
+                : 'No assets in spot wallet — transfer USDT from Earn/Funding to Spot on Binance'}
             </div>
           )}
         </div>
