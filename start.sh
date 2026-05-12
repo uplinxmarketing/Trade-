@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TradeBot AI — Launch Script (Linux / Mac)
+# TradeBot AI — VPS Launch Script
 # Run:  bash start.sh   OR   ./start.sh
 
 set -euo pipefail
@@ -10,8 +10,6 @@ mkdir -p logs
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="logs/tradebot_$TIMESTAMP.log"
 echo "TradeBot AI — Session $TIMESTAMP" > "$LOG_FILE"
-
-# Tee all output to terminal AND log simultaneously
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -19,106 +17,85 @@ bail() { log "ERROR: $*"; echo; echo "  Log: $LOG_FILE"; exit 1; }
 
 echo ""
 echo "  ╔══════════════════════════════╗"
-echo "  ║      TradeBot AI v2.5.0      ║"
+echo "  ║      TradeBot AI v5.12.37    ║"
 echo "  ╚══════════════════════════════╝"
 echo ""
-log "Log: $LOG_FILE"
-echo ""
-
-# ── Check Node.js ─────────────────────────────────────────────────────────────
-if ! command -v node &>/dev/null; then
-  bail "Node.js not installed. Download from https://nodejs.org (v18+)"
-fi
-NODE_VER=$(node -e "process.stdout.write(process.versions.node)")
-MAJOR=${NODE_VER%%.*}
-if [ "$MAJOR" -lt 18 ]; then
-  bail "Node.js v$NODE_VER is too old — need v18+. Download from https://nodejs.org"
-fi
-log "Node.js v$NODE_VER OK"
-
-if ! command -v npm &>/dev/null; then
-  bail "npm not found — reinstall Node.js from https://nodejs.org"
-fi
-log "npm $(npm --version) OK"
-
-# ── Auto-create .env if missing ──────────────────────────────────────────────
-if [ ! -f ".env" ]; then
-  log "Creating .env file with Supabase credentials..."
-  cat > .env << 'ENVEOF'
-VITE_SUPABASE_URL=https://hkwirofdkgdamqnlcjqf.supabase.co
-VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_6p26q62HNaU7pqv9k9jb_w_8S0ixNrP
-ENVEOF
-  log ".env created OK"
-else
-  log ".env file found"
-fi
 
 # ── Auto-update from GitHub ──────────────────────────────────────────────────
 if command -v git &>/dev/null && [ -d ".git" ]; then
-  log "Checking for app updates..."
+  log "Pulling latest code from GitHub..."
   if git fetch origin main 2>&1 && git reset --hard origin/main 2>&1; then
-    log "App updated to latest."
+    log "Code updated to latest."
   else
-    log "Auto-update skipped (offline or error — continuing with local version)."
+    log "Git update failed (offline?) — continuing with local version."
   fi
-else
-  log "git not found or not a git repo — skipping auto-update."
 fi
 
-# ── Smart dependency check ────────────────────────────────────────────────────
-# Only reinstall when package.json changes — stores its timestamp as a marker.
+# ── Check Node.js ─────────────────────────────────────────────────────────────
+if ! command -v node &>/dev/null; then
+  bail "Node.js not installed. Run: curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt install nodejs"
+fi
+log "Node.js $(node --version) / npm $(npm --version)"
+
+# ── Install JS dependencies if needed ────────────────────────────────────────
 MARKER="node_modules/.install-marker"
-NEED_INSTALL=0
-
-if [ ! -d "node_modules" ]; then
-  log "node_modules not found — installing..."
-  NEED_INSTALL=1
-elif [ ! -f "$MARKER" ]; then
-  log "Install marker missing — reinstalling..."
-  NEED_INSTALL=1
-else
-  PKG_TIME=$(date -r package.json +%s 2>/dev/null || stat -f %m package.json 2>/dev/null || echo "0")
-  STORED_TIME=$(cat "$MARKER" 2>/dev/null || echo "")
-  if [ "$PKG_TIME" != "$STORED_TIME" ]; then
-    log "package.json changed — updating dependencies..."
-    NEED_INSTALL=1
-  else
-    log "Dependencies up to date — skipping install."
-  fi
-fi
-
-if [ "$NEED_INSTALL" = "1" ]; then
-  echo ""
-  echo "  ── Installing dependencies ──────────────────────────────────────"
-  echo "  All output is live below. Errors will be visible here and in log."
-  echo "  ─────────────────────────────────────────────────────────────────"
-  echo ""
-  # npm install output already tee'd to terminal+log via exec above
-  if ! npm install; then
-    bail "npm install failed — scroll up to see the error."
-  fi
-  if [ ! -d "node_modules/vite" ]; then
-    bail "Install appeared to succeed but vite is missing. Try 'npm install' manually."
-  fi
-  # Save package.json timestamp so we skip install next time
-  date -r package.json +%s 2>/dev/null || stat -f %m package.json 2>/dev/null > "$MARKER"
-  # Ensure marker is written correctly on both Linux and Mac
-  PKG_TIME=$(date -r package.json +%s 2>/dev/null || stat -f %m package.json 2>/dev/null || echo "0")
+PKG_TIME=$(date -r package.json +%s 2>/dev/null || echo "0")
+STORED=$(cat "$MARKER" 2>/dev/null || echo "")
+if [ ! -d "node_modules" ] || [ "$PKG_TIME" != "$STORED" ]; then
+  log "Installing JS dependencies..."
+  npm ci --prefer-offline 2>/dev/null || npm install || bail "npm install failed"
   echo "$PKG_TIME" > "$MARKER"
-  log "Dependencies installed OK — marker saved."
-  echo ""
+  log "JS dependencies OK"
 fi
 
-# ── Start dev server ──────────────────────────────────────────────────────────
+# ── Build React frontend ──────────────────────────────────────────────────────
+log "Building frontend..."
+npm run build || bail "npm run build failed"
+log "Frontend built OK"
+
+# Copy dist/ into trading-bot/dist/ so the Python bot can serve it
+log "Copying dist/ into trading-bot/..."
+rm -rf trading-bot/dist
+cp -r dist trading-bot/dist
+log "trading-bot/dist ready"
+
+# ── Auto-create .env if missing ──────────────────────────────────────────────
+if [ ! -f "trading-bot/.env" ]; then
+  if [ -f ".env" ]; then
+    cp .env trading-bot/.env
+    log ".env copied to trading-bot/.env"
+  else
+    printf "MODE=paper\nSTARTING_PAPER_USDT=10000.0\n" > trading-bot/.env
+    log "Created minimal trading-bot/.env (paper mode)"
+  fi
+fi
+
+# ── Check Python ──────────────────────────────────────────────────────────────
+PYTHON=$(command -v python3 || command -v python || true)
+[ -z "$PYTHON" ] && bail "Python 3 not found — install with: apt install python3 python3-pip"
+log "Python: $($PYTHON --version)"
+
+# ── Install Python dependencies ───────────────────────────────────────────────
+PY_MARKER="trading-bot/.py-install-marker"
+REQ_TIME=$(date -r trading-bot/requirements.txt +%s 2>/dev/null || echo "0")
+PY_STORED=$(cat "$PY_MARKER" 2>/dev/null || echo "")
+if [ "$REQ_TIME" != "$PY_STORED" ]; then
+  log "Installing Python dependencies..."
+  $PYTHON -m pip install -r trading-bot/requirements.txt --quiet || bail "pip install failed"
+  echo "$REQ_TIME" > "$PY_MARKER"
+  log "Python dependencies OK"
+else
+  log "Python dependencies up to date"
+fi
+
+# ── Start bot ─────────────────────────────────────────────────────────────────
 echo ""
-log "Starting TradeBot AI on http://localhost:8080 ..."
-echo "  Browser will open automatically."
-echo "  Keep this window open while using the app. Press Ctrl+C to stop."
-echo ""
-echo "  ── Server output ────────────────────────────────────────────────────"
+log "Starting TradeBot AI bot on port ${PORT:-8000}..."
+echo "  Dashboard: http://localhost:${PORT:-8000}"
+echo "  Press Ctrl+C to stop."
 echo ""
 
-trap 'echo ""; log "Server stopped."; exit 0' INT TERM
+trap 'echo ""; log "Bot stopped."; exit 0' INT TERM
 
-# dev server output already tee'd via exec above
-npm run dev -- --open || bail "Dev server crashed — scroll up to see the error."
+cd trading-bot
+exec $PYTHON main.py
