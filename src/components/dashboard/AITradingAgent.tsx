@@ -348,7 +348,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [stopLossEnabled, setStopLossEnabled]         = useState(true);
+  const [stopLossEnabled, setStopLossEnabled]         = useState(false);
   const [stopLossPct, setStopLossPct]                 = useState(2.0);
   const [takeProfitEnabled, setTakeProfitEnabled]     = useState(true);
   const [takeProfitPct, setTakeProfitPct]             = useState(0.5);
@@ -358,7 +358,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [maxPositions, setMaxPositions]               = useState(10);
   const [minSignals, setMinSignals]                   = useState(4);
   const [settingsDraft, setSettingsDraft]             = useState({
-    stopLossEnabled: true, stopLossPct: 2.0,
+    stopLossEnabled: false, stopLossPct: 2.0,
     takeProfitEnabled: true, takeProfitPct: 0.5,
     smartHoldEnabled: false, trailingStopPct: 0.5,
     reinvestProfits: false,
@@ -394,7 +394,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // Bot Allocation: total USDT from wallet the bot may use (0 = unlimited)
   const [setupAllocation, setSetupAllocation]   = useState(0);
   // Risk settings (all toggles + values)
-  const [setupSlEnabled, setSetupSlEnabled]         = useState(true);
+  const [setupSlEnabled, setSetupSlEnabled]         = useState(false);
   const [setupStopLoss, setSetupStopLoss]           = useState(2.0);
   const [setupTpEnabled, setSetupTpEnabled]         = useState(true);
   const [setupTakeProfit, setSetupTakeProfit]       = useState(0.5);
