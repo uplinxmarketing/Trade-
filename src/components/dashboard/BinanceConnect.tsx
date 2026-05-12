@@ -17,6 +17,7 @@ interface BotStatus {
   mode: BotMode;
   running: boolean;
   balance_usdt: number;
+  live_error?: string;
 }
 
 const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectProps) => {
@@ -38,6 +39,7 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
         mode:         d.mode ?? 'unknown',
         running:      Boolean(d.running),
         balance_usdt: Number(d.balance_usdt ?? 0),
+        live_error:   d.live_error ?? undefined,
       };
       setBotStatus(status);
       onConnectionChange(status.mode === 'live');
@@ -53,7 +55,7 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
     if (isOpen) checkStatus();
   }, [isOpen, checkStatus]);
 
-  // Poll after switch until the new mode appears (process restarts take ~3 s)
+  // Poll after switch until the new mode appears (process restarts take ~3–5 s)
   const pollUntilMode = useCallback((targetMode: BotMode) => {
     let attempts = 0;
     const id = setInterval(async () => {
@@ -62,10 +64,24 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
         const res = await fetch(`${API_BASE}/api/status`, { cache: 'no-store' });
         if (res.ok) {
           const d = await res.json();
+          const status: BotStatus = {
+            mode:         d.mode ?? 'unknown',
+            running:      Boolean(d.running),
+            balance_usdt: Number(d.balance_usdt ?? 0),
+            live_error:   d.live_error ?? undefined,
+          };
+          // Live connection failed — bot fell back to paper, show error immediately
+          if (targetMode === 'live' && d.live_error) {
+            clearInterval(id);
+            setRestartPoll(null);
+            setBotStatus(status);
+            onConnectionChange(false);
+            toast.error('Binance connection failed', { description: d.live_error });
+            return;
+          }
           if (d.mode === targetMode) {
             clearInterval(id);
             setRestartPoll(null);
-            const status: BotStatus = { mode: d.mode, running: d.running, balance_usdt: Number(d.balance_usdt ?? 0) };
             setBotStatus(status);
             onConnectionChange(targetMode === 'live');
             toast.success(targetMode === 'live'
@@ -74,8 +90,8 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
             return;
           }
         }
-      } catch { /* retry */ }
-      if (attempts >= 20) {
+      } catch { /* still restarting — retry */ }
+      if (attempts >= 30) {
         clearInterval(id);
         setRestartPoll(null);
         toast.error('Timeout waiting for bot restart — check bot logs');
@@ -199,6 +215,17 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
           <p className="text-xs text-muted-foreground text-center mb-4">
             Waiting for the bot to restart with new credentials…
           </p>
+        )}
+
+        {!isRestarting && botStatus?.live_error && (
+          <div className="flex items-start gap-2 p-3 rounded bg-loss/10 border border-loss/30 text-xs mb-2">
+            <XCircle className="w-4 h-4 text-loss mt-0.5 shrink-0" />
+            <div>
+              <div className="font-semibold text-loss">Binance connection failed</div>
+              <div className="text-muted-foreground mt-0.5">{botStatus.live_error}</div>
+              <div className="text-muted-foreground mt-1">Check your API key, secret, and IP whitelist (187.77.88.189), then try again.</div>
+            </div>
+          </div>
         )}
 
         {/* Live mode: option to switch back to paper */}
