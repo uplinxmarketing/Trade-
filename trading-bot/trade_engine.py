@@ -419,6 +419,36 @@ def load_positions_from_db():
     except Exception as e:
         database.log_activity(f"Supabase snapshot push failed: {e}", "warn")
 
+    # Live mode: scan Binance Spot for coins the bot has no position for.
+    # These are orphaned coins — bought by the bot (or a previous session) but
+    # the position record was lost (DB migration, crash, mode switch, etc.).
+    if get_mode() == "live":
+        try:
+            acc = client.get_account()
+            tracked_symbols = {p["symbol"] for p in _positions}
+            for b in acc["balances"]:
+                asset  = b["asset"]
+                free   = float(b["free"])
+                locked = float(b["locked"])
+                total  = free + locked
+                if asset in ("USDT", "BNB", "BUSD", "USDC") or total <= 0:
+                    continue
+                sym = asset + "USDT"
+                # Estimate value — use any cached price or skip if unknown
+                price = _rest_px.get(sym, 0) or 0
+                value = total * price if price > 0 else 0
+                if sym not in tracked_symbols:
+                    msg = (
+                        f"⚠ ORPHANED COIN: {asset} qty={total:.6f}"
+                        + (f" (~${value:.2f} USDT)" if value > 0 else "")
+                        + f" on Binance Spot but no bot position — "
+                        f"likely bought in a previous session. Sell manually or restart bot to re-track."
+                    )
+                    print(f"[TradeEngine] {msg}")
+                    database.log_activity(msg, "warn")
+        except Exception as e:
+            database.log_activity(f"Orphan scan failed (non-fatal): {e}", "warn")
+
     # Sync PaperClient coin balances from the restored positions.
     # After a restart, PaperClient loads from saved paper_state, but if that
     # state is out of sync with the positions table (e.g. a partial crash),
