@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useMemo } from 'react';
+import { API_BASE } from '@/config';
 import TopBar from '@/components/dashboard/TopBar';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import AITradingAgent from '@/components/dashboard/AITradingAgent';
@@ -116,6 +117,19 @@ const Index = () => {
           updated_at: new Date().toISOString(),
         }, { onConflict: 'user_session' });
       }
+    })();
+  }, []);
+
+  // Auto-detect live mode on mount so the wallet shows live balances without
+  // requiring the user to open the BinanceConnect modal after every page refresh.
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/status`, { cache: 'no-store' });
+        if (!res.ok) return;
+        const d = await res.json();
+        if (d.mode === 'live' && !d.live_error) setBinanceConnected(true);
+      } catch { /* bot unreachable — stay disconnected */ }
     })();
   }, []);
 

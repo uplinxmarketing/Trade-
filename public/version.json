@@ -1,5 +1,5 @@
 {
-  "version": "5.12.3",
-  "buildTime": "2026-05-12T00:30:00.000Z",
-  "commit": "v5.12.3-fix-live-mode"
+  "version": "5.12.4",
+  "buildTime": "2026-05-12T00:00:00.000Z",
+  "commit": "v5.12.4-fix-live-error-in-api-status"
 }
