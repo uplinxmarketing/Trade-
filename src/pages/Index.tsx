@@ -218,6 +218,7 @@ const Index = () => {
               prices={prices}
               binanceConnected={binanceConnected}
               onConnectBinance={() => setShowBinanceConnect(true)}
+              onLiveModeDetected={setBinanceConnected}
               onStateChange={(pos, bal, initBal, trades) => {
                 setAgentPositions(pos);
                 setAgentBalance(bal);
