@@ -384,10 +384,16 @@ def delete_position(position_id: int):
         conn.close()
 
 
-def load_positions() -> List[dict]:
+def load_positions(mode: str = None) -> List[dict]:
+    """Load open positions. Pass mode='live' or mode='paper' to avoid cross-contamination."""
     with _lock:
         conn = _conn()
-        rows = conn.execute("SELECT * FROM positions").fetchall()
+        if mode:
+            rows = conn.execute(
+                "SELECT * FROM positions WHERE mode=?", (mode,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM positions").fetchall()
         conn.close()
     return [dict(r) for r in rows]
 

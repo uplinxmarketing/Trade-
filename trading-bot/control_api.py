@@ -1054,6 +1054,21 @@ def api_set_mode(req: ModeRequest):
     if req.mode not in ("paper", "live"):
         return {"ok": False, "error": "mode must be paper or live"}
 
+    # Guard: cannot switch live→paper while bot is actively trading.
+    # Open positions would be orphaned (live coins on Binance, no bot record).
+    # User must pause the bot first so they can review/close positions safely.
+    if req.mode == "paper" and get_mode() == "live":
+        strategy = _load_strategy()
+        if strategy.get("trading_active", False):
+            return {
+                "ok": False,
+                "error": (
+                    "Bot is actively trading in live mode. "
+                    "Pause the bot first to avoid orphaning open positions, "
+                    "then switch to paper mode."
+                ),
+            }
+
     updates = {"MODE": req.mode}
     if req.mode == "live":
         if req.api_key:
@@ -1062,6 +1077,11 @@ def api_set_mode(req: ModeRequest):
             updates["BINANCE_API_SECRET"] = req.api_secret
 
     _update_env_file(updates)
+    # Persist mode to DB as a second source of truth — survives git pull / .env loss.
+    try:
+        database.save_setting("trading_mode", req.mode)
+    except Exception:
+        pass
     # Stop trading before restart so no open orders are left dangling
     _write_strategy_patch({"trading_active": False})
 

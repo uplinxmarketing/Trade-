@@ -15,7 +15,7 @@ type BotMode = 'paper' | 'live' | 'testnet' | 'unknown';
 
 interface BotStatus {
   mode: BotMode;
-  running: boolean;
+  running: boolean;        // true = trading_active (bot is placing orders)
   balance_usdt: number;
   live_error?: string;
 }
@@ -160,9 +160,10 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
     }
   };
 
-  const isRestarting = restartPoll !== null;
-  const isLive       = botStatus?.mode === 'live';
-  const lowBalance   = isLive && (botStatus?.balance_usdt ?? 0) < MIN_TRADE_USDT && (botStatus?.balance_usdt ?? 0) > 0;
+  const isRestarting  = restartPoll !== null;
+  const isLive        = botStatus?.mode === 'live';
+  const isActivelyTrading = isLive && botStatus?.running === true;
+  const lowBalance    = isLive && (botStatus?.balance_usdt ?? 0) < MIN_TRADE_USDT && (botStatus?.balance_usdt ?? 0) > 0;
 
   if (!isOpen) return null;
 
@@ -269,6 +270,21 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
                 </div>
               </div>
             </div>
+
+            {/* Warn: bot is actively trading — must pause before switching to paper */}
+            {isActivelyTrading && (
+              <div className="flex items-start gap-2 p-3 rounded bg-warn/10 border border-warn/30 text-xs">
+                <AlertTriangle className="w-4 h-4 text-warn mt-0.5 shrink-0" />
+                <div>
+                  <div className="font-semibold text-warn">Bot is actively trading</div>
+                  <div className="text-muted-foreground mt-0.5">
+                    Pause the bot from the dashboard before switching to paper mode.
+                    Switching while trading is active could orphan open positions on Binance.
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="flex gap-2">
               <Button
                 variant="outline"
@@ -280,9 +296,10 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
               </Button>
               <Button
                 variant="outline"
-                className="flex-1 text-loss border-loss/30 hover:bg-loss/10 text-xs"
-                onClick={switchToPaper}
-                disabled={saving}
+                className={`flex-1 text-xs ${isActivelyTrading ? 'opacity-50 cursor-not-allowed' : 'text-loss border-loss/30 hover:bg-loss/10'}`}
+                onClick={isActivelyTrading ? undefined : switchToPaper}
+                disabled={saving || isActivelyTrading}
+                title={isActivelyTrading ? 'Pause the bot first before switching to paper mode' : undefined}
               >
                 {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5" /> : null}
                 Switch to Paper

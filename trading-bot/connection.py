@@ -39,13 +39,11 @@ def _build_client():
                 return c
             except Exception as exc:
                 _live_error = f"Binance API connection failed: {exc}"
-                print(f"[Connection] {_live_error} — falling back to paper mode")
+                print(f"[Connection] {_live_error} — using paper client for this session")
                 MODE = "paper"
-                # Revert .env so next restart doesn't retry with broken credentials
-                try:
-                    _revert_to_paper()
-                except Exception:
-                    pass
+                # Do NOT revert .env — keep MODE=live so next restart retries.
+                # _revert_to_paper() was the root cause of mode silently switching to
+                # paper after a temporary network hiccup and never recovering.
 
     elif MODE == "testnet":
         api_key    = (os.getenv("TESTNET_API_KEY")    or "").strip()

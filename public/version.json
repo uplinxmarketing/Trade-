@@ -1,5 +1,5 @@
 {
-  "version": "5.12.18",
-  "buildTime": "2026-05-12T11:00:00.000Z",
-  "commit": "v5.12.18-fix-ws-reconnect-blocking"
+  "version": "5.12.19",
+  "buildTime": "2026-05-12T12:00:00.000Z",
+  "commit": "v5.12.19-fix-mode-persistence-position-isolation"
 }
