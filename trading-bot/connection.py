@@ -14,21 +14,26 @@ _ENV_PATH = pathlib.Path(__file__).parent / ".env"
 # Without this, os.execv() passes the OLD MODE to the restarted process and
 # load_dotenv() silently skips the updated value — bot stays in paper mode forever.
 load_dotenv(_ENV_PATH, override=True)
-MODE = os.getenv("MODE", "paper").lower()
+
+# _CONFIGURED_MODE is the authoritative mode from .env — it NEVER changes at runtime.
+# A Binance connection failure must not alter this: get_mode() always returns what
+# the user set, so /api/status, position tagging, and the frontend all stay consistent.
+_CONFIGURED_MODE: str = os.getenv("MODE", "paper").lower()
 
 _live_error: str = ""   # set if live connection failed; readable via get_live_error()
+_using_paper_fallback: bool = False  # True when live was configured but connection failed
 
 
 def _build_client():
-    global MODE, _live_error
+    global _live_error, _using_paper_fallback
 
-    if MODE == "live":
+    if _CONFIGURED_MODE == "live":
         api_key    = (os.getenv("BINANCE_API_KEY")    or "").strip()
         api_secret = (os.getenv("BINANCE_API_SECRET") or "").strip()
         if not api_key or not api_secret:
-            _live_error = "MODE=live but BINANCE_API_KEY / BINANCE_API_SECRET are empty — falling back to paper"
-            print(f"[Connection] {_live_error}")
-            MODE = "paper"
+            _live_error = "MODE=live but BINANCE_API_KEY / BINANCE_API_SECRET are empty"
+            _using_paper_fallback = True
+            print(f"[Connection] {_live_error} — falling back to paper client")
         else:
             try:
                 from binance.client import Client as BinanceClient
@@ -39,16 +44,19 @@ def _build_client():
                 return c
             except Exception as exc:
                 _live_error = f"Binance API connection failed: {exc}"
+                _using_paper_fallback = True
+                # Do NOT change _CONFIGURED_MODE — .env still says MODE=live.
+                # get_mode() keeps returning "live" so position tags, mode guards,
+                # and the frontend all stay in live mode. live_error banner explains
+                # the connection issue. Next restart will retry the live connection.
                 print(f"[Connection] {_live_error} — using paper client for this session")
-                MODE = "paper"
-                # Do NOT revert .env — keep MODE=live so next restart retries live.
 
-    elif MODE == "testnet":
+    elif _CONFIGURED_MODE == "testnet":
         api_key    = (os.getenv("TESTNET_API_KEY")    or "").strip()
         api_secret = (os.getenv("TESTNET_API_SECRET") or "").strip()
         if not api_key or not api_secret:
             print("[Connection] MODE=testnet but no testnet keys — falling back to paper")
-            MODE = "paper"
+            _using_paper_fallback = True
         else:
             try:
                 from binance.client import Client as BinanceClient
@@ -56,10 +64,11 @@ def _build_client():
                 c.update_price = lambda symbol, price: None
                 return c
             except Exception as exc:
-                print(f"[Connection] Testnet connection failed: {exc} — falling back to paper")
-                MODE = "paper"
+                _live_error = f"Testnet connection failed: {exc}"
+                _using_paper_fallback = True
+                print(f"[Connection] {_live_error} — falling back to paper")
 
-    # Paper mode (default or fallback)
+    # Paper mode (configured or fallback)
     from paper_client import PaperClient
     return PaperClient(
         starting_usdt=float(os.getenv("STARTING_PAPER_USDT", "10000.0")),
@@ -71,8 +80,14 @@ client = _build_client()
 
 
 def get_mode() -> str:
-    return MODE
+    """Return the configured mode from .env. Never changes due to connection failures."""
+    return _CONFIGURED_MODE
 
 
 def get_live_error() -> str:
     return _live_error
+
+
+def is_using_paper_fallback() -> bool:
+    """True when MODE=live but Binance connection failed — using paper client temporarily."""
+    return _using_paper_fallback
