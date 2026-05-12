@@ -760,11 +760,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const handleStartStop = useCallback(async () => {
     if (isRunning) {
       if (isServerMode) {
-          const res = await fetch(`${railwayUrl}/api/mode`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'stop' }),
-          });
+          const res = await fetch(`${railwayUrl}/api/agent/stop`, { method: 'POST' });
           if (res.ok) {
             setIsRunning(false); isRunningRef.current = false;
             setSetupComplete(false); setSettingsSynced(false);
@@ -820,10 +816,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // ── Sync setup wizard settings to server ─────────────────────────────────
   const syncSettingsToServer = useCallback(async (): Promise<boolean> => {
     try {
-      const budgetPayload = {
-        budget_mode: setupBudgetMode,
-        budget_value: setupBudgetValue,
-        allocation: setupAllocation,
+      // Map frontend budget fields to the keys /api/config actually accepts.
+      const budgetPayload: Record<string,unknown> = {
+        budget_mode:           setupBudgetMode,
+        bot_allocation_usdt:   setupAllocation,
+        budget_fixed_usdt:     setupBudgetMode === 'fixed'   ? setupBudgetValue : undefined,
+        budget_pct_of_free:    setupBudgetMode === 'percent' ? setupBudgetValue : undefined,
+        budget_total_cap_usdt: setupBudgetMode === 'capped'  ? setupBudgetValue : undefined,
       };
       const settingsPayload = {
         stop_loss_enabled:   setupSlEnabled,
@@ -872,7 +871,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             return;
           }
         }
-        const endpoint = '/api/start';
+        const endpoint = '/api/agent/start';
         res = await fetch(`${railwayUrl}${endpoint}`, { method: 'POST' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
@@ -1537,59 +1536,47 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Market Signals</p>
         {/* In server mode: show bot's 6-signal cache if available, else JS scan */}
         {(isServerMode && railwaySignals.length > 0) ? (
-          <div className="space-y-0.5">
+          <div className="space-y-0">
             {/* Header row */}
-            <div className="flex items-center justify-between pb-1 border-b border-border/60">
-              <span className="text-[9px] text-muted-foreground w-16">COIN</span>
-              <div className="flex items-center gap-3 flex-1 justify-end">
-                {(['EMA','RSI','MACD','VOL','OBV','ATR'] as const).map(lbl => (
-                  <span key={lbl} className="text-[8px] text-muted-foreground w-7 text-center">{lbl}</span>
-                ))}
-                <span className="text-[8px] text-muted-foreground w-8 text-center">SCORE</span>
-                <span className="text-[8px] text-muted-foreground w-10 text-right">PRICE</span>
-              </div>
+            <div className="grid pb-1 border-b border-border/60" style={{gridTemplateColumns:'3.5rem 1fr 1fr 1fr 1fr 1fr 1fr 2rem 3rem'}}>
+              <span className="text-[8px] text-muted-foreground font-semibold">COIN</span>
+              {(['EMA','RSI','MACD','VOL','OBV','ATR'] as const).map(lbl => (
+                <span key={lbl} className="text-[8px] text-muted-foreground text-center">{lbl}</span>
+              ))}
+              <span className="text-[8px] text-muted-foreground text-center">SCR</span>
+              <span className="text-[8px] text-muted-foreground text-right">PRICE</span>
             </div>
             {railwaySignals.map((sig: any) => {
-              // Correct field names from control_api.py _get_signal_snapshot():
-              // trend, rsi_ok, macd, volume, obv, atr, score, rsi (value), price
-              const metrics: [string, boolean][] = [
-                ['EMA',  !!sig.trend],
-                ['RSI',  !!sig.rsi_ok],
-                ['MACD', !!sig.macd],
-                ['VOL',  !!sig.volume],
-                ['OBV',  !!sig.obv],
-                ['ATR',  !!sig.atr],
-              ];
-              const score = typeof sig.score === 'number' ? sig.score : metrics.filter(([,v]) => v).length;
-              const isBuy = score >= 4;
+              const bools = [!!sig.trend, !!sig.rsi_ok, !!sig.macd, !!sig.volume, !!sig.obv, !!sig.atr];
+              const score = typeof sig.score === 'number' ? sig.score : bools.filter(Boolean).length;
+              const isBuy  = score >= 4;
               const isWeak = score === 3;
               return (
-                <div key={sig.symbol} className="flex items-center justify-between py-1 border-b border-border/30 last:border-0">
-                  <div className="flex items-center gap-1.5 w-16 flex-shrink-0">
-                    <span className={`text-[8px] font-bold px-1 py-0.5 rounded ${
-                      isBuy   ? 'bg-gain/20 text-gain'
-                      : isWeak ? 'bg-yellow-500/20 text-yellow-400'
-                      : 'bg-muted/40 text-muted-foreground'
-                    }`}>{isBuy ? 'BUY' : isWeak ? 'WEAK' : 'HOLD'}</span>
-                    <span className="text-[10px] font-mono font-semibold">{sig.symbol?.replace('USDT','')}</span>
+                <div key={sig.symbol} className="grid items-center py-0.5 border-b border-border/20 last:border-0"
+                  style={{gridTemplateColumns:'3.5rem 1fr 1fr 1fr 1fr 1fr 1fr 2rem 3rem'}}>
+                  <div className="flex items-center gap-1 min-w-0">
+                    <span className={`text-[7px] font-bold px-0.5 rounded shrink-0 ${
+                      isBuy ? 'bg-gain/20 text-gain' : isWeak ? 'bg-yellow-500/20 text-yellow-400' : 'bg-muted/30 text-muted-foreground'
+                    }`}>{isBuy ? 'BUY' : isWeak ? 'WK' : 'HLD'}</span>
+                    <span className="text-[9px] font-mono font-semibold truncate">{sig.symbol?.replace('USDT','')}</span>
                   </div>
-                  <div className="flex items-center gap-3 flex-1 justify-end">
-                    {metrics.map(([lbl, v]) => (
-                      <div key={lbl} className="flex flex-col items-center w-7">
-                        <div className={`w-2 h-2 rounded-full ${v ? 'bg-gain' : 'bg-muted/50'}`} />
-                      </div>
-                    ))}
-                    <span className={`text-[10px] font-bold w-8 text-center ${score >= 4 ? 'text-gain' : score === 3 ? 'text-yellow-400' : 'text-muted-foreground'}`}>
-                      {score}/6
-                    </span>
-                    <span className="text-[10px] font-mono text-muted-foreground w-10 text-right">
-                      {sig.price ? Number(sig.price).toLocaleString('en-US',{maximumFractionDigits: sig.price > 100 ? 2 : 4}) : ''}
-                    </span>
-                  </div>
+                  {bools.map((v, i) => (
+                    <div key={i} className="flex justify-center">
+                      <div className={`w-2 h-2 rounded-full ${v ? 'bg-gain' : 'bg-muted/40'}`} />
+                    </div>
+                  ))}
+                  <span className={`text-[9px] font-bold text-center ${score >= 4 ? 'text-gain' : score === 3 ? 'text-yellow-400' : 'text-muted-foreground'}`}>
+                    {score}/6
+                  </span>
+                  <span className="text-[9px] font-mono text-muted-foreground text-right">
+                    {sig.price ? (sig.price > 100
+                      ? Number(sig.price).toLocaleString('en-US',{maximumFractionDigits:0})
+                      : Number(sig.price).toFixed(4)) : ''}
+                  </span>
                 </div>
               );
             })}
-            <p className="text-[8px] text-muted-foreground pt-1">EMA=EMA9/21 · RSI=40–65 · MACD=hist↑ · VOL=above avg · OBV=buy pressure · ATR=volatility OK</p>
+            <p className="text-[7px] text-muted-foreground pt-1 leading-relaxed">EMA=9/21 · RSI=40–65 · MACD=hist↑ · VOL=&gt;avg · OBV=pressure · ATR=range OK</p>
           </div>
         ) : (
           <div className="space-y-0.5">

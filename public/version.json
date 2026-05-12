@@ -1,5 +1,5 @@
 {
-  "version": "5.12.28",
-  "buildTime": "2026-05-12T22:00:00.000Z",
-  "commit": "v5.12.28-fix-signal-display-correct-field-names-6-metrics"
+  "version": "5.12.29",
+  "buildTime": "2026-05-12T23:00:00.000Z",
+  "commit": "v5.12.29-fix-start-stop-endpoints-budget-keys-signal-layout"
 }
