@@ -1,5 +1,5 @@
 {
-  "version": "5.12.11",
-  "buildTime": "2026-05-12T05:30:00.000Z",
-  "commit": "v5.12.11-fix-ghost-position-2010-force-close"
+  "version": "5.12.12",
+  "buildTime": "2026-05-12T05:45:00.000Z",
+  "commit": "v5.12.12-fix-price-source-accuracy"
 }
