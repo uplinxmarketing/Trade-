@@ -1,5 +1,5 @@
 {
-  "version": "5.12.20",
-  "buildTime": "2026-05-12T14:00:00.000Z",
-  "commit": "v5.12.20-fix-wallet-shows-all-coins"
+  "version": "5.12.21",
+  "buildTime": "2026-05-12T15:00:00.000Z",
+  "commit": "v5.12.21-fix-live-mode-persists-on-reload"
 }
