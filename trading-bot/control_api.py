@@ -661,11 +661,18 @@ def api_wallet():
 
         acc = client.get_account()
         balances = [
-            {"asset": b["asset"], "free": float(b["free"]), "locked": float(b["locked"])}
+            {
+                "asset":  b["asset"],
+                "free":   float(b["free"]),
+                "locked": float(b["locked"]),
+                "total":  float(b["free"]) + float(b["locked"]),
+            }
             for b in acc["balances"]
             if float(b["free"]) + float(b["locked"]) > 0
         ]
-        usdt_free = sum(b["free"] for b in balances if b["asset"] == "USDT")
+        # Trading uses only free USDT; display shows free+locked to match Binance UI
+        usdt_free  = sum(b["free"]  for b in balances if b["asset"] == "USDT")
+        usdt_total = sum(b["total"] for b in balances if b["asset"] == "USDT")
 
         # Total portfolio value = free USDT + mark-to-market value of open positions
         total_value = usdt_free
@@ -685,7 +692,8 @@ def api_wallet():
 
         return {
             "balances":        balances,
-            "total_usdt":      round(usdt_free, 4),
+            "total_usdt":      round(usdt_total, 4),   # free+locked — matches Binance UI
+            "free_usdt":       round(usdt_free, 4),    # tradeable only
             "total_value":     round(total_value, 4),
             "realized_pnl":    round(realized_pnl, 4),
             "session_pnl":     session_pnl,
