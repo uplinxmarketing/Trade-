@@ -1,5 +1,5 @@
 {
-  "version": "5.12.7",
-  "buildTime": "2026-05-12T04:00:00.000Z",
-  "commit": "v5.12.7-fix-trades-schema-migration-sell-parse-safety"
+  "version": "5.12.8",
+  "buildTime": "2026-05-12T04:30:00.000Z",
+  "commit": "v5.12.8-fix-pos-index-mode-detection-min-notional"
 }
