@@ -122,13 +122,15 @@ const Index = () => {
 
   // Auto-detect live mode on mount so the wallet shows live balances without
   // requiring the user to open the BinanceConnect modal after every page refresh.
+  // Check mode only — live_error is shown as a banner inside BinanceConnect;
+  // it must never flip the whole UI back to paper mode.
   useEffect(() => {
     (async () => {
       try {
         const res = await fetch(`${API_BASE}/api/status`, { cache: 'no-store' });
         if (!res.ok) return;
         const d = await res.json();
-        if (d.mode === 'live' && !d.live_error) setBinanceConnected(true);
+        if (d.mode === 'live') setBinanceConnected(true);
       } catch { /* bot unreachable — stay disconnected */ }
     })();
   }, []);
