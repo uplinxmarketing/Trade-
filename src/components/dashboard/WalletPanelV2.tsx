@@ -270,9 +270,12 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     return () => { supabase.removeChannel(ch); clearInterval(poll); };
   }, [mode, binanceConnected, loadPaper, hasAgentData]);
 
-  // Live mode — re-run only when connection state changes (not on every price tick)
+  // Live mode — load immediately on connect, then poll every 15 s for fresh balances
   useEffect(() => {
-    if (mode === 'live' && binanceConnected) loadLive();
+    if (mode !== 'live' || !binanceConnected) return;
+    loadLive();
+    const id = setInterval(loadLive, 15_000);
+    return () => clearInterval(id);
   }, [mode, binanceConnected]); // eslint-disable-line
 
   // ── Server wallet — poll /api/wallet for authoritative P&L numbers ─────────

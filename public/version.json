@@ -1,5 +1,5 @@
 {
-  "version": "5.12.4",
-  "buildTime": "2026-05-12T00:00:00.000Z",
-  "commit": "v5.12.4-fix-live-error-in-api-status"
+  "version": "5.12.5",
+  "buildTime": "2026-05-12T01:00:00.000Z",
+  "commit": "v5.12.5-fix-live-mode-env-path-wallet-polling"
 }

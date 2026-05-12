@@ -4,12 +4,16 @@ All other files import `client` from here — they never check MODE themselves.
 """
 
 import os
+import pathlib
 from dotenv import load_dotenv
+
+# Use absolute path so the correct .env is found regardless of systemd WorkingDirectory.
+_ENV_PATH = pathlib.Path(__file__).parent / ".env"
 
 # override=True ensures .env values always win over inherited process environment.
 # Without this, os.execv() passes the OLD MODE to the restarted process and
 # load_dotenv() silently skips the updated value — bot stays in paper mode forever.
-load_dotenv(override=True)
+load_dotenv(_ENV_PATH, override=True)
 MODE = os.getenv("MODE", "paper").lower()
 
 _live_error: str = ""   # set if live connection failed; readable via get_live_error()
@@ -68,7 +72,7 @@ def _build_client():
 
 
 def _revert_to_paper():
-    env_path = ".env"
+    env_path = _ENV_PATH
     if not os.path.exists(env_path):
         return
     with open(env_path) as f:
