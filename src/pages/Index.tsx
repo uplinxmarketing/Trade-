@@ -63,7 +63,12 @@ const Index = () => {
     })();
   }, []);
   const [activeCoin, setActiveCoin]        = useState('BTCUSDT');
-  const [binanceConnected, setBinanceConnected] = useState(false);
+  // Restore live mode from localStorage so the page loads in the correct state
+  // instantly, without waiting for the API call (which can fail or be slow).
+  const [binanceConnected, setBinanceConnected] = useState(() => {
+    try { return localStorage.getItem('binance_mode') === 'live'; }
+    catch { return false; }
+  });
   const [showBinanceConnect, setShowBinanceConnect] = useState(false);
   const [agentPositions, setAgentPositions] = useState<{symbol:string;quantity:number;avg_entry_price:number}[]>([]);
   const [agentBalance, setAgentBalance] = useState(0);
@@ -120,16 +125,23 @@ const Index = () => {
     })();
   }, []);
 
-  // Auto-detect live mode on mount so the wallet shows live balances without
-  // requiring the user to open the BinanceConnect modal after every page refresh.
+  // Persist mode to localStorage so any reload/device restores state instantly.
+  useEffect(() => {
+    try { localStorage.setItem('binance_mode', binanceConnected ? 'live' : 'paper'); }
+    catch { /* quota */ }
+  }, [binanceConnected]);
+
+  // Verify actual bot mode on mount and correct if it drifted.
+  // Never resets on network failure — keeps localStorage value so a slow or
+  // restarting bot does not flash paper mode.
   useEffect(() => {
     (async () => {
       try {
         const res = await fetch(`${API_BASE}/api/status`, { cache: 'no-store' });
         if (!res.ok) return;
         const d = await res.json();
-        if (d.mode === 'live') setBinanceConnected(true);
-      } catch { /* bot unreachable — stay disconnected */ }
+        setBinanceConnected(d.mode === 'live');
+      } catch { /* bot unreachable — keep localStorage value */ }
     })();
   }, []);
 
