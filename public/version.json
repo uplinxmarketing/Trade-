@@ -1,5 +1,5 @@
 {
-  "version": "5.12.6",
-  "buildTime": "2026-05-12T03:30:00.000Z",
-  "commit": "v5.12.6-fix-market-closed-blacklist-sell-retry"
+  "version": "5.12.7",
+  "buildTime": "2026-05-12T04:00:00.000Z",
+  "commit": "v5.12.7-fix-trades-schema-migration-sell-parse-safety"
 }

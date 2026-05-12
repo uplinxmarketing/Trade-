@@ -707,34 +707,40 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     # ── Fee-aware fill parsing ─────────────────────────────────────────────────
     # Market orders can split across multiple fills at different price levels.
     # Each fill has its own commission amount and asset.
-    fills      = result.get("fills", [])
-    fill_price = float(fills[0].get("price", price)) if fills else price
-    raw_quote  = float(result.get("cummulativeQuoteQty", 0))
-    budget     = pos["budget_usdt"]
+    # Wrap in try/except so an unexpected Binance response format never causes
+    # a silent position ghost (sell executed on Binance, position stays in bot).
+    try:
+        fills      = result.get("fills", [])
+        fill_price = float(fills[0].get("price", price)) if fills else price
+        raw_quote  = float(result.get("cummulativeQuoteQty") or 0)
+        budget     = pos["budget_usdt"]
 
-    if mode == "live":
-        # Live mode — read actual commissions and convert to USDT.
-        # BNB-fee mode: Binance deducts fees from BNB balance so cummulativeQuoteQty
-        # is the GROSS sell proceeds (fee NOT already subtracted from USDT).
-        # Standard fee mode: Binance deducts from USDT, cummulativeQuoteQty is NET.
-        sell_fee, fee_asset = _fills_fee_usdt(fills, raw_quote * _fee_rate)
-        if fee_asset in ("USDT", "BUSD", "USDC"):
-            # Quote-currency fee already deducted from proceeds — use raw_quote as-is
-            usdt_returned = raw_quote
+        if mode == "live":
+            sell_fee, fee_asset = _fills_fee_usdt(fills, raw_quote * _fee_rate)
+            if fee_asset in ("USDT", "BUSD", "USDC"):
+                usdt_returned = raw_quote
+            else:
+                usdt_returned = raw_quote - sell_fee
+            buy_fee = float(pos.get("buy_fee_usdt") or budget * _fee_rate)
         else:
-            # BNB (or estimated) — proceeds are gross; subtract converted fee
-            usdt_returned = raw_quote - sell_fee
-        # Buy fee: use actual value stored on the position (set at buy time),
-        # fall back to estimate for positions restored from DB without the field.
-        buy_fee = float(pos.get("buy_fee_usdt") or budget * _fee_rate)
-    else:
-        # Paper mode — PaperClient already deducts fee from cummulativeQuoteQty,
-        # and commissions are expressed in USDT, so no conversion needed.
-        sell_fee      = sum(float(f.get("commission") or 0) for f in fills)
-        usdt_returned = raw_quote
-        buy_fee       = budget * _fee_rate
+            sell_fee      = sum(float(f.get("commission") or 0) for f in fills)
+            usdt_returned = raw_quote
+            buy_fee       = budget * _fee_rate
 
-    net_profit = usdt_returned - budget - buy_fee
+        net_profit = usdt_returned - budget - buy_fee
+    except Exception as parse_err:
+        # Sell DID execute on Binance — fall back to estimates so trade is
+        # still recorded and position is properly cleaned up.
+        database.log_activity(
+            f"SELL {sym} ({reason}): fill parse error ({parse_err}) — using estimates", "warn"
+        )
+        fill_price    = price
+        raw_quote     = price * pos.get("quantity", 0)
+        budget        = pos.get("budget_usdt", 0)
+        sell_fee      = raw_quote * _fee_rate
+        buy_fee       = float(pos.get("buy_fee_usdt") or budget * _fee_rate)
+        usdt_returned = raw_quote - sell_fee
+        net_profit    = usdt_returned - budget - buy_fee
 
     buy_ts  = pos.get("timestamp", now)
     sell_ts = now
