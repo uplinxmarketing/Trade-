@@ -1537,53 +1537,92 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Market Signals</p>
         {/* In server mode: show bot's 6-signal cache if available, else JS scan */}
         {(isServerMode && railwaySignals.length > 0) ? (
-          <div className="space-y-1">
+          <div className="space-y-0.5">
+            {/* Header row */}
+            <div className="flex items-center justify-between pb-1 border-b border-border/60">
+              <span className="text-[9px] text-muted-foreground w-16">COIN</span>
+              <div className="flex items-center gap-3 flex-1 justify-end">
+                {(['EMA','RSI','MACD','VOL','OBV','ATR'] as const).map(lbl => (
+                  <span key={lbl} className="text-[8px] text-muted-foreground w-7 text-center">{lbl}</span>
+                ))}
+                <span className="text-[8px] text-muted-foreground w-8 text-center">SCORE</span>
+                <span className="text-[8px] text-muted-foreground w-10 text-right">PRICE</span>
+              </div>
+            </div>
             {railwaySignals.map((sig: any) => {
-              const bullishCount = [sig.ema_bullish, sig.rsi_ok, sig.macd_bullish, sig.volume_ok, sig.bb_squeeze, sig.momentum_ok].filter(Boolean).length;
+              // Correct field names from control_api.py _get_signal_snapshot():
+              // trend, rsi_ok, macd, volume, obv, atr, score, rsi (value), price
+              const metrics: [string, boolean][] = [
+                ['EMA',  !!sig.trend],
+                ['RSI',  !!sig.rsi_ok],
+                ['MACD', !!sig.macd],
+                ['VOL',  !!sig.volume],
+                ['OBV',  !!sig.obv],
+                ['ATR',  !!sig.atr],
+              ];
+              const score = typeof sig.score === 'number' ? sig.score : metrics.filter(([,v]) => v).length;
+              const isBuy = score >= 4;
+              const isWeak = score === 3;
               return (
-                <div key={sig.symbol} className="flex items-center justify-between py-1 border-b border-border/40 last:border-0">
-                  <div className="flex items-center gap-2">
-                    <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
-                      sig.signal === 'BUY' ? 'bg-gain/20 text-gain'
-                      : sig.signal === 'SELL' ? 'bg-loss/20 text-loss'
+                <div key={sig.symbol} className="flex items-center justify-between py-1 border-b border-border/30 last:border-0">
+                  <div className="flex items-center gap-1.5 w-16 flex-shrink-0">
+                    <span className={`text-[8px] font-bold px-1 py-0.5 rounded ${
+                      isBuy   ? 'bg-gain/20 text-gain'
+                      : isWeak ? 'bg-yellow-500/20 text-yellow-400'
                       : 'bg-muted/40 text-muted-foreground'
-                    }`}>{sig.signal ?? 'HOLD'}</span>
-                    <span className="text-xs font-mono">{sig.symbol?.replace('USDT','')}</span>
+                    }`}>{isBuy ? 'BUY' : isWeak ? 'WEAK' : 'HOLD'}</span>
+                    <span className="text-[10px] font-mono font-semibold">{sig.symbol?.replace('USDT','')}</span>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <div className="flex gap-0.5">
-                      {[sig.ema_bullish, sig.rsi_ok, sig.macd_bullish, sig.volume_ok].map((v: boolean, idx: number) => (
-                        <div key={idx} className={`w-1.5 h-1.5 rounded-full ${v ? 'bg-gain' : 'bg-muted/60'}`} />
-                      ))}
-                    </div>
-                    <span className="text-[9px] text-muted-foreground">{bullishCount}/6</span>
-                    <span className="text-[10px] font-mono text-muted-foreground">{sig.price ? Number(sig.price).toFixed(2) : ''}</span>
+                  <div className="flex items-center gap-3 flex-1 justify-end">
+                    {metrics.map(([lbl, v]) => (
+                      <div key={lbl} className="flex flex-col items-center w-7">
+                        <div className={`w-2 h-2 rounded-full ${v ? 'bg-gain' : 'bg-muted/50'}`} />
+                      </div>
+                    ))}
+                    <span className={`text-[10px] font-bold w-8 text-center ${score >= 4 ? 'text-gain' : score === 3 ? 'text-yellow-400' : 'text-muted-foreground'}`}>
+                      {score}/6
+                    </span>
+                    <span className="text-[10px] font-mono text-muted-foreground w-10 text-right">
+                      {sig.price ? Number(sig.price).toLocaleString('en-US',{maximumFractionDigits: sig.price > 100 ? 2 : 4}) : ''}
+                    </span>
                   </div>
                 </div>
               );
             })}
+            <p className="text-[8px] text-muted-foreground pt-1">EMA=EMA9/21 · RSI=40–65 · MACD=hist↑ · VOL=above avg · OBV=buy pressure · ATR=volatility OK</p>
           </div>
         ) : (
-          <div className="space-y-1">
+          <div className="space-y-0.5">
+            {/* Header row */}
+            <div className="flex items-center justify-between pb-1 border-b border-border/60">
+              <span className="text-[9px] text-muted-foreground w-16">COIN</span>
+              <div className="flex items-center gap-3 flex-1 justify-end">
+                {(['EMA','RSI','MACD','VOL'] as const).map(lbl => (
+                  <span key={lbl} className="text-[8px] text-muted-foreground w-7 text-center">{lbl}</span>
+                ))}
+                <span className="text-[8px] text-muted-foreground w-16 text-right">RSI val · Price</span>
+              </div>
+            </div>
             {coinSignals.length === 0 && !scanning && (
-              <p className="text-[10px] text-muted-foreground">Click refresh to scan</p>
+              <p className="text-[10px] text-muted-foreground py-2">Click refresh to scan</p>
             )}
             {coinSignals.map(sig => (
-              <div key={sig.symbol} className="flex items-center justify-between py-1 border-b border-border/40 last:border-0">
-                <div className="flex items-center gap-2">
-                  <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+              <div key={sig.symbol} className="flex items-center justify-between py-1 border-b border-border/30 last:border-0">
+                <div className="flex items-center gap-1.5 w-16 flex-shrink-0">
+                  <span className={`text-[8px] font-bold px-1 py-0.5 rounded ${
                     sig.signal === 'BUY' ? 'bg-gain/20 text-gain' : 'bg-muted/40 text-muted-foreground'
                   }`}>{sig.signal === 'loading' ? '…' : sig.signal}</span>
-                  <span className="text-xs font-mono">{sig.symbol.replace('USDT','')}</span>
+                  <span className="text-[10px] font-mono font-semibold">{sig.symbol.replace('USDT','')}</span>
                 </div>
-                <div className="flex items-center gap-2">
-                  <div className="flex gap-0.5">
-                    {[sig.emaBullish, sig.rsiOk, sig.macdPos, sig.volUp].map((v, idx) => (
-                      <div key={idx} className={`w-1.5 h-1.5 rounded-full ${v ? 'bg-gain' : 'bg-muted/60'}`} />
-                    ))}
-                  </div>
-                  <span className="text-[9px] text-muted-foreground">RSI {sig.rsi.toFixed(0)}</span>
-                  <span className="text-[10px] font-mono text-muted-foreground">{sig.price.toFixed(2)}</span>
+                <div className="flex items-center gap-3 flex-1 justify-end">
+                  {[sig.emaBullish, sig.rsiOk, sig.macdPos, sig.volUp].map((v, idx) => (
+                    <div key={idx} className="flex flex-col items-center w-7">
+                      <div className={`w-2 h-2 rounded-full ${v ? 'bg-gain' : 'bg-muted/50'}`} />
+                    </div>
+                  ))}
+                  <span className="text-[9px] text-muted-foreground w-16 text-right">
+                    {sig.rsi.toFixed(0)} · {sig.price > 0 ? sig.price.toLocaleString('en-US',{maximumFractionDigits: sig.price > 100 ? 2 : 4}) : '—'}
+                  </span>
                 </div>
               </div>
             ))}
