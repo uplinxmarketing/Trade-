@@ -1,1 +1,0 @@
-python3 -c "import json; d=json.load(open('/tmp/files_payload.json')); print(d['f1'])" 2>/dev/null || true
