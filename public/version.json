@@ -1,5 +1,5 @@
 {
-  "version": "5.12.8",
-  "buildTime": "2026-05-12T04:30:00.000Z",
-  "commit": "v5.12.8-fix-pos-index-mode-detection-min-notional"
+  "version": "5.12.9",
+  "buildTime": "2026-05-12T05:00:00.000Z",
+  "commit": "v5.12.9-fix-sell-cooldown-reason-aware"
 }

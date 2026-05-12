@@ -106,7 +106,9 @@ _selling_ts: Dict[str, float] = {}   # when each sym was added — for watchdog
 # Prevents repeated buy attempts and rate-limits sell retries on closed markets.
 _bad_symbols: set = set()
 _sell_last_failed_ts: Dict[str, float] = {}  # last sell failure time per symbol
-_SELL_RETRY_COOLDOWN = 30.0  # seconds to wait before retrying a failed sell
+_sell_last_failed_reason: Dict[str, str] = {}  # reason that triggered the failed sell
+_SELL_RETRY_COOLDOWN_PROFIT = 5.0   # take-profit: 5s is enough to break retry loop
+_SELL_RETRY_COOLDOWN_LOSS   = 0.0   # stop-loss / force-sell: retry immediately
 
 # ── Sell executor — parallel sells so 10 simultaneous exits never queue up ───
 # Each position gets its own worker thread; _selling guard prevents duplicates.
@@ -691,6 +693,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         print(f"[TradeEngine] {msg}")
         database.log_activity(msg, "error")
         _sell_last_failed_ts[sym] = time.time()
+        _sell_last_failed_reason[sym] = reason
         if "-1013" in err_str or "Market is closed" in err_str:
             _bad_symbols.add(sym)
             database.log_activity(
@@ -1148,10 +1151,14 @@ def realtime_monitor(prices: Dict[str, float]):
         pos = pos_index.get(sym)
         if pos is None or price <= 0:
             continue
-        # Rate-limit retries for positions whose last sell attempt failed recently.
+        # Rate-limit retries: stop-loss retries immediately, take-profit waits 5s.
         last_fail = _sell_last_failed_ts.get(sym, 0)
-        if last_fail and (now - last_fail) < _SELL_RETRY_COOLDOWN:
-            continue
+        if last_fail:
+            _cooldown = (_SELL_RETRY_COOLDOWN_LOSS
+                         if _sell_last_failed_reason.get(sym, "") in ("stop-loss", "force-sell")
+                         else _SELL_RETRY_COOLDOWN_PROFIT)
+            if (now - last_fail) < _cooldown:
+                continue
         entry  = pos["entry_price"]
         # Use configurable take-profit multiplier (refreshed from strategy.json every buy cycle).
         # Must be at least _breakeven_mult so we never sell at a loss via take-profit.
@@ -1435,10 +1442,14 @@ def _sell_monitor_loop():
                 with _selling_lock:
                     if sym in _selling:
                         continue
-                # Rate-limit retries for positions whose last sell attempt failed recently.
+                # Rate-limit retries: stop-loss retries immediately, take-profit waits 5s.
                 last_fail = _sell_last_failed_ts.get(sym, 0)
-                if last_fail and (now_monitor - last_fail) < _SELL_RETRY_COOLDOWN:
-                    continue
+                if last_fail:
+                    _cooldown = (_SELL_RETRY_COOLDOWN_LOSS
+                                 if _sell_last_failed_reason.get(sym, "") in ("stop-loss", "force-sell")
+                                 else _SELL_RETRY_COOLDOWN_PROFIT)
+                    if (now_monitor - last_fail) < _cooldown:
+                        continue
                 entry  = pos["entry_price"]
                 target = entry * _take_profit_mult
                 stop   = entry * _stop_loss_mult
