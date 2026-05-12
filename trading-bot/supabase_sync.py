@@ -242,7 +242,8 @@ def sync_sell_result_sync(trade: dict, symbol: str, usdt: float):
     if not _enabled:
         return
     from concurrent.futures import ThreadPoolExecutor as _TPE
-    with _TPE(max_workers=3) as _ex:
+    _ex = _TPE(max_workers=3)
+    try:
         f1 = _ex.submit(_sync_trade_impl, trade)
         f2 = _ex.submit(_delete, "paper_portfolio",
                         f"user_session=eq.{SESSION}&symbol=eq.{symbol}")
@@ -252,6 +253,8 @@ def sync_sell_result_sync(trade: dict, symbol: str, usdt: float):
                 f.result(timeout=4)
             except Exception:
                 pass
+    finally:
+        _ex.shutdown(wait=False)
 
 
 def sync_buy_result_sync(pos: dict, usdt: float):
@@ -262,7 +265,8 @@ def sync_buy_result_sync(pos: dict, usdt: float):
     if not _enabled:
         return
     from concurrent.futures import ThreadPoolExecutor as _TPE
-    with _TPE(max_workers=2) as _ex:
+    _ex = _TPE(max_workers=2)
+    try:
         f1 = _ex.submit(_upsert_portfolio, pos)
         f2 = _ex.submit(_upsert_config, usdt)
         for f in (f1, f2):
@@ -270,6 +274,8 @@ def sync_buy_result_sync(pos: dict, usdt: float):
                 f.result(timeout=4)
             except Exception:
                 pass
+    finally:
+        _ex.shutdown(wait=False)
 
 
 def sync_all(positions: list, usdt: float):

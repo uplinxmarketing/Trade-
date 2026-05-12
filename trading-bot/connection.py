@@ -37,7 +37,8 @@ def _build_client():
         else:
             try:
                 from binance.client import Client as BinanceClient
-                c = BinanceClient(api_key, api_secret)
+                c = BinanceClient(api_key, api_secret,
+                                  requests_params={"timeout": 10})
                 c.ping()
                 c.update_price = lambda symbol, price: None
                 print("[Connection] Live Binance connection established ✓")
@@ -60,7 +61,8 @@ def _build_client():
         else:
             try:
                 from binance.client import Client as BinanceClient
-                c = BinanceClient(api_key, api_secret, testnet=True)
+                c = BinanceClient(api_key, api_secret, testnet=True,
+                                  requests_params={"timeout": 10})
                 c.update_price = lambda symbol, price: None
                 return c
             except Exception as exc:
