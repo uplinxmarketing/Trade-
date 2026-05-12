@@ -107,7 +107,7 @@ _selling_ts: Dict[str, float] = {}   # when each sym was added — for watchdog
 _bad_symbols: set = set()
 _sell_last_failed_ts: Dict[str, float] = {}  # last sell failure time per symbol
 _sell_last_failed_reason: Dict[str, str] = {}  # reason that triggered the failed sell
-_SELL_RETRY_COOLDOWN_PROFIT = 5.0   # take-profit: 5s is enough to break retry loop
+_SELL_RETRY_COOLDOWN_PROFIT = 2.0   # take-profit: 2s breaks retry loop without delaying exit
 _SELL_RETRY_COOLDOWN_LOSS   = 0.0   # stop-loss / force-sell: retry immediately
 
 # ── Sell executor — parallel sells so 10 simultaneous exits never queue up ───

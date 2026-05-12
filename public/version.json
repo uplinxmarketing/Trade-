@@ -1,5 +1,5 @@
 {
-  "version": "5.12.9",
-  "buildTime": "2026-05-12T05:00:00.000Z",
-  "commit": "v5.12.9-fix-sell-cooldown-reason-aware"
+  "version": "5.12.10",
+  "buildTime": "2026-05-12T05:15:00.000Z",
+  "commit": "v5.12.10-reduce-take-profit-retry-cooldown"
 }
