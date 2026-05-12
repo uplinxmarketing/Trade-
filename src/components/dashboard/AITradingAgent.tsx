@@ -170,6 +170,7 @@ interface AITradingAgentProps {
   binanceConnected?: boolean;
   onConnectBinance?: () => void;
   onCoinsChange?: (coins: string[]) => void;
+  onLiveModeDetected?: (isLive: boolean) => void;
   onStateChange?: (
     positions: {symbol:string;quantity:number;avg_entry_price:number}[],
     balance: number,
@@ -179,7 +180,6 @@ interface AITradingAgentProps {
 }
 
 const INSTRUCTIONS_KEY  = 'ai_agent_instructions';
-const BOT_URL_KEY       = 'bot_server_url';
 const AGENT_CYCLE_MS    = 30_000;
 const BEP_MULT          = 1 / Math.pow(1 - TAKER_FEE, 2);
 
@@ -360,7 +360,7 @@ const AgentTradingFields = ({
 );
 
 // ── Component ────────────────────────────────────────────────────────────────
-const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onCoinsChange, onStateChange }: AITradingAgentProps) => {
+const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onCoinsChange, onStateChange, onLiveModeDetected }: AITradingAgentProps) => {
   const [mode, setMode]           = useState<'test' | 'live'>('test');
   const [isRunning, setIsRunning] = useState(false);
   const [loading, setLoading]     = useState(false);
@@ -401,25 +401,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [instrDraft, setInstrDraft]       = useState('');
   const [actLog, setActLog]       = useState<string[]>([]);
   const [dataPersistent, setDataPersistent] = useState<boolean | null>(null);
-  // Server-authoritative P&L stats — avoids Railway+Supabase double-counting
+  // Server-authoritative P&L stats — avoids double-counting with Supabase
   const [serverRealizedPnl, setServerRealizedPnl]     = useState<number | null>(null);
   const [serverWins, setServerWins]                   = useState<number | null>(null);
   const [serverTotalTrades, setServerTotalTrades]     = useState<number | null>(null);
   const [showLog, setShowLog]     = useState(true);
-  // botUrl defaults to '' (same origin) so all /api/* calls are relative.
-  // Users can override via localStorage if they ever need to point at a different backend.
-  // Migration: clear any stale Railway URL stored under the old key.
-  const [railwayUrl, setRailwayUrl] = useState(() => {
-    try {
-      const old = localStorage.getItem('railway_bot_url');
-      if (old !== null) { localStorage.removeItem('railway_bot_url'); localStorage.setItem(BOT_URL_KEY, old); }
-    } catch { /* ignore */ }
-    return localStorage.getItem(BOT_URL_KEY) ??
-      (import.meta.env.VITE_API_URL as string | undefined) ??
-      '';
-  });
-  const [showRailwayInput, setShowRailwayInput] = useState(false);
-  const [railwayDraft, setRailwayDraft] = useState('');
+  // All API calls are relative (same-origin) — bot runs on wolfbot.tech.
+  const railwayUrl = '';
   const [liveApiKey, setLiveApiKey]         = useState('');
   const [liveApiSecret, setLiveApiSecret]   = useState('');
   const [showLiveSecret, setShowLiveSecret] = useState(false);
@@ -772,15 +760,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     }).catch(() => {});
   }, [selectedCoins, railwayUrl]); // eslint-disable-line
 
-  // ── Railway server-mode poller ─────────────────────────────────────────────
-  // When a Railway URL is configured the JS trading loop is disabled.
-  // Instead we poll the Railway bot's REST API every 30 s and mirror its state
-  // into the same React state variables so the UI shows live Railway data.
+  // ── VPS bot poller ────────────────────────────────────────────────────────
+  // Polls /api/all (same-origin → wolfbot.tech) every 5 s normally, every 1 s
+  // when positions are open. Mirrors bot state into React state for live UI.
   const serverPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const fastPollRef   = useRef<ReturnType<typeof setInterval> | null>(null);
-  // In-flight guard: serverPollRef (5 s) and fastPollRef (1 s) both call
-  // pollRailway. Without this, an older 5-s response can land AFTER a newer
-  // 1-s response and clobber positions/trades with stale data.
+  // In-flight guard: both poll intervals call pollRailway. Without this, a slow
+  // 5-s response can land after a fast 1-s response and clobber newer data.
   const pollInFlightRef = useRef<boolean>(false);
 
   const pollRailway = useCallback(async () => {
@@ -810,7 +796,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       // one immediate retry on failure
       try { data = await attempt(); }
       catch (e: any) {
-        if (e.name !== 'AbortError') addLog(`[Railway] poll failed: ${e.message}`);
+        if (e.name !== 'AbortError') addLog(`[Bot] poll failed: ${e.message}`);
         return;
       }
     }
@@ -819,15 +805,16 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     const running = Boolean(s.running);
     // Reset wizard when poll detects bot stopped (handles stop from another tab/session).
     if (isRunningRef.current && !running) { setSetupComplete(false); setSettingsSynced(false); }
-    // When bot is already running (auto-started by Railway deploy), mark setup complete
-    // so the settings panel is accessible without requiring a manual wizard confirmation.
     if (running) { setSetupComplete(true); setSettingsSynced(true); }
     isRunningRef.current = running;
     setIsRunning(running);
     const bal = Number(s.balance_usdt ?? 0);
     setBalance(bal); balanceRef.current = bal;
     setInitialBalance(Number(s.initial_balance ?? bal));
-    setAgentStatus(`Railway · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${new Date().toLocaleTimeString()}`);
+    // Propagate mode to parent so binanceConnected stays correct even when the
+    // page loaded while the bot was restarting and the mount hook failed.
+    onLiveModeDetected?.(s.mode === 'live');
+    setAgentStatus(`Bot · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${new Date().toLocaleTimeString()}`);
     if (s.data_persistent !== undefined) setDataPersistent(Boolean(s.data_persistent));
     // Update committed state from server — never touch settingsDraft here.
     // The draft is only reset when the user opens the settings panel, so
@@ -1239,7 +1226,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         });
         const data = await res.json();
         if (!data.ok) throw new Error(data.error ?? 'Force buy failed');
-        addLog(`FORCE BUY ${sym} via Railway @ ${Number(data.price).toFixed(4)} USDT · ${Number(data.budget).toFixed(2)} USDT`);
+        addLog(`FORCE BUY ${sym} @ ${Number(data.price).toFixed(4)} USDT · ${Number(data.budget).toFixed(2)} USDT`);
         toast.success(`Force BUY: ${sym.replace('USDT','')} @ ${Number(data.price).toFixed(4)} USDT`);
         await pollRailway();
         return;
@@ -1296,7 +1283,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         });
         const data = await res.json();
         if (!data.ok) throw new Error(data.error ?? 'Force sell failed');
-        addLog(`FORCE SELL ${pos.symbol} via Railway @ ${Number(data.price).toFixed(4)} USDT`);
+        addLog(`FORCE SELL ${pos.symbol} @ ${Number(data.price).toFixed(4)} USDT`);
         toast.success(`Force SELL sent: ${pos.symbol.replace('USDT','')}`);
         await pollRailway();
       } catch (e) {
@@ -1340,8 +1327,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         const data = await res.json();
         if (!data.ok) throw new Error(data.error ?? 'Reset failed');
         setTrades([]); setPositions([]); setActLog([]);
-        addLog('=== Railway wallet reset ===');
-        toast.success(`Railway reset · ${data.balance_usdt?.toLocaleString()} USDT restored`);
+        addLog('=== Bot wallet reset ===');
+        toast.success(`Bot reset · ${data.balance_usdt?.toLocaleString()} USDT restored`);
         await pollRailway();
       } catch (e: any) {
         toast.error(`Reset failed: ${e.message}`);
@@ -1578,43 +1565,16 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         </div>
       )}
 
-      {/* ── Bot Server URL ── */}
-      <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-1.5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Activity className="w-3.5 h-3.5 text-accent" />
-            <span className="text-xs font-semibold text-accent">Bot Server</span>
-            {isServerMode && <span className="text-[9px] px-1.5 py-0.5 rounded bg-gain/20 text-gain font-bold">CONNECTED</span>}
-          </div>
-          {!showRailwayInput ? (
-            <button onClick={() => { setRailwayDraft(railwayUrl); setShowRailwayInput(true); }}
-              className="text-[10px] text-muted-foreground hover:text-foreground flex items-center gap-1">
-              <Pencil className="w-3 h-3" />{isServerMode ? 'Edit URL' : 'Set URL'}
-            </button>
-          ) : (
-            <div className="flex gap-2">
-              <button onClick={() => {
-                const url = railwayDraft.trim().replace(/\/$/, '');
-                setRailwayUrl(url);
-                if (url) localStorage.setItem(BOT_URL_KEY, url);
-                else localStorage.removeItem(BOT_URL_KEY);
-                setShowRailwayInput(false);
-              }} className="text-[10px] text-gain flex items-center gap-0.5"><Check className="w-3 h-3" />Save</button>
-              <button onClick={() => setShowRailwayInput(false)} className="text-[10px] text-loss flex items-center gap-0.5"><X className="w-3 h-3" />Cancel</button>
-            </div>
-          )}
+      {/* ── Bot Server ── */}
+      <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-1">
+        <div className="flex items-center gap-2">
+          <Activity className="w-3.5 h-3.5 text-accent" />
+          <span className="text-xs font-semibold text-accent">Bot Server</span>
+          {isServerMode && <span className="text-[9px] px-1.5 py-0.5 rounded bg-gain/20 text-gain font-bold">CONNECTED</span>}
         </div>
-        {showRailwayInput ? (
-          <input value={railwayDraft} onChange={e => setRailwayDraft(e.target.value)}
-            placeholder="Leave empty for same-origin (e.g. wolfbot.tech)"
-            className="w-full text-xs bg-background border border-border rounded px-2 py-1.5 font-mono outline-none focus:border-accent" />
-        ) : (
-          <p className="text-[10px] text-muted-foreground font-mono break-all">
-            {railwayUrl
-              ? railwayUrl
-              : <span className="font-sans text-gain">Same-origin · API calls go to <code className="bg-muted px-1 rounded text-foreground">/api/*</code></span>}
-          </p>
-        )}
+        <p className="text-[10px] text-gain font-sans">
+          Same-origin · API calls go to <code className="bg-muted px-1 rounded text-foreground">/api/*</code>
+        </p>
       </div>
 
       {/* ── Instructions ── */}
@@ -1953,7 +1913,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       }
 
       {/* ── Live coin signals ── */}
-      {/* In server mode: show Railway bot's 6-signal cache if available, else JS scan */}
+      {/* In server mode: show bot's 6-signal cache if available, else JS scan */}
       {(isServerMode && railwaySignals.length > 0) ? (
         <div>
           <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2 flex items-center gap-1.5">

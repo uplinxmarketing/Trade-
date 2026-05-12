@@ -1,5 +1,5 @@
 {
-  "version": "5.12.21",
-  "buildTime": "2026-05-12T15:00:00.000Z",
-  "commit": "v5.12.21-fix-live-mode-persists-on-reload"
+  "version": "5.12.26",
+  "buildTime": "2026-05-12T15:44:41.476Z",
+  "commit": "9aa8d27"
 }
