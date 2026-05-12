@@ -7,16 +7,13 @@ import { toast } from 'sonner';
 import { API_BASE } from '@/config';
 
 const PAPER_CFG_KEY  = 'paper_wallet_config';
-const BOT_URL_KEY    = 'bot_server_url';
 
-function getRailwayUrl(): string {
-  try {
-    // Migrate old Railway URL key if present
-    const old = localStorage.getItem('railway_bot_url');
-    if (old !== null) { localStorage.removeItem('railway_bot_url'); localStorage.setItem(BOT_URL_KEY, old); }
-    return localStorage.getItem(BOT_URL_KEY) ?? API_BASE;
-  } catch { return API_BASE; }
-}
+// All API calls are same-origin — bot runs on wolfbot.tech.
+// Clean up any stale Railway/bot URL keys left in localStorage.
+try {
+  localStorage.removeItem('railway_bot_url');
+  localStorage.removeItem('bot_server_url');
+} catch { /* ignore */ }
 
 const COIN_COLORS: Record<string, string> = {
   BTC: '#F7931A', ETH: '#627EEA', SOL: '#9945FF', BNB: '#F3BA2F',
@@ -155,8 +152,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
         budget_per_coin:       next.budgetPerCoin,
         budget_coin_pct:       next.budgetCoinPct,
       };
-      // Use the Railway URL the user configured in the AI Agent panel
-      const url = getRailwayUrl();
+      const url = API_BASE;
       fetch(`${url}/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -215,13 +211,13 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   }, []);
 
   // ── Live mode ──────────────────────────────────────────────────────────────
-  // Reads directly from Railway /api/wallet which calls the real Binance API
+  // Reads directly from /api/wallet which calls the real Binance API
   // when the bot is in live mode (MODE=live env var). No Supabase proxy needed.
   const loadLive = useCallback(async () => {
     if (!binanceConnected) return;
     setLoading(true);
     try {
-      const url = getRailwayUrl();
+      const url = API_BASE;
       const res = await fetch(`${url}/api/wallet`, { cache: 'no-store' });
       if (!res.ok) { toast.error('Failed to load live wallet'); return; }
       const data = await res.json();
@@ -263,15 +259,19 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   // ── Use agent-provided state when available (instant sync / server mode) ─────
   // Use agentInitialBalance (never reset to 0) as the Railway-mode flag so that
   // resetting the wallet (which briefly sets agentBalance=0) doesn't flip back to Supabase mode.
-  const hasAgentData = (agentInitialBalance ?? 0) > 0 || (agentBalance ?? 0) > 0;
+  // hasAgentData = true whenever the bot is the authoritative source.
+  // Including binanceConnected here ensures paper/Supabase data is never
+  // loaded on initial render when the user is in live mode — even before
+  // the first poll returns agentBalance/agentInitialBalance.
+  const hasAgentData = binanceConnected || (agentInitialBalance ?? 0) > 0 || (agentBalance ?? 0) > 0;
 
   const isPaper = mode === 'test' || !binanceConnected;
 
   // Paper subscription + polling — disabled when Railway is the backend
-  // (hasAgentData=true means Railway /api/wallet is the authoritative source)
+  // (hasAgentData=true means /api/wallet is the authoritative source)
   useEffect(() => {
     if (mode === 'live' && binanceConnected) return;
-    if (hasAgentData) return; // Railway mode: no Supabase needed
+    if (hasAgentData) return; // server mode: no Supabase needed
     loadPaper();
     const ch = supabase.channel('walletv2')
       .on('postgres_changes',{event:'*',schema:'public',table:'bot_config'},loadPaper)
@@ -291,7 +291,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   }, [mode, binanceConnected]); // eslint-disable-line
 
   // ── Server wallet — poll /api/wallet for authoritative P&L numbers ─────────
-  // Replaces Supabase-derived P&L when Railway is the backend.
+  // Replaces Supabase-derived P&L when server is the backend.
   const [serverWallet, setServerWallet] = useState<{
     realized_pnl: number; session_pnl: number; starting_balance: number;
     total_fees: number; open_pos_value: number;
@@ -302,7 +302,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     let cancelled = false;
     const poll = async () => {
       try {
-        const res = await fetch(`${getRailwayUrl()}/api/wallet`, { cache: 'no-store' });
+        const res = await fetch(`${API_BASE}/api/wallet`, { cache: 'no-store' });
         if (!res.ok || cancelled) return;
         const d = await res.json();
         if (!cancelled) setServerWallet({
@@ -318,14 +318,14 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     const id = setInterval(poll, 5_000);
     return () => { cancelled = true; clearInterval(id); };
   }, [hasAgentData]); // eslint-disable-line
-  // In Railway mode keep local `positions` state in sync with parent's agentPositions
+  // In server mode keep local `positions` state in sync with parent's agentPositions
   // so the refresh button (which writes to `positions` directly) and the AITradingAgent
   // poll both flow through the same variable.
   useEffect(() => {
     if (hasAgentData && agentPositions) setPositions(agentPositions);
   }, [agentPositions, hasAgentData]);
 
-  // Keep usdtFree in sync with Railway agentBalance polls
+  // Keep usdtFree in sync with agent balance polls
   useEffect(() => {
     if (hasAgentData && (agentBalance ?? 0) > 0) setUsdtFree(agentBalance!);
   }, [agentBalance, hasAgentData]);
@@ -357,18 +357,18 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
 
   // ── Reset paper wallet ───────────────────────────────────────────────────
   const resetWallet = async () => {
-    // Use Railway's authoritative starting balance when available, else local config
+    // Use server's authoritative starting balance when available, else local config
     const resetBal = (serverWallet?.starting_balance ?? 0) > 0
       ? serverWallet!.starting_balance
       : walletCfg.startingBalance;
     if (!confirm(`Reset paper wallet to ${resetBal.toLocaleString()} USDT and clear all positions?`)) return;
     setResetting(true);
     try {
-      // Only call Railway when in agent/server mode — pure-paper users without
-      // a Railway URL would otherwise always hit the network error path and
+      // Only call server when in agent/server mode — pure-paper users without
+      // a bot URL would otherwise always hit the network error path and
       // never reach the Supabase reset below.
       if (hasAgentData) {
-        const res = await fetch(`${getRailwayUrl()}/api/reset`, { method: 'POST' }).catch(() => null);
+        const res = await fetch(`${API_BASE}/api/reset`, { method: 'POST' }).catch(() => null);
         if (!res?.ok) {
           toast.error('Server reset failed — check bot logs');
           return;
@@ -376,7 +376,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
       }
 
       if (!hasAgentData) {
-        // Pure paper mode (no Railway): sync Supabase too
+        // Pure paper mode (no server): sync Supabase too
         await Promise.all([
           supabase.from('paper_portfolio').delete().eq('user_session', 'default'),
           supabase.from('bot_trade_history').delete().eq('user_session', 'default'),
@@ -403,7 +403,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   // ── Compute portfolio totals (paper mode) ─────────────────────────────────────────
   // Number() casts guard against Supabase PostgREST returning NUMERIC columns as strings.
   const positionRows = effectivePositions.map(pos => {
-    // toNum: guarantees a finite, non-negative number — malformed Railway/Supabase
+    // toNum: guarantees a finite, non-negative number — malformed server/Supabase
     // rows (string "abc", null, or NaN-yielding parses) would otherwise propagate
     // into pnl/pct as NaN and render as "NaN%" / impossibly large losses.
     const toNum = (v: unknown) => {
@@ -451,12 +451,12 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
         </span>
         <button onClick={async () => {
           if (hasAgentData) {
-            // Railway mode — fetch fresh data directly from the bot
+            // Server mode — fetch fresh data directly from the bot
             setLoading(true);
             try {
               const [walRes, posRes] = await Promise.all([
-                fetch(`${getRailwayUrl()}/api/wallet`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null).catch(() => null),
-                fetch(`${getRailwayUrl()}/api/positions`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null).catch(() => null),
+                fetch(`${API_BASE}/api/wallet`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null).catch(() => null),
+                fetch(`${API_BASE}/api/positions`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null).catch(() => null),
               ]);
               if (walRes) setServerWallet({ realized_pnl: Number(walRes.realized_pnl ?? 0), session_pnl: Number(walRes.session_pnl ?? 0), starting_balance: Number(walRes.starting_balance ?? 0), total_fees: Number(walRes.total_fees ?? 0), open_pos_value: Number(walRes.open_pos_value ?? 0) });
               if (walRes?.total_usdt !== undefined) setUsdtFree(Number(walRes.total_usdt));
