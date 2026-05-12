@@ -694,18 +694,32 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         database.log_activity(msg, "error")
         _sell_last_failed_ts[sym] = time.time()
         _sell_last_failed_reason[sym] = reason
-        if "-1013" in err_str or "Market is closed" in err_str:
+
+        # -1013: market closed/delisted — blacklist and force-close
+        # -2010: insufficient balance — ghost position (paper position carried into live),
+        #        bot doesn't actually own the coin; force-close so retries stop
+        is_ghost = "-2010" in err_str or "insufficient balance" in err_str.lower()
+        is_closed = "-1013" in err_str or "Market is closed" in err_str
+        if is_closed:
             _bad_symbols.add(sym)
+        if is_closed or is_ghost:
+            reason_label = "market closed/delisted" if is_closed else "ghost position (no coin balance on Binance)"
             database.log_activity(
-                f"{sym}: blacklisted — market closed/delisted; position will be force-closed", "warn"
+                f"{sym}: force-closing position — {reason_label}", "warn"
             )
-            # Force-remove the position so we stop retrying a delisted coin.
             with _positions_lock:
                 before = len(_positions)
                 _positions[:] = [p for p in _positions if p.get("symbol") != sym]
                 if len(_positions) < before:
-                    database.log_activity(f"{sym}: position force-closed (market closed)", "warn")
-            _rebuild_pos_index()  # keep O(1) index consistent with _positions
+                    # Remove from DB too so it doesn't come back on restart
+                    pos_id = pos.get("id")
+                    if pos_id:
+                        try:
+                            database.delete_position(pos_id)
+                        except Exception:
+                            pass
+                    database.log_activity(f"{sym}: position removed from records", "warn")
+            _rebuild_pos_index()
         return
 
     # ── Fee-aware fill parsing ─────────────────────────────────────────────────
