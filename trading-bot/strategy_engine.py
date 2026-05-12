@@ -16,6 +16,14 @@ import learning
 from data_collector import prices
 
 
+def _load_strategy() -> dict:
+    try:
+        with open(config.STRATEGY_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def _atomic_write_strategy(data: dict):
     """Write strategy.json via temp+rename so concurrent readers never see a
     half-written or empty file (which would silently reset live trade settings)."""
