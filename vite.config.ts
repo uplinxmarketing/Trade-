@@ -6,20 +6,15 @@ import { execSync } from "child_process";
 
 const versionJson = JSON.parse(fs.readFileSync("./public/version.json", "utf-8"));
 
-// Prefer RAILWAY_GIT_COMMIT_SHA (injected by Railway Dockerfile ARG) so the
-// fingerprint is based on the git commit rather than wall-clock time.
-// Falls back to git CLI, then to the last committed value.
+// Use git HEAD commit for the bundle fingerprint; fall back to the last committed value.
 // buildTime is always a fresh timestamp for the "Updated to vX.Y.Z" toast.
-const railwayShort = (process.env.RAILWAY_GIT_COMMIT_SHA || '').slice(0, 8);
-let buildCommit = railwayShort || versionJson.commit;
+let buildCommit = versionJson.commit;
 let buildTime   = new Date().toISOString();
 
-if (!railwayShort) {
-  try {
-    buildCommit = execSync("git rev-parse --short HEAD", { stdio: ["pipe","pipe","ignore"] }).toString().trim();
-  } catch {
-    // git unavailable — buildCommit keeps last committed value
-  }
+try {
+  buildCommit = execSync("git rev-parse --short HEAD", { stdio: ["pipe","pipe","ignore"] }).toString().trim();
+} catch {
+  // git unavailable — buildCommit keeps last committed value
 }
 
 // Always write version.json so dist/ matches the baked bundle constants

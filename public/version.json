@@ -1,5 +1,5 @@
 {
-  "version": "5.12.34",
-  "buildTime": "2026-05-13T01:30:00.000Z",
-  "commit": "v5.12.34-fix-positions-price-progress-bar-signal-speed"
+  "version": "5.12.35",
+  "buildTime": "2026-05-12T23:35:01.339Z",
+  "commit": "b1e5030"
 }

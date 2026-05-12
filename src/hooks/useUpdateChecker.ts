@@ -56,8 +56,7 @@ export function useUpdateChecker(pollIntervalMs = 30_000) {
         return true;
       }
 
-      // Same version: use deployId to catch same-version redeploys (e.g. config-only
-      // changes where version string didn't change but Railway restarted).
+      // Same version: use deployId to catch same-version redeploys.
       if (data.deployId) {
         latestDeployIdRef.current = data.deployId;
         const seenDeploy = localStorage.getItem(SEEN_DEPLOY) ?? '';
@@ -108,6 +107,26 @@ export function useUpdateChecker(pollIntervalMs = 30_000) {
   const applyUpdate = useCallback(async () => {
     setUpdating(true);
     if (latestDeployIdRef.current) localStorage.setItem(SEEN_DEPLOY, latestDeployIdRef.current);
+    try {
+      const res = await fetch('/api/update', { method: 'POST', cache: 'no-store' });
+      const body = await res.json().catch(() => ({}));
+      if (body.success) {
+        toast.loading('Updating — bot will restart in ~30 s…', { duration: 35_000 });
+        // Poll until the server returns the new version, then reload.
+        const start = Date.now();
+        const poll = setInterval(async () => {
+          try {
+            const vr = await fetch(`/version.json?t=${Date.now()}`, { cache: 'no-store' });
+            const vd = await vr.json();
+            if (vd.version !== LOCAL_VERSION || Date.now() - start > 60_000) {
+              clearInterval(poll);
+              hardReload();
+            }
+          } catch { /* server still restarting */ }
+        }, 3_000);
+        return;
+      }
+    } catch { /* fall through to simple reload */ }
     toast.loading('Reloading…');
     setTimeout(hardReload, 400);
   }, []);

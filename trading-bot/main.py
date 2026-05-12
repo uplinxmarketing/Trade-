@@ -2,16 +2,16 @@
 Trading bot entry point.
 
 Startup order:
-  1. chdir to this file's directory (works regardless of Railway's CWD)
+  1. chdir to this file's directory
   2. Init DB (before any import that touches SQLite)
   3. start_control_api() — blocks on uvicorn; all bot logic launches via
-     FastAPI lifespan once the HTTP server is ready and Railway can reach it
+     FastAPI lifespan once the HTTP server is ready
 """
 
 import os
 import sys
 
-# Ensure CWD is trading-bot/ regardless of where Railway launched the process
+# Ensure CWD is trading-bot/ regardless of launch location
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -41,8 +41,7 @@ def main():
     database.init_db()
 
     # start_control_api() binds uvicorn on the main thread (blocking).
-    # All remaining bot initialisation runs inside the FastAPI lifespan
-    # so Railway's health-check passes before any slow startup work begins.
+    # All remaining bot initialisation runs inside the FastAPI lifespan.
     import control_api
     control_api.start_control_api()
 
