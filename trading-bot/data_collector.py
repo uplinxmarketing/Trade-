@@ -297,11 +297,17 @@ async def start_websocket():
             print(f"[DataCollector] WebSocket disconnected: {e}")
             print(f"[DataCollector] Reconnecting in {backoff}s…")
 
-            # Fill gap: re-fetch last 10 candles via REST for active coins only
-            try:
+            # Fill gap: re-fetch last 10 candles via REST for active coins only.
+            # Run in a thread so the blocking urlopen never freezes the event loop.
+            def _gap_fill():
                 for coin in active_coins:
-                    raw = _fetch_klines_rest(coin, config.CANDLE_TIMEFRAME, limit=10)
-                    _compute_and_save(coin, raw, save_all=True)
+                    try:
+                        raw = _fetch_klines_rest(coin, config.CANDLE_TIMEFRAME, limit=10)
+                        _compute_and_save(coin, raw, save_all=True)
+                    except Exception:
+                        pass
+            try:
+                await asyncio.to_thread(_gap_fill)
             except Exception:
                 pass
 
