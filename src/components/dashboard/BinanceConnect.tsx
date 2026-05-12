@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Key, Eye, EyeOff, CheckCircle2, XCircle, Loader2, X, Wifi, FlaskConical, AlertTriangle } from 'lucide-react';
+import { Key, Eye, EyeOff, CheckCircle2, XCircle, Loader2, X, Wifi, FlaskConical, AlertTriangle, RefreshCw, Edit2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { toast } from 'sonner';
@@ -20,6 +20,8 @@ interface BotStatus {
   live_error?: string;
 }
 
+const MIN_TRADE_USDT = 10; // Binance minimum notional
+
 const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectProps) => {
   const [apiKey, setApiKey]       = useState('');
   const [apiSecret, setApiSecret] = useState('');
@@ -28,6 +30,7 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
   const [checking, setChecking]   = useState(false);
   const [botStatus, setBotStatus] = useState<BotStatus | null>(null);
   const [restartPoll, setRestartPoll] = useState<ReturnType<typeof setInterval> | null>(null);
+  const [showUpdateKeys, setShowUpdateKeys] = useState(false);
 
   const checkStatus = useCallback(async () => {
     setChecking(true);
@@ -42,7 +45,7 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
         live_error:   d.live_error ?? undefined,
       };
       setBotStatus(status);
-      onConnectionChange(status.mode === 'live');
+      onConnectionChange(status.mode === 'live' && !status.live_error);
     } catch {
       setBotStatus(null);
       onConnectionChange(false);
@@ -70,7 +73,7 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
             balance_usdt: Number(d.balance_usdt ?? 0),
             live_error:   d.live_error ?? undefined,
           };
-          // Live connection failed — bot fell back to paper, show error immediately
+          // Live connection failed — bot fell back to paper
           if (targetMode === 'live' && d.live_error) {
             clearInterval(id);
             setRestartPoll(null);
@@ -84,13 +87,21 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
             setRestartPoll(null);
             setBotStatus(status);
             onConnectionChange(targetMode === 'live');
-            toast.success(targetMode === 'live'
-              ? `Connected to Binance Live — $${status.balance_usdt.toFixed(2)} USDT`
-              : 'Switched to Paper mode');
+            setShowUpdateKeys(false);
+            if (targetMode === 'live') {
+              const bal = Number(d.balance_usdt ?? 0);
+              if (bal < MIN_TRADE_USDT) {
+                toast.warning(`Connected — but only $${bal.toFixed(2)} USDT available. Binance requires ≥$${MIN_TRADE_USDT} per trade.`);
+              } else {
+                toast.success(`Connected to Binance Live — $${bal.toFixed(2)} USDT`);
+              }
+            } else {
+              toast.success('Switched to Paper mode');
+            }
             return;
           }
         }
-      } catch { /* still restarting — retry */ }
+      } catch { /* still restarting */ }
       if (attempts >= 30) {
         clearInterval(id);
         setRestartPoll(null);
@@ -151,6 +162,7 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
 
   const isRestarting = restartPoll !== null;
   const isLive       = botStatus?.mode === 'live';
+  const lowBalance   = isLive && (botStatus?.balance_usdt ?? 0) < MIN_TRADE_USDT && (botStatus?.balance_usdt ?? 0) > 0;
 
   if (!isOpen) return null;
 
@@ -205,8 +217,8 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
             </span>
           )}
           {!isRestarting && botStatus && (
-            <button onClick={checkStatus} className="ml-auto text-[10px] text-muted-foreground hover:text-foreground">
-              {checking ? '' : 'Refresh'}
+            <button onClick={checkStatus} className="ml-auto text-[10px] text-muted-foreground hover:text-foreground flex items-center gap-1">
+              {checking ? '' : <><RefreshCw className="w-2.5 h-2.5" />Refresh</>}
             </button>
           )}
         </div>
@@ -217,19 +229,35 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
           </p>
         )}
 
-        {!isRestarting && botStatus?.live_error && (
-          <div className="flex items-start gap-2 p-3 rounded bg-loss/10 border border-loss/30 text-xs mb-2">
-            <XCircle className="w-4 h-4 text-loss mt-0.5 shrink-0" />
+        {/* Low balance warning */}
+        {!isRestarting && lowBalance && (
+          <div className="flex items-start gap-2 p-3 rounded bg-warn/10 border border-warn/30 text-xs mb-3">
+            <AlertTriangle className="w-4 h-4 text-warn mt-0.5 shrink-0" />
             <div>
-              <div className="font-semibold text-loss">Binance connection failed</div>
-              <div className="text-muted-foreground mt-0.5">{botStatus.live_error}</div>
-              <div className="text-muted-foreground mt-1">Check your API key, secret, and IP whitelist (187.77.88.189), then try again.</div>
+              <div className="font-semibold text-warn">Insufficient balance for trading</div>
+              <div className="text-muted-foreground mt-0.5">
+                Your Binance account has ${botStatus!.balance_usdt.toFixed(2)} USDT.
+                Binance requires a minimum of ${MIN_TRADE_USDT} USDT per trade (minimum notional value).
+                Deposit more USDT to start trading.
+              </div>
             </div>
           </div>
         )}
 
-        {/* Live mode: option to switch back to paper */}
-        {!isRestarting && isLive && (
+        {/* Live connection error */}
+        {!isRestarting && botStatus?.live_error && (
+          <div className="flex items-start gap-2 p-3 rounded bg-loss/10 border border-loss/30 text-xs mb-3">
+            <XCircle className="w-4 h-4 text-loss mt-0.5 shrink-0" />
+            <div>
+              <div className="font-semibold text-loss">Binance connection failed</div>
+              <div className="text-muted-foreground mt-0.5">{botStatus.live_error}</div>
+              <div className="text-muted-foreground mt-1">Check your API key, secret, and IP whitelist, then try again.</div>
+            </div>
+          </div>
+        )}
+
+        {/* Live mode: connected state */}
+        {!isRestarting && isLive && !showUpdateKeys && (
           <div className="space-y-3">
             <div className="flex items-start gap-2 p-3 rounded bg-gain/5 border border-gain/20 text-xs">
               <CheckCircle2 className="w-4 h-4 text-gain mt-0.5 shrink-0" />
@@ -241,30 +269,50 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
                 </div>
               </div>
             </div>
-            <Button
-              variant="outline"
-              className="w-full text-loss border-loss/30 hover:bg-loss/10"
-              onClick={switchToPaper}
-              disabled={saving}
-            >
-              {saving ? <Loader2 className="w-4 h-4 animate-spin mr-1.5" /> : null}
-              Switch back to Paper mode
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                className="flex-1 text-xs"
+                onClick={() => setShowUpdateKeys(true)}
+              >
+                <Edit2 className="w-3.5 h-3.5 mr-1.5" />
+                Update API Keys
+              </Button>
+              <Button
+                variant="outline"
+                className="flex-1 text-loss border-loss/30 hover:bg-loss/10 text-xs"
+                onClick={switchToPaper}
+                disabled={saving}
+              >
+                {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5" /> : null}
+                Switch to Paper
+              </Button>
+            </div>
           </div>
         )}
 
-        {/* Paper/unknown mode: show API key form */}
-        {!isRestarting && !isLive && (
+        {/* API key form — shown in paper mode, or when updating keys in live mode */}
+        {!isRestarting && (!isLive || showUpdateKeys) && (
           <div className="space-y-3">
-            <div className="flex items-start gap-2 p-3 rounded bg-warn/5 border border-warn/20 text-xs mb-1">
-              <AlertTriangle className="w-4 h-4 text-warn mt-0.5 shrink-0" />
-              <div>
-                <div className="font-semibold text-foreground">Live trading uses real money</div>
-                <div className="text-muted-foreground mt-0.5">
-                  Enable Spot Trading on your Binance API key. Do NOT enable Withdrawals or Margin.
+            {showUpdateKeys && (
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-foreground">Update API Keys</span>
+                <button onClick={() => setShowUpdateKeys(false)} className="text-[10px] text-muted-foreground hover:text-foreground">Cancel</button>
+              </div>
+            )}
+
+            {!showUpdateKeys && (
+              <div className="flex items-start gap-2 p-3 rounded bg-warn/5 border border-warn/20 text-xs mb-1">
+                <AlertTriangle className="w-4 h-4 text-warn mt-0.5 shrink-0" />
+                <div>
+                  <div className="font-semibold text-foreground">Live trading uses real money</div>
+                  <div className="text-muted-foreground mt-0.5">
+                    Enable Spot Trading on your Binance API key. Do NOT enable Withdrawals or Margin.
+                    Minimum ${MIN_TRADE_USDT} USDT balance required to trade.
+                  </div>
                 </div>
               </div>
-            </div>
+            )}
 
             <div>
               <label className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1 block">API Key</label>
@@ -310,7 +358,7 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
                 className="flex-1 font-semibold"
               >
                 {saving ? <Loader2 className="w-4 h-4 animate-spin mr-1.5" /> : <Wifi className="w-4 h-4 mr-1.5" />}
-                Connect to Binance Live
+                {showUpdateKeys ? 'Save New Keys' : 'Connect to Binance Live'}
               </Button>
               <Button variant="outline" onClick={checkStatus} disabled={checking}>
                 {checking ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Test'}

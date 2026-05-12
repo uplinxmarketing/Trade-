@@ -976,7 +976,8 @@ class ModeRequest(BaseModel):
 
 
 def _update_env_file(updates: dict):
-    env_path = ".env"
+    import pathlib
+    env_path = pathlib.Path(__file__).parent / ".env"
     lines: list[str] = []
     if os.path.exists(env_path):
         with open(env_path) as f:
