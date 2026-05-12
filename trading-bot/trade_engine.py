@@ -867,7 +867,15 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         database.log_trade(trade_record)
         try:
             import supabase_sync
-            usdt_now = _get_usdt_balance()
+            # Paper mode: read balance from memory (instant, no network call).
+            # Live mode: skip the get_account() REST call — Supabase sync gets
+            # an estimate from net_profit instead, avoiding a 10s blocking call
+            # on the sell worker thread.
+            if get_mode() != "live" and hasattr(client, "_balances"):
+                with client._lock:
+                    usdt_now = float(client._balances.get("USDT", 0.0))
+            else:
+                usdt_now = _get_usdt_balance()
             supabase_sync.sync_sell_result_sync(trade_record, sym, usdt_now)
         except Exception as se:
             err_msg = f"Supabase sync error after selling {sym}: {se}"
@@ -1450,7 +1458,7 @@ def _sell_monitor_loop():
                     _selling_ts.pop(s, None)
                 try:
                     database.log_activity(
-                        f"Sell monitor: force-cleared stuck guard for {s} (>90 s)", "warn"
+                        f"Sell monitor: force-cleared stuck guard for {s} (>20 s)", "warn"
                     )
                 except Exception:
                     pass
