@@ -1547,12 +1547,13 @@ async def signal_scanner(prices: dict):
 
 
 _KLINE_BASES = [
-    # Binance public CDN — served via Cloudflare, often accessible when api.binance.com is blocked
-    "https://data-api.binance.vision",
+    # Direct Binance API first — most accurate, real-time prices (no CDN delay)
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com",
+    # CDN fallback — may serve slightly stale data but works when API is geo-blocked
+    "https://data-api.binance.vision",
     "https://api4.binance.com",
 ]
 

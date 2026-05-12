@@ -201,15 +201,11 @@ def _get_positions():
         out = []
         for p in pos:
             sym    = p["symbol"]
-            # Price priority chain — fall through to the next source whenever
-            # the previous one is missing or 0:
-            #   1. _rest_px  (REST refresh every 2 s — usually freshest)
-            #   2. WebSocket prices dict (sub-second updates when subscribed)
+            # Price priority chain — WebSocket first (sub-second), REST fallback (2 s)
+            #   1. WebSocket prices dict (sub-second, most accurate for live mode)
+            #   2. _rest_px  (REST refresh every 2 s — good fallback)
             #   3. Latest cached signal price (60 s old at worst)
-            #   4. The position's entry price (so display never shows 0)
-            # Without 3 and 4 the frontend was rendering Now == Entry every
-            # time a single source briefly missed the symbol.
-            price  = _rest_px.get(sym) or prices.get(sym, 0)
+            price  = prices.get(sym, 0) or _rest_px.get(sym, 0)
             if not price:
                 with _signal_cache_lock:
                     sc_entry = _signal_cache.get(sym)
