@@ -200,6 +200,17 @@ def init_db():
             "ALTER TABLE positions         ADD COLUMN buy_fee_usdt REAL",
             "ALTER TABLE futures_trades    ADD COLUMN buy_fee  REAL DEFAULT 0.0",
             "ALTER TABLE futures_trades    ADD COLUMN sell_fee REAL DEFAULT 0.0",
+            # trades table — columns added after initial schema
+            "ALTER TABLE trades ADD COLUMN entry_rsi          REAL",
+            "ALTER TABLE trades ADD COLUMN entry_ma_position  TEXT",
+            "ALTER TABLE trades ADD COLUMN entry_bb_position  TEXT",
+            "ALTER TABLE trades ADD COLUMN entry_volume_trend TEXT",
+            "ALTER TABLE trades ADD COLUMN hour_of_day        INTEGER",
+            "ALTER TABLE trades ADD COLUMN day_of_week        INTEGER",
+            "ALTER TABLE trades ADD COLUMN buy_fee            REAL",
+            "ALTER TABLE trades ADD COLUMN sell_fee           REAL",
+            "ALTER TABLE trades ADD COLUMN duration_seconds   INTEGER",
+            "ALTER TABLE trades ADD COLUMN profitable         INTEGER",
         ]
         for sql in migrations:
             try:
@@ -349,13 +360,15 @@ def save_position(pos: dict) -> Optional[int]:
         conn.execute("""
             INSERT INTO positions
                 (symbol, entry_price, exit_target, quantity, budget_usdt, timestamp, mode,
-                 entry_rsi, entry_ma_position, entry_bb_position, entry_volume_trend)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 entry_rsi, entry_ma_position, entry_bb_position, entry_volume_trend,
+                 buy_fee_usdt)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             pos["symbol"], pos["entry_price"], pos.get("exit_target"),
             pos["quantity"], pos["budget_usdt"], pos["timestamp"], pos.get("mode", "paper"),
             pos.get("entry_rsi"), pos.get("entry_ma_position"),
             pos.get("entry_bb_position"), pos.get("entry_volume_trend"),
+            pos.get("buy_fee_usdt"),
         ))
         conn.commit()
         row = conn.execute("SELECT last_insert_rowid() AS id").fetchone()
