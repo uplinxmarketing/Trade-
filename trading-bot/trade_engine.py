@@ -102,6 +102,12 @@ _selling: set = set()
 _selling_lock = threading.Lock()
 _selling_ts: Dict[str, float] = {}   # when each sym was added — for watchdog
 
+# ── Bad-symbol blacklist — populated when Binance returns -1013 (market closed)
+# Prevents repeated buy attempts and rate-limits sell retries on closed markets.
+_bad_symbols: set = set()
+_sell_last_failed_ts: Dict[str, float] = {}  # last sell failure time per symbol
+_SELL_RETRY_COOLDOWN = 30.0  # seconds to wait before retrying a failed sell
+
 # ── Sell executor — parallel sells so 10 simultaneous exits never queue up ───
 # Each position gets its own worker thread; _selling guard prevents duplicates.
 _sell_executor = ThreadPoolExecutor(max_workers=12, thread_name_prefix="sell-worker")
@@ -680,9 +686,22 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         else:
             result = client.order_market_sell(symbol=sym, quantity=qty)
     except Exception as e:
+        err_str = str(e)
         msg = f"SELL failed {sym} ({reason}): {e}"
         print(f"[TradeEngine] {msg}")
         database.log_activity(msg, "error")
+        _sell_last_failed_ts[sym] = time.time()
+        if "-1013" in err_str or "Market is closed" in err_str:
+            _bad_symbols.add(sym)
+            database.log_activity(
+                f"{sym}: blacklisted — market closed/delisted; position will be force-closed", "warn"
+            )
+            # Force-remove the position so we stop retrying a delisted coin.
+            with _positions_lock:
+                before = len(_positions)
+                _positions[:] = [p for p in _positions if p.get("symbol") != sym]
+                if len(_positions) < before:
+                    database.log_activity(f"{sym}: position force-closed (market closed)", "warn")
         return
 
     # ── Fee-aware fill parsing ─────────────────────────────────────────────────
@@ -978,11 +997,19 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             database.log_activity(f"{sym}: buy skipped — {reason}", "info")
             continue
 
+        if sym in _bad_symbols:
+            database.log_activity(f"{sym}: buy skipped — market closed/delisted (blacklisted this session)", "warn")
+            continue
+
         try:
             result = client.order_market_buy(symbol=sym, quoteOrderQty=budget)
         except Exception as e:
+            err_str = str(e)
             print(f"[RealtimeBuy] BUY failed {sym}: {e}")
             database.log_activity(f"{sym}: BUY failed — {e}", "error")
+            if "-1013" in err_str or "Market is closed" in err_str:
+                _bad_symbols.add(sym)
+                database.log_activity(f"{sym}: blacklisted — market closed/delisted on Binance", "warn")
             continue
 
         buy_fills  = result.get("fills", [])
@@ -1104,6 +1131,10 @@ def realtime_monitor(prices: Dict[str, float]):
     for sym, price in prices.items():
         pos = pos_index.get(sym)
         if pos is None or price <= 0:
+            continue
+        # Rate-limit retries for positions whose last sell attempt failed recently.
+        last_fail = _sell_last_failed_ts.get(sym, 0)
+        if last_fail and (now - last_fail) < _SELL_RETRY_COOLDOWN:
             continue
         entry  = pos["entry_price"]
         # Use configurable take-profit multiplier (refreshed from strategy.json every buy cycle).
@@ -1379,6 +1410,7 @@ def _sell_monitor_loop():
                     msg += f" | WARN: no price for {no_price_syms}"
                 database.log_activity(msg, "info")
 
+            now_monitor = time.time()
             for pos in snap:
                 sym   = pos["symbol"]
                 price = prices.get(sym, 0.0)
@@ -1387,6 +1419,10 @@ def _sell_monitor_loop():
                 with _selling_lock:
                     if sym in _selling:
                         continue
+                # Rate-limit retries for positions whose last sell attempt failed recently.
+                last_fail = _sell_last_failed_ts.get(sym, 0)
+                if last_fail and (now_monitor - last_fail) < _SELL_RETRY_COOLDOWN:
+                    continue
                 entry  = pos["entry_price"]
                 target = entry * _take_profit_mult
                 stop   = entry * _stop_loss_mult
