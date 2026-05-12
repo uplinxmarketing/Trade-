@@ -45,7 +45,9 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
         live_error:   d.live_error ?? undefined,
       };
       setBotStatus(status);
-      onConnectionChange(status.mode === 'live' && !status.live_error);
+      // Connected = mode is live, regardless of live_error (error shown as banner separately).
+      // A transient Binance connection failure must not flip the whole UI back to paper.
+      onConnectionChange(status.mode === 'live');
     } catch {
       setBotStatus(null);
       onConnectionChange(false);
@@ -73,20 +75,16 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
             balance_usdt: Number(d.balance_usdt ?? 0),
             live_error:   d.live_error ?? undefined,
           };
-          // Live connection failed — bot fell back to paper
+          // Show live_error as banner but keep connected=true — transient failures
+          // must not flip the UI back to paper mode.
           if (targetMode === 'live' && d.live_error) {
-            clearInterval(id);
-            setRestartPoll(null);
-            setBotStatus(status);
-            onConnectionChange(false);
-            toast.error('Binance connection failed', { description: d.live_error });
-            return;
+            toast.error('Binance connection error', { description: d.live_error });
           }
           if (d.mode === targetMode) {
             clearInterval(id);
             setRestartPoll(null);
             setBotStatus(status);
-            onConnectionChange(targetMode === 'live');
+            onConnectionChange(d.mode === 'live');
             setShowUpdateKeys(false);
             if (targetMode === 'live') {
               const bal = Number(d.balance_usdt ?? 0);
