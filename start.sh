@@ -87,8 +87,8 @@ REQ_TIME=$(date -r trading-bot/requirements.txt +%s 2>/dev/null || echo "0")
 PY_STORED=$(cat "$PY_MARKER" 2>/dev/null || echo "")
 if [ "$REQ_TIME" != "$PY_STORED" ]; then
   log "Installing Python dependencies..."
-  $PYTHON -m pip install -r trading-bot/requirements.txt --quiet --break-system-packages 2>/dev/null \
-    || $PYTHON -m pip install -r trading-bot/requirements.txt --break-system-packages \
+  $PYTHON -m pip install -r trading-bot/requirements.txt --quiet --break-system-packages --ignore-installed 2>/dev/null \
+    || $PYTHON -m pip install -r trading-bot/requirements.txt --break-system-packages --ignore-installed \
     || bail "pip install failed"
   echo "$REQ_TIME" > "$PY_MARKER"
   log "Python dependencies OK"
