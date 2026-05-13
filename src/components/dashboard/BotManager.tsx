@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo, memo } from 'react';
 import { Plus, Trash2, Play, Pause, Square, Settings2, DollarSign, Coins, Shield, AlertTriangle, Bot, Search, ChevronUp } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -39,18 +39,23 @@ interface BotManagerProps {
 }
 
 // Sub-component for coin selection with search
-const BotCoinSelector = ({ selectedCoins, onToggle }: { selectedCoins: string[]; onToggle: (coin: string) => void }) => {
+const BotCoinSelector = memo(({ selectedCoins, onToggle }: { selectedCoins: string[]; onToggle: (coin: string) => void }) => {
   const [coinSearch, setCoinSearch] = useState('');
   const [showAll, setShowAll] = useState(false);
 
-  const filtered = coinSearch.trim()
+  const filtered = useMemo(() => coinSearch.trim()
     ? BINANCE_COINS.filter(c => c.toUpperCase().includes(coinSearch.toUpperCase()))
-    : BINANCE_COINS;
-  const displayCoins = showAll ? filtered : filtered.slice(0, 15);
+    : BINANCE_COINS, [coinSearch]);
+
+  const displayCoins = useMemo(() => showAll ? filtered : filtered.slice(0, 15), [filtered, showAll]);
 
   const handleToggle = (coin: string) => {
     onToggle(coin);
-    setCoinSearch(''); // clear search after selecting
+    // Don't close the dropdown — let user keep selecting.
+    // Only clear search if there was an active search query.
+    if (coinSearch.trim()) {
+      setCoinSearch('');
+    }
   };
 
   return (
@@ -121,7 +126,13 @@ const BotCoinSelector = ({ selectedCoins, onToggle }: { selectedCoins: string[];
       )}
     </div>
   );
-};
+}, (prev, next) => {
+  if (prev.selectedCoins.length !== next.selectedCoins.length) return false;
+  for (let i = 0; i < prev.selectedCoins.length; i++) {
+    if (prev.selectedCoins[i] !== next.selectedCoins[i]) return false;
+  }
+  return true;
+});
 
 const BotManager = ({ onKillSwitch, killSwitchActive }: BotManagerProps) => {
   const [bots, setBots] = useState<TradingBot[]>([]);
