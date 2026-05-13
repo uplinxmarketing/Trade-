@@ -21,11 +21,17 @@ echo "  ║      TradeBot AI v5.12.37    ║"
 echo "  ╚══════════════════════════════╝"
 echo ""
 
-# ── Auto-update from GitHub ──────────────────────────────────────────────────
+# ── Auto-update from GitHub (re-exec so new script takes effect) ───────────
 if command -v git &>/dev/null && [ -d ".git" ]; then
+  BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "none")
   log "Pulling latest code from GitHub..."
   if git fetch origin main 2>&1 && git reset --hard origin/main 2>&1; then
-    log "Code updated to latest."
+    AFTER=$(git rev-parse HEAD 2>/dev/null || echo "none")
+    if [ "$BEFORE" != "$AFTER" ]; then
+      log "New code pulled — restarting script to apply changes..."
+      exec bash "$0" --already-updated
+    fi
+    log "Already up to date."
   else
     log "Git update failed (offline?) — continuing with local version."
   fi
@@ -43,7 +49,8 @@ PKG_TIME=$(date -r package.json +%s 2>/dev/null || echo "0")
 STORED=$(cat "$MARKER" 2>/dev/null || echo "")
 if [ ! -d "node_modules" ] || [ "$PKG_TIME" != "$STORED" ]; then
   log "Installing JS dependencies..."
-  npm ci --prefer-offline 2>/dev/null || npm install || bail "npm install failed"
+  # Ignore engine warnings — Node 18 works fine despite some packages requesting 20+
+  npm install --engine-strict=false 2>/dev/null || npm install || bail "npm install failed"
   echo "$PKG_TIME" > "$MARKER"
   log "JS dependencies OK"
 fi
