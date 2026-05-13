@@ -127,7 +127,7 @@ _tick_signal_ts: Dict[str, float] = {}
 _TICK_REFRESH_SEC = 30.0  # recompute at most every 30 s per coin from price ticks
 
 
-# ── Balance guard + budget helpers ──────────────────────────────────────────────
+# ── Balance guard + budget helpers ───────────────────────────────────────────
 
 def can_execute_buy(coin_cfg: dict, client) -> tuple[bool, str]:
     """
@@ -235,7 +235,7 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
     return round(min(base, effective_free * 0.9), 2)
 
 
-# ── Cooldown helpers ───────────────────────────────────────────────────────
+# ── Cooldown helpers ──────────────────────────────────────────────────────────
 
 def _refresh_risk_params():
     """Read stop_loss_enabled/pct, take_profit_pct and new exit flags from strategy.json."""
@@ -265,7 +265,7 @@ def _in_cooldown(symbol: str) -> bool:
     return time.time() < exp
 
 
-# ── DB / startup helpers ─────────────────────────────────────────────────────
+# ── DB / startup helpers ──────────────────────────────────────────────────────
 
 def _rebuild_pos_index():
     """Rebuild O(1) symbol→position lookup. Call whenever _positions changes."""
@@ -368,7 +368,7 @@ def load_positions_from_db():
                 "Startup: no positions in local DB or Supabase — fresh wallet", "info"
             )
 
-        # ── Trade history: restore when SQLite trades table is empty ──────────────────
+        # ── Trade history: restore when SQLite trades table is empty ────────────
         # Rebuilds win-rate, P&L stats and trade list from bot_trade_history.
         try:
             if not database.get_recent_trades(limit=1) and restored.get("trades"):
@@ -391,7 +391,7 @@ def load_positions_from_db():
         except Exception as te:
             print(f"[TradeEngine] Trade history restore failed (non-fatal): {te}")
 
-        # ── Balance: restore when SQLite paper-state is empty or zero ────────────
+        # ── Balance: restore when SQLite paper-state is empty or zero ──────────
         if restored.get("usdt_balance") is not None:
             usdt = restored["usdt_balance"]
             if hasattr(client, "_balances"):
@@ -548,7 +548,7 @@ def get_open_positions() -> List[dict]:
         return list(_positions)
 
 
-# ── Strategy loader ─────────────────────────────────────────────────────────────
+# ── Strategy loader ───────────────────────────────────────────────────────────
 
 def _load_strategy() -> dict:
     global _strategy_mtime, _strategy_cache
@@ -566,7 +566,7 @@ def _load_strategy() -> dict:
     return _strategy_cache
 
 
-# ── Account helpers ─────────────────────────────────────────────────────────────
+# ── Account helpers ───────────────────────────────────────────────────────────
 
 def _get_usdt_balance() -> float:
     try:
@@ -600,7 +600,7 @@ def _floor_qty(qty: float, decimals: int = 8) -> float:
     return math.floor(qty * factor) / factor
 
 
-# ── Indicator helpers (derive from candle dict) ────────────────────────────────
+# ── Indicator helpers (derive from candle dict) ───────────────────────────────
 
 def _derive_ma_pos(price: float, ma20: Optional[float]) -> Optional[str]:
     if ma20 is None or ma20 == 0:
@@ -632,7 +632,7 @@ def _derive_bb_pos(price: float, candle: dict) -> Optional[str]:
     return "mid_zone"
 
 
-# ── Signal evaluation — 6-signal dict ──────────────────────────────────────────────
+# ── Signal evaluation — 6-signal dict ────────────────────────────────────────
 
 def evaluate_signals(candles: list) -> dict:
     """
@@ -831,7 +831,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             _rebuild_pos_index()
         return
 
-    # ── Fee-aware fill parsing ────────────────────────────────────────────────────
+    # ── Fee-aware fill parsing ─────────────────────────────────────────────────
     # Market orders can split across multiple fills at different price levels.
     # Each fill has its own commission amount and asset.
     # Wrap in try/except so an unexpected Binance response format never causes
@@ -908,3 +908,443 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     # Supabase sync and learning run after so a slow network never delays cleanup.
     if pos.get("id"):
         try:
+            database.delete_position(pos["id"])
+        except Exception:
+            pass
+    with _positions_lock:
+        _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")
+                         and p.get("symbol") != sym]
+    _rebuild_pos_index()
+
+    try:
+        database.log_trade(trade_record)
+    except Exception as e:
+        database.log_activity(f"log_trade failed for {sym}: {e}", "warn")
+
+    profit_str = f"+{net_profit:.4f}" if net_profit >= 0 else f"{net_profit:.4f}"
+    msg = (
+        f"SOLD {sym} ({reason}) @ ${fill_price:.4f} | "
+        f"entry=${pos['entry_price']:.4f} | "
+        f"P&L={profit_str} USDT | "
+        f"buy_fee={buy_fee:.4f} sell_fee={sell_fee:.4f}"
+    )
+    print(f"[TradeEngine] {msg}")
+    database.log_activity(msg, "info")
+
+    # ── Post-sell: async Supabase sync + ML learning ──────────────────────────
+    try:
+        import supabase_sync
+        usdt = _get_usdt_balance()
+        open_positions = get_open_positions()
+        supabase_sync.sync_all(open_positions, usdt)
+    except Exception as e:
+        database.log_activity(f"Post-sell Supabase sync failed: {e}", "warn")
+
+    try:
+        learning.record_trade(trade_record)
+    except Exception as e:
+        database.log_activity(f"learning.record_trade failed: {e}", "warn")
+
+    if net_profit < 0:
+        _set_cooldown(sym)
+
+
+# ── REST price cache (for orphan recovery) ────────────────────────────────────
+_rest_px: Dict[str, float] = {}
+
+
+# ── Real-time monitor — called on every WebSocket price tick ─────────────────
+
+def realtime_monitor(prices: Dict[str, float]):
+    """
+    Called on every WebSocket trade tick (~100 ms cadence).
+
+    Two responsibilities:
+      1. Check all open positions for take-profit / stop-loss / smart-hold exits.
+      2. Check the signal cache for buy opportunities (rate-limited to SCAN_INTERVAL_SEC).
+
+    Exits are submitted to _sell_executor so they run in parallel without
+    blocking the WebSocket receive loop.
+    """
+    global _last_buy_check, _last_no_signal_log, _last_buy_scan_log, _last_at_capacity_log
+    _rest_px.update(prices)
+
+    _refresh_risk_params()
+
+    # ── 1. Exit checks ────────────────────────────────────────────────────────
+    with _positions_lock:
+        positions_snapshot = list(_positions)
+
+    now = time.time()
+
+    # ── Sell-guard watchdog: release stale locks (>30 s) ─────────────────────
+    # A sell worker that crashes without running its finally block would leave
+    # the symbol locked forever, preventing any future exits.
+    with _selling_lock:
+        stale = [s for s, ts in _selling_ts.items() if now - ts > 30]
+    for s in stale:
+        with _selling_lock:
+            _selling.discard(s)
+            _selling_ts.pop(s, None)
+        database.log_activity(
+            f"[SellGuard] Released stale sell lock for {s} (>30 s)", "warn"
+        )
+
+    for pos in positions_snapshot:
+        sym   = pos["symbol"]
+        price = prices.get(sym)
+        if price is None or price <= 0:
+            continue
+
+        entry  = pos["entry_price"]
+        target = pos.get("exit_target", entry * _take_profit_mult)
+
+        # Inline tick-driven signal refresh (rate-limited per coin)
+        last_refresh = _tick_signal_ts.get(sym, 0)
+        if now - last_refresh >= _TICK_REFRESH_SEC:
+            try:
+                from data_collector import get_recent_closes_volumes
+                closes_vols = get_recent_closes_volumes(sym, limit=50)
+                if closes_vols:
+                    cls, vols = zip(*closes_vols)
+                    update_coin_signals(sym, list(cls), list(vols))
+                    _tick_signal_ts[sym] = now
+            except Exception:
+                pass
+
+        # ── Smart-hold logic ──────────────────────────────────────────────────
+        if _smart_hold_enabled and price >= target:
+            # Update high-water mark
+            peak = _pos_peaks.get(sym, price)
+            if price > peak:
+                _pos_peaks[sym] = price
+                peak = price
+
+            # Check if signals are still bullish
+            with _signal_cache_lock:
+                cached = _signal_cache.get(sym, {})
+            score = cached.get("score", 0)
+            still_bullish = score >= config.MIN_SIGNALS_TO_BUY
+
+            if still_bullish:
+                # Hold — only exit when price drops _trailing_stop_pct% from peak
+                trail_trigger = peak * (1.0 - _trailing_stop_pct / 100.0)
+                if price <= trail_trigger:
+                    with _selling_lock:
+                        if sym not in _selling:
+                            _selling.add(sym)
+                            _selling_ts[sym] = now
+                    _sell_executor.submit(_execute_sell, pos, price, "smart-hold trail")
+                continue  # don't check normal TP while smart-hold is active
+            # Signals turned bearish — fall through to normal TP check
+
+        # ── Normal take-profit ────────────────────────────────────────────────
+        if price >= target:
+            # Rate-limit retries for take-profit sells
+            last_fail = _sell_last_failed_ts.get(sym, 0)
+            last_reason = _sell_last_failed_reason.get(sym, "")
+            if (last_reason == "take-profit"
+                    and now - last_fail < _SELL_RETRY_COOLDOWN_PROFIT):
+                continue
+            with _selling_lock:
+                if sym in _selling or sym in _bad_symbols:
+                    continue
+                _selling.add(sym)
+                _selling_ts[sym] = now
+            _sell_executor.submit(_execute_sell, pos, price, "take-profit")
+
+        # ── Stop-loss ─────────────────────────────────────────────────────────
+        elif _stop_loss_mult > 0 and price <= entry * _stop_loss_mult:
+            with _selling_lock:
+                if sym in _selling or sym in _bad_symbols:
+                    continue
+                _selling.add(sym)
+                _selling_ts[sym] = now
+            _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
+
+    # ── 2. Buy checks (rate-limited) ──────────────────────────────────────────
+    scan_interval = float(_load_strategy().get("scan_interval_sec", config.SCAN_INTERVAL_SEC))
+    if now - _last_buy_check < scan_interval:
+        return
+    _last_buy_check = now
+
+    _check_buys_from_cache(prices)
+
+
+def _check_buys_from_cache(prices: Dict[str, float]):
+    """
+    Called from realtime_monitor (rate-limited) and signal_scanner.
+    Reads the signal cache and executes buys for qualifying coins.
+    """
+    strategy = _load_strategy()
+    approved_coins = strategy.get("approved_coins", [])
+    if not approved_coins:
+        return
+
+    with _positions_lock:
+        n_open = len(_positions)
+
+    max_pos = int(strategy.get("max_open_positions", config.MAX_OPEN_POSITIONS))
+    if n_open >= max_pos:
+        now = time.time()
+        if now - _last_at_capacity_log >= 60:
+            _last_at_capacity_log = now
+            database.log_activity(
+                f"Buy scan skipped — at max capacity ({n_open}/{max_pos} positions open)", "info"
+            )
+        return
+
+    mode = get_mode()
+    try:
+        free_usdt = _get_usdt_balance()
+    except Exception:
+        free_usdt = 0.0
+
+    min_score = int(strategy.get("min_signals", config.MIN_SIGNALS_TO_BUY))
+
+    ready_coins = []
+    with _signal_cache_lock:
+        for coin_cfg in approved_coins:
+            if not coin_cfg.get("approved", False):
+                continue
+            sym = coin_cfg["symbol"]
+            cached = _signal_cache.get(sym)
+            if not cached:
+                continue
+            score  = cached.get("score", 0)
+            bb_ok  = cached.get("bb_ok",  True)
+            five_ok = cached.get("5m_ok", True)
+            if score >= min_score and bb_ok and five_ok:
+                ready_coins.append((sym, score, cached.get("price", 0), coin_cfg))
+
+    if not ready_coins:
+        now = time.time()
+        if now - _last_no_signal_log >= 60:
+            _last_no_signal_log = now
+        return
+
+    # Sort by score descending so highest-conviction coin buys first
+    ready_coins.sort(key=lambda x: x[1], reverse=True)
+
+    now = time.time()
+    if now - _last_buy_scan_log >= 30:
+        _last_buy_scan_log = now
+        syms = [s for s, *_ in ready_coins]
+        database.log_activity(
+            f"Buy scan: {len(ready_coins)} coin(s) ready — {syms}", "info"
+        )
+
+    for sym, score, cached_price, coin_cfg in ready_coins:
+        with _positions_lock:
+            if len(_positions) >= max_pos:
+                break
+
+        if _in_cooldown(sym) or sym in _bad_symbols:
+            continue
+
+        price = prices.get(sym) or cached_price
+        if not price or price <= 0:
+            continue
+
+        ok, reason = can_execute_buy(coin_cfg, client)
+        if not ok:
+            continue
+
+        budget = get_budget_for_coin(sym, free_usdt)
+        if budget <= 0:
+            continue
+
+        _execute_buy(sym, price, budget, coin_cfg, score, mode)
+
+
+def _execute_buy(sym: str, price: float, budget: float, coin_cfg: dict, score: int, mode: str):
+    """Place a market buy order and record the position."""
+    from datetime import timezone as _tz
+
+    qty = _floor_qty(budget / price)
+    if qty <= 0:
+        return
+
+    try:
+        if mode != "live":
+            result = client.order_market_buy(symbol=sym, quantity=qty, price=price)
+        else:
+            result = client.order_market_buy(symbol=sym, quantity=qty)
+    except Exception as e:
+        err_str = str(e)
+        msg = f"BUY failed {sym}: {e}"
+        print(f"[TradeEngine] {msg}")
+        database.log_activity(msg, "error")
+        if "-1013" in err_str or "Market is closed" in err_str:
+            _bad_symbols.add(sym)
+        return
+
+    try:
+        fills      = result.get("fills", [])
+        fill_price = float(fills[0].get("price", price)) if fills else price
+        raw_quote  = float(result.get("cummulativeQuoteQty") or budget)
+
+        if mode == "live":
+            buy_fee, fee_asset = _fills_fee_usdt(fills, raw_quote * _fee_rate)
+        else:
+            buy_fee   = sum(float(f.get("commission") or 0) for f in fills)
+            fee_asset = "paper"
+
+        qty_filled = float(result.get("executedQty") or qty)
+    except Exception as parse_err:
+        database.log_activity(
+            f"BUY {sym}: fill parse error ({parse_err}) — using estimates", "warn"
+        )
+        fill_price = price
+        raw_quote  = budget
+        buy_fee    = budget * _fee_rate
+        fee_asset  = "estimated"
+        qty_filled = qty
+
+    exit_target = round(fill_price * _take_profit_mult, 8)
+    now_ts      = datetime.now(_tz.utc).isoformat()
+
+    # Snapshot indicator context for later ML analysis
+    with _signal_cache_lock:
+        cached = _signal_cache.get(sym, {})
+    rsi_val    = cached.get("rsi_val")
+    last_candle = {}  # full candle not available here; REST scan populates BB/MA
+    ma_pos  = _derive_ma_pos(fill_price, last_candle.get("ma20"))
+    bb_pos  = _derive_bb_pos(fill_price, last_candle)
+    vol_trend = "high" if cached.get("signals", {}).get("volume") else "normal"
+
+    pos_record = {
+        "symbol":             sym,
+        "entry_price":        fill_price,
+        "exit_target":        exit_target,
+        "quantity":           qty_filled,
+        "budget_usdt":        raw_quote,
+        "buy_fee_usdt":       buy_fee,
+        "timestamp":          now_ts,
+        "mode":               mode,
+        "entry_rsi":          rsi_val,
+        "entry_ma_position":  ma_pos,
+        "entry_bb_position":  bb_pos,
+        "entry_volume_trend": vol_trend,
+    }
+
+    pos_id = database.save_position(pos_record)
+    pos_record["id"] = pos_id
+
+    with _positions_lock:
+        _positions.append(pos_record)
+    _rebuild_pos_index()
+
+    msg = (
+        f"BOUGHT {sym} @ ${fill_price:.4f} | qty={qty_filled:.6f} | "
+        f"budget={raw_quote:.2f} USDT | fee={buy_fee:.4f} ({fee_asset}) | "
+        f"target=${exit_target:.4f} | score={score}/6"
+    )
+    print(f"[TradeEngine] {msg}")
+    database.log_activity(msg, "info")
+
+    try:
+        import supabase_sync
+        usdt = _get_usdt_balance()
+        supabase_sync.sync_all(get_open_positions(), usdt)
+    except Exception as e:
+        database.log_activity(f"Post-buy Supabase sync failed: {e}", "warn")
+
+
+# ── Signal scanner (REST-driven, runs every SCAN_INTERVAL_SEC) ───────────────
+
+async def signal_scanner():
+    """
+    Async coroutine — runs every SCAN_INTERVAL_SEC.
+    Refreshes the signal cache from REST candle data and triggers buy checks.
+    Does NOT execute sells — that is handled exclusively by realtime_monitor.
+    """
+    while True:
+        strategy   = _load_strategy()
+        interval   = float(strategy.get("scan_interval_sec", config.SCAN_INTERVAL_SEC))
+        await asyncio.sleep(interval)
+        try:
+            await _run_signal_scan()
+        except Exception as e:
+            print(f"[TradeEngine] signal_scanner error: {e}")
+            database.log_activity(f"signal_scanner error: {e}", "error")
+
+
+async def _run_signal_scan():
+    """Refresh signal cache from REST for all approved coins, then check buys."""
+    from data_collector import get_candles, prices as live_prices
+
+    strategy      = _load_strategy()
+    approved_coins = strategy.get("approved_coins", [])
+    if not approved_coins:
+        return
+
+    loop    = asyncio.get_event_loop()
+    updated = 0
+    ready   = 0
+
+    min_score = int(strategy.get("min_signals", config.MIN_SIGNALS_TO_BUY))
+
+    for coin_cfg in approved_coins:
+        if not coin_cfg.get("approved", False):
+            continue
+        sym = coin_cfg["symbol"]
+        try:
+            candles = await loop.run_in_executor(None, get_candles, sym)
+            if not candles or len(candles) < 16:
+                continue
+
+            signals = evaluate_signals(candles)
+            score   = sum(signals.values())
+
+            last_candle = candles[-2]
+            rsi_list    = indicators.calc_rsi([c["close"] for c in candles], 14)
+            rsi_display = rsi_list[-2] if rsi_list[-2] is not None else 0.0
+
+            # Bollinger Band filter: price must be below upper band
+            bb_ok = True
+            if last_candle.get("bb_upper") and last_candle.get("close"):
+                bb_ok = last_candle["close"] < last_candle["bb_upper"]
+
+            # 5-minute confirmation: RSI on 5m chart must also be in buy range
+            five_ok = True
+            try:
+                candles_5m = await loop.run_in_executor(
+                    None, lambda: get_candles(sym, interval="5m", limit=50)
+                )
+                if candles_5m and len(candles_5m) >= 16:
+                    rsi_5m = indicators.calc_rsi(
+                        [c["close"] for c in candles_5m], 14
+                    )
+                    r5 = rsi_5m[-2]
+                    if r5 is not None:
+                        five_ok = config.RSI_BUY_MIN <= r5 <= config.RSI_BUY_MAX
+            except Exception:
+                pass
+
+            with _signal_cache_lock:
+                _signal_cache[sym] = {
+                    "signals": signals,
+                    "score":   score,
+                    "price":   last_candle["close"],
+                    "rsi_val": rsi_display,
+                    "bb_ok":   bb_ok,
+                    "5m_ok":   five_ok,
+                }
+            updated += 1
+            if score >= min_score and bb_ok and five_ok:
+                ready += 1
+
+        except Exception as e:
+            print(f"[TradeEngine] Signal scan error {sym}: {e}")
+
+    # Trigger buy check with current live prices
+    prices_snapshot = dict(live_prices)
+    if prices_snapshot:
+        _check_buys_from_cache(prices_snapshot)
+
+    database.log_activity(
+        f"Signal cache refreshed: {updated}/{len(approved_coins)} coins updated, "
+        f"{ready} at score≥{config.MIN_SIGNALS_TO_BUY}",
+        "info",
+    )
