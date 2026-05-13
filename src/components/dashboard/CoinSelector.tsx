@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, memo } from 'react';
 import { Check, X, Search } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { BINANCE_COINS, COIN_CATEGORIES } from '@/lib/binance-coins';
@@ -139,4 +139,15 @@ const CoinSelector = ({ selected, onChange, maxCoins = 10 }: CoinSelectorProps) 
   );
 };
 
-export default CoinSelector;
+export default memo(CoinSelector, (prev, next) => {
+  // Only re-render when selected coins or maxCoins actually change.
+  // Reference-identity change of onChange must NOT trigger re-render
+  // (parent passes a new function each render, which previously caused
+  // the dropdown to close and inputs to lose focus).
+  if (prev.maxCoins !== next.maxCoins) return false;
+  if (prev.selected.length !== next.selected.length) return false;
+  for (let i = 0; i < prev.selected.length; i++) {
+    if (prev.selected[i] !== next.selected[i]) return false;
+  }
+  return true;
+});

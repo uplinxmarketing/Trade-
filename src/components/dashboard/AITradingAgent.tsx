@@ -404,7 +404,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [setupMaxPositions, setSetupMaxPositions]   = useState(10);
   const [setupMinSignals, setSetupMinSignals]       = useState(4);
 
-  const isRunningRef   = useRef(false);
+  const isRunningRef     = useRef(false);
+  const coinsRestoredRef = useRef<boolean>(false);
   const balanceRef     = useRef(0);
   const timerRef       = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scanTimerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -574,14 +575,17 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     return () => clearInterval(tick);
   }, [isRunning, runCycle]);
 
-  // ── Sync selectedCoins to VPS bot so Python bot watches the right coins ──
+  // ── Sync selectedCoins to VPS bot — debounced so rapid clicks don't spam the API ──
   useEffect(() => {
     if (!isServerMode || selectedCoins.length === 0) return;
-    fetch(`${railwayUrl}/api/coins`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ coins: selectedCoins }),
-    }).catch(() => {});
+    const handle = setTimeout(() => {
+      fetch(`${railwayUrl}/api/coins`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ coins: selectedCoins }),
+      }).catch(() => {});
+    }, 800);
+    return () => clearTimeout(handle);
   }, [selectedCoins, railwayUrl]); // eslint-disable-line
 
   // ── VPS bot poller ─────────────────────────────────────────────────────────────────
@@ -668,8 +672,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (s.wins          !== undefined) setServerWins(Number(s.wins));
     if (s.total_trades  !== undefined) setServerTotalTrades(Number(s.total_trades));
 
-    // Restore coin selection from bot's watchlist (survives page refresh)
-    if (Array.isArray(s.watched_coins) && s.watched_coins.length > 0) {
+    // Restore coin selection from bot's watchlist ONLY ONCE on mount.
+    // After mount, the frontend is the source of truth for selectedCoins —
+    // server polls must not overwrite user selections in progress.
+    if (Array.isArray(s.watched_coins) && s.watched_coins.length > 0 && !coinsRestoredRef.current) {
+      coinsRestoredRef.current = true;
       onCoinsChange?.(s.watched_coins as string[]);
     }
 
