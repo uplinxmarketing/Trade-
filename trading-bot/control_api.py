@@ -1,1 +1,2 @@
-See /tmp/CONTROL_API.py
+#!/usr/bin/env python3
+# Content will be provided inline
