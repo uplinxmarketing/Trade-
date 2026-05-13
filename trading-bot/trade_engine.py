@@ -731,6 +731,7 @@ def update_coin_signals(symbol: str, closes: list, volumes: list):
                 "rsi_val":  rsi_display,
                 "bb_ok":    prev.get("bb_ok",  True),  # preserved from last REST scan
                 "5m_ok":    prev.get("5m_ok",  True),  # preserved from last REST scan
+                "ts":       time.time(),
             }
     except Exception as e:
         print(f"[TradeEngine] Signal cache error {symbol}: {e}")
