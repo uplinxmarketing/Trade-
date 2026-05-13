@@ -225,7 +225,11 @@ def _get_positions():
                     pass
             entry  = p.get("entry_price", 0)
             qty    = p.get("quantity", 0)
-            target = p.get("exit_target") or (entry / (0.999 ** 2) if entry else 0)
+            try:
+                from trade_engine import _take_profit_mult as _tpm
+            except Exception:
+                _tpm = 1.0 / (0.999 ** 2) * 1.0015
+            target = p.get("exit_target") or (entry * _tpm if entry else 0)
             pnl    = (price - entry) * qty if price and entry else 0
             dist   = ((price - target) / target * 100) if target and price else 0
             out.append({

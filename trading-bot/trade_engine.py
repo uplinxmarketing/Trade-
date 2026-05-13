@@ -76,7 +76,7 @@ def _fills_fee_usdt(fills: list, fallback_usdt: float) -> tuple:
                 # Price unavailable — fall back to estimate for entire order
                 return fallback_usdt, "estimated"
     return total, first_asset
-_breakeven_mult = 1.0 / (0.999 ** 2) * 1.0005  # 0.05% buffer above fees = guaranteed profit on every sell
+_breakeven_mult = 1.0 / (0.999 ** 2) * 1.0015  # 0.15% buffer for slippage on market orders
 
 # Configurable exit multipliers — refreshed from strategy.json every buy/sell cycle.
 # _take_profit_mult: price must reach entry * this to trigger a sell (>=_breakeven_mult).
@@ -729,8 +729,8 @@ def update_coin_signals(symbol: str, closes: list, volumes: list):
                 "score":    score,
                 "price":    closes[-1],
                 "rsi_val":  rsi_display,
-                "bb_ok":    prev.get("bb_ok",  True),  # preserved from last REST scan
-                "5m_ok":    prev.get("5m_ok",  True),  # preserved from last REST scan
+                "bb_ok":    prev.get("bb_ok",  False),  # preserved from last REST scan
+                "5m_ok":    prev.get("5m_ok",  False),  # preserved from last REST scan
                 "ts":       time.time(),
             }
     except Exception as e:
@@ -1274,6 +1274,17 @@ def _inline_refresh_from_ticks(sym: str, price: float):
             return
         closes[-1] = price
 
+    # Don't compute signals from fake volume — preserve existing signal entry
+    # and only update price + RSI. Volume signal stays from last REST scan.
+    import data_collector as _dc2
+    with _signal_cache_lock:
+        prev_entry = _signal_cache.get(sym)
+    if prev_entry:
+        with _signal_cache_lock:
+            if sym in _signal_cache:
+                _signal_cache[sym]["price"] = closes[-1]
+                _signal_cache[sym]["ts"] = time.time()
+        return
     vols = [1.0] * len(closes)
     update_coin_signals(sym, closes, vols)
 
@@ -1814,6 +1825,7 @@ async def _refresh_signal_cache():
             five_m_ok  = True  # don't block trades if 5m fetch fails
 
         with _signal_cache_lock:
+            prev = _signal_cache.get(sym, {})
             _signal_cache[sym] = {
                 "signals":  signals,
                 "score":    score,
@@ -1821,6 +1833,7 @@ async def _refresh_signal_cache():
                 "rsi_val":  rsi_display,
                 "bb_ok":    bb_ok,
                 "5m_ok":    five_m_ok,
+                "ts":       time.time(),
             }
         return True
 

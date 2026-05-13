@@ -1102,29 +1102,33 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           )}
           {isRunning && <span className="w-2 h-2 rounded-full bg-gain animate-pulse" />}
           <button onClick={async () => {
-              const opening = !showSettings;
-              setShowSettings(opening);
-              if (opening) {
+              const next = !showSettings;
+              setShowSettings(next);
+              if (next) {
                 try {
-                  const res = await fetch(`${railwayUrl}/api/settings`);
-                  if (res.ok) {
-                    const s = await res.json();
+                  const [s, c] = await Promise.all([
+                    fetch(`/api/settings`, { cache: 'no-store' }).then(r => r.json()),
+                    fetch(`/api/config`,   { cache: 'no-store' }).then(r => r.json()),
+                  ]);
+                  if (s?.ok) {
                     setSettingsDraft({
                       stopLossEnabled:   Boolean(s.stop_loss_enabled),
                       stopLossPct:       Number(s.stop_loss_pct ?? 2.0),
-                      takeProfitEnabled: Boolean(s.take_profit_enabled ?? true),
+                      takeProfitEnabled: Boolean(s.take_profit_enabled),
                       takeProfitPct:     Number(s.take_profit_pct ?? 0.1),
                       smartHoldEnabled:  Boolean(s.smart_hold_enabled),
                       trailingStopPct:   Number(s.trailing_stop_pct ?? 0.5),
                       reinvestProfits:   Boolean(s.reinvest_profits),
-                      maxPositions:      Number(s.max_positions ?? 10),
-                      minSignals:        Number(s.min_signals ?? 4),
+                      maxPositions:      Number(s.max_positions ?? 20),
+                      minSignals:        Number(s.min_signals ?? 3),
                     });
-                    if (s.budget_mode       !== undefined) setSetupBudgetMode(s.budget_mode as 'fixed'|'percent'|'capped');
-                    if (s.budget_fixed_usdt !== undefined) setSetupBudgetValue(Number(s.budget_fixed_usdt));
-                    if (s.bot_allocation_usdt !== undefined) setSetupAllocation(Number(s.bot_allocation_usdt));
                   }
-                } catch { /* use stale state */ }
+                  if (c) {
+                    if (c.budget_mode) setSetupBudgetMode(c.budget_mode as 'fixed'|'percent'|'capped');
+                    if (c.budget_fixed_usdt !== undefined) setSetupBudgetValue(Number(c.budget_fixed_usdt));
+                    if (c.bot_allocation_usdt !== undefined) setSetupAllocation(Number(c.bot_allocation_usdt));
+                  }
+                } catch { }
               }
             }}
             className={`p-1.5 rounded hover:bg-muted/40 transition-colors ${showSettings ? 'text-accent' : 'text-muted-foreground'}`}>
@@ -1530,9 +1534,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         {(isServerMode && railwaySignals.length > 0) ? (
           <div className="space-y-0">
             {/* Header row */}
-            <div className="grid pb-1 border-b border-border/60" style={{gridTemplateColumns:'3.5rem 1fr 1fr 1fr 1fr 1fr 1fr 2rem 3rem'}}>
+            <div className="grid pb-1 border-b border-border/60" style={{gridTemplateColumns:'4rem 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 2rem 3rem'}}>
               <span className="text-[8px] text-muted-foreground font-semibold">COIN</span>
-              {(['EMA','RSI','MACD','VOL','OBV','ATR'] as const).map(lbl => (
+              {(['EMA','RSI','MACD','VOL','OBV','ATR','BB','5m'] as const).map(lbl => (
                 <span key={lbl} className="text-[8px] text-muted-foreground text-center">{lbl}</span>
               ))}
               <span className="text-[8px] text-muted-foreground text-center">SCR</span>
@@ -1541,15 +1545,29 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             {railwaySignals.map((sig: any) => {
               const bools = [!!sig.trend, !!sig.rsi_ok, !!sig.macd, !!sig.volume, !!sig.obv, !!sig.atr];
               const score = typeof sig.score === 'number' ? sig.score : bools.filter(Boolean).length;
-              const isBuy  = score >= 4;
-              const isWeak = score === 3;
+              const bbBlock   = sig.bb_ok === false;
+              const fiveBlock = sig['5m_ok'] === false;
+              const isBuy      = score >= 4 && !bbBlock && !fiveBlock;
+              const isReady    = score >= 3 && !bbBlock && !fiveBlock;
+              const isVetoBb   = score >= 3 && bbBlock;
+              const isVetoFive = score >= 3 && !bbBlock && fiveBlock;
+              const isDowntrend = !sig.trend && score < 3;
+
+              let label: string;
+              let labelColor: string;
+              if (isBuy)        { label = 'BUY';     labelColor = 'bg-gain/20 text-gain'; }
+              else if (isReady) { label = 'READY';   labelColor = 'bg-gain/10 text-gain'; }
+              else if (isVetoBb)   { label = 'VETO·BB'; labelColor = 'bg-orange-500/20 text-orange-400'; }
+              else if (isVetoFive) { label = 'VETO·5m'; labelColor = 'bg-orange-500/20 text-orange-400'; }
+              else if (isDowntrend){ label = 'DOWN';    labelColor = 'bg-loss/20 text-loss'; }
+              else if (score === 2){ label = 'WAIT';    labelColor = 'bg-yellow-500/20 text-yellow-400'; }
+              else                 { label = 'HOLD';    labelColor = 'bg-muted/30 text-muted-foreground'; }
+
               return (
                 <div key={sig.symbol} className="grid items-center py-0.5 border-b border-border/20 last:border-0"
-                  style={{gridTemplateColumns:'3.5rem 1fr 1fr 1fr 1fr 1fr 1fr 2rem 3rem'}}>
+                  style={{gridTemplateColumns:'4rem 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 2rem 3rem'}}>
                   <div className="flex items-center gap-1 min-w-0">
-                    <span className={`text-[7px] font-bold px-0.5 rounded shrink-0 ${
-                      isBuy ? 'bg-gain/20 text-gain' : isWeak ? 'bg-yellow-500/20 text-yellow-400' : 'bg-muted/30 text-muted-foreground'
-                    }`}>{isBuy ? 'BUY' : isWeak ? 'WK' : 'HLD'}</span>
+                    <span className={`text-[7px] font-bold px-0.5 rounded shrink-0 ${labelColor}`}>{label}</span>
                     <span className="text-[9px] font-mono font-semibold truncate">{sig.symbol?.replace('USDT','')}</span>
                   </div>
                   {bools.map((v, i) => (
@@ -1557,6 +1575,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       <div className={`w-2 h-2 rounded-full ${v ? 'bg-gain' : 'bg-muted/40'}`} />
                     </div>
                   ))}
+                  <div className="flex justify-center" title="BB veto">
+                    <div className={`w-2 h-2 rounded-full ${sig.bb_ok !== false ? 'bg-gain' : 'bg-loss'}`} />
+                  </div>
+                  <div className="flex justify-center" title="5m trend veto">
+                    <div className={`w-2 h-2 rounded-full ${sig['5m_ok'] !== false ? 'bg-gain' : 'bg-loss'}`} />
+                  </div>
                   <span className={`text-[9px] font-bold text-center ${score >= 4 ? 'text-gain' : score === 3 ? 'text-yellow-400' : 'text-muted-foreground'}`}>
                     {score}/6
                   </span>
@@ -1568,7 +1592,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 </div>
               );
             })}
-            <p className="text-[7px] text-muted-foreground pt-1 leading-relaxed">EMA=9/21 · RSI=40–65 · MACD=hist↑ · VOL=&gt;avg · OBV=pressure · ATR=range OK</p>
+            <p className="text-[7px] text-muted-foreground pt-1 leading-relaxed">EMA=9/21 · RSI=45–65 · MACD=hist↑ · VOL=&gt;1.3× · OBV=pressure · ATR=range · BB=middle/lower · 5m=uptrend</p>
           </div>
         ) : (
           <div className="space-y-0.5">
