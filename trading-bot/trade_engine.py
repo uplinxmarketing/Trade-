@@ -1,1 +1,1 @@
-See content below — using python read
+"""\nTrade execution engine — unified real-time architecture.\n"""
