@@ -96,6 +96,13 @@ else
   log "Python dependencies up to date"
 fi
 
+# ── Kill any existing bot instance ─────────────────────────────────────────────
+if fuser "${PORT:-8000}/tcp" &>/dev/null 2>&1; then
+  log "Stopping existing bot on port ${PORT:-8000}..."
+  fuser -k "${PORT:-8000}/tcp" &>/dev/null 2>&1 || true
+  sleep 2
+fi
+
 # ── Start bot ─────────────────────────────────────────────────────────────────
 echo ""
 log "Starting TradeBot AI bot on port ${PORT:-8000}..."
