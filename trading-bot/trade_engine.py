@@ -241,7 +241,7 @@ def _refresh_risk_params():
     """Read stop_loss_enabled/pct, take_profit_pct and new exit flags from strategy.json."""
     global _take_profit_mult, _stop_loss_mult, _take_profit_enabled, _smart_hold_enabled, _trailing_stop_pct
     strategy = _load_strategy()
-    tp_pct = float(strategy.get("take_profit_pct", 0.0))   # e.g. 0.5 → 0.5%
+    tp_pct = float(strategy.get("take_profit_pct", 0.1))   # e.g. 0.5 → 0.5%
     sl_pct = float(strategy.get("stop_loss_pct",   2.0))   # e.g. 2.0 → 2.0%
     sl_on  = bool(strategy.get("stop_loss_enabled", True))
     _take_profit_enabled = bool(strategy.get("take_profit_enabled", True))
