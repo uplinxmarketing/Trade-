@@ -659,6 +659,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (s.max_positions       !== undefined) setMaxPositions(Number(s.max_positions));
     if (s.min_signals         !== undefined) setMinSignals(Number(s.min_signals));
     if (s.strategy_notes   !== undefined) { setInstructions(s.strategy_notes as string); localStorage.setItem(INSTRUCTIONS_KEY, s.strategy_notes as string); }
+    if (s.budget_mode        !== undefined) setSetupBudgetMode(s.budget_mode as 'fixed'|'percent'|'capped');
+    if (s.budget_fixed_usdt  !== undefined) setSetupBudgetValue(Number(s.budget_fixed_usdt));
+    if (s.bot_allocation_usdt !== undefined) setSetupAllocation(Number(s.bot_allocation_usdt));
     // Server-authoritative stats — use these instead of summing individual trade rows
     // to avoid double-counting with Supabase.
     if (s.realized_pnl  !== undefined) setServerRealizedPnl(Number(s.realized_pnl));
@@ -749,7 +752,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (!isServerMode) return;
     if (fastPollRef.current) clearInterval(fastPollRef.current);
     if (positions.length > 0) {
-      fastPollRef.current = setInterval(pollRailway, 1_000);
+      fastPollRef.current = setInterval(pollRailway, 500);
     } else {
       fastPollRef.current = null;
     }
@@ -1098,7 +1101,32 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             }`}>{dataPersistent ? 'PERSISTENT' : 'VOLATILE'}</span>
           )}
           {isRunning && <span className="w-2 h-2 rounded-full bg-gain animate-pulse" />}
-          <button onClick={() => setShowSettings(!showSettings)}
+          <button onClick={async () => {
+              const opening = !showSettings;
+              setShowSettings(opening);
+              if (opening) {
+                try {
+                  const res = await fetch(`${railwayUrl}/api/settings`);
+                  if (res.ok) {
+                    const s = await res.json();
+                    setSettingsDraft({
+                      stopLossEnabled:   Boolean(s.stop_loss_enabled),
+                      stopLossPct:       Number(s.stop_loss_pct ?? 2.0),
+                      takeProfitEnabled: Boolean(s.take_profit_enabled ?? true),
+                      takeProfitPct:     Number(s.take_profit_pct ?? 0.1),
+                      smartHoldEnabled:  Boolean(s.smart_hold_enabled),
+                      trailingStopPct:   Number(s.trailing_stop_pct ?? 0.5),
+                      reinvestProfits:   Boolean(s.reinvest_profits),
+                      maxPositions:      Number(s.max_positions ?? 10),
+                      minSignals:        Number(s.min_signals ?? 4),
+                    });
+                    if (s.budget_mode       !== undefined) setSetupBudgetMode(s.budget_mode as 'fixed'|'percent'|'capped');
+                    if (s.budget_fixed_usdt !== undefined) setSetupBudgetValue(Number(s.budget_fixed_usdt));
+                    if (s.bot_allocation_usdt !== undefined) setSetupAllocation(Number(s.bot_allocation_usdt));
+                  }
+                } catch { /* use stale state */ }
+              }
+            }}
             className={`p-1.5 rounded hover:bg-muted/40 transition-colors ${showSettings ? 'text-accent' : 'text-muted-foreground'}`}>
             <Settings2 className="w-4 h-4" />
           </button>

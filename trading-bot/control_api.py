@@ -266,6 +266,7 @@ def _get_signal_snapshot() -> list:
                 "volume":  bool(sig.get("volume")),
                 "obv":     bool(sig.get("obv")),
                 "atr":     bool(sig.get("atr")),
+                "ts":      entry.get("ts", 0),
             })
         return result
     except Exception:
@@ -1281,7 +1282,8 @@ def api_all():
     Reduces frontend from 4 concurrent fetches to 1, cutting Railway load 4x."""
     now_ts = time.time()
     cached = _API_ALL_CACHE.get("data")
-    if cached is not None and (now_ts - _API_ALL_CACHE["ts"]) < _API_ALL_TTL:
+    _ttl = 0.3 if _API_ALL_CACHE.get("has_positions") else 0.8
+    if cached is not None and (now_ts - _API_ALL_CACHE["ts"]) < _ttl:
         return cached
 
     strategy = _load_strategy()
@@ -1295,6 +1297,7 @@ def api_all():
     balance   = round(_get_usdt_display_balance(), 2)
     approved  = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
     positions = _get_positions()
+    _API_ALL_CACHE["has_positions"] = len(positions) > 0
     trades    = database.get_recent_trades(limit=200)   # for the trades list payload only
     payload = {
         "status": {
@@ -1326,6 +1329,9 @@ def api_all():
             "max_positions":      strategy.get("max_positions",       20),
             "min_signals":        strategy.get("min_signals",          config.MIN_SIGNALS_TO_BUY),
             "strategy_notes":     strategy.get("strategy_notes",      ""),
+            "budget_mode":        strategy.get("budget_mode",         config.BUDGET_MODE),
+            "budget_fixed_usdt":  strategy.get("budget_fixed_usdt",   config.BUDGET_FIXED_USDT),
+            "bot_allocation_usdt": strategy.get("bot_allocation_usdt", config.BOT_ALLOCATION_USDT),
         },
         "positions": positions,
         "trades":    _format_trades(trades[:200]),
