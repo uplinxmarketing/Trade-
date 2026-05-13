@@ -49,7 +49,6 @@ PKG_TIME=$(date -r package.json +%s 2>/dev/null || echo "0")
 STORED=$(cat "$MARKER" 2>/dev/null || echo "")
 if [ ! -d "node_modules" ] || [ "$PKG_TIME" != "$STORED" ]; then
   log "Installing JS dependencies..."
-  # Ignore engine warnings — Node 18 works fine despite some packages requesting 20+
   npm install --engine-strict=false 2>/dev/null || npm install || bail "npm install failed"
   echo "$PKG_TIME" > "$MARKER"
   log "JS dependencies OK"
@@ -88,7 +87,9 @@ REQ_TIME=$(date -r trading-bot/requirements.txt +%s 2>/dev/null || echo "0")
 PY_STORED=$(cat "$PY_MARKER" 2>/dev/null || echo "")
 if [ "$REQ_TIME" != "$PY_STORED" ]; then
   log "Installing Python dependencies..."
-  $PYTHON -m pip install -r trading-bot/requirements.txt --quiet || bail "pip install failed"
+  $PYTHON -m pip install -r trading-bot/requirements.txt --quiet --break-system-packages 2>/dev/null \
+    || $PYTHON -m pip install -r trading-bot/requirements.txt --break-system-packages \
+    || bail "pip install failed"
   echo "$REQ_TIME" > "$PY_MARKER"
   log "Python dependencies OK"
 else
