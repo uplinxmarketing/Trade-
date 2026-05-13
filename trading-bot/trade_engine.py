@@ -114,7 +114,7 @@ _SELL_RETRY_COOLDOWN_LOSS   = 0.0   # stop-loss / force-sell: retry immediately
 # Each position gets its own worker thread; _selling guard prevents duplicates.
 _sell_executor = ThreadPoolExecutor(max_workers=12, thread_name_prefix="sell-worker")
 
-# ── Real-time signal cache — updated on every kline close ──────────────────
+# ── Real-time signal cache — updated on every kline close ────────────────────
 _signal_cache: Dict[str, dict] = {}
 _signal_cache_lock = threading.Lock()
 _last_buy_check: float = 0.0
@@ -127,7 +127,7 @@ _tick_signal_ts: Dict[str, float] = {}
 _TICK_REFRESH_SEC = 30.0  # recompute at most every 30 s per coin from price ticks
 
 
-# ── Balance guard + budget helpers ─────────────────────────────────────────────
+# ── Balance guard + budget helpers ───────────────────────────────────────────
 
 def can_execute_buy(coin_cfg: dict, client) -> tuple[bool, str]:
     """
@@ -235,7 +235,7 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
     return round(min(base, effective_free * 0.9), 2)
 
 
-# ── Cooldown helpers ──────────────────────────────────────────────────────────────
+# ── Cooldown helpers ──────────────────────────────────────────────────────────
 
 def _refresh_risk_params():
     """Read stop_loss_enabled/pct, take_profit_pct and new exit flags from strategy.json."""
@@ -265,7 +265,7 @@ def _in_cooldown(symbol: str) -> bool:
     return time.time() < exp
 
 
-# ── DB / startup helpers ─────────────────────────────────────────────────────────
+# ── DB / startup helpers ──────────────────────────────────────────────────────
 
 def _rebuild_pos_index():
     """Rebuild O(1) symbol→position lookup. Call whenever _positions changes."""
@@ -368,7 +368,7 @@ def load_positions_from_db():
                 "Startup: no positions in local DB or Supabase — fresh wallet", "info"
             )
 
-        # ── Trade history: restore when SQLite trades table is empty ──────────
+        # ── Trade history: restore when SQLite trades table is empty ────────────
         # Rebuilds win-rate, P&L stats and trade list from bot_trade_history.
         try:
             if not database.get_recent_trades(limit=1) and restored.get("trades"):
@@ -548,7 +548,7 @@ def get_open_positions() -> List[dict]:
         return list(_positions)
 
 
-# ── Strategy loader ───────────────────────────────────────────────────────────────
+# ── Strategy loader ───────────────────────────────────────────────────────────
 
 def _load_strategy() -> dict:
     global _strategy_mtime, _strategy_cache
@@ -566,7 +566,7 @@ def _load_strategy() -> dict:
     return _strategy_cache
 
 
-# ── Account helpers ───────────────────────────────────────────────────────────────
+# ── Account helpers ───────────────────────────────────────────────────────────
 
 def _get_usdt_balance() -> float:
     try:
@@ -600,7 +600,7 @@ def _floor_qty(qty: float, decimals: int = 8) -> float:
     return math.floor(qty * factor) / factor
 
 
-# ── Indicator helpers (derive from candle dict) ────────────────────────────────
+# ── Indicator helpers (derive from candle dict) ───────────────────────────────
 
 def _derive_ma_pos(price: float, ma20: Optional[float]) -> Optional[str]:
     if ma20 is None or ma20 == 0:
@@ -632,7 +632,7 @@ def _derive_bb_pos(price: float, candle: dict) -> Optional[str]:
     return "mid_zone"
 
 
-# ── Signal evaluation — 6-signal dict ────────────────────────────────────────────
+# ── Signal evaluation — 6-signal dict ────────────────────────────────────────
 
 def evaluate_signals(candles: list) -> dict:
     """
@@ -831,7 +831,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             _rebuild_pos_index()
         return
 
-    # ── Fee-aware fill parsing ───────────────────────────────────────────────────────
+    # ── Fee-aware fill parsing ─────────────────────────────────────────────────
     # Market orders can split across multiple fills at different price levels.
     # Each fill has its own commission amount and asset.
     # Wrap in try/except so an unexpected Binance response format never causes
@@ -1235,7 +1235,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         database.log_activity(msg, "info")
 
 
-# ── Inline tick-driven signal refresh ─────────────────────────────────────────────
+# ── Inline tick-driven signal refresh ────────────────────────────────────────
 
 def _inline_refresh_from_ticks(sym: str, price: float):
     """
@@ -1294,11 +1294,15 @@ def realtime_monitor(prices: Dict[str, float]):
         target = entry * _take_profit_mult
         stop   = entry * _stop_loss_mult
 
-        if price >= target:
+        breakeven = entry * _breakeven_mult
+        if price >= breakeven:
+            # Always sell immediately once price covers fees — no smart-hold
+            # or signal conditions can delay this. Smart-hold only applies
+            # when price is above the configured TP target beyond breakeven.
             with _selling_lock:
                 already = sym in _selling
             if not already:
-                if _smart_hold_enabled:
+                if _smart_hold_enabled and price >= target and target > breakeven:
                     _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
                     peak       = _pos_peaks[sym]
                     trail_stop = peak * (1.0 - _trailing_stop_pct / 100.0)
@@ -1338,11 +1342,11 @@ def realtime_monitor(prices: Dict[str, float]):
             _tick_signal_ts[sym] = now
             _inline_refresh_from_ticks(sym, price)
 
-    # ── Real-time buy check — throttled to 1 s ─────────────────────────────────
+    # ── Real-time buy check — throttled to 1 s ────────────────────────────────
     _check_buys_from_cache(prices)
 
 
-# ── Sell monitor — daemon thread, independent of asyncio ───────────────────────
+# ── Sell monitor — daemon thread, independent of asyncio ─────────────────────
 
 _sell_diag_ts: float      = 0.0
 _sell_monitor_heartbeat: float = 0.0   # updated every loop — 0 means not started
@@ -1501,7 +1505,7 @@ def _sell_monitor_loop():
             with _positions_lock:
                 snap = list(_positions)
 
-            # ── Watchdog: force-clear _selling entries stuck > 20 s ──────────────
+            # ── Watchdog: force-clear _selling entries stuck > 20 s ──────────
             now_wd = time.time()
             with _selling_lock:
                 stuck = [s for s, t in list(_selling_ts.items()) if now_wd - t > 20]
@@ -1584,9 +1588,10 @@ def _sell_monitor_loop():
                 stop   = entry * _stop_loss_mult
 
                 sell_reason3: Optional[str] = None
+                breakeven3 = entry * _breakeven_mult
 
-                if price >= target:
-                    if _smart_hold_enabled:
+                if price >= breakeven3:
+                    if _smart_hold_enabled and price >= target and target > breakeven3:
                         _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
                         peak       = _pos_peaks[sym]
                         trail_stop = peak * (1.0 - _trailing_stop_pct / 100.0)
