@@ -76,7 +76,7 @@ def _fills_fee_usdt(fills: list, fallback_usdt: float) -> tuple:
                 # Price unavailable — fall back to estimate for entire order
                 return fallback_usdt, "estimated"
     return total, first_asset
-_breakeven_mult = 1.0 / (0.999 ** 2) * 1.0015  # 0.15% buffer for slippage on market orders
+_breakeven_mult = 1.0 / (0.999 ** 2) * 1.0025  # 0.25% buffer — accounts for Binance slippage on volatile coins
 
 # Configurable exit multipliers — refreshed from strategy.json every buy/sell cycle.
 # _take_profit_mult: price must reach entry * this to trigger a sell (>=_breakeven_mult).
@@ -254,6 +254,40 @@ def _refresh_risk_params():
                          else max(_breakeven_mult, tp_mult))
     # Stop loss: set to 0.0 when disabled so the check (price <= 0.0) never fires
     _stop_loss_mult   = (1.0 - sl_pct / 100.0) if sl_on else 0.0
+
+
+def _profitable_sell_check(pos: dict, price: float) -> bool:
+    """Return True only when selling at `price` is mathematically profitable in USDT.
+
+    Computes expected USDT received (after sell fee) minus total cost
+    (budget + buy fee + minimum profit margin). Returns False if the
+    net would not exceed the profit threshold — guarantees we NEVER
+    realize a loss on a take-profit sell.
+
+    Minimum profit margin = take_profit_pct% of budget OR _MIN_PROFIT_USDT,
+    whichever is greater.
+    """
+    entry = pos.get("entry_price", 0)
+    qty = pos.get("quantity", 0)
+    budget = pos.get("budget_usdt", 0)
+    buy_fee = float(pos.get("buy_fee_usdt") or budget * _fee_rate)
+    if entry <= 0 or qty <= 0 or budget <= 0 or price <= 0:
+        return False
+    # Estimated raw quote received (before sell fee)
+    gross_quote = price * qty
+    # Estimated sell fee (worst case — assumes USDT fee mode)
+    est_sell_fee = gross_quote * _fee_rate
+    # Estimated USDT actually returned to wallet
+    net_returned = gross_quote - est_sell_fee
+    # Total cost basis (original spend + buy commission already paid)
+    total_cost = budget + buy_fee
+    # Required minimum profit — must clear take_profit_pct AND be at least $0.005 absolute
+    strategy = _load_strategy()
+    tp_pct = float(strategy.get("take_profit_pct", 0.1))
+    min_profit = max(0.005, budget * (tp_pct / 100.0))
+    # Sell only if estimated profit ≥ minimum required
+    estimated_profit = net_returned - total_cost
+    return estimated_profit >= min_profit
 
 
 def _set_cooldown(symbol: str):
@@ -807,6 +841,29 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             )
 
     _is_paper = (mode != "live")
+    # FINAL SAFETY GATE — never lose money on a take-profit sell.
+    # Stop-loss and force-sell bypass this check (they're meant to fire even at a loss).
+    if reason not in ("stop-loss", "force-sell"):
+        # Get the freshest available price (WebSocket tick may have moved since trigger)
+        try:
+            from data_collector import prices as _live_px
+            freshest = _live_px.get(sym, 0) or _rest_px.get(sym, 0) or price
+        except Exception:
+            freshest = price
+        if not _profitable_sell_check(pos, freshest):
+            # Price slipped below profit threshold between trigger and execution.
+            # Abort the sell — position stays open, next tick will re-evaluate.
+            database.log_activity(
+                f"SELL ABORTED {sym} ({reason}): price slipped to ${freshest:.6f}, "
+                f"would not net profit. Position held — will retry on next favourable tick.",
+                "warn"
+            )
+            _sell_last_failed_ts[sym] = time.time()
+            _sell_last_failed_reason[sym] = reason
+            return  # exit before placing order
+        # Use the freshest price as the trigger so paper-mode sell executes at current market
+        price = freshest
+
     try:
         # Paper mode: pass the trigger price directly so concurrent WebSocket/REST
         # updates cannot cause the sell to execute at the wrong price.
@@ -1324,37 +1381,38 @@ def realtime_monitor(prices: Dict[str, float]):
         stop   = entry * _stop_loss_mult
 
         breakeven = entry * _breakeven_mult
-        if price >= breakeven:
-            # Always sell immediately once price covers fees — no smart-hold
-            # or signal conditions can delay this. Smart-hold only applies
-            # when price is above the configured TP target beyond breakeven.
+        if price >= breakeven and _profitable_sell_check(pos, price):
+            # ABSOLUTE PROFIT GATE: only proceed if selling at this exact price would
+            # net at least take_profit_pct% of budget after fees. Eliminates loss
+            # from market-order slippage — if price drops between trigger and fill,
+            # the next tick re-checks; we never commit to a sell that loses money.
             with _selling_lock:
                 already = sym in _selling
             if not already:
                 if _smart_hold_enabled and price >= target and target > breakeven:
                     _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
-                    peak       = _pos_peaks[sym]
+                    peak = _pos_peaks[sym]
                     trail_stop = peak * (1.0 - _trailing_stop_pct / 100.0)
                     sell_reason: Optional[str] = None
-                    if price <= trail_stop:
+                    if price <= trail_stop and _profitable_sell_check(pos, price):
                         sell_reason = "smart-hold-trail"
                     else:
                         with _signal_cache_lock:
                             score = _signal_cache.get(sym, {}).get("score", 0)
-                        if score < 3:
+                        if score < 3 and _profitable_sell_check(pos, price):
                             sell_reason = "take-profit"
                     if sell_reason:
                         with _selling_lock:
                             if sym not in _selling:
                                 _selling.add(sym)
                                 _selling_ts[sym] = time.time()
-                        _sell_executor.submit(_execute_sell, pos, price, sell_reason)
+                                _sell_executor.submit(_execute_sell, pos, price, sell_reason)
                 else:
                     with _selling_lock:
                         if sym not in _selling:
                             _selling.add(sym)
                             _selling_ts[sym] = time.time()
-                    _sell_executor.submit(_execute_sell, pos, price, "take-profit")
+                            _sell_executor.submit(_execute_sell, pos, price, "take-profit")
         elif _stop_loss_mult < 1.0 and price <= stop:
             with _selling_lock:
                 if sym in _selling:
@@ -1619,17 +1677,18 @@ def _sell_monitor_loop():
                 sell_reason3: Optional[str] = None
                 breakeven3 = entry * _breakeven_mult
 
-                if price >= breakeven3:
+                if price >= breakeven3 and _profitable_sell_check(pos, price):
+                    # Profit gate — see realtime_monitor for rationale
                     if _smart_hold_enabled and price >= target and target > breakeven3:
                         _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
-                        peak       = _pos_peaks[sym]
+                        peak = _pos_peaks[sym]
                         trail_stop = peak * (1.0 - _trailing_stop_pct / 100.0)
-                        if price <= trail_stop:
+                        if price <= trail_stop and _profitable_sell_check(pos, price):
                             sell_reason3 = "smart-hold-trail"
                         else:
                             with _signal_cache_lock:
                                 score2 = _signal_cache.get(sym, {}).get("score", 0)
-                            if score2 < 3:
+                            if score2 < 3 and _profitable_sell_check(pos, price):
                                 sell_reason3 = "take-profit"
                     else:
                         sell_reason3 = "take-profit"
