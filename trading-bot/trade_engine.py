@@ -1442,7 +1442,7 @@ _sell_monitor_thread: Optional[threading.Thread] = None
 # REST price fallback cache — populated when WebSocket is geo-blocked on Railway
 _rest_px: Dict[str, float] = {}
 _rest_px_ts: float = 0.0
-_REST_PX_TTL = 2.0   # refetch REST prices every 2 s when WebSocket is down
+_REST_PX_TTL = 5.0   # refetch REST prices every 5 s when WebSocket is down
 
 
 def _fetch_rest_prices(symbols: list) -> Dict[str, float]:
@@ -1565,7 +1565,7 @@ def _price_refresher_loop():
                                 _rest_px[s] = ws_p
         except Exception:
             pass
-        time.sleep(2.0)
+        time.sleep(5.0)
 
 
 def _sell_monitor_loop():
@@ -1876,15 +1876,23 @@ async def _refresh_signal_cache():
         bb_u, bb_m, _ = indicators.calc_bollinger(closes)
         bb_ok = indicators.bb_buy_allowed(closes[-2], bb_u[-2], bb_m[-2])
 
-        # 5m timeframe veto — fetched once per coin per 60 s scan cycle
-        try:
-            candles_5m = await asyncio.to_thread(_dc.fetch_5m_candles, sym)
-            five_m_ok  = indicators.is_5m_bullish(candles_5m)
-        except Exception:
-            five_m_ok  = True  # don't block trades if 5m fetch fails
+        # 5m timeframe veto — cached 180 s to avoid repeated REST calls
+        with _signal_cache_lock:
+            prev = dict(_signal_cache.get(sym, {}))
+        _5m_age = time.time() - prev.get("5m_ts", 0)
+        if _5m_age >= 180:
+            try:
+                candles_5m = await asyncio.to_thread(_dc.fetch_5m_candles, sym)
+                five_m_ok  = indicators.is_5m_bullish(candles_5m)
+                _5m_ts     = time.time()
+            except Exception:
+                five_m_ok  = prev.get("5m_ok", True)
+                _5m_ts     = prev.get("5m_ts", 0)
+        else:
+            five_m_ok = prev.get("5m_ok", True)
+            _5m_ts    = prev.get("5m_ts", 0)
 
         with _signal_cache_lock:
-            prev = _signal_cache.get(sym, {})
             _signal_cache[sym] = {
                 "signals":  signals,
                 "score":    score,
@@ -1892,15 +1900,23 @@ async def _refresh_signal_cache():
                 "rsi_val":  rsi_display,
                 "bb_ok":    bb_ok,
                 "5m_ok":    five_m_ok,
+                "5m_ts":    _5m_ts,
                 "ts":       time.time(),
             }
         return True
 
+    results = []
     async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(
-            *[_refresh_one(session, sym) for sym in approved_coins],
-            return_exceptions=True,
-        )
+        batch_size = 5
+        for i in range(0, len(approved_coins), batch_size):
+            batch = approved_coins[i:i + batch_size]
+            batch_results = await asyncio.gather(
+                *[_refresh_one(session, sym) for sym in batch],
+                return_exceptions=True,
+            )
+            results.extend(batch_results)
+            if i + batch_size < len(approved_coins):
+                await asyncio.sleep(1.0)
 
     updated = sum(1 for r in results if r is True)
     with _signal_cache_lock:

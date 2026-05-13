@@ -411,6 +411,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const scanTimerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
   const positionsRef   = useRef<OpenPosition[]>([]);
   const [railwaySignals, setRailwaySignals] = useState<any[]>([]);
+  const [usingPaperFallback, setUsingPaperFallback] = useState(false);
+  const [liveErrorMsg, setLiveErrorMsg] = useState<string | null>(null);
 
   const addLog = useCallback((msg: string) => {
     setActLog(prev => [msg, ...prev].slice(0, MAX_LOG_LINES));
@@ -650,6 +652,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     onLiveModeDetected?.(s.mode === 'live');
     setAgentStatus(`Bot · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${new Date().toLocaleTimeString()}`);
     if (s.data_persistent !== undefined) setDataPersistent(Boolean(s.data_persistent));
+    setUsingPaperFallback(Boolean(s.using_paper_fallback));
+    setLiveErrorMsg(s.live_error ?? null);
     // Update committed state from server — never touch settingsDraft here.
     // The draft is only reset when the user opens the settings panel, so
     // in-progress edits are never overwritten by a background poll.
@@ -1088,6 +1092,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="trading-card">
+      {/* Paper-fallback warning banner */}
+      {usingPaperFallback && (
+        <div className="flex items-center gap-2 px-4 py-2 bg-amber-500/15 border-b border-amber-500/30 text-amber-400 text-xs">
+          <span className="font-bold">⚠ PAPER FALLBACK ACTIVE</span>
+          <span className="text-amber-400/80">{liveErrorMsg ?? 'Live Binance connection failed — running on paper wallet. Retrying every 60 s.'}</span>
+        </div>
+      )}
       {/* Header */}
       <div className="flex items-center justify-between p-4 border-b border-border">
         <div className="flex items-center gap-3">

@@ -28,6 +28,12 @@ ws_candles: Dict[str, list] = {}
 _WS_CANDLE_MAX = 60   # candles to keep per coin
 _MIN_CANDLES   = 16   # minimum candles needed for at least RSI signal to work
 
+# In-memory 5-minute candle buffer — filled via WebSocket @kline_5m subscription.
+# Eliminates REST calls for 5m veto checks after the first 5 candles arrive.
+ws_candles_5m: Dict[str, list] = {}
+_WS_5M_CANDLE_MAX = 30   # 150 minutes of 5m candles
+_MIN_CANDLES_5M   = 21   # enough for EMA21 to be meaningful
+
 # Rolling price-tick buffer — filled by every WebSocket @trade event.
 # Used as immediate fallback (available in seconds) but RSI quality is poor
 # because all ticks come from the same second (prices nearly identical → RSI≈50).
@@ -88,9 +94,24 @@ def _fetch_klines_rest(symbol: str, interval: str, limit: int = 500):
 
 def fetch_5m_candles(symbol: str, limit: int = 30) -> list:
     """Fetch 5-minute candles for multi-timeframe confirmation.
+    Prefers the WebSocket buffer (ws_candles_5m) to avoid REST calls.
+    Falls back to REST only when the buffer has fewer than _MIN_CANDLES_5M candles.
     Returns a list of dicts with open/high/low/close/volume keys.
-    Tries each Binance base URL in order; returns [] on total failure.
     """
+    buf = ws_candles_5m.get(symbol, [])
+    if len(buf) >= _MIN_CANDLES_5M:
+        return [
+            {
+                "open_time": int(k[0]),
+                "open":      float(k[1]),
+                "high":      float(k[2]),
+                "low":       float(k[3]),
+                "close":     float(k[4]),
+                "volume":    float(k[5]),
+            }
+            for k in buf[-limit:]
+        ]
+
     for base in _BINANCE_BASES:
         url = f"{base}/api/v3/klines?symbol={symbol}&interval=5m&limit={limit}"
         try:
@@ -189,7 +210,7 @@ def download_history():
 
 def _build_ws_url(coins: list) -> str:
     streams = "/".join(
-        f"{coin.lower()}@trade/{coin.lower()}@kline_{config.CANDLE_TIMEFRAME}"
+        f"{coin.lower()}@trade/{coin.lower()}@kline_{config.CANDLE_TIMEFRAME}/{coin.lower()}@kline_5m"
         for coin in coins
     )
     return f"wss://stream.binance.com:9443/stream?streams={streams}"
@@ -262,11 +283,20 @@ async def _start_websocket_loop():
                         elif evt == "kline":
                             k = data["k"]
                             if k.get("x"):   # candle closed
-                                sym = k["s"]
+                                sym      = k["s"]
+                                interval = k.get("i", "1m")
                                 closed = [
                                     int(k["t"]),   float(k["o"]), float(k["h"]),
                                     float(k["l"]), float(k["c"]), float(k["v"]),
                                 ]
+
+                                # ── Route 5m candles to separate buffer
+                                if interval == "5m":
+                                    buf5 = ws_candles_5m.setdefault(sym, [])
+                                    buf5.append(closed)
+                                    if len(buf5) > _WS_5M_CANDLE_MAX:
+                                        buf5.pop(0)
+                                    continue
 
                                 # ── Update in-memory candle buffer (primary signal source)
                                 buf = ws_candles.setdefault(sym, [])

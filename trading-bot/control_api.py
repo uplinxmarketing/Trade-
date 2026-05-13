@@ -35,7 +35,7 @@ from pydantic import BaseModel
 
 import config
 import database
-from connection import get_mode, get_live_error
+from connection import get_mode, get_live_error, is_using_paper_fallback
 
 
 # ── Lifespan: start the full trading bot after HTTP server is ready ───────────
@@ -292,7 +292,7 @@ def _sell_monitor_alive() -> bool:
 # hammer the REST API on every frontend poll.
 _acct_cache: dict = {}
 _acct_cache_ts: float = 0.0
-_ACCT_CACHE_TTL = 5.0
+_ACCT_CACHE_TTL = 20.0
 _acct_cache_lock = threading.Lock()
 
 def _get_cached_account() -> dict:
@@ -750,15 +750,18 @@ def api_wallet():
         starting_bal  = float(starting_str) if starting_str else float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
         session_pnl   = round(total_value - starting_bal, 4)
 
+        _paper_fallback = is_using_paper_fallback()
         return {
-            "balances":        balances,
-            "total_usdt":      round(usdt_total, 4),   # free+locked — matches Binance UI
-            "free_usdt":       round(usdt_free, 4),    # tradeable only
-            "total_value":     round(total_value, 4),
-            "realized_pnl":    round(realized_pnl, 4),
-            "session_pnl":     session_pnl,
-            "starting_balance": round(starting_bal, 4),
-            "mode":            _mode,
+            "balances":              balances,
+            "total_usdt":            round(usdt_total, 4),
+            "free_usdt":             round(usdt_free, 4),
+            "total_value":           round(total_value, 4),
+            "realized_pnl":          round(realized_pnl, 4),
+            "session_pnl":           session_pnl,
+            "starting_balance":      round(starting_bal, 4),
+            "mode":                  _mode,
+            "using_paper_fallback":  _paper_fallback,
+            "is_paper_data":         _paper_fallback or _mode == "paper",
         }
     except Exception as e:
         return {"balances": [], "total_usdt": 0.0, "total_value": 0.0,
@@ -785,9 +788,10 @@ def api_status():
     wins     = stats["wins"]
     total    = stats["total"]
     return {
-        "running":             strategy.get("trading_active", False),
-        "mode":                get_mode(),
-        "live_error":          get_live_error() or None,
+        "running":                strategy.get("trading_active", False),
+        "mode":                   get_mode(),
+        "live_error":             get_live_error() or None,
+        "using_paper_fallback":   is_using_paper_fallback(),
         "balance_usdt":        balance,
         "paper_balance":       balance,
         "initial_balance":     initial or balance,
@@ -1305,9 +1309,11 @@ def api_all():
     trades    = database.get_recent_trades(limit=200)   # for the trades list payload only
     payload = {
         "status": {
-            "running":            strategy.get("trading_active", False),
-            "mode":               get_mode(),
-            "balance_usdt":       balance,
+            "running":                strategy.get("trading_active", False),
+            "mode":                   get_mode(),
+            "live_error":             get_live_error() or None,
+            "using_paper_fallback":   is_using_paper_fallback(),
+            "balance_usdt":           balance,
             "paper_balance":      balance,
             "initial_balance":    initial or balance,
             "open_positions":     len(positions),
