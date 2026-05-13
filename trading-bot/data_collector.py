@@ -230,7 +230,7 @@ async def _start_websocket_loop():
         url = _build_ws_url(active_coins)
         print(f"[DataCollector] Connecting WebSocket ({len(active_coins)} coins)…")
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=30, open_timeout=10, extra_headers={"User-Agent": "Mozilla/5.0"}) as ws:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=30, open_timeout=10) as ws:
                 backoff = 1  # reset on successful connect
                 print("[DataCollector] WebSocket connected ✓")
 
