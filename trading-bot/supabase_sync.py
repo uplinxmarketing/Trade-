@@ -24,7 +24,7 @@ from typing import Optional
 from urllib import request
 from urllib.error import HTTPError
 
-# ── Credentials ───────────────────────────────────────────────────────────────
+# ── Credentials ───────────────────────────────────────────────────────────────────────────────────
 # MUST match the frontend Supabase project (src/integrations/supabase/client.ts).
 # The bot and the UI share the same Supabase project so trades/positions are
 # visible in the UI and survive Railway redeploys.
@@ -44,7 +44,7 @@ _enabled = bool(SUPABASE_URL and SUPABASE_KEY)
 _pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="supa-sync")
 
 
-# ── Low-level helpers ─────────────────────────────────────────────────────────
+# ── Low-level helpers ───────────────────────────────────────────────────────────────────────────────────
 
 def _hdrs(prefer: str = "") -> dict:
     h = {
@@ -121,7 +121,7 @@ def _bg(fn, *args):
         _pool.submit(fn, *args)
 
 
-# ── Upsert helpers (PATCH first, INSERT if no row exists) ─────────────────────
+# ── Upsert helpers (PATCH first, INSERT if no row exists) ────────────────────────────────────────────────────
 
 def _upsert_portfolio(pos: dict):
     """Update an existing paper_portfolio row, or insert if it doesn't exist."""
@@ -165,7 +165,7 @@ def _upsert_config(usdt: float):
         })
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Public API ────────────────────────────────────────────────────────────────────────────────────────
 
 def sync_trade(trade: dict):
     """Mirror a completed trade (buy + sell rows) to bot_trade_history."""
@@ -317,9 +317,8 @@ def restore_from_supabase() -> dict:
         rows = _get("paper_portfolio",
                     f"user_session=eq.{SESSION}&select=symbol,quantity,avg_entry_price,updated_at")
         if rows:
-            # exact breakeven: entry / (0.999 ** 2) = entry * 1.002003...
             _fee = 0.001
-            _bep_mult = 1.0 / (0.999 ** 2)
+            _bep_mult = 1.0 / (0.999 ** 2)  # exact breakeven: entry / 0.999^2
             for r in rows:
                 qty   = float(r.get("quantity") or 0)
                 price = float(r.get("avg_entry_price") or 0)
@@ -348,7 +347,7 @@ def restore_from_supabase() -> dict:
     except Exception as e:
         print(f"[SupaSync] restore balance error: {e}")
 
-    # ── Trade history restore ─────────────────────────────────────────────────
+    # ── Trade history restore ───────────────────────────────────────────────────────────────────────────────────
     # Reconstruct completed trade records from bot_trade_history so the SQLite
     # trades table (and therefore win-rate, P&L stats) survive Railway redeploys.
     try:

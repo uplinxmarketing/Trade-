@@ -48,6 +48,7 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
     try {
       const found = await checkForUpdates();
       if (found) {
+        // Update found — apply it immediately instead of waiting for a second click
         toast.success('Update found — reloading…', { id: toastId });
         await applyUpdate();
       } else {
@@ -88,7 +89,7 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
             </div>
           )}
 
-          {/* Reconcile button */}
+          {/* Reconcile button — only show in live mode context */}
           {isConnected && (
             <button
               onClick={handleReconcile}

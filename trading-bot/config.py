@@ -49,12 +49,12 @@ RSI_BUY_MIN          = 20
 RSI_BUY_MAX          = 80      # wide window — scalping works across most RSI zones
 VOLUME_RATIO_MIN     = 1.1     # volume must be 1.1× the 20-candle average
 
-# ── ATR filter thresholds ─────────────────────────────────────────────
+# ── ATR filter thresholds ──────────────────────────────────────────────────────────────────────────────
 ATR_MIN_PCT = 0.0005   # ATR must be ≥ 0.05% of price (lowered — scalping works on small moves)
 ATR_MAX_PCT = 0.015    # ATR must be ≤ 1.5% of price (too volatile → skip)
 ATR_PERIOD  = 14       # standard ATR lookback period
 
-# ── Budget allocation settings ────────────────────────────────────────────
+# ── Budget allocation settings ──────────────────────────────────────────────────────────────────────────────────
 BUDGET_MODE           = "fixed"   # fixed | percent | capped | per_coin
 BUDGET_FIXED_USDT     = 5.0       # $5 per trade
 BUDGET_PCT_OF_FREE    = 5.0       # 5% of free USDT per trade (when mode=percent)
@@ -70,7 +70,7 @@ BUDGET_PER_COIN = {
     "DOGEUSDT": 50.0,
 }
 
-# ── Futures paper-trading agent ─────────────────────────────────────────────────────
+# ── Futures paper-trading agent ────────────────────────────────────────────────────────────────────────────────────────
 FUTURES_ENABLED           = True
 FUTURES_WATCHED_COINS     = [
     "BTCUSDT", "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
