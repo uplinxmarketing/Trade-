@@ -24,9 +24,7 @@ RSI_OVERBOUGHT          = 75
 RSI_OVERSOLD            = 25
 CANDLE_TIMEFRAME        = "1m"
 CANDLE_LOOKBACK         = 50
-BNB_FEE_MODE            = True
-FEE_RATE_BNB            = 0.00075
-FEE_RATE_STANDARD       = 0.001
+FEE_RATE                = 0.001    # 0.1% standard Binance spot (USDT, no BNB discount)
 CLAUDE_MODEL            = "claude-haiku-4-5-20251001"
 CLAUDE_MAX_TOKENS       = 400
 import os as _os
@@ -42,7 +40,7 @@ def _data_dir() -> str:
 _DATA_DIR     = _data_dir()
 STRATEGY_FILE = _os.path.join(_DATA_DIR, "strategy.json")
 
-# ── Two-speed architecture constants ─────────────────────────────────────────────
+# ── Two-speed architecture constants ────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC    = 60      # REST backup cache refresh — WebSocket handles real-time
 STOP_LOSS_PCT        = 0.005   # 0.5% stop-loss
 COOLDOWN_AFTER_LOSS  = 30      # 30s cooldown after stop-loss — scalping needs fast re-entry
@@ -51,7 +49,7 @@ RSI_BUY_MIN          = 20
 RSI_BUY_MAX          = 80      # wide window — scalping works across most RSI zones
 VOLUME_RATIO_MIN     = 1.1     # volume must be 1.1× the 20-candle average
 
-# ── ATR filter thresholds ───────────────────────────────────────────────────
+# ── ATR filter thresholds ─────────────────────────────────────────────
 ATR_MIN_PCT = 0.0005   # ATR must be ≥ 0.05% of price (lowered — scalping works on small moves)
 ATR_MAX_PCT = 0.015    # ATR must be ≤ 1.5% of price (too volatile → skip)
 ATR_PERIOD  = 14       # standard ATR lookback period
@@ -72,7 +70,7 @@ BUDGET_PER_COIN = {
     "DOGEUSDT": 50.0,
 }
 
-# ── Futures paper-trading agent ─────────────────────────────────────────────────
+# ── Futures paper-trading agent ─────────────────────────────────────────────────────
 FUTURES_ENABLED           = True
 FUTURES_WATCHED_COINS     = [
     "BTCUSDT", "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",

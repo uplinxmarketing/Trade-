@@ -1,6 +1,7 @@
-import { Activity, Bot, Key, Wifi, WifiOff, RefreshCw, Download } from 'lucide-react';
+import { Activity, Bot, Key, Wifi, WifiOff, RefreshCw, Download, ShieldCheck } from 'lucide-react';
 import { useUpdateChecker } from '@/hooks/useUpdateChecker';
 import { toast } from 'sonner';
+import { useState } from 'react';
 
 interface TopBarProps {
   isConnected: boolean;
@@ -12,13 +13,41 @@ const APP_VERSION = __APP_VERSION__;
 
 const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
   const { updateAvailable, checking, updating, checkForUpdates, applyUpdate } = useUpdateChecker();
+  const [reconciling, setReconciling] = useState(false);
+
+  const handleReconcile = async () => {
+    setReconciling(true);
+    const toastId = toast.loading('Reconciling positions with Binance…');
+    try {
+      const res  = await fetch('/api/reconcile', { cache: 'no-store' });
+      const data = await res.json();
+      if (data.error) {
+        toast.error('Reconcile failed', { id: toastId, description: data.error });
+        return;
+      }
+      const ghosts     = data.ghosts?.length ?? 0;
+      const mismatches = data.mismatches?.length ?? 0;
+      if (ghosts > 0 || mismatches > 0) {
+        toast.warning(`Found ${ghosts} ghost(s), ${mismatches} mismatch(es)`, {
+          id: toastId,
+          description: 'Check activity log for details. Ghost positions removed.',
+          duration: 8000,
+        });
+      } else {
+        toast.success('All positions match Binance', { id: toastId });
+      }
+    } catch {
+      toast.error('Reconcile request failed', { id: toastId });
+    } finally {
+      setReconciling(false);
+    }
+  };
 
   const handleCheckUpdate = async () => {
     const toastId = toast.loading('Checking for updates…');
     try {
       const found = await checkForUpdates();
       if (found) {
-        // Update found — apply it immediately instead of waiting for a second click
         toast.success('Update found — reloading…', { id: toastId });
         await applyUpdate();
       } else {
@@ -57,6 +86,19 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
                 </>
               )}
             </div>
+          )}
+
+          {/* Reconcile button */}
+          {isConnected && (
+            <button
+              onClick={handleReconcile}
+              disabled={reconciling}
+              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+              title="Check positions match Binance balances"
+            >
+              <ShieldCheck className={`w-3.5 h-3.5 ${reconciling ? 'animate-spin' : ''}`} />
+              <span className="hidden sm:inline">Reconcile</span>
+            </button>
           )}
 
           {/* Check for updates button */}

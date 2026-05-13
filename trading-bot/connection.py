@@ -46,10 +46,6 @@ def _build_client():
             except Exception as exc:
                 _live_error = f"Binance API connection failed: {exc}"
                 _using_paper_fallback = True
-                # Do NOT change _CONFIGURED_MODE — .env still says MODE=live.
-                # get_mode() keeps returning "live" so position tags, mode guards,
-                # and the frontend all stay in live mode. live_error banner explains
-                # the connection issue. Next restart will retry the live connection.
                 print(f"[Connection] {_live_error} — using paper client for this session")
 
     elif _CONFIGURED_MODE == "testnet":
@@ -74,7 +70,7 @@ def _build_client():
     from paper_client import PaperClient
     return PaperClient(
         starting_usdt=float(os.getenv("STARTING_PAPER_USDT", "10000.0")),
-        fee_rate=0.00075,
+        fee_rate=0.001,
     )
 
 

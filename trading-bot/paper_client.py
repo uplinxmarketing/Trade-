@@ -12,7 +12,7 @@ import database
 
 
 class PaperClient:
-    def __init__(self, starting_usdt: float = 10000.0, fee_rate: float = 0.00075):
+    def __init__(self, starting_usdt: float = 10000.0, fee_rate: float = 0.001):
         self._fee_rate = fee_rate
         self._prices: Dict[str, float] = {}
         self._lock = threading.Lock()
@@ -27,7 +27,7 @@ class PaperClient:
             database.save_paper_state(self._balances)
             print(f"[PaperClient] Fresh start — USDT: {starting_usdt:.2f}")
 
-    # ── Price management ────────────────────────────────────────────────────
+    # ── Price management ─────────────────────────────────────────────────────────
 
     def update_price(self, symbol: str, price: float):
         with self._lock:
@@ -44,7 +44,7 @@ class PaperClient:
         with self._lock:
             return self._balances.get(asset, 0.0)
 
-    # ── Account ─────────────────────────────────────────────────────────────
+    # ── Account ─────────────────────────────────────────────────────────────────
 
     def get_account(self) -> dict:
         with self._lock:
@@ -72,7 +72,7 @@ class PaperClient:
         bal = self._get_balance(asset)
         return {"asset": asset, "free": f"{bal:.8f}", "locked": "0.00000000"}
 
-    # ── Orders ──────────────────────────────────────────────────────────────
+    # ── Orders ──────────────────────────────────────────────────────────────────
 
     def order_market_buy(self, symbol: str, quoteOrderQty: float) -> dict:
         price = self._get_price(symbol)
@@ -121,9 +121,6 @@ class PaperClient:
         }
 
     def order_market_sell(self, symbol: str, quantity: float, price: float = 0) -> dict:
-        # Use caller-supplied price when provided — prevents race conditions where
-        # a concurrent update_price() call overwrites the trigger price before
-        # order execution, causing sells to execute at the wrong (lower) price.
         if price <= 0:
             price = self._get_price(symbol)
         coin  = symbol[:-4]  # strip USDT
@@ -146,7 +143,6 @@ class PaperClient:
             self._balances["USDT"] = self._balances.get("USDT", 0.0) + net_usdt
             snapshot = dict(self._balances)
 
-        # Single save after all balance changes are applied (was 2 saves before)
         database.save_paper_state(snapshot)
 
         order_id = str(uuid.uuid4())[:12].replace("-", "")
@@ -175,7 +171,7 @@ class PaperClient:
             }],
         }
 
-    # ── No-ops for real client compatibility ─────────────────────────────────
+    # ── No-ops for real client compatibility ───────────────────────────────────────────────
 
     def ping(self) -> dict:
         return {}
