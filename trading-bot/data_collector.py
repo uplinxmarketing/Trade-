@@ -220,7 +220,7 @@ async def start_websocket():
     On closed kline: update candle DB.
     """
     import websockets
-    backoff = 2
+    backoff = 1
 
     # Verify symbols once on startup so invalid coins don't break the connection
     active_coins = await _verify_symbols(config.WATCHED_COINS)
@@ -229,8 +229,8 @@ async def start_websocket():
         url = _build_ws_url(active_coins)
         print(f"[DataCollector] Connecting WebSocket ({len(active_coins)} coins)…")
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=30, open_timeout=10) as ws:
-                backoff = 2  # reset on successful connect
+            async with websockets.connect(url, ping_interval=20, ping_timeout=30, open_timeout=10, extra_headers={"User-Agent": "Mozilla/5.0"}) as ws:
+                backoff = 1  # reset on successful connect
                 print("[DataCollector] WebSocket connected ✓")
 
                 async for raw in ws:
