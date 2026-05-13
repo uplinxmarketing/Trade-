@@ -760,18 +760,18 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const handleStartStop = useCallback(async () => {
     if (isRunning) {
       if (isServerMode) {
-          const res = await fetch(`${railwayUrl}/api/agent/stop`, { method: 'POST' });
-          if (res.ok) {
-            setIsRunning(false); isRunningRef.current = false;
-            setSetupComplete(false); setSettingsSynced(false);
-            addLog('Bot stopped');
-          }
-          return;
+        const res = await fetch(`${railwayUrl}/api/agent/stop`, { method: 'POST' });
+        if (res.ok) {
+          setIsRunning(false); isRunningRef.current = false;
+          setSetupComplete(false); setSettingsSynced(false);
+          addLog('Bot stopped');
+          toast.success('Bot stopped');
+        }
+        return;
       }
       setIsRunning(false); isRunningRef.current = false;
-      return;
     }
-  }, [isRunning, isServerMode, railwayUrl, binanceConnected, onConnectBinance]);
+  }, [isRunning, isServerMode, railwayUrl, addLog]);
 
   // ── Switch bot to live mode with API keys ───────────────────────────────────
   const handleGoLive = useCallback(async () => {
@@ -1007,22 +1007,34 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const saveSettings = useCallback(async () => {
     setSavingSettings(true);
     try {
-      const res = await fetch(`${railwayUrl}/api/settings`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          stop_loss_enabled:   settingsDraft.stopLossEnabled,
-          stop_loss_pct:       settingsDraft.stopLossPct,
-          take_profit_enabled: settingsDraft.takeProfitEnabled,
-          take_profit_pct:     settingsDraft.takeProfitPct,
-          smart_hold_enabled:  settingsDraft.smartHoldEnabled,
-          trailing_stop_pct:   settingsDraft.trailingStopPct,
-          reinvest_profits:    settingsDraft.reinvestProfits,
-          max_positions:       settingsDraft.maxPositions,
-          min_signals:         settingsDraft.minSignals,
+      await Promise.all([
+        fetch(`${railwayUrl}/api/settings`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            stop_loss_enabled:   settingsDraft.stopLossEnabled,
+            stop_loss_pct:       settingsDraft.stopLossPct,
+            take_profit_enabled: settingsDraft.takeProfitEnabled,
+            take_profit_pct:     settingsDraft.takeProfitPct,
+            smart_hold_enabled:  settingsDraft.smartHoldEnabled,
+            trailing_stop_pct:   settingsDraft.trailingStopPct,
+            reinvest_profits:    settingsDraft.reinvestProfits,
+            max_positions:       settingsDraft.maxPositions,
+            min_signals:         settingsDraft.minSignals,
+          }),
         }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        fetch(`${railwayUrl}/api/config`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            budget_mode:           setupBudgetMode,
+            budget_fixed_usdt:     setupBudgetValue,
+            budget_pct_of_free:    setupBudgetMode === 'percent' ? setupBudgetValue : undefined,
+            budget_total_cap_usdt: setupBudgetMode === 'capped'  ? setupBudgetValue : undefined,
+            bot_allocation_usdt:   setupAllocation,
+          }),
+        }),
+      ]);
       setStopLossEnabled(settingsDraft.stopLossEnabled);
       setStopLossPct(settingsDraft.stopLossPct);
       setTakeProfitEnabled(settingsDraft.takeProfitEnabled);
@@ -1038,7 +1050,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     } finally {
       setSavingSettings(false);
     }
-  }, [settingsDraft, railwayUrl]);
+  }, [settingsDraft, setupBudgetMode, setupBudgetValue, setupAllocation, railwayUrl]);
 
   // ── Computed stats ────────────────────────────────────────────────────────
   const totalValue = positions.reduce((sum, p) => {
@@ -1139,17 +1151,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
       {/* Setup wizard / start button */}
       {!setupComplete ? (
-        <div className="p-4 space-y-4">
-          <div className="flex items-center gap-2 text-xs font-semibold text-accent">
-            <Zap className="w-4 h-4" />
-            Agent Trading Settings
-          </div>
-
+        <div className="px-4 py-3 space-y-3">
+          <p className="text-xs text-muted-foreground">Configure settings via the gear icon, then start the bot.</p>
           <Button
             onClick={async () => { setSetupComplete(true); await handleStartBot(); }}
             disabled={loading}
             className="w-full bg-gain hover:bg-gain/90 text-white font-bold">
-            {loading ? 'Starting…' : <><Play className="w-4 h-4 mr-2" />Start Bot</>}
+            {loading ? 'Starting…' : <>Start Bot</>}
           </Button>
         </div>
       ) : (
@@ -1182,94 +1190,20 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                   className="text-[10px] text-muted-foreground hover:text-foreground">Reload from server</button>
               </div>
 
-              {/* Stop Loss */}
-              <div className="bg-muted/30 rounded-md px-3 py-2.5 space-y-2">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-xs font-semibold">Stop Loss</p>
-                    <p className="text-[9px] text-muted-foreground">{settingsDraft.stopLossEnabled ? 'Auto-exit at loss threshold' : 'OFF'}</p>
-                  </div>
-                  <Toggle on={settingsDraft.stopLossEnabled} onChange={() => setSettingsDraft(d => ({ ...d, stopLossEnabled: !d.stopLossEnabled }))} color="bg-loss/80" />
-                </div>
-                {settingsDraft.stopLossEnabled && (
-                  <div className="flex items-center gap-2">
-                    <input type="number" min="0.1" max="50" step="0.1" value={settingsDraft.stopLossPct}
-                      onChange={e => setSettingsDraft(d => ({ ...d, stopLossPct: parseFloat(e.target.value) || 2 }))}
-                      className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-loss/60" />
-                    <span className="text-xs text-muted-foreground">%</span>
-                  </div>
-                )}
-              </div>
-
-              {/* Take Profit */}
-              <div className="bg-muted/30 rounded-md px-3 py-2.5 space-y-2">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-xs font-semibold">Take Profit</p>
-                    <p className="text-[9px] text-muted-foreground">{settingsDraft.takeProfitEnabled ? 'Auto-exit at profit threshold' : 'OFF'}</p>
-                  </div>
-                  <Toggle on={settingsDraft.takeProfitEnabled} onChange={() => setSettingsDraft(d => ({ ...d, takeProfitEnabled: !d.takeProfitEnabled }))} color="bg-gain/80" />
-                </div>
-                {settingsDraft.takeProfitEnabled && (
-                  <div className="flex items-center gap-2">
-                    <input type="number" min="0.1" max="100" step="0.1" value={settingsDraft.takeProfitPct}
-                      onChange={e => setSettingsDraft(d => ({ ...d, takeProfitPct: parseFloat(e.target.value) || 0.5 }))}
-                      className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-gain/60" />
-                    <span className="text-xs text-muted-foreground">%</span>
-                  </div>
-                )}
-              </div>
-
-              {/* Smart Hold */}
-              <div className="bg-muted/30 rounded-md px-3 py-2.5 space-y-2">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-xs font-semibold">Smart Hold</p>
-                    <p className="text-[9px] text-muted-foreground">{settingsDraft.smartHoldEnabled ? 'Hold while bullish' : 'OFF'}</p>
-                  </div>
-                  <Toggle on={settingsDraft.smartHoldEnabled} onChange={() => setSettingsDraft(d => ({ ...d, smartHoldEnabled: !d.smartHoldEnabled }))} color="bg-accent/80" />
-                </div>
-                {settingsDraft.smartHoldEnabled && (
-                  <div className="flex items-center gap-2">
-                    <input type="number" min="0.1" max="10" step="0.1" value={settingsDraft.trailingStopPct}
-                      onChange={e => setSettingsDraft(d => ({ ...d, trailingStopPct: parseFloat(e.target.value) || 0.5 }))}
-                      className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-accent/60" />
-                    <span className="text-xs text-muted-foreground">% trailing drop</span>
-                  </div>
-                )}
-              </div>
-
-              {/* Reinvest */}
-              <div className="bg-muted/30 rounded-md px-3 py-2.5">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-xs font-semibold">Reinvest Profits</p>
-                    <p className="text-[9px] text-muted-foreground">{settingsDraft.reinvestProfits ? 'Compound gains' : 'OFF'}</p>
-                  </div>
-                  <Toggle on={settingsDraft.reinvestProfits} onChange={() => setSettingsDraft(d => ({ ...d, reinvestProfits: !d.reinvestProfits }))} color="bg-gain/80" />
-                </div>
-              </div>
-
-              {/* Max Positions + Min Signals */}
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Max Positions</label>
-                  <input type="number" min="1" max="50" step="1" value={settingsDraft.maxPositions}
-                    onChange={e => setSettingsDraft(d => ({ ...d, maxPositions: parseInt(e.target.value) || 10 }))}
-                    className="w-full mt-1 bg-muted/40 border border-border rounded px-2 py-1.5 text-xs font-mono focus:outline-none focus:border-accent/60" />
-                </div>
-                <div>
-                  <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Min Signals</label>
-                  <div className="flex gap-1 mt-1">
-                    {[1,2,3,4,5,6].map(n => (
-                      <button key={n} onClick={() => setSettingsDraft(d => ({ ...d, minSignals: n }))}
-                        className={`flex-1 py-1.5 text-xs font-bold rounded border transition-colors ${settingsDraft.minSignals === n ? 'bg-accent text-accent-foreground border-accent' : 'border-border text-muted-foreground hover:border-accent/50'}`}>
-                        {n}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
+              <AgentTradingFields
+                budgetMode={setupBudgetMode} setBudgetMode={setSetupBudgetMode}
+                budgetValue={setupBudgetValue} setBudgetValue={setSetupBudgetValue}
+                allocation={setupAllocation} setAllocation={setSetupAllocation}
+                slEnabled={settingsDraft.stopLossEnabled} setSlEnabled={v => setSettingsDraft(d => ({...d, stopLossEnabled: v}))}
+                stopLoss={settingsDraft.stopLossPct} setStopLoss={v => setSettingsDraft(d => ({...d, stopLossPct: v}))}
+                tpEnabled={settingsDraft.takeProfitEnabled} setTpEnabled={v => setSettingsDraft(d => ({...d, takeProfitEnabled: v}))}
+                takeProfit={settingsDraft.takeProfitPct} setTakeProfit={v => setSettingsDraft(d => ({...d, takeProfitPct: v}))}
+                smartHold={settingsDraft.smartHoldEnabled} setSmartHold={v => setSettingsDraft(d => ({...d, smartHoldEnabled: v}))}
+                trailingStop={settingsDraft.trailingStopPct} setTrailingStop={v => setSettingsDraft(d => ({...d, trailingStopPct: v}))}
+                reinvest={settingsDraft.reinvestProfits} setReinvest={v => setSettingsDraft(d => ({...d, reinvestProfits: v}))}
+                maxPositions={settingsDraft.maxPositions} setMaxPositions={v => setSettingsDraft(d => ({...d, maxPositions: v}))}
+                minSignals={settingsDraft.minSignals} setMinSignals={v => setSettingsDraft(d => ({...d, minSignals: v}))}
+              />
 
               <Button onClick={saveSettings} disabled={savingSettings} size="sm" className="w-full">
                 {savingSettings ? 'Saving…' : 'Save Settings'}

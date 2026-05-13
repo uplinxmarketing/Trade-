@@ -5,6 +5,7 @@ No auth required for any endpoint in any mode.
 
 import asyncio
 import json
+import threading
 import time
 import urllib.request
 from collections import deque
@@ -213,7 +214,7 @@ async def _verify_symbols(coins: list) -> list:
         return coins
 
 
-async def start_websocket():
+async def _start_websocket_loop():
     """
     Async WebSocket loop with exponential-backoff reconnect.
     On each trade event: update prices, call trade_engine via callback.
@@ -313,3 +314,14 @@ async def start_websocket():
 
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
+
+
+async def start_websocket():
+    """Run WebSocket loop in a dedicated thread — never blocks the uvicorn asyncio event loop."""
+    loop = asyncio.new_event_loop()
+    t = threading.Thread(
+        target=lambda: loop.run_until_complete(_start_websocket_loop()),
+        name="websocket-feed",
+        daemon=True
+    )
+    t.start()
