@@ -76,7 +76,7 @@ def _fills_fee_usdt(fills: list, fallback_usdt: float) -> tuple:
                 # Price unavailable — fall back to estimate for entire order
                 return fallback_usdt, "estimated"
     return total, first_asset
-_breakeven_mult = 1.0 / (0.999 ** 2)  # exact: entry / (0.999²) ≈ entry × 1.002003
+_breakeven_mult = 1.0 / (0.999 ** 2) * 1.0005  # 0.05% buffer above fees = guaranteed profit on every sell
 
 # Configurable exit multipliers — refreshed from strategy.json every buy/sell cycle.
 # _take_profit_mult: price must reach entry * this to trigger a sell (>=_breakeven_mult).
