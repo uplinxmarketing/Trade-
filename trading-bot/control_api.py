@@ -28,6 +28,24 @@ _github_ver_cache_ts: float = 0.0
 _GITHUB_VER_TTL = 120  # re-fetch at most every 2 minutes
 
 import uvicorn
+
+import json as _json_v
+import pathlib as _pl_v
+
+def _read_frontend_version() -> dict:
+    """Read version metadata from dist/version.json.
+    Checks trading-bot/dist/ first, then the repo-root dist/, so the
+    endpoint always reflects whatever the bot is actually serving."""
+    for candidate in [
+        _pl_v.Path(__file__).parent / "dist" / "version.json",
+        _pl_v.Path(__file__).parent.parent / "dist" / "version.json",
+    ]:
+        try:
+            if candidate.exists():
+                return _json_v.loads(candidate.read_text())
+        except Exception:
+            pass
+    return {"version": "unknown", "buildTime": "", "commit": ""}
 from fastapi import FastAPI, Response, Body, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -1461,14 +1479,7 @@ async def api_chat(req: ChatRequest):
 
 @app.get("/api/version")
 def api_version():
-    import pathlib, json as _json
-    vf = pathlib.Path(__file__).parent / "dist" / "version.json"
-    if vf.exists():
-        try:
-            return _json.loads(vf.read_text())
-        except Exception:
-            pass
-    return {"version": "unknown"}
+    return _read_frontend_version()
 
 
 @app.get("/version.json")
@@ -1698,8 +1709,14 @@ def start_control_api():
     # Mount React build INSIDE start_control_api so any failure (missing
     # aiofiles, missing dist/) is caught and logged — it never prevents the
     # HTTP server from binding and passing Railway's health check.
-    dist = pathlib.Path(__file__).parent / "dist"
-    if dist.exists():
+    # Check trading-bot/dist/ first, then repo-root dist/ as fallback.
+    # Repo-root dist/ is what gets committed when building locally.
+    _dist_candidates = [
+        pathlib.Path(__file__).parent / "dist",
+        pathlib.Path(__file__).parent.parent / "dist",
+    ]
+    dist = next((d for d in _dist_candidates if d.exists()), None)
+    if dist:
         try:
             from fastapi.staticfiles import StaticFiles
             app.mount("/", StaticFiles(directory=str(dist), html=True), name="static")
