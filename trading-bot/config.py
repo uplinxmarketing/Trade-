@@ -17,7 +17,7 @@ WATCHED_COINS = [
 ]
 
 BUDGET_PER_TRADE_USDT   = 5.0
-MAX_OPEN_POSITIONS      = 20
+MAX_OPEN_POSITIONS      = 30
 DECISION_INTERVAL_SEC   = 600       # Claude strategy runs every 10 minutes
 MIN_CLAUDE_CONFIDENCE   = 0.65
 RSI_OVERBOUGHT          = 75
@@ -40,21 +40,21 @@ def _data_dir() -> str:
 _DATA_DIR     = _data_dir()
 STRATEGY_FILE = _os.path.join(_DATA_DIR, "strategy.json")
 
-# ── Two-speed architecture constants ────────────────────────────────────────────────────
-SCAN_INTERVAL_SEC    = 60      # REST backup cache refresh — WebSocket handles real-time
+# ── Two-speed architecture constants ────────────────────────────────────────────
+SCAN_INTERVAL_SEC    = 10      # REST backup cache refresh — WebSocket handles real-time
 STOP_LOSS_PCT        = 0.005   # 0.5% stop-loss
-COOLDOWN_AFTER_LOSS  = 30      # 30s cooldown after stop-loss — scalping needs fast re-entry
+COOLDOWN_AFTER_LOSS  = 15      # 15s cooldown after stop-loss — scalping needs fast re-entry
 MIN_SIGNALS_TO_BUY   = 3       # at least 3 of 6 signals must be bullish
-RSI_BUY_MIN          = 20
-RSI_BUY_MAX          = 80      # wide window — scalping works across most RSI zones
-VOLUME_RATIO_MIN     = 1.1     # volume must be 1.1× the 20-candle average
+RSI_BUY_MIN          = 40
+RSI_BUY_MAX          = 70      # tighter window — avoid overbought/oversold extremes
+VOLUME_RATIO_MIN     = 1.2     # volume must be 1.2× the 20-candle average
 
-# ── ATR filter thresholds ──────────────────────────────────────────────────────────────────────────────
-ATR_MIN_PCT = 0.0005   # ATR must be ≥ 0.05% of price (lowered — scalping works on small moves)
+# ── ATR filter thresholds ────────────────────────────────────────────────────────────────────────────────────────────────────────
+ATR_MIN_PCT = 0.0003   # ATR must be ≥ 0.03% of price (lowered — scalping works on small moves)
 ATR_MAX_PCT = 0.015    # ATR must be ≤ 1.5% of price (too volatile → skip)
 ATR_PERIOD  = 14       # standard ATR lookback period
 
-# ── Budget allocation settings ──────────────────────────────────────────────────────────────────────────────────
+# ── Budget allocation settings ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 BUDGET_MODE           = "fixed"   # fixed | percent | capped | per_coin
 BUDGET_FIXED_USDT     = 5.0       # $5 per trade
 BUDGET_PCT_OF_FREE    = 5.0       # 5% of free USDT per trade (when mode=percent)
@@ -70,7 +70,7 @@ BUDGET_PER_COIN = {
     "DOGEUSDT": 50.0,
 }
 
-# ── Futures paper-trading agent ────────────────────────────────────────────────────────────────────────────────────────
+# ── Futures paper-trading agent ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 FUTURES_ENABLED           = True
 FUTURES_WATCHED_COINS     = [
     "BTCUSDT", "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
