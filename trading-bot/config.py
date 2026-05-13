@@ -43,14 +43,14 @@ STRATEGY_FILE = _os.path.join(_DATA_DIR, "strategy.json")
 # ── Two-speed architecture constants ────────────────────────────────────────────
 SCAN_INTERVAL_SEC    = 10      # REST backup cache refresh — WebSocket handles real-time
 STOP_LOSS_PCT        = 0.005   # 0.5% stop-loss
-COOLDOWN_AFTER_LOSS  = 15      # 15s cooldown after stop-loss — scalping needs fast re-entry
+COOLDOWN_AFTER_LOSS  = 30
 MIN_SIGNALS_TO_BUY   = 3       # at least 3 of 6 signals must be bullish
-RSI_BUY_MIN          = 40
-RSI_BUY_MAX          = 70      # tighter window — avoid overbought/oversold extremes
-VOLUME_RATIO_MIN     = 1.2     # volume must be 1.2× the 20-candle average
+RSI_BUY_MIN          = 45
+RSI_BUY_MAX          = 65
+VOLUME_RATIO_MIN     = 1.3     # volume must be 1.3× the 20-candle average
 
 # ── ATR filter thresholds ────────────────────────────────────────────────────────────────────────────────────────────────────────
-ATR_MIN_PCT = 0.0003   # ATR must be ≥ 0.03% of price (lowered — scalping works on small moves)
+ATR_MIN_PCT = 0.0005   # ATR must be ≥ 0.05% of price
 ATR_MAX_PCT = 0.015    # ATR must be ≤ 1.5% of price (too volatile → skip)
 ATR_PERIOD  = 14       # standard ATR lookback period
 
