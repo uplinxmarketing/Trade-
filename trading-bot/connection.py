@@ -81,6 +81,36 @@ def _build_client():
 client = _build_client()
 
 
+def _live_reconnect_loop():
+    """Retry live Binance connection every 60 s when on paper fallback."""
+    global client, _live_error, _using_paper_fallback
+    import time as _t
+    while True:
+        _t.sleep(60)
+        if _CONFIGURED_MODE != "live" or not _using_paper_fallback:
+            continue
+        api_key    = (os.getenv("BINANCE_API_KEY")    or "").strip()
+        api_secret = (os.getenv("BINANCE_API_SECRET") or "").strip()
+        if not api_key or not api_secret:
+            continue
+        try:
+            from binance.client import Client as BinanceClient
+            c = BinanceClient(api_key, api_secret, requests_params={"timeout": 10})
+            c.ping()
+            c.update_price = lambda symbol, price: None
+            client = c
+            _live_error = ""
+            _using_paper_fallback = False
+            print("[Connection] Auto-reconnect: live Binance connection restored ✓")
+        except Exception as exc:
+            print(f"[Connection] Auto-reconnect failed: {exc}")
+
+
+if _CONFIGURED_MODE == "live" and _using_paper_fallback:
+    import threading as _th
+    _th.Thread(target=_live_reconnect_loop, name="binance-reconnect", daemon=True).start()
+
+
 def get_mode() -> str:
     """Return the configured mode from .env. Never changes due to connection failures."""
     return _CONFIGURED_MODE

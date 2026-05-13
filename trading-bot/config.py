@@ -41,7 +41,7 @@ _DATA_DIR     = _data_dir()
 STRATEGY_FILE = _os.path.join(_DATA_DIR, "strategy.json")
 
 # ── Two-speed architecture constants ────────────────────────────────────────────
-SCAN_INTERVAL_SEC    = 10      # REST backup cache refresh — WebSocket handles real-time
+SCAN_INTERVAL_SEC    = 30      # REST backup cache refresh — WebSocket handles real-time
 STOP_LOSS_PCT        = 0.005   # 0.5% stop-loss
 COOLDOWN_AFTER_LOSS  = 30
 MIN_SIGNALS_TO_BUY   = 3       # at least 3 of 6 signals must be bullish
