@@ -107,7 +107,7 @@ _selling_ts: Dict[str, float] = {}   # when each sym was added — for watchdog
 _bad_symbols: set = set()
 _sell_last_failed_ts: Dict[str, float] = {}  # last sell failure time per symbol
 _sell_last_failed_reason: Dict[str, str] = {}  # reason that triggered the failed sell
-_SELL_RETRY_COOLDOWN_PROFIT = 2.0   # take-profit: 2s breaks retry loop without delaying exit
+_SELL_RETRY_COOLDOWN_PROFIT = 0.5   # take-profit: 0.5s breaks retry loop without delaying exit
 _SELL_RETRY_COOLDOWN_LOSS   = 0.0   # stop-loss / force-sell: retry immediately
 
 # ── Sell executor — parallel sells so 10 simultaneous exits never queue up ───
@@ -124,10 +124,10 @@ _last_at_capacity_log: float = 0.0 # throttle "at max capacity" log to once per 
 
 # Per-coin timestamp of last inline tick-driven signal refresh
 _tick_signal_ts: Dict[str, float] = {}
-_TICK_REFRESH_SEC = 30.0  # recompute at most every 30 s per coin from price ticks
+_TICK_REFRESH_SEC = 1.0   # recompute at most every 1 s per coin from price ticks
 
 
-# ── Balance guard + budget helpers ───────────────────────────────────────────
+# ── Balance guard + budget helpers ──────────────────────────────────────────────
 
 def can_execute_buy(coin_cfg: dict, client) -> tuple[bool, str]:
     """
@@ -235,13 +235,13 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
     return round(min(base, effective_free * 0.9), 2)
 
 
-# ── Cooldown helpers ──────────────────────────────────────────────────────────
+# ── Cooldown helpers ────────────────────────────────────────────────────
 
 def _refresh_risk_params():
     """Read stop_loss_enabled/pct, take_profit_pct and new exit flags from strategy.json."""
     global _take_profit_mult, _stop_loss_mult, _take_profit_enabled, _smart_hold_enabled, _trailing_stop_pct
     strategy = _load_strategy()
-    tp_pct = float(strategy.get("take_profit_pct", 0.5))   # e.g. 0.5 → 0.5%
+    tp_pct = float(strategy.get("take_profit_pct", 0.0))   # e.g. 0.5 → 0.5%
     sl_pct = float(strategy.get("stop_loss_pct",   2.0))   # e.g. 2.0 → 2.0%
     sl_on  = bool(strategy.get("stop_loss_enabled", True))
     _take_profit_enabled = bool(strategy.get("take_profit_enabled", True))
@@ -265,7 +265,7 @@ def _in_cooldown(symbol: str) -> bool:
     return time.time() < exp
 
 
-# ── DB / startup helpers ──────────────────────────────────────────────────────
+# ── DB / startup helpers ─────────────────────────────────────────────────
 
 def _rebuild_pos_index():
     """Rebuild O(1) symbol→position lookup. Call whenever _positions changes."""
@@ -548,7 +548,7 @@ def get_open_positions() -> List[dict]:
         return list(_positions)
 
 
-# ── Strategy loader ───────────────────────────────────────────────────────────
+# ── Strategy loader ────────────────────────────────────────────────────
 
 def _load_strategy() -> dict:
     global _strategy_mtime, _strategy_cache
@@ -566,7 +566,7 @@ def _load_strategy() -> dict:
     return _strategy_cache
 
 
-# ── Account helpers ───────────────────────────────────────────────────────────
+# ── Account helpers ────────────────────────────────────────────────────
 
 def _get_usdt_balance() -> float:
     try:
@@ -586,21 +586,32 @@ def _get_usdt_balance() -> float:
     return 0.0
 
 
-def _floor_qty(qty: float, decimals: int = 8) -> float:
-    """Floor quantity to avoid Binance LOT_SIZE precision errors.
+_lot_step_cache: Dict[str, float] = {}
 
-    Default is 8 decimal places — matches PaperClient's buy precision so the
-    sell quantity is never truncated below what was actually purchased.
-    (The old default of 6 dp caused a double-floor: paper buys stored 8 dp,
-    sells re-floored to 6 dp, silently discarding ~$0.04–$0.09 per BTC trade
-    and turning every profitable +0.5% exit into a ~−0.0099 USDT loss.)
-    For live Binance use the symbol-specific LOT_SIZE stepSize instead.
-    """
+
+def _floor_qty(qty: float, symbol: str = "", decimals: int = 8) -> float:
+    """Floor quantity to the symbol's LOT_SIZE stepSize to avoid Binance -1111 errors.
+    Falls back to flat 8 decimal places if symbol is unknown or API call fails."""
+    if symbol:
+        step = _lot_step_cache.get(symbol)
+        if step is None:
+            try:
+                info = client.get_symbol_info(symbol)
+                for f in (info or {}).get("filters", []):
+                    if f.get("filterType") == "LOT_SIZE":
+                        step = float(f["stepSize"])
+                        break
+            except Exception:
+                step = 0.0
+            _lot_step_cache[symbol] = step or 0.0
+        if step and step > 0:
+            factor = 1.0 / step
+            return math.floor(qty * factor) / factor
     factor = 10 ** decimals
     return math.floor(qty * factor) / factor
 
 
-# ── Indicator helpers (derive from candle dict) ───────────────────────────────
+# ── Indicator helpers (derive from candle dict) ─────────────────────────────
 
 def _derive_ma_pos(price: float, ma20: Optional[float]) -> Optional[str]:
     if ma20 is None or ma20 == 0:
@@ -632,7 +643,7 @@ def _derive_bb_pos(price: float, candle: dict) -> Optional[str]:
     return "mid_zone"
 
 
-# ── Signal evaluation — 6-signal dict ────────────────────────────────────────
+# ── Signal evaluation — 6-signal dict ────────────────────────────────────
 
 def evaluate_signals(candles: list) -> dict:
     """
@@ -727,7 +738,7 @@ def _execute_sell(pos: dict, price: float, reason: str):
     to the executor — this function just verifies and executes."""
     from datetime import timezone as _tz
     sym  = pos["symbol"]
-    qty  = _floor_qty(pos["quantity"])
+    qty  = _floor_qty(pos["quantity"], pos["symbol"])
     mode = get_mode()
     now  = datetime.now(_tz.utc).isoformat()
 
@@ -831,7 +842,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             _rebuild_pos_index()
         return
 
-    # ── Fee-aware fill parsing ─────────────────────────────────────────────────
+    # ── Fee-aware fill parsing ───────────────────────────────────────────────────
     # Market orders can split across multiple fills at different price levels.
     # Each fill has its own commission amount and asset.
     # Wrap in try/except so an unexpected Binance response format never causes
@@ -1000,7 +1011,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
     # Throttle: don't call get_account() faster than every 1 s
     now = time.time()
-    if now - _last_buy_check < 1.0:
+    if now - _last_buy_check < 0.1:
         return
     _last_buy_check = now
 
@@ -1087,7 +1098,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         if already_held:
             continue
 
-        # ── Hard veto checks: BB position and 5m trend ────────────────────────
+        # ── Hard veto checks: BB position and 5m trend ────────────────────
         # Both are populated by the REST scan (_refresh_one) every 60 s and
         # preserved across kline-close updates.  Default True = not blocking.
         sigs    = cached.get("signals", {})
@@ -1235,7 +1246,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         database.log_activity(msg, "info")
 
 
-# ── Inline tick-driven signal refresh ────────────────────────────────────────
+# ── Inline tick-driven signal refresh ────────────────────────────────────────────
 
 def _inline_refresh_from_ticks(sym: str, price: float):
     """
@@ -1342,7 +1353,7 @@ def realtime_monitor(prices: Dict[str, float]):
             _tick_signal_ts[sym] = now
             _inline_refresh_from_ticks(sym, price)
 
-    # ── Real-time buy check — throttled to 1 s ────────────────────────────────
+    # ── Real-time buy check — throttled to 1 s ──────────────────────────────────
     _check_buys_from_cache(prices)
 
 
