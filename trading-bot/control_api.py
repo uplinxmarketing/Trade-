@@ -78,9 +78,7 @@ async def lifespan(app: FastAPI):
         #    trading_active is preserved so a running bot resumes after a redeploy.
         _s = _load_strategy()
         _auto_patch: dict = {
-            "pause_reason":       None,
-            "stop_loss_enabled":  False,   # always OFF — user opts in each session
-            "smart_hold_enabled": False,   # always OFF — user opts in each session
+            "pause_reason": None,
         }
         if "trading_active" not in _s:
             # Brand-new deploy — don't auto-start, let user press Start
@@ -1156,17 +1154,21 @@ def api_get_settings():
     """Return current bot risk/strategy settings."""
     s = _load_strategy()
     return {
-        "ok":                 True,
-        "stop_loss_enabled":  s.get("stop_loss_enabled",  True),
-        "stop_loss_pct":      s.get("stop_loss_pct",      2.0),
-        "take_profit_enabled":s.get("take_profit_enabled", True),
-        "take_profit_pct":    s.get("take_profit_pct",    0.5),
-        "smart_hold_enabled": s.get("smart_hold_enabled", False),
-        "trailing_stop_pct":  s.get("trailing_stop_pct",  0.5),
-        "reinvest_profits":   s.get("reinvest_profits",   False),
-        "max_positions":      s.get("max_positions",       20),
-        "min_signals":        s.get("min_signals",          config.MIN_SIGNALS_TO_BUY),
-        "strategy_notes":     s.get("strategy_notes",      ""),
+        "ok":                  True,
+        "stop_loss_enabled":   s.get("stop_loss_enabled",   False),
+        "stop_loss_pct":       s.get("stop_loss_pct",       2.0),
+        "take_profit_enabled": s.get("take_profit_enabled", True),
+        "take_profit_pct":     s.get("take_profit_pct",     0.1),
+        "smart_hold_enabled":  s.get("smart_hold_enabled",  False),
+        "trailing_stop_pct":   s.get("trailing_stop_pct",   0.5),
+        "reinvest_profits":    s.get("reinvest_profits",    False),
+        "max_positions":       s.get("max_positions",       20),
+        "min_signals":         s.get("min_signals",         config.MIN_SIGNALS_TO_BUY),
+        "strategy_notes":      s.get("strategy_notes",      ""),
+        "budget_mode":         s.get("budget_mode",         config.BUDGET_MODE),
+        "budget_fixed_usdt":   s.get("budget_fixed_usdt",   config.BUDGET_FIXED_USDT),
+        "budget_pct_of_free":  s.get("budget_pct_of_free",  config.BUDGET_PCT_OF_FREE),
+        "bot_allocation_usdt": s.get("bot_allocation_usdt", config.BOT_ALLOCATION_USDT),
     }
 
 
@@ -1191,7 +1193,7 @@ def api_save_settings(req: SettingsRequest):
         if req.stop_loss_enabled   is not None: patch["stop_loss_enabled"]  = bool(req.stop_loss_enabled)
         if req.stop_loss_pct       is not None: patch["stop_loss_pct"]      = max(0.1, min(20.0, req.stop_loss_pct))
         if req.take_profit_enabled is not None: patch["take_profit_enabled"] = bool(req.take_profit_enabled)
-        if req.take_profit_pct     is not None: patch["take_profit_pct"]    = max(0.1, min(50.0, req.take_profit_pct))
+        if req.take_profit_pct     is not None: patch["take_profit_pct"]    = max(0.0, min(50.0, req.take_profit_pct))
         if req.smart_hold_enabled  is not None: patch["smart_hold_enabled"] = bool(req.smart_hold_enabled)
         if req.trailing_stop_pct   is not None: patch["trailing_stop_pct"]  = max(0.1, min(10.0, req.trailing_stop_pct))
         if req.reinvest_profits    is not None: patch["reinvest_profits"]   = bool(req.reinvest_profits)
@@ -1314,10 +1316,10 @@ def api_all():
             "watched_coins":      approved or config.WATCHED_COINS,
             "data_persistent": database._DATA_DIR == "/data",
             "data_dir":        database._DATA_DIR,
-            "stop_loss_enabled":  strategy.get("stop_loss_enabled",  True),
-            "stop_loss_pct":      strategy.get("stop_loss_pct",      2.0),
-            "take_profit_enabled":strategy.get("take_profit_enabled", True),
-            "take_profit_pct":    strategy.get("take_profit_pct",    0.5),
+            "stop_loss_enabled":   strategy.get("stop_loss_enabled",   False),
+            "stop_loss_pct":       strategy.get("stop_loss_pct",       2.0),
+            "take_profit_enabled": strategy.get("take_profit_enabled", True),
+            "take_profit_pct":     strategy.get("take_profit_pct",     0.1),
             "smart_hold_enabled": strategy.get("smart_hold_enabled", False),
             "trailing_stop_pct":  strategy.get("trailing_stop_pct",  0.5),
             "reinvest_profits":   strategy.get("reinvest_profits",   False),
