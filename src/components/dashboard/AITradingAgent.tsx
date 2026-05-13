@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Play, Square, Brain, TrendingUp, TrendingDown, Zap,
   RotateCcw, ChevronDown, ChevronUp, FlaskConical,
@@ -182,7 +182,7 @@ const Toggle = ({ on, onChange, color = 'bg-accent/80' }: { on: boolean; onChang
   </button>
 );
 
-const AgentTradingFields = ({
+const AgentTradingFields = React.memo(({
   budgetMode, setBudgetMode, budgetValue, setBudgetValue,
   allocation, setAllocation,
   slEnabled, setSlEnabled, stopLoss, setStopLoss,
@@ -326,7 +326,7 @@ const AgentTradingFields = ({
       </div>
     </div>
   </div>
-);
+));
 
 // ── Component ────────────────────────────────────────────────────────────────────────────
 const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBinance, onCoinsChange, onStateChange, onLiveModeDetected }: AITradingAgentProps) => {
@@ -820,7 +820,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       const budgetPayload: Record<string,unknown> = {
         budget_mode:           setupBudgetMode,
         bot_allocation_usdt:   setupAllocation,
-        budget_fixed_usdt:     setupBudgetMode === 'fixed'   ? setupBudgetValue : undefined,
+        budget_fixed_usdt:     setupBudgetValue,
         budget_pct_of_free:    setupBudgetMode === 'percent' ? setupBudgetValue : undefined,
         budget_total_cap_usdt: setupBudgetMode === 'capped'  ? setupBudgetValue : undefined,
       };
@@ -1144,21 +1144,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             <Zap className="w-4 h-4" />
             Agent Trading Settings
           </div>
-
-          <AgentTradingFields
-            budgetMode={setupBudgetMode}   setBudgetMode={setSetupBudgetMode}
-            budgetValue={setupBudgetValue} setBudgetValue={setSetupBudgetValue}
-            allocation={setupAllocation}   setAllocation={setSetupAllocation}
-            slEnabled={setupSlEnabled}     setSlEnabled={setSetupSlEnabled}
-            stopLoss={setupStopLoss}       setStopLoss={setSetupStopLoss}
-            tpEnabled={setupTpEnabled}     setTpEnabled={setSetupTpEnabled}
-            takeProfit={setupTakeProfit}   setTakeProfit={setSetupTakeProfit}
-            smartHold={setupSmartHold}     setSmartHold={setSetupSmartHold}
-            trailingStop={setupTrailingStop} setTrailingStop={setSetupTrailingStop}
-            reinvest={setupReinvest}       setReinvest={setSetupReinvest}
-            maxPositions={setupMaxPositions} setMaxPositions={setSetupMaxPositions}
-            minSignals={setupMinSignals}   setMinSignals={setSetupMinSignals}
-          />
 
           <Button
             onClick={async () => { setSetupComplete(true); await handleStartBot(); }}
