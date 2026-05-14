@@ -1,5 +1,5 @@
 {
-  "version": "0.0.7",
-  "buildTime": "2026-05-14T19:00:00.000Z",
-  "commit": "stale-price-fix"
+  "version": "0.0.8",
+  "buildTime": "2026-05-14T19:30:00.000Z",
+  "commit": "silent-fail-fix"
 }

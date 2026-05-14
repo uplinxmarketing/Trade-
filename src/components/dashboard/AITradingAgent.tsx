@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
 import {
   Play, Square, Brain, TrendingUp, TrendingDown, Zap,
   RotateCcw, ChevronDown, ChevronUp, FlaskConical,
@@ -1393,7 +1394,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             ) : (
               <>
                 <div className="space-y-2">
-                  {(showAllPositions ? positions : positions.slice(0, 5)).map(pos => {
+                  <AnimatePresence initial={false}>
+                  {(showAllPositions
+                    ? [...positions].sort((a, b) => (b.dist_to_bep_pct ?? -999) - (a.dist_to_bep_pct ?? -999))
+                    : [...positions].sort((a, b) => (b.dist_to_bep_pct ?? -999) - (a.dist_to_bep_pct ?? -999)).slice(0, 5)
+                  ).map(pos => {
                     const entry = pos.avg_entry_price > 0 ? pos.avg_entry_price : 0;
                     // Priority: fresh_prices (injected per-poll outside cache) > local WS > cached server price
                     const cur   = freshPrices[pos.symbol]
@@ -1411,7 +1416,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       ? Math.max(0, Math.min(100, (cur - entry) / (exitTarget - entry) * 100))
                       : 0;
                     return (
-                      <div key={pos.symbol} className="bg-muted/20 rounded px-3 py-2 space-y-1">
+                      <motion.div
+                        key={pos.symbol}
+                        layout
+                        initial={{ opacity: 0, y: -8 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: 8 }}
+                        transition={{ duration: 0.25, type: 'spring', stiffness: 300, damping: 30 }}
+                        className="bg-muted/20 rounded px-3 py-2 space-y-1"
+                      >
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-2">
                             <div className={`w-1.5 h-1.5 rounded-full ${profitable ? 'bg-gain' : pct < 0 ? 'bg-loss' : 'bg-amber-400'}`} />
@@ -1483,9 +1496,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                             <span>Trapped: needs +{pos.real_bep_gap_pct.toFixed(2)}% to break even{pos.breakeven_price_real ? ` (real target $${pos.breakeven_price_real.toFixed(6)})` : ''}</span>
                           </div>
                         )}
-                      </div>
+                      </motion.div>
                     );
                   })}
+                  </AnimatePresence>
                 </div>
                 {positions.length > 5 && (
                   <button onClick={() => setShowAllPositions(!showAllPositions)}
