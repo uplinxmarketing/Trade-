@@ -385,38 +385,54 @@ def _refresh_risk_params():
     _stop_loss_mult   = (1.0 - sl_pct / 100.0) if sl_on else 0.0
 
 
-def _profitable_sell_check(pos: dict, price: float) -> bool:
+def _profitable_sell_check(pos: dict, price: float, force_fresh: bool = False) -> bool:
     """Return True only when selling at `price` is mathematically profitable in USDT.
 
-    Profit floor depends on whether take_profit is enabled:
-    - TP enabled  → require at least take_profit_pct% of budget (e.g. $0.055 on $11 @ 0.5%)
-    - TP disabled → require only $0.005 absolute (essentially breakeven + tiny buffer)
+    When force_fresh=True, does a single-symbol REST fetch and overrides the
+    passed price with the freshest available — used in the final pre-order gate
+    to ensure the profitability check is never based on a stale price.
 
-    This lets the user choose between strict profit targets and "exit as soon as
-    I cover fees + tiny safety" via the take_profit_enabled toggle.
+    Profit floor includes a 0.15% slippage buffer so even a bad market-order fill
+    (low-volume coin book slippage) still nets positive after fees.
     """
-    entry = pos.get("entry_price", 0)
-    qty = pos.get("quantity", 0)
+    symbol = pos.get("symbol", "")
+    if force_fresh and symbol:
+        try:
+            _fresh = _fetch_rest_prices([symbol])
+            _fp = _fresh.get(symbol, 0) if _fresh else 0
+            if _fp > 0:
+                price = _fp
+                # Keep caches consistent with this fresh price
+                _rest_px[symbol] = _fp
+                _last_ws_price_ts[symbol] = time.time()
+                try:
+                    import data_collector as _dc_psc
+                    _dc_psc.prices[symbol] = _fp
+                except Exception:
+                    pass
+        except Exception:
+            pass  # fall through to use passed price
+
+    entry  = pos.get("entry_price", 0)
+    qty    = pos.get("quantity", 0)
     budget = pos.get("budget_usdt", 0)
     buy_fee = float(pos.get("buy_fee_usdt") or budget * _fee_rate)
     if entry <= 0 or qty <= 0 or budget <= 0 or price <= 0:
         return False
-    gross_quote = price * qty
-    est_sell_fee = gross_quote * _fee_rate
-    net_returned = gross_quote - est_sell_fee
-    total_cost = budget + buy_fee
-    strategy = _load_strategy()
-    tp_enabled = bool(strategy.get("take_profit_enabled", True))
-    tp_pct = float(strategy.get("take_profit_pct", 0.1))
+    gross_quote    = price * qty
+    est_sell_fee   = gross_quote * _fee_rate
+    net_returned   = gross_quote - est_sell_fee
+    total_cost     = budget + buy_fee
+    strategy       = _load_strategy()
+    tp_enabled     = bool(strategy.get("take_profit_enabled", True))
+    tp_pct         = float(strategy.get("take_profit_pct", 0.1))
+    # 0.15% slippage buffer — absorbs worst-case market-order book slippage on
+    # low-volume coins so a bad fill can't push a "profitable" trade into a loss.
+    slippage_buf   = budget * 0.0015
     if tp_enabled:
-        # When TP enabled: enforce user's configured profit target as the floor.
-        # Absolute minimum $0.003 (0.027% on $11 trade) — avoids blocking
-        # near-breakeven sells due to fee-estimation rounding.
-        min_profit = max(0.003, budget * (tp_pct / 100.0))
+        min_profit = max(0.003 + slippage_buf, budget * (tp_pct / 100.0))
     else:
-        # TP disabled: lock in tiniest profit above slippage buffer.
-        # $0.003 fires on every +0.30% move, matching the adaptive breakeven tier.
-        min_profit = 0.003
+        min_profit = 0.003 + slippage_buf
     estimated_profit = net_returned - total_cost
     return estimated_profit >= min_profit
 
@@ -1007,52 +1023,28 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     # FINAL SAFETY GATE — never lose money on a take-profit sell.
     # Stop-loss and force-sell bypass this check (they're meant to fire even at a loss).
     if reason not in ("stop-loss", "force-sell", "manual", "user-initiated"):
-        # FIX C: always fetch a fresh REST price right before placing the order.
-        # Eliminates risk of stale WS/cache price passing the profitability check
-        # but the actual Binance fill being at a lower price.
-        ws_age = time.time() - _last_ws_price_ts.get(sym, 0)
-        try:
-            from data_collector import prices as _live_px
-            if ws_age <= 1.5:
-                # WS is fresh — use it directly (no extra API call)
-                freshest = _live_px.get(sym, 0) or price
-            else:
-                # WS stale — do a single-symbol REST fetch for the most accurate price
-                try:
-                    _presell_rest = _fetch_rest_prices([sym])
-                    _presell_p = _presell_rest.get(sym, 0) if _presell_rest else 0
-                except Exception:
-                    _presell_p = 0
-                if _presell_p > 0:
-                    freshest = _presell_p
-                    # Update caches so sell monitor / refresher see the fresh price
-                    _rest_px[sym] = _presell_p
-                    _last_ws_price_ts[sym] = time.time()
-                    try:
-                        from data_collector import prices as _dc_presell
-                        _dc_presell[sym] = _presell_p
-                    except Exception:
-                        pass
-                else:
-                    freshest = _live_px.get(sym, 0) or _rest_px.get(sym, 0) or price
-        except Exception:
-            freshest = price
-        if not _profitable_sell_check(pos, freshest):
-            # Price slipped below profit threshold between trigger and execution.
-            # Abort the sell — position stays open, next tick will re-evaluate.
+        # force_fresh=True: _profitable_sell_check fetches a fresh REST price for this
+        # symbol RIGHT NOW before evaluating. This prevents a stale price from passing
+        # the check while the actual Binance fill comes back at a lower level.
+        if not _profitable_sell_check(pos, price, force_fresh=True):
+            # Price is not profitable even at the freshest REST quote.
+            # Abort — position stays open, next tick re-evaluates.
             _now_abort = time.time()
             if _now_abort - _last_abort_log_ts.get(sym, 0) >= _ABORT_LOG_THROTTLE_SEC:
                 _last_abort_log_ts[sym] = _now_abort
+                _fresh_now = _rest_px.get(sym, 0) or price
                 database.log_activity(
-                    f"SELL ABORTED {sym} ({reason}): price ${freshest:.6f} would not net profit. "
+                    f"SELL ABORTED {sym} ({reason}): freshest REST price ${_fresh_now:.6f} "
+                    f"would not net profit (incl. slippage buffer). "
                     f"Position held — will retry on next favourable tick (log throttled 60s).",
                     "warn"
                 )
             _sell_last_failed_ts[sym] = time.time()
             _sell_last_failed_reason[sym] = reason
             return  # exit before placing order
-        # Use the freshest price as the trigger so paper-mode sell executes at current market
-        price = freshest
+        # _profitable_sell_check with force_fresh=True updated _rest_px[sym] — use it
+        # as the paper-mode execution price so the fill reflects current market
+        price = _rest_px.get(sym, 0) or price
 
     try:
         # Paper mode: pass the trigger price directly so concurrent WebSocket/REST
@@ -2077,6 +2069,23 @@ def _sell_monitor_loop():
         try:
             with _positions_lock:
                 snap = list(_positions)
+
+            # ── REST price refresh BEFORE trigger evaluation ─────────────────
+            # Fetch current prices for all held positions via a single batch REST
+            # call. This ensures trigger decisions use prices ≤3s old regardless
+            # of WebSocket activity on low-volume coins.
+            if snap:
+                _sm_syms = list({p["symbol"] for p in snap})
+                try:
+                    _sm_fetched = _fetch_rest_prices(_sm_syms)
+                    if _sm_fetched:
+                        _sm_now = time.time()
+                        for _s, _p in _sm_fetched.items():
+                            _dc.prices[_s]        = _p
+                            _rest_px[_s]          = _p
+                            _last_ws_price_ts[_s] = _sm_now
+                except Exception:
+                    pass  # non-fatal — monitor continues with cached prices
 
             # ── Watchdog: force-clear _selling entries stuck > 20 s ──────────
             now_wd = time.time()
