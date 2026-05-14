@@ -271,6 +271,15 @@ async def _start_websocket_loop():
                 _ws_health["connect_count"]  += 1
                 _ws_health["last_connect_ts"] = time.time()
                 print("[DataCollector] WebSocket connected ✓")
+                if _ws_health["disconnect_count"] > 0:
+                    try:
+                        import trade_engine as _te_dc
+                        _te_dc.log_diag_issue(
+                            "websocket", "info",
+                            f"WebSocket reconnected (subscribed {len(active_coins)} symbols)",
+                        )
+                    except Exception:
+                        pass
 
                 async for raw in ws:
                     _ws_health["messages_received"] += 1
@@ -363,6 +372,15 @@ async def _start_websocket_loop():
             _ws_health["last_disconnect_ts"]   = time.time()
             print(f"[DataCollector] WebSocket disconnected: {e}")
             print(f"[DataCollector] Reconnecting in {backoff}s…")
+            try:
+                import trade_engine as _te_dc
+                _te_dc.log_diag_issue(
+                    "websocket", "warn",
+                    f"WebSocket disconnected, reconnect #{_ws_health['disconnect_count']}",
+                    detail=f"{type(e).__name__}: {e} — backoff {backoff}s",
+                )
+            except Exception:
+                pass
 
             # Fill gap: re-fetch last 10 candles via REST for active coins only.
             # Run in a thread so the blocking urlopen never freezes the event loop.

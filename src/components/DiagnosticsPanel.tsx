@@ -1,5 +1,14 @@
 import { useEffect, useState } from 'react';
 
+interface DiagIssue {
+  ts: number;
+  iso: string;
+  source: string;
+  severity: 'error' | 'warn' | 'info';
+  message: string;
+  detail: string;
+}
+
 interface Diagnostics {
   server_time: number;
   binance: {
@@ -45,6 +54,12 @@ interface Diagnostics {
     active_threads_count: number;
     active_threads: string[];
   };
+  issues: {
+    recent: DiagIssue[];
+    error_count: number;
+    warn_count: number;
+    total_buffered: number;
+  };
 }
 
 function StatusDot({ ok, pulse = true }: { ok: boolean; pulse?: boolean }) {
@@ -57,13 +72,7 @@ function StatusDot({ ok, pulse = true }: { ok: boolean; pulse?: boolean }) {
   );
 }
 
-function Bar({
-  pct,
-  color = 'bg-blue-500',
-}: {
-  pct: number;
-  color?: string;
-}) {
+function Bar({ pct, color = 'bg-blue-500' }: { pct: number; color?: string }) {
   return (
     <div className="w-full h-1.5 bg-gray-700 rounded-full overflow-hidden">
       <div
@@ -74,12 +83,47 @@ function Bar({
   );
 }
 
+function IssueRow({ issue, expanded, onToggle }: {
+  issue: DiagIssue;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const time = new Date(issue.ts * 1000).toLocaleTimeString();
+  const colorClass =
+    issue.severity === 'error' ? 'border-red-500 text-red-300' :
+    issue.severity === 'warn'  ? 'border-yellow-500 text-yellow-200' :
+                                  'border-blue-500 text-blue-200';
+
+  return (
+    <div
+      className={`border-l-2 ${colorClass} pl-2 text-[10px] cursor-pointer`}
+      onClick={onToggle}
+    >
+      <div className="flex justify-between text-gray-400">
+        <span>[{issue.source}]</span>
+        <span>{time}</span>
+      </div>
+      <div className="font-mono break-words">{issue.message}</div>
+      {!expanded && issue.detail && (
+        <div className="text-gray-500 text-[9px] mt-0.5 truncate">↳ {issue.detail}</div>
+      )}
+      {expanded && issue.detail && (
+        <div className="text-gray-400 text-[9px] mt-1 p-1 bg-black/30 rounded font-mono whitespace-pre-wrap break-words">
+          {issue.detail}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const POLL_MS = 2000;
 
 export function DiagnosticsPanel() {
   const [diag, setDiag]           = useState<Diagnostics | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [error, setError]         = useState<string | null>(null);
+  const [expandedTs, setExpandedTs] = useState<Set<number>>(new Set());
+  const [copyMsg, setCopyMsg]     = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -89,8 +133,8 @@ export function DiagnosticsPanel() {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
         if (!cancelled) { setDiag(data); setError(null); }
-      } catch (e: any) {
-        if (!cancelled) setError(e.message ?? 'fetch failed');
+      } catch (e: unknown) {
+        if (!cancelled) setError((e as Error).message ?? 'fetch failed');
       }
     }
     poll();
@@ -113,6 +157,11 @@ export function DiagnosticsPanel() {
         >
           <StatusDot ok={overallOk} />
           <span>Diagnostics</span>
+          {(diag?.issues?.error_count ?? 0) > 0 && (
+            <span className="bg-red-600 text-white text-[9px] px-1 rounded">
+              {diag!.issues.error_count}
+            </span>
+          )}
         </button>
       </div>
     );
@@ -131,6 +180,32 @@ export function DiagnosticsPanel() {
     diag.binance.used_weight_pct < 50 ? 'bg-green-500' :
     diag.binance.used_weight_pct < 80 ? 'bg-yellow-500' : 'bg-red-500';
 
+  async function copyLog() {
+    try {
+      const r = await fetch('/api/diagnostics/log/text');
+      const text = await r.text();
+      await navigator.clipboard.writeText(text);
+      setCopyMsg('Copied!');
+      setTimeout(() => setCopyMsg(''), 2000);
+    } catch (e) {
+      setCopyMsg('Failed');
+      setTimeout(() => setCopyMsg(''), 2000);
+    }
+  }
+
+  async function clearLog() {
+    if (!confirm('Clear diagnostic log?')) return;
+    await fetch('/api/diagnostics/log/clear', { method: 'POST' });
+  }
+
+  function toggleExpanded(ts: number) {
+    setExpandedTs(prev => {
+      const next = new Set(prev);
+      next.has(ts) ? next.delete(ts) : next.add(ts);
+      return next;
+    });
+  }
+
   return (
     <div className="fixed bottom-4 right-4 z-50 bg-gray-900 border border-gray-700 rounded-lg shadow-xl w-80 text-xs text-gray-200 font-mono select-none">
       {/* Header */}
@@ -146,7 +221,7 @@ export function DiagnosticsPanel() {
         >×</button>
       </div>
 
-      <div className="p-3 space-y-3 max-h-[32rem] overflow-y-auto">
+      <div className="p-3 space-y-3 max-h-[80vh] overflow-y-auto">
         {/* Binance REST */}
         <section>
           <div className="flex items-center gap-2 mb-1">
@@ -190,7 +265,7 @@ export function DiagnosticsPanel() {
           </div>
         </section>
 
-        {/* Signal scanner — animated progress bar */}
+        {/* Signal scanner */}
         <section>
           <div className="flex items-center gap-2 mb-1">
             <StatusDot
@@ -239,6 +314,57 @@ export function DiagnosticsPanel() {
             <span>Threads</span>
             <span>{diag.system.active_threads_count}</span>
           </div>
+        </section>
+
+        {/* Issues feed */}
+        <section className="border-t border-gray-700 pt-2">
+          <div className="flex justify-between items-center mb-2">
+            <span className="font-semibold flex items-center gap-1.5">
+              Issues
+              {(diag.issues?.error_count ?? 0) > 0 && (
+                <span className="bg-red-600 text-white text-[9px] px-1.5 py-0.5 rounded">
+                  {diag.issues.error_count} err
+                </span>
+              )}
+              {(diag.issues?.warn_count ?? 0) > 0 && (
+                <span className="bg-yellow-600 text-white text-[9px] px-1.5 py-0.5 rounded">
+                  {diag.issues.warn_count} warn
+                </span>
+              )}
+            </span>
+            <div className="flex gap-1 items-center">
+              {copyMsg && <span className="text-green-400 text-[9px]">{copyMsg}</span>}
+              <button
+                onClick={copyLog}
+                className="text-[10px] bg-gray-700 hover:bg-gray-600 px-2 py-0.5 rounded"
+                title="Copy plain-text report to clipboard"
+              >
+                Copy
+              </button>
+              <button
+                onClick={clearLog}
+                className="text-[10px] bg-gray-700 hover:bg-gray-600 px-2 py-0.5 rounded"
+                title="Clear issue log"
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+
+          {(!diag.issues?.recent?.length) ? (
+            <div className="text-gray-500 text-[10px] italic">No recent issues</div>
+          ) : (
+            <div className="space-y-1.5 max-h-48 overflow-y-auto pr-0.5">
+              {diag.issues.recent.slice(0, 10).map((issue, i) => (
+                <IssueRow
+                  key={`${issue.ts}-${i}`}
+                  issue={issue}
+                  expanded={expandedTs.has(issue.ts)}
+                  onToggle={() => toggleExpanded(issue.ts)}
+                />
+              ))}
+            </div>
+          )}
         </section>
       </div>
     </div>
