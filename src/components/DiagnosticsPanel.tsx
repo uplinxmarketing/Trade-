@@ -131,6 +131,9 @@ export function DiagnosticsPanel() {
   const [error, setError]         = useState<string | null>(null);
   const [expandedTs, setExpandedTs] = useState<Set<number>>(new Set());
   const [copyMsg, setCopyMsg]     = useState('');
+  const [claudeEnabled, setClaudeEnabled] = useState<boolean | null>(null);
+  const [claudeKeyOk, setClaudeKeyOk]     = useState(false);
+  const [claudeToggling, setClaudeToggling] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -148,6 +151,29 @@ export function DiagnosticsPanel() {
     const id = setInterval(poll, POLL_MS);
     return () => { cancelled = true; clearInterval(id); };
   }, []);
+
+  useEffect(() => {
+    fetch('/api/strategy/claude-status')
+      .then(r => r.json())
+      .then(d => { setClaudeEnabled(d.claude_agent_enabled); setClaudeKeyOk(d.api_key_configured); })
+      .catch(() => {});
+  }, []);
+
+  async function toggleClaude() {
+    if (claudeEnabled === null || claudeToggling) return;
+    setClaudeToggling(true);
+    try {
+      const r = await fetch('/api/strategy/claude-toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !claudeEnabled }),
+      });
+      const d = await r.json();
+      setClaudeEnabled(d.claude_agent_enabled);
+    } finally {
+      setClaudeToggling(false);
+    }
+  }
 
   const overallOk =
     (diag?.binance.rest_ok ?? false) &&
@@ -353,6 +379,31 @@ export function DiagnosticsPanel() {
             <span>{diag.system.active_threads_count}</span>
           </div>
         </section>
+
+        {/* Claude agent toggle */}
+        {claudeEnabled !== null && (
+          <section className="border-t border-gray-700 pt-2">
+            <div className="flex items-center gap-2">
+              <div className="flex-1">
+                <div className="font-semibold text-[11px]">Claude AI Agent</div>
+                <div className="text-[9px] text-gray-400 mt-0.5">
+                  {claudeEnabled
+                    ? (claudeKeyOk ? 'Active — reviews strategy every 10 min' : 'Enabled but no API key set')
+                    : 'Disabled — bot uses static strategy.json'}
+                </div>
+              </div>
+              <button
+                onClick={toggleClaude}
+                disabled={claudeToggling}
+                className={`text-[10px] px-2.5 py-1 rounded font-medium transition-colors ${
+                  claudeEnabled ? 'bg-green-700 hover:bg-green-600 text-white' : 'bg-gray-600 hover:bg-gray-500 text-gray-300'
+                } disabled:opacity-50`}
+              >
+                {claudeEnabled ? 'ON' : 'OFF'}
+              </button>
+            </div>
+          </section>
+        )}
 
         {/* Issues feed */}
         <section className="border-t border-gray-700 pt-2">
