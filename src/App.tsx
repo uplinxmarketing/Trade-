@@ -21,14 +21,20 @@ function VersionChecker() {
         if (data.version && typeof __APP_VERSION__ !== 'undefined'
             && __APP_VERSION__ !== 'unknown'
             && data.version !== __APP_VERSION__) {
+          // Guard: only reload once per server version to prevent infinite reload loops
+          // when bundle version and server version.json are persistently out of sync.
+          const guardKey = `reloaded_for_v${data.version}`;
+          if (sessionStorage.getItem(guardKey)) return;
+          sessionStorage.setItem(guardKey, '1');
           console.log(`[Version] server=${data.version} bundle=${__APP_VERSION__} — reloading`);
           window.location.reload();
         }
       } catch { /* ignore */ }
     }
-    check();
-    const id = setInterval(check, 60_000);
-    return () => clearInterval(id);
+    // Delay initial check by 5s so the page finishes rendering before any reload.
+    const init = setTimeout(check, 5_000);
+    const id   = setInterval(check, 60_000);
+    return () => { clearTimeout(init); clearInterval(id); };
   }, []);
   return null;
 }

@@ -1525,6 +1525,35 @@ def api_diagnostics_log_text(limit: int = 50, severity: str = ""):
     return _Resp(content="\n".join(header + body), media_type="text/plain")
 
 
+@app.get("/api/stats/daily")
+def api_stats_daily(days: int = 7):
+    """Daily trade summary — buys, sells, PnL, win rate per day."""
+    import sqlite3 as _sq
+    days = max(1, min(30, int(days)))
+    conn = _sq.connect(database.DB_PATH)
+    conn.row_factory = _sq.Row
+    rows = conn.execute("""
+        SELECT
+            DATE(created_at)                                                          AS day,
+            COUNT(*) FILTER (WHERE side='BUY')                                        AS buys,
+            COUNT(*) FILTER (WHERE side='SELL')                                       AS sells,
+            ROUND(SUM(pnl), 4)                                                        AS total_pnl,
+            ROUND(AVG(pnl) FILTER (WHERE side='SELL'), 4)                             AS avg_pnl,
+            ROUND(MIN(pnl) FILTER (WHERE side='SELL'), 4)                             AS worst_pnl,
+            ROUND(MAX(pnl) FILTER (WHERE side='SELL'), 4)                             AS best_pnl,
+            ROUND(
+                100.0 * COUNT(*) FILTER (WHERE pnl > 0)
+                / NULLIF(COUNT(*) FILTER (WHERE side='SELL'), 0),
+            1)                                                                         AS win_rate
+        FROM trades
+        WHERE created_at > datetime('now', ?)
+        GROUP BY day
+        ORDER BY day DESC
+    """, (f"-{days} days",)).fetchall()
+    conn.close()
+    return {"days": [dict(r) for r in rows]}
+
+
 @app.get("/api/debug-refresher")
 def api_debug_refresher():
     """Diagnostic: price refresher threads health + per-symbol REST price ages."""

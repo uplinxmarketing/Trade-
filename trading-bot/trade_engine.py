@@ -168,7 +168,7 @@ _binance_health_lock = threading.Lock()
 # ── In-memory diagnostic ring buffer — last 50 issues, never written to DB ────
 from collections import deque as _deque
 
-_diag_log: "_deque[dict]" = _deque(maxlen=50)
+_diag_log: "_deque[dict]" = _deque(maxlen=100)
 _diag_log_lock = threading.Lock()
 
 
