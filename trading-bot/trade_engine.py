@@ -259,13 +259,12 @@ def _refresh_risk_params():
 def _profitable_sell_check(pos: dict, price: float) -> bool:
     """Return True only when selling at `price` is mathematically profitable in USDT.
 
-    Computes expected USDT received (after sell fee) minus total cost
-    (budget + buy fee + minimum profit margin). Returns False if the
-    net would not exceed the profit threshold — guarantees we NEVER
-    realize a loss on a take-profit sell.
+    Profit floor depends on whether take_profit is enabled:
+    - TP enabled  → require at least take_profit_pct% of budget (e.g. $0.055 on $11 @ 0.5%)
+    - TP disabled → require only $0.005 absolute (essentially breakeven + tiny buffer)
 
-    Minimum profit margin = take_profit_pct% of budget OR _MIN_PROFIT_USDT,
-    whichever is greater.
+    This lets the user choose between strict profit targets and "exit as soon as
+    I cover fees + tiny safety" via the take_profit_enabled toggle.
     """
     entry = pos.get("entry_price", 0)
     qty = pos.get("quantity", 0)
@@ -273,19 +272,19 @@ def _profitable_sell_check(pos: dict, price: float) -> bool:
     buy_fee = float(pos.get("buy_fee_usdt") or budget * _fee_rate)
     if entry <= 0 or qty <= 0 or budget <= 0 or price <= 0:
         return False
-    # Estimated raw quote received (before sell fee)
     gross_quote = price * qty
-    # Estimated sell fee (worst case — assumes USDT fee mode)
     est_sell_fee = gross_quote * _fee_rate
-    # Estimated USDT actually returned to wallet
     net_returned = gross_quote - est_sell_fee
-    # Total cost basis (original spend + buy commission already paid)
     total_cost = budget + buy_fee
-    # Required minimum profit — must clear take_profit_pct AND be at least $0.005 absolute
     strategy = _load_strategy()
+    tp_enabled = bool(strategy.get("take_profit_enabled", True))
     tp_pct = float(strategy.get("take_profit_pct", 0.1))
-    min_profit = max(0.005, budget * (tp_pct / 100.0))
-    # Sell only if estimated profit ≥ minimum required
+    if tp_enabled:
+        # Strict floor: must clear configured TP % of budget OR $0.005, whichever larger
+        min_profit = max(0.005, budget * (tp_pct / 100.0))
+    else:
+        # TP disabled: just clear breakeven + tiny safety buffer
+        min_profit = 0.005
     estimated_profit = net_returned - total_cost
     return estimated_profit >= min_profit
 
@@ -843,7 +842,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     _is_paper = (mode != "live")
     # FINAL SAFETY GATE — never lose money on a take-profit sell.
     # Stop-loss and force-sell bypass this check (they're meant to fire even at a loss).
-    if reason not in ("stop-loss", "force-sell"):
+    if reason not in ("stop-loss", "force-sell", "manual", "user-initiated"):
         # Get the freshest available price (WebSocket tick may have moved since trigger)
         try:
             from data_collector import prices as _live_px
@@ -1020,8 +1019,9 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         database.log_activity(f"log_trade error ({sym}): {te}", "warn")
 
     pnl_sign = "+" if net_profit >= 0 else ""
+    mode_tag = "LIVE" if mode == "live" else "PAPER"
     sell_msg = (
-        f"SOLD {sym} @ ${fill_price:.4f} "
+        f"[{mode_tag}] SOLD {sym} @ ${fill_price:.4f} "
         f"· received {usdt_returned:.4f} USDT · P&L: {pnl_sign}{net_profit:.4f} USDT"
         f"  ({reason}, held {duration}s)"
     )
@@ -1301,8 +1301,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         usdt_balance -= budget + buy_fee_usdt
 
+        mode_tag = "LIVE" if mode == "live" else "PAPER"
         msg = (
-            f"BOUGHT {sym} @ ${fill_price:.4f} "
+            f"[{mode_tag}] BOUGHT {sym} @ ${fill_price:.4f} "
             f"| qty={qty:.6f} | EXIT TARGET=${exit_target:.4f} "
             f"| {sig_str} | {bb_str} {m5_str} | count:{score}/6"
         )
