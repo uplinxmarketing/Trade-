@@ -448,6 +448,15 @@ _selling: set = set()
 _selling_lock = threading.Lock()
 _selling_ts: Dict[str, float] = {}   # when each sym was added — for watchdog
 
+# ── In-progress BUY guard — mirrors _selling pattern to prevent double-buys ──
+# Without this, two concurrent buy paths (scanner iteration overlap, force-buy
+# racing scheduled buy, retry-after-failure) can fire two buys for the same
+# symbol within milliseconds. Confirmed by duplicate DOT and IMX entries in DB.
+_buying: set = set()
+_buying_lock = threading.Lock()
+_buying_ts: Dict[str, float] = {}
+_BUYING_TIMEOUT_SEC = 30.0   # auto-release if a buy attempt crashes silently
+
 # ── Bad-symbol blacklist — populated when Binance returns -1013 (market closed)
 # Prevents repeated buy attempts and rate-limits sell retries on closed markets.
 _bad_symbols: set = set()
@@ -1834,9 +1843,25 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             )
             continue
 
+        # Atomic claim — prevents concurrent buy for the same symbol
+        with _buying_lock:
+            _now_b = time.time()
+            _stale_b = [s for s, ts in _buying_ts.items() if (_now_b - ts) > _BUYING_TIMEOUT_SEC]
+            for _s in _stale_b:
+                _buying.discard(_s)
+                _buying_ts.pop(_s, None)
+            if sym in _buying:
+                database.log_activity(f"{sym}: buy skipped — concurrent buy already in flight", "info")
+                continue
+            _buying.add(sym)
+            _buying_ts[sym] = _now_b
+
         try:
             result = client.order_market_buy(symbol=sym, quoteOrderQty=budget)
         except Exception as e:
+            with _buying_lock:
+                _buying.discard(sym)
+                _buying_ts.pop(sym, None)
             err_str = str(e)
             print(f"[RealtimeBuy] BUY failed {sym}: {e}")
             database.log_activity(f"{sym}: BUY failed — {e}", "error")
@@ -1849,6 +1874,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         fill_price = float(buy_fills[0].get("price", price)) if buy_fills else price
         qty        = float(result.get("executedQty", 0))
         if qty <= 0:
+            with _buying_lock:
+                _buying.discard(sym)
+                _buying_ts.pop(sym, None)
             continue
 
         # Compute actual buy fee in USDT across all fills.
@@ -1941,6 +1969,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         )
         print(f"[RealtimeBuy] {msg}")
         database.log_activity(msg, "info")
+        with _buying_lock:
+            _buying.discard(sym)
+            _buying_ts.pop(sym, None)
 
 
 # ── Inline tick-driven signal refresh ────────────────────────────────────────────

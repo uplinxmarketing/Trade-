@@ -1149,6 +1149,7 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
     """Force-buy a coin immediately regardless of current signals."""
     sym = symbol.upper()
     try:
+        import trade_engine as _te
         from trade_engine import (get_budget_for_coin, _positions, _positions_lock,
                                     _get_breakeven_mult, _rebuild_pos_index)
         from connection import client as _client
@@ -1170,12 +1171,34 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
         if already_held:
             return {"ok": False, "error": f"Already holding {sym}"}
 
+        # Atomic claim — same guard as _check_buys_from_cache to prevent race with scanner
+        with _te._buying_lock:
+            _now_fb = time.time()
+            _stale_fb = [s for s, ts in _te._buying_ts.items()
+                         if (_now_fb - ts) > _te._BUYING_TIMEOUT_SEC]
+            for _s in _stale_fb:
+                _te._buying.discard(_s)
+                _te._buying_ts.pop(_s, None)
+            if sym in _te._buying:
+                return {"ok": False, "error": f"Buy already in progress for {sym}"}
+            _te._buying.add(sym)
+            _te._buying_ts[sym] = _now_fb
+
         _client.update_price(sym, price)
-        result = _client.order_market_buy(symbol=sym, quoteOrderQty=budget)
+        try:
+            result = _client.order_market_buy(symbol=sym, quoteOrderQty=budget)
+        except Exception as _buy_e:
+            with _te._buying_lock:
+                _te._buying.discard(sym)
+                _te._buying_ts.pop(sym, None)
+            raise _buy_e
         fill       = result.get("fills", [{}])[0]
         fill_price = float(fill.get("price", price))
         qty        = float(result.get("executedQty", 0))
         if qty <= 0:
+            with _te._buying_lock:
+                _te._buying.discard(sym)
+                _te._buying_ts.pop(sym, None)
             return {"ok": False, "error": "Order returned 0 quantity"}
 
         _bep_m_fb = _get_breakeven_mult(fill_price, sym)
@@ -1198,6 +1221,9 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
             database.log_activity(f"Supabase sync error after force-buy {sym}: {_sbe}", "error")
 
         database.log_activity(f"Force buy: {sym} @ ${fill_price:.4f} | qty={qty:.6f} | budget={budget:.2f} USDT", "info")
+        with _te._buying_lock:
+            _te._buying.discard(sym)
+            _te._buying_ts.pop(sym, None)
         return {"ok": True, "symbol": sym, "price": fill_price, "quantity": qty, "budget": budget}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -1661,6 +1687,10 @@ def api_diagnostics():
             "heartbeat_age_sec": sm_hb_age,
             "open_positions":    len(_te._positions),
             "in_progress_sells": len(_te._selling),
+        },
+        "buying": {
+            "in_progress_count":   len(_te._buying),
+            "in_progress_symbols": list(_te._buying),
         },
         "price_refresher": {
             "alive":       ref_alive,
