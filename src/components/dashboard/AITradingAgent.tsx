@@ -11,6 +11,7 @@ import { toast } from 'sonner';
 import { checkExits, TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
 import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcSMA } from '@/lib/indicators';
+import { formatTime, formatPnL } from '@/lib/format';
 
 // ── Simple 4-signal analyser (no API key, Binance public data only) ────────────────────
 const BIN = 'https://api.binance.com/api/v3';
@@ -656,7 +657,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     // Propagate mode to parent so binanceConnected stays correct even when the
     // page loaded while the bot was restarting and the mount hook failed.
     onLiveModeDetected?.(s.mode === 'live');
-    setAgentStatus(`Bot · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${new Date().toLocaleTimeString()}`);
+    setAgentStatus(`Bot · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${formatTime(new Date())}`);
     if (s.data_persistent !== undefined) setDataPersistent(Boolean(s.data_persistent));
     setUsingPaperFallback(Boolean(s.using_paper_fallback));
     setLiveErrorMsg(s.live_error ?? null);
@@ -1141,7 +1142,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           {dataPersistent !== null && (
             <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${
               dataPersistent ? 'bg-gain/20 text-gain' : 'bg-amber-500/20 text-amber-400'
-            }`}>{dataPersistent ? 'PERSISTENT' : 'VOLATILE'}</span>
+            }`}>{dataPersistent ? 'Live (DB connected)' : 'Volatile (no DB)'}</span>
           )}
           {isRunning && <span className="w-2 h-2 rounded-full bg-gain animate-pulse" />}
           <button onClick={async () => {
@@ -1184,7 +1185,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       <div className="grid grid-cols-4 divide-x divide-border border-b border-border">
         {[['Balance', `${(balance).toLocaleString(undefined, {maximumFractionDigits:2})} USDT`, balance > initialBalance ? 'text-gain' : 'text-foreground'],
           ['Positions', `${positions.length}`, 'text-foreground'],
-          ['Total PnL', `${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}`, totalPnl >= 0 ? 'text-gain' : 'text-loss'],
+          ['Total PnL', formatPnL(totalPnl, 2), totalPnl >= 0 ? 'text-gain' : 'text-loss'],
           ['Win Rate', `${winRate.toFixed(0)}%`, winRate >= 50 ? 'text-gain' : 'text-muted-foreground'],
         ].map(([label, val, cls]) => (
           <div key={label} className="p-3 text-center">
@@ -1379,7 +1380,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             <span className="text-xs font-semibold">Open Positions ({positions.length})</span>
             {unrealizedPnl !== 0 && (
               <span className={`text-[10px] font-mono ${unrealizedPnl >= 0 ? 'text-gain' : 'text-loss'}`}>
-                {unrealizedPnl >= 0 ? '+' : ''}{unrealizedPnl.toFixed(2)} USDT
+                {formatPnL(unrealizedPnl, 2)} USDT
               </span>
             )}
           </div>
@@ -1431,7 +1432,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                               >${cur > 0 ? cur.toFixed(6) : '…'}</span>
                             </p>
                             <p className={`text-[9px] font-mono ${pnl >= 0 ? 'text-gain' : 'text-loss'}`}>
-                              {pnl >= 0 ? '+' : ''}{pnl.toFixed(4)} USDT ({pct >= 0 ? '+' : ''}{pct.toFixed(3)}%)
+                              {formatPnL(pnl, 4)} USDT ({pct >= 0 ? '+' : pct < 0 ? '−' : ''}{Math.abs(pct).toFixed(3)}%)
                             </p>
                           </div>
                           <button
@@ -1469,7 +1470,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                         </div>
                         {/* Real breakeven — shown only when it differs meaningfully from trigger price */}
                         {pos.breakeven_price_real && pos.breakeven_price_real > exitTarget * 1.001 && (
-                          <div className="text-[8px] text-amber-500/80 font-mono">
+                          <div className="text-[8px] text-amber-500/80 font-mono" title="Real breakeven after Binance fees + lot-size rounding. Bot won't sell below this even if trigger fires.">
                             Real target: ${pos.breakeven_price_real.toFixed(6)}
                             {pos.real_bep_gap_pct !== undefined && pos.real_bep_gap_pct > 0 && (
                               <span className="ml-1">(+{pos.real_bep_gap_pct.toFixed(2)}% needed)</span>
@@ -1529,14 +1530,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                           : <TrendingDown className="w-3 h-3 text-loss" />}
                         <div>
                           <p className="text-[11px] font-bold">{t.symbol.replace('USDT','')}</p>
-                          <p className="text-[9px] text-muted-foreground">{new Date(t.created_at).toLocaleTimeString()}</p>
+                          <p className="text-[9px] text-muted-foreground">{formatTime(t.created_at)}</p>
                         </div>
                       </div>
                       <div className="text-right">
                         <p className="text-[11px] font-mono">{t.price.toFixed(4)}</p>
                         {t.pnl !== null && (
                           <p className={`text-[9px] font-mono font-bold ${t.pnl >= 0 ? 'text-gain' : 'text-loss'}`}>
-                            {t.pnl >= 0 ? '+' : ''}{t.pnl.toFixed(2)}
+                            {formatPnL(t.pnl, 2)}
                           </p>
                         )}
                       </div>
@@ -1558,7 +1559,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       {/* Force buy section */}
       {isServerMode && setupComplete && (
         <div className="border-t border-border px-4 py-3">
-          <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Force Buy</p>
+          <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Manual Buy</p>
           <div className="flex flex-wrap gap-1.5">
             {selectedCoins.slice(0, 20).map(sym => {
               const held = positions.find(p => p.symbol === sym);

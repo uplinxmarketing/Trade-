@@ -125,5 +125,5 @@ function formatTime(ts: number, interval: string): string {
     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
   if (interval === '4h' || interval === '1h')
     return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
-  return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+  return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
 }

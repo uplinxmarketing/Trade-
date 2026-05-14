@@ -1,5 +1,6 @@
 import { SupabaseClient } from '@supabase/supabase-js';
 import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcATR, calcSMA, calcEntryScore, calcTechnicalSignal } from './indicators';
+import { formatTime } from './format';
 
 const B = 'https://api.binance.com/api/v3';
 
@@ -303,5 +304,5 @@ export async function runAnalysisCycle(
       });
     } catch { /* skip */ }
   }
-  onStatus?.(`Analyzed ${coins.length} coins · ${new Date().toLocaleTimeString()}`);
+  onStatus?.(`Analyzed ${coins.length} coins · ${formatTime(new Date())}`);
 }

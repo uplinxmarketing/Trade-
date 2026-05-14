@@ -4,6 +4,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
 import { toast } from 'sonner';
+import { formatTime as fmtTimeLib } from '@/lib/format';
 
 const BREAK_EVEN_MULT = 1 / Math.pow(1 - TAKER_FEE, 2);
 
@@ -32,8 +33,7 @@ interface Props {
 
 function fmt(n: number, d = 2) { return n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }); }
 function fmtTime(iso: string) {
-  const d = new Date(iso);
-  return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  return fmtTimeLib(iso);
 }
 function fmtDate(iso: string) {
   const d = new Date(iso);

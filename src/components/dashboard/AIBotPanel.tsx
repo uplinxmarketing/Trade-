@@ -4,6 +4,7 @@ import {
   RotateCcw, ChevronDown, ChevronUp, FlaskConical,
   DollarSign, Pencil, Check, X, Settings2,
 } from 'lucide-react';
+import { formatTime, formatPnL } from '@/lib/format';
 import { Button } from '@/components/ui/button';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
@@ -131,7 +132,7 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
       scores[sym] = sig.entryScore + sig.aiBoost;
     }
     setSignalScores(scores);
-    setSignalRefreshedAt(new Date().toLocaleTimeString());
+    setSignalRefreshedAt(formatTime(new Date()));
   }, []);
 
   useEffect(() => {
@@ -428,8 +429,8 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
       <div className="grid grid-cols-4 gap-1.5">
         {[
           { label: 'USDT Free',  value: balance.toLocaleString('en-US', { maximumFractionDigits: 2 }), unit: '', color: '' },
-          { label: 'Net P&L',   value: `${totalPnl >= 0 ? '+' : ''}${Math.abs(totalPnl).toFixed(2)}`, unit: ' USDT', color: pnlColor },
-          { label: 'Return',    value: `${totalPnl >= 0 ? '+' : ''}${pnlPct}%`, unit: '', color: pnlColor },
+          { label: 'Net P&L',   value: formatPnL(totalPnl, 2), unit: ' USDT', color: pnlColor },
+          { label: 'Return',    value: `${totalPnl >= 0 ? '+' : totalPnl < 0 ? '−' : ''}${pnlPct}%`, unit: '', color: pnlColor },
           { label: 'Win Rate',  value: `${winRate}%`, unit: '', color: winRate >= 50 ? 'text-gain' : trades.filter(t => t.side === 'SELL').length > 0 ? 'text-loss' : '' },
         ].map(s => (
           <div key={s.label} className="bg-muted/20 rounded-md p-2 text-center">
@@ -482,7 +483,7 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
                       <span className="text-muted-foreground font-mono text-[10px]">×{Number(pos.quantity).toFixed(6)}</span>
                     </div>
                     <span className={`font-mono font-semibold ${uPnl >= 0 ? 'text-gain' : 'text-loss'}`}>
-                      {uPnl >= 0 ? '+' : ''}{uPnl.toFixed(4)} USDT
+                      {formatPnL(uPnl, 4)} USDT
                       <span className="font-normal opacity-70 ml-1">({pct.toFixed(2)}%)</span>
                     </span>
                   </div>
@@ -514,7 +515,7 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
               const isBuy  = t.side === 'BUY';
               const profit = t.pnl !== null && t.pnl > 0;
               const loss   = t.pnl !== null && t.pnl < 0;
-              const time   = new Date(t.created_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+              const time   = formatTime(t.created_at);
               return (
                 <div key={t.id} className={`flex items-start justify-between py-1.5 px-2.5 rounded text-xs ${profit ? 'bg-gain/10 border border-gain/20' : loss ? 'bg-loss/10 border border-loss/20' : isBuy ? 'bg-muted/20 border border-border/30' : 'bg-muted/10 border border-border/20'}`}>
                   <div className="flex items-start gap-2 min-w-0">
@@ -533,7 +534,7 @@ const AIBotPanel = ({ selectedCoins, prices, binanceConnected, onConnectBinance 
                   <div className="text-right flex-shrink-0 ml-2">
                     {t.pnl !== null && (
                       <div className={`font-mono font-bold text-[10px] ${t.pnl >= 0 ? 'text-gain' : 'text-loss'}`}>
-                        {t.pnl >= 0 ? '+' : ''}{t.pnl.toFixed(4)} USDT
+                        {formatPnL(t.pnl, 4)} USDT
                       </div>
                     )}
                     <div className="text-[9px] text-muted-foreground font-mono">{time}</div>
