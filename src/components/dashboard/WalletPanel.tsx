@@ -55,11 +55,13 @@ const WalletPanel = ({ binanceConnected, onSelectCoin, selectedTradingCoins = []
         let usdValue = 0;
         const symbol = asset === 'USDT' ? 'USDT' : `${asset}USDT`;
 
-        if (asset === 'USDT' || asset === 'BUSD' || asset === 'USDC') {
+        if (asset === 'USDT' || asset === 'BUSD' || asset === 'USDC' || asset === 'USD') {
           usdValue = parseFloat(free) + parseFloat(locked);
+        } else if (asset.startsWith('LD')) {
+          // Launchpool tokens (LDBTC, LDPYTH…) have no direct USDT pair — skip
         } else {
           try {
-            const priceResp = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${asset}USDT`);
+            const priceResp = await fetch(`/api/proxy/binance/ticker/price?symbol=${asset}USDT`);
             const priceData = await priceResp.json();
             if (priceData.price) {
               usdValue = (parseFloat(free) + parseFloat(locked)) * parseFloat(priceData.price);

@@ -2,7 +2,7 @@ import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcSMA, calcEntryScore
 import { TAKER_FEE } from './trading-engine';
 import type { LivePrices } from './trading-engine';
 
-const B = 'https://api.binance.com/api/v3';
+const B = '/api/proxy/binance';
 const MIN_NOTIONAL_USDT = 11;
 
 export interface AgentDecision {

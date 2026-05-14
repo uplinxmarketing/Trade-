@@ -1,24 +1,43 @@
-import { createClient } from '@supabase/supabase-js';
-import type { Database } from './types';
-
-// Publishable (anon) keys are public by design — security is via Supabase RLS.
-const SUPABASE_URL =
-  (import.meta.env.VITE_SUPABASE_URL as string | undefined) ??
-  'https://vrmnmedrwsddxovqcuns.supabase.co';
-const SUPABASE_PUBLISHABLE_KEY =
-  (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string | undefined) ??
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZybW5tZWRyd3NkZHhvdnFjdW5zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3MjYwNTIsImV4cCI6MjA5MzMwMjA1Mn0.sV_iJu0CYQwQ9aQGWgFfusqH92QhPKgThOWrCmKKXJo';
+// Supabase is not used in this deployment — all data comes from the local backend API.
+// This stub silently no-ops every call so imported components don't crash.
 
 export const supabaseConfigured = true;
 
-export const supabase = createClient<Database>(
-  SUPABASE_URL,
-  SUPABASE_PUBLISHABLE_KEY,
-  {
-    auth: {
-      storage: localStorage,
-      persistSession: true,
-      autoRefreshToken: true,
-    },
-  }
-);
+const noopQuery = (): any => {
+  const q: any = {
+    select: () => q,
+    insert: () => q,
+    update: () => q,
+    upsert: () => q,
+    delete: () => q,
+    eq: () => q,
+    gt: () => q,
+    lt: () => q,
+    gte: () => q,
+    lte: () => q,
+    order: () => q,
+    limit: () => q,
+    single: () => Promise.resolve({ data: null, error: null }),
+    maybeSingle: () => Promise.resolve({ data: null, error: null }),
+    then: (resolve: (v: any) => any) => Promise.resolve({ data: [], error: null }).then(resolve),
+  };
+  return q;
+};
+
+const noopChannel = () => ({
+  on: () => noopChannel(),
+  subscribe: (_cb?: any) => ({ unsubscribe: () => {} }),
+});
+
+export const supabase: any = {
+  from: (_table: string) => noopQuery(),
+  channel: (_name: string) => noopChannel(),
+  removeChannel: (_ch: any) => Promise.resolve(),
+  functions: {
+    invoke: (_name: string, _opts?: any) => Promise.resolve({ data: null, error: { message: 'Supabase not configured' } }),
+  },
+  auth: {
+    onAuthStateChange: (_cb: any) => ({ data: { subscription: { unsubscribe: () => {} } } }),
+    getSession: () => Promise.resolve({ data: { session: null }, error: null }),
+  },
+};

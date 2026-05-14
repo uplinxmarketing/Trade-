@@ -14,7 +14,7 @@ import type { LivePrices } from '@/lib/trading-engine';
 import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcSMA } from '@/lib/indicators';
 
 // ── Simple 4-signal analyser (no API key, Binance public data only) ────────────────────
-const BIN = 'https://api.binance.com/api/v3';
+const BIN = '/api/proxy/binance';
 const SESSION = 'default';
 const MAX_POSITIONS = 3;
 const MIN_USDT      = 11;

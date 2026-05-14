@@ -37,11 +37,11 @@ const PortfolioSummary = ({ binanceConnected, botCount }: PortfolioSummaryProps)
             const free = parseFloat(b.free);
             const locked = parseFloat(b.locked);
             if (free + locked <= 0) continue;
-            if (b.asset === 'USDT' || b.asset === 'BUSD' || b.asset === 'USDC') {
+            if (b.asset === 'USDT' || b.asset === 'BUSD' || b.asset === 'USDC' || b.asset === 'USD') {
               total += free + locked;
-            } else {
+            } else if (!b.asset.startsWith('LD')) {
               try {
-                const pr = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${b.asset}USDT`);
+                const pr = await fetch(`/api/proxy/binance/ticker/price?symbol=${b.asset}USDT`);
                 const pd = await pr.json();
                 if (pd.price) total += (free + locked) * parseFloat(pd.price);
               } catch { /* skip */ }

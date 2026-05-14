@@ -238,7 +238,8 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
           } else {
             // Coin not in watched list — fetch price from Binance REST
             try {
-              const pr = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${asset}USDT`);
+              if (asset === 'USD' || asset.startsWith('LD')) continue;
+              const pr = await fetch(`/api/proxy/binance/ticker/price?symbol=${asset}USDT`);
               if (pr.ok) {
                 const pd = await pr.json();
                 if (pd.price) usdValue = total * parseFloat(pd.price);
