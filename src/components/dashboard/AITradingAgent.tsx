@@ -132,6 +132,7 @@ interface OpenPosition {
   exit_target?: number;
   current_price?: number;
   profitable?: boolean;
+  ready_to_sell?: boolean;
   hold_human?: string;
   hold_minutes?: number;
   breakeven_price_real?: number;
@@ -700,6 +701,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       exit_target: p.exit_target !== undefined ? Number(p.exit_target) : undefined,
       current_price: p.current_price !== undefined ? Number(p.current_price) : undefined,
       profitable: p.profitable,
+      ready_to_sell: p.ready_to_sell === true,
       hold_human: p.hold_human,
       hold_minutes: p.hold_minutes !== undefined ? Number(p.hold_minutes) : undefined,
       breakeven_price_real: p.breakeven_price_real !== undefined ? Number(p.breakeven_price_real) : undefined,
@@ -1412,7 +1414,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                     const exitTarget = pos.exit_target && pos.exit_target > 0
                       ? pos.exit_target
                       : entry * 1.0017;
-                    const profitable = cur >= exitTarget;
+                    // Use server's profitable (real BEP after fees + lot rounding) not local exit_target check
+                    const profitable = pos.profitable ?? false;
+                    // ready_to_sell = price above BOTH real BEP and exit_target (bot will sell)
+                    const readyToSell = pos.ready_to_sell ?? (profitable && cur >= exitTarget);
                     const progressPct = entry > 0 && exitTarget > entry
                       ? Math.max(0, Math.min(100, (cur - entry) / (exitTarget - entry) * 100))
                       : 0;
@@ -1428,7 +1433,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       >
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-2">
-                            <div className={`w-1.5 h-1.5 rounded-full ${profitable ? 'bg-gain' : pct < 0 ? 'bg-loss' : 'bg-amber-400'}`} />
+                            <div className={`w-1.5 h-1.5 rounded-full ${readyToSell ? 'bg-gain' : profitable ? 'bg-amber-400' : pct < 0 ? 'bg-loss' : 'bg-amber-400/50'}`} />
                             <div>
                               <p className="text-xs font-bold">{pos.symbol.replace('USDT','')}</p>
                               <p className="text-[9px] text-muted-foreground">
@@ -1462,7 +1467,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                         <div className="w-full h-1.5 bg-muted/40 rounded-full overflow-hidden">
                           <div
                             className={`h-full rounded-full transition-all duration-700 ${
-                              profitable ? 'bg-gain' : progressPct > 50 ? 'bg-amber-400' : 'bg-accent/70'
+                              readyToSell ? 'bg-gain' : profitable ? 'bg-amber-400' : progressPct > 50 ? 'bg-accent/70' : 'bg-accent/40'
                             }`}
                             style={{ width: `${progressPct.toFixed(1)}%` }}
                           />
@@ -1473,9 +1478,20 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                             Buy <span className="font-mono">${entry > 0 ? entry.toFixed(6) : '—'}</span>
                             {' → '}Sell ≥ <span className="font-mono text-accent">${exitTarget > 0 ? exitTarget.toFixed(6) : '—'}</span>
                           </span>
-                          <span className={`text-[8px] font-mono ${profitable ? 'text-gain font-semibold' : 'text-muted-foreground'}`}>
-                            {profitable
+                          <span
+                            className={`text-[8px] font-mono ${readyToSell ? 'text-gain font-semibold' : profitable ? 'text-amber-400' : 'text-muted-foreground'}`}
+                            title={
+                              readyToSell
+                                ? 'Above user profit threshold — next price tick will trigger sell'
+                                : profitable
+                                ? `Above breakeven but below exit target. Waiting for +${((exitTarget - cur) / cur * 100).toFixed(3)}% more.`
+                                : `Below breakeven — needs +${pos.real_bep_gap_pct !== undefined && pos.real_bep_gap_pct > 0 ? pos.real_bep_gap_pct.toFixed(2) : ((exitTarget - cur) / cur * 100).toFixed(2)}% to cover fees and lot rounding`
+                            }
+                          >
+                            {readyToSell
                               ? '✓ READY TO SELL'
+                              : profitable
+                              ? `PROFITABLE — needs +${((exitTarget - cur) / cur * 100).toFixed(3)}%`
                               : cur > 0
                                 ? `${progressPct.toFixed(1)}% — needs +${((exitTarget - cur) / cur * 100).toFixed(3)}%`
                                 : 'loading…'}

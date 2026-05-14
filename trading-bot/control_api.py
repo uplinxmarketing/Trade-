@@ -295,6 +295,9 @@ def _get_positions():
                     # Override simple BEP with real BEP so UI reflects actual sell threshold
                     row["breakeven_price"] = round(_real_bep, 8)
                     row["profitable"] = bool(price >= _real_bep) if price else False
+                    # ready_to_sell = price is above BOTH real_bep AND exit_target (bot will sell)
+                    _exit_t_all = target  # already computed above
+                    row["ready_to_sell"] = bool(price >= max(_real_bep, _exit_t_all)) if price else False
                     if price > 0:
                         _gap_pct = round((_real_bep - price) / price * 100, 4)
                         row["real_bep_gap_pct"]        = _gap_pct
@@ -1440,7 +1443,11 @@ def api_sell_monitor():
             import trade_engine as _te_sm
             _real_bep_sm = _te_sm.compute_real_breakeven_price(p)
             if _real_bep_sm > 0:
-                checks[-1]["breakeven_price_real"]     = round(_real_bep_sm, 8)
+                checks[-1]["breakeven_price_real"] = round(_real_bep_sm, 8)
+                # Fix: profitable uses real BEP (matches /api/all) not simple BEP
+                checks[-1]["profitable"] = bool(price >= _real_bep_sm) if price else False
+                _exit_t = p.get("exit_target") or bep
+                checks[-1]["ready_to_sell"] = bool(price >= max(_real_bep_sm, _exit_t)) if price else False
                 if price > 0:
                     _gap_pct_sm = round((_real_bep_sm - price) / price * 100, 4)
                     checks[-1]["real_bep_gap_pct"]       = _gap_pct_sm
