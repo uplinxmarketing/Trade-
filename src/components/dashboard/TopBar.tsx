@@ -95,10 +95,10 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
               onClick={handleReconcile}
               disabled={reconciling}
               className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-              title="Check positions match Binance balances"
+              title="Verify open positions match what Binance shows. Removes ghost positions if any."
             >
               <ShieldCheck className={`w-3.5 h-3.5 ${reconciling ? 'animate-spin' : ''}`} />
-              <span className="hidden sm:inline">Reconcile</span>
+              <span className="hidden sm:inline">Sync with Binance</span>
             </button>
           )}
 
