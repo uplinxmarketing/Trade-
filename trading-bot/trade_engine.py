@@ -1645,19 +1645,21 @@ def realtime_monitor(prices: Dict[str, float]):
         if opened_ts > 0 and (now - opened_ts) < _MIN_HOLD_SEC:
             continue
         entry  = pos["entry_price"]
-        # Real breakeven trigger: accounts for qty rounding, buy fee, sell fee.
-        # Uses same math as _profitable_sell_check so trigger and gate never disagree.
-        real_target = compute_real_breakeven_price(pos)
-        if real_target <= 0:
-            continue
+        # Simple trigger fires whenever price crosses the adaptive breakeven threshold.
+        # _profitable_sell_check (inside _do_execute_sell) is the safety gate that
+        # uses real qty-aware math — it aborts the sell if fill won't net a profit.
+        # Using real BEP here would be too strict for high-price coins (BTC/BNB) where
+        # lot-step rounding creates a large gap between simple BEP and real BEP.
+        _bep_m = pos.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
+        breakeven = entry * _bep_m
         stop   = entry * _stop_loss_mult
-        # Effective TP target: max(real_target, entry * user_tp setting) when TP enabled
+        # Effective TP target: max(breakeven, entry * user_tp setting) when TP enabled
         if _take_profit_enabled:
-            target = max(real_target, entry * _user_tp_mult)
+            target = max(breakeven, entry * _user_tp_mult)
         else:
-            target = real_target
+            target = breakeven
 
-        if price >= real_target and _profitable_sell_check(pos, price):
+        if price >= breakeven and _profitable_sell_check(pos, price):
             # ABSOLUTE PROFIT GATE: only proceed if selling at this exact price would
             # net at least take_profit_pct% of budget after fees. Eliminates loss
             # from market-order slippage — if price drops between trigger and fill,
@@ -1665,7 +1667,7 @@ def realtime_monitor(prices: Dict[str, float]):
             with _selling_lock:
                 already = sym in _selling
             if not already:
-                if _smart_hold_enabled and price >= target and target > real_target:
+                if _smart_hold_enabled and price >= target and target > breakeven:
                     _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
                     peak = _pos_peaks[sym]
                     trail_stop = peak * (1.0 - _trailing_stop_pct / 100.0)
@@ -1964,21 +1966,20 @@ def _sell_monitor_loop():
                 if opened_ts3 > 0 and (now_monitor - opened_ts3) < _MIN_HOLD_SEC:
                     continue
                 entry  = pos["entry_price"]
-                # Real breakeven trigger — same math as _profitable_sell_check
-                real_target3 = compute_real_breakeven_price(pos)
-                if real_target3 <= 0:
-                    continue
+                # Simple trigger — see realtime_monitor comment for rationale
+                _bep_m3   = pos.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
+                breakeven3 = entry * _bep_m3
                 stop       = entry * _stop_loss_mult
                 if _take_profit_enabled:
-                    target = max(real_target3, entry * _user_tp_mult)
+                    target = max(breakeven3, entry * _user_tp_mult)
                 else:
-                    target = real_target3
+                    target = breakeven3
 
                 sell_reason3: Optional[str] = None
 
-                if price >= real_target3 and _profitable_sell_check(pos, price):
+                if price >= breakeven3 and _profitable_sell_check(pos, price):
                     # Profit gate — see realtime_monitor for rationale
-                    if _smart_hold_enabled and price >= target and target > real_target3:
+                    if _smart_hold_enabled and price >= target and target > breakeven3:
                         _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
                         peak = _pos_peaks[sym]
                         trail_stop = peak * (1.0 - _trailing_stop_pct / 100.0)
