@@ -1453,6 +1453,17 @@ def api_diagnostics():
     }
 
 
+@app.post("/api/diagnostics/reset")
+def api_diagnostics_reset():
+    """Reset REST error counters in the diagnostics health dict."""
+    import trade_engine as _te
+    with _te._binance_health_lock:
+        _te._binance_health["rest_error_count"] = 0
+        _te._binance_health["last_error_ts"]    = 0.0
+        _te._binance_health["last_error_msg"]   = ""
+    return {"ok": True, "reset": True}
+
+
 @app.get("/api/debug-refresher")
 def api_debug_refresher():
     """Diagnostic: price refresher threads health + per-symbol REST price ages."""
@@ -2168,8 +2179,36 @@ def start_control_api():
     if dist:
         try:
             from fastapi.staticfiles import StaticFiles
-            app.mount("/", StaticFiles(directory=str(dist), html=True), name="static")
-            print(f"[ControlAPI] Serving React build from {dist}")
+            from fastapi.responses import FileResponse as _FR
+
+            # Hashed assets (filename changes every build) — long cache is safe
+            _assets_dir = dist / "assets"
+            if _assets_dir.exists():
+                app.mount("/assets", StaticFiles(directory=str(_assets_dir)), name="assets")
+
+            # index.html must NEVER be cached — it references hashed bundles
+            _index_path = dist / "index.html"
+
+            @app.get("/")
+            @app.get("/{full_path:path}")
+            def _serve_spa(full_path: str = ""):
+                if full_path.startswith("api/") or full_path.startswith("assets/"):
+                    from fastapi.responses import Response as _Resp
+                    return _Resp(status_code=404)
+                if _index_path.exists():
+                    return _FR(
+                        str(_index_path),
+                        media_type="text/html",
+                        headers={
+                            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                            "Pragma":        "no-cache",
+                            "Expires":       "0",
+                        },
+                    )
+                from fastapi.responses import Response as _Resp
+                return _Resp(status_code=404)
+
+            print(f"[ControlAPI] Serving React build from {dist} (index.html: no-cache)")
         except Exception as e:
             print(f"[ControlAPI] WARNING: Could not mount static files: {e}")
             print("[ControlAPI] Continuing without static file serving — API-only mode")
