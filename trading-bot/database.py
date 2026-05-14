@@ -233,6 +233,7 @@ def init_db():
             "ALTER TABLE trades ADD COLUMN sell_fee           REAL",
             "ALTER TABLE trades ADD COLUMN duration_seconds   INTEGER",
             "ALTER TABLE trades ADD COLUMN profitable         INTEGER",
+            "ALTER TABLE trades ADD COLUMN sell_reason        TEXT",
         ]
         for sql in migrations:
             try:
@@ -311,8 +312,8 @@ def log_trade(trade: dict):
                  buy_fee, sell_fee, net_profit, profitable, duration_seconds,
                  entry_rsi, entry_ma_position, entry_bb_position,
                  entry_volume_trend, hour_of_day, day_of_week,
-                 timestamp_buy, timestamp_sell)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 timestamp_buy, timestamp_sell, sell_reason)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             trade.get("coin"), trade.get("mode"), trade.get("entry_price"),
             trade.get("exit_price"), trade.get("quantity"), trade.get("budget_usdt"),
@@ -322,6 +323,7 @@ def log_trade(trade: dict):
             trade.get("entry_bb_position"), trade.get("entry_volume_trend"),
             trade.get("hour_of_day"), trade.get("day_of_week"),
             trade.get("timestamp_buy"), trade.get("timestamp_sell"),
+            trade.get("sell_reason"),
         ))
         conn.commit()
         conn.close()
