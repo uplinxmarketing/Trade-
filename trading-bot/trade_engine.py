@@ -108,6 +108,24 @@ def _get_breakeven_mult(entry_price: float, symbol: str = "") -> float:
         buf = 0.30
     return _FEE_FLOOR * (1.0 + buf / 100.0)
 
+def compute_real_breakeven_price(pos: dict, min_profit: float = 0.003) -> float:
+    """Return the REAL price at which selling pos would net at least min_profit USDT.
+
+    Accounts for quantity rounding loss, buy fee already paid, and sell fee.
+    DIAGNOSTIC ONLY — not called from any sell-decision code path.
+    """
+    try:
+        budget   = float(pos.get("budget_usdt", 0))
+        buy_fee  = float(pos.get("buy_fee_usdt") or 0)
+        qty      = float(pos.get("quantity", 0))
+        if qty <= 0 or budget <= 0:
+            return 0.0
+        # qty * price * (1 - 0.001) >= budget + buy_fee + min_profit
+        return (budget + buy_fee + min_profit) / (qty * (1.0 - 0.001))
+    except Exception:
+        return 0.0
+
+
 # Configurable exit multipliers — refreshed from strategy.json every buy/sell cycle.
 # _user_tp_mult:    raw user TP target (1 + tp_pct/100); compared to per-position breakeven.
 # _take_profit_mult: kept for UI/diagnostic exports; updated by _refresh_risk_params.
@@ -119,6 +137,10 @@ _stop_loss_mult:   float = 1.0 - 0.02           # default: -2% stop loss
 # Post-loss cooldown: after a confirmed slippage-loss fill, skip re-buying that coin for 30 min
 _loss_cooldown: Dict[str, float] = {}
 _LOSS_COOLDOWN_SEC = 1800  # 30 minutes
+
+# Abort-log throttle — SELL ABORTED fires every 250ms per stuck position; cap to 1/min per symbol
+_last_abort_log_ts: Dict[str, float] = {}
+_ABORT_LOG_THROTTLE_SEC = 60.0
 
 # WebSocket price freshness — updated by data_collector on every @trade or @miniTicker event.
 # Used by the pre-sell check to decide whether a REST re-fetch is needed.
@@ -918,11 +940,14 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         if not _profitable_sell_check(pos, freshest):
             # Price slipped below profit threshold between trigger and execution.
             # Abort the sell — position stays open, next tick will re-evaluate.
-            database.log_activity(
-                f"SELL ABORTED {sym} ({reason}): price slipped to ${freshest:.6f}, "
-                f"would not net profit. Position held — will retry on next favourable tick.",
-                "warn"
-            )
+            _now_abort = time.time()
+            if _now_abort - _last_abort_log_ts.get(sym, 0) >= _ABORT_LOG_THROTTLE_SEC:
+                _last_abort_log_ts[sym] = _now_abort
+                database.log_activity(
+                    f"SELL ABORTED {sym} ({reason}): price ${freshest:.6f} would not net profit. "
+                    f"Position held — will retry on next favourable tick (log throttled 60s).",
+                    "warn"
+                )
             _sell_last_failed_ts[sym] = time.time()
             _sell_last_failed_reason[sym] = reason
             return  # exit before placing order
