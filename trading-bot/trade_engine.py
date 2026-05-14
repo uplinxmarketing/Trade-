@@ -165,7 +165,100 @@ _binance_health: Dict = {
 }
 _binance_health_lock = threading.Lock()
 
-# ── In-memory diagnostic ring buffer — last 50 issues, never written to DB ────
+# ── Circuit breaker — prevents runaway 400s from burning Binance weight ───────
+_consecutive_400_count: int = 0
+_circuit_breaker_until: float = 0.0
+
+
+def _check_circuit_breaker() -> bool:
+    return time.time() < _circuit_breaker_until
+
+
+def _trip_circuit_breaker() -> None:
+    global _consecutive_400_count, _circuit_breaker_until
+    _consecutive_400_count += 1
+    if _consecutive_400_count >= 50:
+        _circuit_breaker_until = time.time() + 60.0
+        _consecutive_400_count = 0
+        try:
+            log_diag_issue(
+                "binance", "warn",
+                "Circuit breaker tripped — pausing REST 60s after 50 consecutive 400s",
+            )
+        except Exception:
+            pass
+
+
+def _reset_circuit_breaker() -> None:
+    global _consecutive_400_count
+    _consecutive_400_count = 0
+
+
+def _binance_request(url: str, timeout: float = 3.0, source: str = "unknown"):
+    """Unified Binance REST caller that captures FULL error context.
+
+    Returns (success, data, headers, latency_ms).
+    On failure records the exact URL + Binance JSON body in the diag log so we
+    can see which call site fails and what Binance is actually complaining about.
+    """
+    import urllib.request as _ur_b
+    import urllib.error as _ue_b
+    import traceback as _tb_b
+
+    if _check_circuit_breaker():
+        return (False, None, {}, 0.0)
+
+    t0 = time.time()
+    try:
+        req = _ur_b.Request(url, headers={"User-Agent": "WolfBot/1.0"})
+        with _ur_b.urlopen(req, timeout=timeout) as r:
+            body = r.read()
+            hdrs = dict(r.headers)
+        latency_ms = (time.time() - t0) * 1000
+        try:
+            _record_rest_health(hdrs, latency_ms)
+        except Exception:
+            pass
+        _reset_circuit_breaker()
+        return (True, json.loads(body), hdrs, latency_ms)
+    except _ue_b.HTTPError as he:
+        latency_ms = (time.time() - t0) * 1000
+        try:
+            body_text = he.read().decode("utf-8", errors="replace")[:600]
+        except Exception:
+            body_text = "<unreadable>"
+        try:
+            err_hdrs = dict(he.headers) if he.headers else {}
+            _record_rest_health(err_hdrs, latency_ms)
+        except Exception:
+            pass
+        if he.code == 400:
+            _trip_circuit_breaker()
+        try:
+            _record_rest_error(
+                f"[{source}] HTTP {he.code}: {he.reason}",
+                url=url, response_body=body_text,
+            )
+        except TypeError:
+            try:
+                _record_rest_error(f"[{source}] HTTP {he.code} | {url[:200]} | {body_text[:200]}")
+            except Exception:
+                pass
+        return (False, None, {}, latency_ms)
+    except Exception as e:
+        latency_ms = (time.time() - t0) * 1000
+        tb = _tb_b.format_exc()[-400:]
+        try:
+            _record_rest_error(f"[{source}] {type(e).__name__}: {e}", url=url, response_body=tb)
+        except TypeError:
+            try:
+                _record_rest_error(f"[{source}] {type(e).__name__}: {e} | {url[:200]}")
+            except Exception:
+                pass
+        return (False, None, {}, latency_ms)
+
+
+# ── In-memory diagnostic ring buffer — last 100 issues, never written to DB ───
 from collections import deque as _deque
 
 _diag_log: "_deque[dict]" = _deque(maxlen=100)
@@ -1603,10 +1696,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # Cache can be 30-60s stale. A single REST kline fetch verifies signals
         # are still valid at execution time — eliminates stale-cache buys.
         try:
-            import urllib.request as _fresh_ur
-            _fresh_url = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval=1m&limit=30"
-            with _fresh_ur.urlopen(_fresh_url, timeout=2) as _fr:
-                _raw = json.loads(_fr.read())
+            import urllib.parse as _up_kb
+            _fresh_url = (
+                f"https://api.binance.com/api/v3/klines?"
+                + _up_kb.urlencode({"symbol": sym, "interval": "1m", "limit": 30})
+            )
+            _ok_kb, _raw, _, _ = _binance_request(_fresh_url, timeout=2.0, source="klines_pre_buy")
+            if not _ok_kb or not isinstance(_raw, list):
+                _raw = []
             _fresh_closes  = [float(k[4]) for k in _raw]
             _fresh_volumes = [float(k[5]) for k in _raw]
             _fresh_candles = [
@@ -1892,49 +1989,26 @@ _sell_monitor_last_rest_ts: float = 0.0   # rate-limits sell-monitor REST refres
 
 
 def _fetch_batch_prices(symbols: list) -> Dict[str, float]:
-    """Single batch REST call for a list of symbols.
-
-    URL format matches Binance docs exactly:
-      symbols=%5B%22BTCUSDT%22%2C%22ETHUSDT%22%5D
-    Uses separators=(',',':') so json.dumps has NO spaces, then quote() with
-    safe='' so no character is left unencoded (no + for spaces, no literal commas).
-    """
+    """Batch ticker price fetch via _binance_request (source-tagged, circuit-broken)."""
     import urllib.parse as _up2
-    import urllib.request as _ur2
-    import urllib.error as _ue2
     if not symbols:
         return {}
-    # CRITICAL: compact JSON (no spaces) → quote with safe='' → exact Binance format
     _syms_json = json.dumps(list(symbols), separators=(',', ':'))
     _encoded   = _up2.quote(_syms_json, safe='')
     url = f"https://api.binance.com/api/v3/ticker/price?symbols={_encoded}"
-    try:
-        req = _ur2.Request(url, headers={"User-Agent": "TradingBot/1.0"})
-        _t0 = time.time()
-        with _ur2.urlopen(req, timeout=3.0) as resp:
-            _body = resp.read()
-            _hdrs = dict(resp.headers)
-        _record_rest_health(_hdrs, (time.time() - _t0) * 1000)
-        result: Dict[str, float] = {}
-        for entry in json.loads(_body):
-            s  = entry.get("symbol", "")
-            try:
-                px = float(entry.get("price", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            if s and px > 0:
-                result[s] = px
-        return result
-    except _ue2.HTTPError as _he:
+    ok, data, _, _ = _binance_request(url, timeout=3.0, source="batch_prices")
+    if not ok or not isinstance(data, list):
+        return {}
+    result: Dict[str, float] = {}
+    for entry in data:
+        s = entry.get("symbol", "")
         try:
-            _rb = _he.read().decode("utf-8", errors="replace")[:500]
-        except Exception:
-            _rb = ""
-        _record_rest_error(f"HTTP {_he.code}: {_he.reason}", url=url, response_body=_rb)
-        return {}
-    except Exception as _e:
-        _record_rest_error(str(_e), url=url)
-        return {}
+            px = float(entry.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if s and px > 0:
+            result[s] = px
+    return result
 
 
 def _fetch_rest_prices(symbols: list) -> Dict[str, float]:

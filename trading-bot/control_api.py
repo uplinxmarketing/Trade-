@@ -1525,6 +1525,41 @@ def api_diagnostics_log_text(limit: int = 50, severity: str = ""):
     return _Resp(content="\n".join(header + body), media_type="text/plain")
 
 
+@app.get("/api/diagnostics/errors/summary")
+def api_diagnostics_errors_summary():
+    """Group recent diag errors by source tag + Binance error code.
+    Shows which call site is failing most and what Binance is complaining about."""
+    import trade_engine as _te
+    import re as _re
+
+    entries = _te.get_diag_log(limit=200, severity_filter="error")
+    by_source: dict = {}
+    by_binance_code: dict = {}
+    examples: dict = {}
+
+    for e in entries:
+        msg    = e.get("message", "")
+        detail = e.get("detail", "")
+
+        m = _re.match(r'^REST:\s*\[(\w+)\]', msg) or _re.match(r'^\[(\w+)\]', msg)
+        src = m.group(1) if m else "untagged"
+        by_source[src] = by_source.get(src, 0) + 1
+
+        mc = _re.search(r'"code":\s*(-?\d+)', detail)
+        if mc:
+            code = mc.group(1)
+            by_binance_code[code] = by_binance_code.get(code, 0) + 1
+            if code not in examples:
+                examples[code] = detail[:400]
+
+    return {
+        "total_errors_in_buffer": len(entries),
+        "by_source":      dict(sorted(by_source.items(), key=lambda x: -x[1])),
+        "by_binance_code": dict(sorted(by_binance_code.items(), key=lambda x: -x[1])),
+        "examples_by_code": examples,
+    }
+
+
 @app.get("/api/stats/daily")
 def api_stats_daily(days: int = 7):
     """Daily trade summary — buys, sells, PnL, win rate per day."""
