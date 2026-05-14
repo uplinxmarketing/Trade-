@@ -1,8 +1,14 @@
 .env
-bot.db
+*.db
+*.db-shm
+*.db-wal
 strategy.json
+data/
 __pycache__/
 *.pyc
 *.pyo
 logs/
 *.log
+.persistence_probe
+.write_probe
+.cfg_probe

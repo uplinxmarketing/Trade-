@@ -28,6 +28,28 @@ _DATA_DIR = _resolve_data_dir()
 DB_PATH = os.path.join(_DATA_DIR, "bot.db")
 _lock = threading.Lock()
 
+import time as _time
+_persistence_check: dict = {"ts": 0.0, "ok": None}
+
+def is_data_persistent() -> bool:
+    """Test whether _DATA_DIR is actually writable AND survives between calls.
+    Cached for 60s — write probe is cheap but we don't need it every API call."""
+    now = _time.time()
+    if _persistence_check["ok"] is not None and (now - _persistence_check["ts"]) < 60:
+        return _persistence_check["ok"]
+    try:
+        probe = os.path.join(_DATA_DIR, ".persistence_probe")
+        with open(probe, "w") as f:
+            f.write(str(now))
+        with open(probe) as f:
+            ok = f.read() == str(now)
+        os.remove(probe)
+        _persistence_check["ok"] = ok
+    except Exception:
+        _persistence_check["ok"] = False
+    _persistence_check["ts"] = now
+    return _persistence_check["ok"]
+
 
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -546,6 +568,46 @@ def get_trade_stats(mode: str = "paper") -> dict:
         "locked_profit": 0.0, "total_fees": 0.0,
     }
 
+def get_trade_stats_all_modes() -> dict:
+    """Aggregate closed-trade stats across ALL modes (paper + live combined)."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    with _lock:
+        conn = _conn()
+        row = conn.execute("""
+            SELECT
+                COUNT(*)                                            AS total,
+                SUM(CASE WHEN net_profit >  0 THEN 1 ELSE 0 END)  AS wins,
+                SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END)  AS losses,
+                COALESCE(SUM(net_profit), 0.0)                    AS realized_pnl,
+                SUM(CASE WHEN timestamp_sell LIKE ? THEN 1 ELSE 0 END)          AS trades_today,
+                COALESCE(SUM(CASE WHEN timestamp_sell LIKE ? THEN net_profit ELSE 0 END), 0.0)
+                                                                   AS today_realized_pnl,
+                COALESCE(SUM(COALESCE(buy_fee, 0) + COALESCE(sell_fee, 0)), 0.0)
+                                                                   AS total_fees
+            FROM trades
+            WHERE exit_price IS NOT NULL
+        """, (f"{today}%", f"{today}%")).fetchone()
+        conn.close()
+    if row:
+        total = int(row["total"] or 0)
+        wins  = int(row["wins"]  or 0)
+        return {
+            "total":              total,
+            "wins":               wins,
+            "losses":             int(row["losses"]            or 0),
+            "realized_pnl":       float(row["realized_pnl"]   or 0.0),
+            "trades_today":       int(row["trades_today"]      or 0),
+            "today_realized_pnl": float(row["today_realized_pnl"] or 0.0),
+            "total_fees":         float(row["total_fees"]      or 0.0),
+            "win_rate":           round(wins / total, 3) if total else 0.0,
+        }
+    return {
+        "total": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0,
+        "trades_today": 0, "today_realized_pnl": 0.0,
+        "total_fees": 0.0, "win_rate": 0.0,
+    }
+
+
 def get_stats_for_range(mode: str = "paper", date_from: str = None, date_to: str = None) -> dict:
     """Return aggregated trade stats for an optional date range.
     When both params are None, returns all-time stats (same as get_trade_stats totals).
@@ -850,3 +912,31 @@ def get_recent_futures_trades(limit: int = 20) -> List[dict]:
         """, (limit,)).fetchall()
         conn.close()
     return [dict(r) for r in rows]
+
+
+def import_trades(trades: list) -> int:
+    """Insert trade records from a backup export, skipping rows that already exist
+    (matched on coin + timestamp_buy + mode). Returns count of rows inserted."""
+    _COLS = (
+        "coin", "mode", "entry_price", "exit_price", "quantity", "budget_usdt",
+        "buy_fee", "sell_fee", "net_profit", "profitable", "duration_seconds",
+        "entry_rsi", "entry_ma_position", "entry_bb_position", "entry_volume_trend",
+        "hour_of_day", "day_of_week", "timestamp_buy", "timestamp_sell",
+    )
+    inserted = 0
+    with _lock:
+        conn = _conn()
+        for t in trades:
+            vals = tuple(t.get(c) for c in _COLS)
+            try:
+                conn.execute(
+                    f"INSERT OR IGNORE INTO trades ({', '.join(_COLS)}) VALUES ({', '.join(['?']*len(_COLS))})",
+                    vals,
+                )
+                if conn.execute("SELECT changes()").fetchone()[0]:
+                    inserted += 1
+            except Exception:
+                pass
+        conn.commit()
+        conn.close()
+    return inserted

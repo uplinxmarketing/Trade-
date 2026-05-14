@@ -24,3 +24,15 @@ dist-ssr
 *.sw?
 .env
 .local-version
+
+# Bot runtime data — never commit these
+data/
+*.db
+*.db-shm
+*.db-wal
+trading-bot/strategy.json
+trading-bot/data/
+# probe files left by write-test
+.persistence_probe
+.write_probe
+.cfg_probe
