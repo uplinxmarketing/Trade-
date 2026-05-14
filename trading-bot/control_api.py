@@ -1324,6 +1324,63 @@ def api_sell_monitor():
     }
 
 
+@app.get("/api/debug-refresher")
+def api_debug_refresher():
+    """Diagnostic: price refresher thread health + per-symbol REST price ages."""
+    import trade_engine as _te
+    from data_collector import prices as live_prices
+
+    now_t = time.time()
+
+    # Refresher thread health
+    ref_thread = _te._price_refresher_thread
+    ref_alive  = bool(ref_thread and ref_thread.is_alive())
+    ref_hb     = _te._price_refresher_heartbeat
+    ref_hb_age = round(now_t - ref_hb, 1) if ref_hb > 0 else None
+
+    # Sell monitor thread health
+    sm_hb      = _te._sell_monitor_heartbeat
+    sm_alive   = bool(sm_hb > 0 and (now_t - sm_hb) < 10.0)
+    sm_hb_age  = round(now_t - sm_hb, 1) if sm_hb > 0 else None
+
+    # Per-symbol price info for open positions
+    try:
+        ws_ts_map = _te._last_ws_price_ts
+        rest_px   = _te._rest_px
+        rest_px_ts = _te._rest_px_ts
+    except Exception:
+        ws_ts_map = {}
+        rest_px   = {}
+        rest_px_ts = 0.0
+
+    positions = _get_positions()
+    sym_info = []
+    for p in positions:
+        sym   = p["symbol"]
+        ws_ts = ws_ts_map.get(sym, 0)
+        sym_info.append({
+            "symbol":          sym,
+            "ws_price":        round(live_prices.get(sym, 0), 8),
+            "rest_price":      round(rest_px.get(sym, 0), 8),
+            "price_age_sec":   round(now_t - ws_ts, 1) if ws_ts > 0 else None,
+            "rest_cache_age":  round(now_t - rest_px_ts, 1) if rest_px_ts > 0 else None,
+        })
+
+    return {
+        "ok": True,
+        "price_refresher": {
+            "alive":          ref_alive,
+            "heartbeat_age":  ref_hb_age,
+        },
+        "sell_monitor": {
+            "alive":          sm_alive,
+            "heartbeat_age":  sm_hb_age,
+        },
+        "rest_cache_age_sec": round(now_t - rest_px_ts, 1) if rest_px_ts > 0 else None,
+        "symbols": sym_info,
+    }
+
+
 @app.get("/api/settings")
 def api_get_settings():
     """Return current bot risk/strategy settings."""
