@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { RefreshCw, Loader2, Wifi, FlaskConical, RotateCcw, Lock, Percent, Zap, Layers, ChevronDown, ChevronUp, Check } from 'lucide-react';
+import { formatTime } from '@/lib/format';
 import { supabase } from '@/integrations/supabase/client';
 import { TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
@@ -207,7 +208,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
       },0);
       setTotalFees(Math.round(fees*10000)/10000);
     }
-    setLastUpdated(new Date().toLocaleTimeString());
+    setLastUpdated(formatTime(new Date()));
   }, []);
 
   // ── Live mode ──────────────────────────────────────────────────────────────
@@ -252,7 +253,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
       }
       assets.sort((a, b) => b.usdValue - a.usdValue);
       setLiveAssets(assets);
-      setLastUpdated(new Date().toLocaleTimeString());
+      setLastUpdated(formatTime(new Date()));
     } catch { toast.error('Live wallet load error'); }
     finally { setLoading(false); }
   }, [binanceConnected, prices]);
@@ -462,7 +463,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
               if (walRes) setServerWallet({ realized_pnl: Number(walRes.realized_pnl ?? 0), session_pnl: Number(walRes.session_pnl ?? 0), starting_balance: Number(walRes.starting_balance ?? 0), total_fees: Number(walRes.total_fees ?? 0), open_pos_value: Number(walRes.open_pos_value ?? 0) });
               if (walRes?.total_usdt !== undefined) setUsdtFree(Number(walRes.total_usdt));
               if (posRes?.positions) setPositions(posRes.positions as Position[]);
-              setLastUpdated(new Date().toLocaleTimeString());
+              setLastUpdated(formatTime(new Date()));
             } finally { setLoading(false); }
           } else if (isPaper) {
             loadPaper();

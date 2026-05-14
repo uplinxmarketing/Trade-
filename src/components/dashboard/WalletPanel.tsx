@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Wallet, RefreshCw, Loader2, Lock, AlertTriangle, ChevronUp, ChevronDown } from 'lucide-react';
+import { formatTime } from '@/lib/format';
 import { Button } from '@/components/ui/button';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
@@ -144,7 +145,7 @@ const WalletPanel = ({ binanceConnected, onSelectCoin, selectedTradingCoins = []
         </div>
         {lastUpdated && (
           <div className="text-[9px] text-muted-foreground/60 mt-0.5">
-            Updated {lastUpdated.toLocaleTimeString()}
+            Updated {formatTime(lastUpdated)}
           </div>
         )}
       </div>

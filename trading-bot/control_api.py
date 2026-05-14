@@ -1013,6 +1013,42 @@ def api_stats(
     }
 
 
+@app.get("/api/stats/summary")
+def api_stats_summary():
+    """Single source of truth for portfolio metrics — today vs all-time."""
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(database.DB_PATH)
+    conn.row_factory = _sqlite3.Row
+
+    today = conn.execute("""
+        SELECT
+            COUNT(*) FILTER (WHERE side='SELL' AND pnl IS NOT NULL) AS closed_trades,
+            COUNT(*) FILTER (WHERE side='SELL' AND pnl > 0) AS wins,
+            COUNT(*) FILTER (WHERE side='SELL' AND pnl < 0) AS losses,
+            ROUND(SUM(pnl), 4) AS net_pnl
+        FROM trades
+        WHERE DATE(created_at) = DATE('now')
+    """).fetchone()
+
+    alltime = conn.execute("""
+        SELECT
+            COUNT(*) FILTER (WHERE side='SELL' AND pnl IS NOT NULL) AS closed_trades,
+            COUNT(*) FILTER (WHERE side='SELL' AND pnl > 0) AS wins,
+            COUNT(*) FILTER (WHERE side='SELL' AND pnl < 0) AS losses,
+            ROUND(SUM(pnl), 4) AS net_pnl,
+            ROUND(AVG(pnl) FILTER (WHERE side='SELL' AND pnl > 0), 4) AS avg_win,
+            ROUND(AVG(pnl) FILTER (WHERE side='SELL' AND pnl < 0), 4) AS avg_loss
+        FROM trades
+        WHERE pnl IS NOT NULL
+    """).fetchone()
+    conn.close()
+
+    return {
+        "today":    dict(today)   if today   else {},
+        "all_time": dict(alltime) if alltime else {},
+    }
+
+
 class CoinsRequest(BaseModel):
     coins: list[str]
 

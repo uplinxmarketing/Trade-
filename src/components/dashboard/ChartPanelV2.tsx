@@ -4,6 +4,7 @@ import { TAKER_FEE } from '@/lib/trading-engine';
 import { supabase } from '@/integrations/supabase/client';
 import { Loader2 } from 'lucide-react';
 import type { LivePrices } from '@/lib/trading-engine';
+import { formatTime } from '@/lib/format';
 
 const BREAK_EVEN_MULT = 1 / Math.pow(1 - TAKER_FEE, 2);
 
@@ -63,7 +64,7 @@ export default function ChartPanelV2({ activeCoin, prices }: Props) {
     const buf = tickBufferRef.current;
     if (interval === 'live') {
       return buf.map(t => ({
-        time: new Date(t.ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }),
+        time: formatTime(t.ts),
         open: t.price, high: t.price, low: t.price, close: t.price, volume: 0,
       }));
     }
@@ -77,7 +78,7 @@ export default function ChartPanelV2({ activeCoin, prices }: Props) {
         else { bk.high = Math.max(bk.high, t.price); bk.low = Math.min(bk.low, t.price); bk.close = t.price; }
       }
       return Array.from(buckets.entries()).sort((a, b) => a[0] - b[0]).map(([ts, bk]) => ({
-        time: new Date(ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }),
+        time: formatTime(ts),
         open: bk.open, high: bk.high, low: bk.low, close: bk.close, volume: 0,
       }));
     }

@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
+import { formatTime } from '@/lib/format';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -634,7 +635,7 @@ const FuturesAgent = () => {
             <div className="text-[9px] text-muted-foreground uppercase tracking-widest">Scanner</div>
             <div className="text-[10px] font-mono text-muted-foreground">
               {status?.scan_count
-                ? `#${status.scan_count} · ${status.last_scan_at ? new Date(status.last_scan_at).toLocaleTimeString() : '—'}`
+                ? `#${status.scan_count} · ${status.last_scan_at ? formatTime(status.last_scan_at) : '—'}`
                 : 'waiting…'}
             </div>
           </div>

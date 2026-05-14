@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { BarChart3, DollarSign, TrendingUp, Percent, Loader2, RefreshCw, Activity, Lock, Trophy, Hash, Calendar, ChevronDown } from 'lucide-react';
+import { formatTime } from '@/lib/format';
 import { API_BASE } from '@/config';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -80,7 +81,7 @@ function fmt(n: number, d = 2) {
 }
 function fmtDate(iso: string) {
   const d = new Date(iso);
-  return `${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} ${d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}`;
+  return `${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} ${formatTime(d)}`;
 }
 function fmtDur(sec: number) {
   if (sec < 60)   return `${sec}s`;

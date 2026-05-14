@@ -3,6 +3,7 @@ import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'rec
 import { useBinanceKlines } from '@/hooks/useBinanceKlines';
 import { Loader2 } from 'lucide-react';
 import type { KlineData } from '@/lib/binance-types';
+import { formatTime } from '@/lib/format';
 
 interface PriceChartProps {
   symbol: string;
@@ -39,7 +40,7 @@ const PriceChart = ({ symbol, currentPrice, priceChange }: PriceChartProps) => {
     if (!currentPrice || currentPrice === lastPrice.current) return;
     lastPrice.current = currentPrice;
     const now = new Date();
-    const label = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    const label = formatTime(now);
     setLiveTicks(prev => {
       const next = [...prev, { time: label, open: price, high: price, low: price, close: price, volume: 0 }];
       return next.length > MAX_LIVE_TICKS ? next.slice(next.length - MAX_LIVE_TICKS) : next;
