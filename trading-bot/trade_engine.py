@@ -155,13 +155,18 @@ _last_ws_price_ts: Dict[str, float] = {}
 
 # ── Binance REST health — updated by _fetch_rest_prices (zero extra calls) ────
 _binance_health: Dict = {
-    "last_rest_ok_ts":    0.0,
+    "last_rest_ok_ts":      0.0,
     "last_rest_latency_ms": 0.0,
-    "used_weight_1m":     0,
-    "used_weight_pct":    0.0,
-    "rest_error_count":   0,
-    "last_error_ts":      0.0,
-    "last_error_msg":     "",
+    "used_weight_1m":       0,
+    "used_weight_pct":      0.0,
+    "rest_error_count":     0,
+    "last_error_ts":        0.0,
+    "last_error_msg":       "",
+    # Claude API counters (separate from Binance REST errors)
+    "claude_error_count":   0,
+    "claude_last_error_ts": 0.0,
+    "claude_last_error_msg": "",
+    "claude_disabled_until": 0.0,
 }
 _binance_health_lock = threading.Lock()
 
@@ -356,6 +361,65 @@ def _record_rest_error(err_msg: str, url: str = "", response_body: str = "") -> 
             )
     except Exception:
         pass
+
+
+# ── Claude API error tracking (separate from Binance REST errors) ─────────────
+_claude_consecutive_401s: int = 0
+_CLAUDE_DISABLE_SECS = 86400  # 24 h after 3 consecutive 401s
+
+
+def _record_claude_error(err_msg: str, is_auth_error: bool = False) -> None:
+    """Record a Claude API error. After 3 consecutive auth failures, disable Claude for 24 h."""
+    global _claude_consecutive_401s
+    try:
+        now = time.time()
+        with _binance_health_lock:
+            _binance_health["claude_error_count"]   += 1
+            _binance_health["claude_last_error_ts"]  = now
+            _binance_health["claude_last_error_msg"] = str(err_msg)[:200]
+
+        if is_auth_error:
+            _claude_consecutive_401s += 1
+            if _claude_consecutive_401s >= 3:
+                with _binance_health_lock:
+                    _binance_health["claude_disabled_until"] = now + _CLAUDE_DISABLE_SECS
+                log_diag_issue(
+                    "claude", "error",
+                    f"Claude API disabled for 24h — 3 consecutive auth failures",
+                    detail=str(err_msg)[:300],
+                )
+            else:
+                log_diag_issue(
+                    "claude", "error",
+                    f"Claude API auth error ({_claude_consecutive_401s}/3 before disable)",
+                    detail=str(err_msg)[:300],
+                )
+        else:
+            _claude_consecutive_401s = 0  # reset streak on non-auth errors
+            log_diag_issue(
+                "claude", "error",
+                f"Claude API error (×{_binance_health['claude_error_count']} since start)",
+                detail=str(err_msg)[:300],
+            )
+    except Exception:
+        pass
+
+
+def is_claude_disabled() -> bool:
+    """Return True if Claude has been rate-disabled due to repeated auth failures."""
+    with _binance_health_lock:
+        return time.time() < _binance_health["claude_disabled_until"]
+
+
+def reset_claude_errors() -> None:
+    """Reset Claude error counters and re-enable Claude (called after key is fixed)."""
+    global _claude_consecutive_401s
+    _claude_consecutive_401s = 0
+    with _binance_health_lock:
+        _binance_health["claude_error_count"]    = 0
+        _binance_health["claude_last_error_ts"]  = 0.0
+        _binance_health["claude_last_error_msg"] = ""
+        _binance_health["claude_disabled_until"] = 0.0
 
 
 # ── Signal scanner health ──────────────────────────────────────────────────────

@@ -60,6 +60,13 @@ interface Diagnostics {
     warn_count: number;
     total_buffered: number;
   };
+  claude_api?: {
+    error_count: number;
+    last_error_age_sec: number | null;
+    last_error_msg: string;
+    disabled: boolean;
+    disabled_until: number | null;
+  };
 }
 
 function StatusDot({ ok, pulse = true }: { ok: boolean; pulse?: boolean }) {
@@ -303,6 +310,37 @@ export function DiagnosticsPanel() {
             {diag.price_refresher.alive ? 'running' : <span className="text-red-400">stopped</span>}
           </span>
         </section>
+
+        {/* Claude API — only show when errors present */}
+        {diag.claude_api && (diag.claude_api.error_count > 0 || diag.claude_api.disabled) && (
+          <section>
+            <div className="flex items-center gap-2 mb-1">
+              <StatusDot ok={!diag.claude_api.disabled} />
+              <span className="font-semibold">Claude API</span>
+              <span className="ml-auto text-[10px] text-gray-500">
+                {diag.claude_api.last_error_age_sec != null
+                  ? `${diag.claude_api.last_error_age_sec}s ago`
+                  : ''}
+              </span>
+            </div>
+            <div className="text-[10px]">
+              {diag.claude_api.disabled ? (
+                <span className="text-red-400">
+                  Disabled (auth failures) — restart bot after fixing ANTHROPIC_API_KEY
+                </span>
+              ) : (
+                <span className="text-yellow-400">
+                  {diag.claude_api.error_count} error{diag.claude_api.error_count !== 1 ? 's' : ''} since start
+                </span>
+              )}
+              {diag.claude_api.last_error_msg && (
+                <div className="truncate text-red-300/70 mt-0.5" title={diag.claude_api.last_error_msg}>
+                  ↳ {diag.claude_api.last_error_msg}
+                </div>
+              )}
+            </div>
+          </section>
+        )}
 
         {/* System */}
         <section className="border-t border-gray-700 pt-2 space-y-0.5 text-[10px] text-gray-500">
