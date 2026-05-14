@@ -1266,7 +1266,9 @@ def api_sell_monitor():
         # Use the stored multiplier from buy time if available; else adaptive tier
         bep_m = p.get("breakeven_mult_at_buy") or (_te._get_breakeven_mult(entry, sym) if entry else 1.002)
         bep   = entry * bep_m if entry else 0
-        sl    = entry * (1.0 - config.STOP_LOSS_PCT) if entry else 0
+        sl_mult = _te._stop_loss_mult  # 0.0 when disabled
+        sl      = entry * sl_mult if entry and sl_mult > 0 else 0
+        sl_on   = sl_mult > 0 and sl_mult < 1.0
         pct   = ((price - entry) / entry * 100) if entry else 0
         ws_age = round(now_t - ws_ts_map.get(sym, 0), 2) if ws_ts_map.get(sym) else None
         checks.append({
@@ -1276,9 +1278,9 @@ def api_sell_monitor():
             "pct_from_entry":  round(pct, 4),
             "breakeven_price": round(bep, 6),
             "breakeven_mult":  round(bep_m, 6),
-            "stop_loss":       round(sl, 6),
+            "stop_loss":       round(sl, 6) if sl_on else None,
             "profitable":      price > bep if price and bep else False,
-            "sl_hit":          price <= sl if price and sl else False,
+            "sl_hit":          (price <= sl) if (sl_on and price and sl) else False,
             "price_age_sec":   ws_age,
         })
 
