@@ -130,6 +130,8 @@ interface OpenPosition {
   exit_target?: number;
   current_price?: number;
   profitable?: boolean;
+  hold_human?: string;
+  hold_minutes?: number;
 }
 
 interface TradeRow {
@@ -693,6 +695,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       exit_target: p.exit_target !== undefined ? Number(p.exit_target) : undefined,
       current_price: p.current_price !== undefined ? Number(p.current_price) : undefined,
       profitable: p.profitable,
+      hold_human: p.hold_human,
+      hold_minutes: p.hold_minutes !== undefined ? Number(p.hold_minutes) : undefined,
     }));
     setPositions(rawPos);
     positionsRef.current = rawPos;
@@ -1409,6 +1413,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                               <p className="text-xs font-bold">{pos.symbol.replace('USDT','')}</p>
                               <p className="text-[9px] text-muted-foreground">
                                 {pos.quantity.toFixed(6)} @ <span className="font-mono">${entry > 0 ? entry.toFixed(6) : '—'}</span>
+                                {pos.hold_human && <span className="ml-1 text-muted-foreground/60">· {pos.hold_human}</span>}
                               </p>
                             </div>
                           </div>
