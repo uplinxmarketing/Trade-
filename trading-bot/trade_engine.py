@@ -1943,7 +1943,7 @@ def _price_refresher_loop():
                 snap = list(_positions)
             if snap:
                 all_syms = list({p["symbol"] for p in snap})
-                fetched = _fetch_rest_prices(all_syms)
+                fetched = _fetch_batch_prices(all_syms)
                 if fetched:
                     _now_rf = time.time()
                     _rest_px.update(fetched)
@@ -1997,7 +1997,7 @@ def _price_refresher_loop():
                                 _rest_px[s] = ws_p
         except Exception:
             pass
-        time.sleep(2.0)
+        time.sleep(10.0)
 
 
 _held_refresher_thread: Optional[threading.Thread] = None
@@ -2013,7 +2013,7 @@ def _held_position_price_refresher():
     consecutive_errors = 0
 
     try:
-        database.log_activity("Held-position price refresher started (2s interval)", "info")
+        database.log_activity("Held-position price refresher started (5s interval)", "info")
     except Exception:
         pass
 
@@ -2022,10 +2022,10 @@ def _held_position_price_refresher():
             with _positions_lock:
                 held_syms = list({p.get("symbol") for p in _positions if p.get("symbol")})
             if not held_syms:
-                time.sleep(2.0)
+                time.sleep(5.0)
                 continue
 
-            fetched = _fetch_rest_prices(held_syms)
+            fetched = _fetch_batch_prices(held_syms)
             now_ts = time.time()
             if fetched:
                 for s, px in fetched.items():
@@ -2065,7 +2065,7 @@ def _held_position_price_refresher():
                     )
                 except Exception:
                     pass
-        time.sleep(max(2.0, min(10.0, 2.0 + consecutive_errors * 0.5)))
+        time.sleep(max(5.0, min(30.0, 5.0 + consecutive_errors * 1.0)))
 
 
 def start_held_position_refresher():
