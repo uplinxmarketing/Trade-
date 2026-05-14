@@ -872,6 +872,10 @@ def _execute_sell(pos: dict, price: float, reason: str):
     now  = datetime.now(_tz.utc).isoformat()
 
     if qty <= 0 or price <= 0:
+        database.log_activity(
+            f"[SELL_EARLY_RETURN] {sym} ({reason}): qty={qty} price={price} — invalid, skipping",
+            "warn"
+        )
         with _selling_lock:
             _selling.discard(sym)
             _selling_ts.pop(sym, None)
@@ -882,6 +886,10 @@ def _execute_sell(pos: dict, price: float, reason: str):
     with _positions_lock:
         pos_id = pos.get("id")
         if pos_id and not any(p.get("id") == pos_id for p in _positions):
+            database.log_activity(
+                f"[SELL_EARLY_RETURN] {sym} ({reason}): position id={pos_id} already removed — skipping duplicate sell",
+                "warn"
+            )
             with _selling_lock:
                 _selling.discard(sym)
                 _selling_ts.pop(sym, None)
@@ -889,6 +897,26 @@ def _execute_sell(pos: dict, price: float, reason: str):
 
     try:
         _do_execute_sell(pos, sym, qty, price, reason, mode, now)
+    except Exception as _exc_sell:
+        database.log_activity(
+            f"[SELL_EXCEPTION] {sym} ({reason}): {type(_exc_sell).__name__}: {_exc_sell}",
+            "error"
+        )
+        # Force-sell / manual: if we hit an exception, the user explicitly wanted the
+        # position gone. Remove from records so retries stop rather than leaving a ghost.
+        if reason in ("force-sell", "manual", "user-initiated"):
+            with _positions_lock:
+                _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
+            if pos.get("id"):
+                try:
+                    database.delete_position(pos["id"])
+                except Exception:
+                    pass
+            _rebuild_pos_index()
+            database.log_activity(
+                f"[FORCE_CLEAN] {sym}: force-sell raised exception — position removed from records",
+                "warn"
+            )
     finally:
         with _selling_lock:
             _selling.discard(sym)
@@ -1888,6 +1916,87 @@ def _price_refresher_loop():
         time.sleep(2.0)
 
 
+_held_refresher_thread: Optional[threading.Thread] = None
+_held_refresher_hb_log_ts: float = 0.0
+
+
+def _held_position_price_refresher():
+    """Dedicated REST refresher for held (open) positions every 2 s.
+    Critically important for low-WS-volume coins (ENJ, SUSHI, PENDLE, etc.)
+    that rarely generate @trade events — without this they go minutes stale."""
+    import data_collector as _dc_hr
+    global _held_refresher_hb_log_ts
+    consecutive_errors = 0
+
+    try:
+        database.log_activity("Held-position price refresher started (2s interval)", "info")
+    except Exception:
+        pass
+
+    while True:
+        try:
+            with _positions_lock:
+                held_syms = list({p.get("symbol") for p in _positions if p.get("symbol")})
+            if not held_syms:
+                time.sleep(2.0)
+                continue
+
+            fetched = _fetch_rest_prices(held_syms)
+            now_ts = time.time()
+            if fetched:
+                for s, px in fetched.items():
+                    _dc_hr.prices[s] = px
+                    _last_ws_price_ts[s] = now_ts
+                    _rest_px[s] = px
+                consecutive_errors = 0
+
+                # 60s heartbeat log
+                if now_ts - _held_refresher_hb_log_ts >= 60.0:
+                    _held_refresher_hb_log_ts = now_ts
+                    try:
+                        database.log_activity(
+                            f"[HeldRefresher] OK — {len(fetched)}/{len(held_syms)} symbols refreshed: "
+                            + ", ".join(f"{s}={v:.6f}" for s, v in list(fetched.items())[:5]),
+                            "info"
+                        )
+                    except Exception:
+                        pass
+            else:
+                consecutive_errors += 1
+                if consecutive_errors <= 3 or consecutive_errors % 30 == 0:
+                    try:
+                        database.log_activity(
+                            f"[HeldRefresher] REST fetch returned empty for {held_syms} "
+                            f"(attempt {consecutive_errors})", "warn"
+                        )
+                    except Exception:
+                        pass
+        except Exception as _e:
+            consecutive_errors += 1
+            if consecutive_errors <= 3 or consecutive_errors % 30 == 0:
+                try:
+                    database.log_activity(
+                        f"[HeldRefresher] {type(_e).__name__}: {_e} ({consecutive_errors} consecutive errors)",
+                        "warn"
+                    )
+                except Exception:
+                    pass
+        time.sleep(max(2.0, min(10.0, 2.0 + consecutive_errors * 0.5)))
+
+
+def start_held_position_refresher():
+    """Idempotent — starts the held-position REST refresher if not already running."""
+    global _held_refresher_thread
+    if _held_refresher_thread is not None and _held_refresher_thread.is_alive():
+        return
+    _held_refresher_thread = threading.Thread(
+        target=_held_position_price_refresher,
+        name="held-price-refresher",
+        daemon=True
+    )
+    _held_refresher_thread.start()
+
+
 def _sell_monitor_loop():
     """
     Fallback daemon thread — wakes every 0.5 s and checks sell conditions.
@@ -2086,7 +2195,7 @@ async def position_guardian():
     Watchdog coroutine — starts the sell monitor and price refresher threads
     and restarts them if they ever die (belt-and-suspenders).
     """
-    global _sell_monitor_thread, _price_refresher_thread
+    global _sell_monitor_thread, _price_refresher_thread, _held_refresher_thread
     while True:
         if not (_sell_monitor_thread and _sell_monitor_thread.is_alive()):
             _sell_monitor_thread = threading.Thread(
@@ -2098,6 +2207,11 @@ async def position_guardian():
                 target=_price_refresher_loop, name="price-refresher", daemon=True
             )
             _price_refresher_thread.start()
+        if not (_held_refresher_thread and _held_refresher_thread.is_alive()):
+            _held_refresher_thread = threading.Thread(
+                target=_held_position_price_refresher, name="held-price-refresher", daemon=True
+            )
+            _held_refresher_thread.start()
         await asyncio.sleep(5.0)
 
 

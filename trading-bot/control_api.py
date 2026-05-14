@@ -90,6 +90,11 @@ async def lifespan(app: FastAPI):
         trade_engine.load_positions_from_db()
         steps.append("positions OK")
 
+        # 3b. Start REST price refresher for held positions (2s interval — critical for
+        #     low-WS-volume coins that can go minutes stale without this)
+        trade_engine.start_held_position_refresher()
+        steps.append("held_price_refresher OK")
+
         # 4. Apply startup defaults and auto-resume logic.
         #    stop_loss and smart_hold are ALWAYS forced OFF on every deploy —
         #    the user must explicitly enable them each session.
@@ -1182,6 +1187,52 @@ def api_force_sell(symbol: str, req: Optional[ForceSellRequest] = None):
         return {"ok": False, "error": str(e)}
 
 
+@app.post("/api/positions/force-remove/{symbol}")
+def api_force_remove_position(symbol: str):
+    """Remove a position from the bot's records WITHOUT placing a sell order.
+    Use ONLY when the coin is already sold on Binance but the bot still tracks it
+    (ghost position). This is a recovery tool — not a normal sell path."""
+    from trade_engine import (
+        _positions, _positions_lock, _rebuild_pos_index,
+        _selling, _selling_lock, _selling_ts, _pos_peaks
+    )
+    sym = symbol.upper().strip()
+    try:
+        removed_ids = []
+        with _positions_lock:
+            for p in _positions:
+                if p.get("symbol") == sym:
+                    removed_ids.append(p.get("id"))
+            before = len(_positions)
+            _positions[:] = [p for p in _positions if p.get("symbol") != sym]
+            removed_count = before - len(_positions)
+
+        for pid in removed_ids:
+            if pid:
+                try:
+                    database.delete_position(pid)
+                except Exception:
+                    pass
+
+        # Clear any selling guard so future positions on same symbol aren't blocked
+        with _selling_lock:
+            _selling.discard(sym)
+            _selling_ts.pop(sym, None)
+        _pos_peaks.pop(sym, None)
+
+        _rebuild_pos_index()
+
+        if removed_count > 0:
+            database.log_activity(
+                f"[FORCE_REMOVE] {sym}: removed {removed_count} position(s) from records (no sell executed)",
+                "warn"
+            )
+            return {"ok": True, "removed": removed_count, "symbol": sym}
+        return {"ok": False, "error": f"No open position found for {sym}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 class ModeRequest(BaseModel):
     mode: str           # "paper" or "live"
     api_key: str = ""
@@ -1326,58 +1377,62 @@ def api_sell_monitor():
 
 @app.get("/api/debug-refresher")
 def api_debug_refresher():
-    """Diagnostic: price refresher thread health + per-symbol REST price ages."""
+    """Diagnostic: price refresher threads health + per-symbol REST price ages."""
     import trade_engine as _te
     from data_collector import prices as live_prices
 
     now_t = time.time()
 
-    # Refresher thread health
-    ref_thread = _te._price_refresher_thread
-    ref_alive  = bool(ref_thread and ref_thread.is_alive())
-    ref_hb     = _te._price_refresher_heartbeat
-    ref_hb_age = round(now_t - ref_hb, 1) if ref_hb > 0 else None
+    # Held-position refresher thread (primary, 2s interval)
+    held_thread   = getattr(_te, "_held_refresher_thread", None)
+    held_alive    = bool(held_thread and held_thread.is_alive())
+    held_name     = held_thread.name if held_thread else None
+
+    # Background _price_refresher_loop thread (secondary)
+    ref_thread    = _te._price_refresher_thread
+    ref_alive     = bool(ref_thread and ref_thread.is_alive())
+    ref_hb        = _te._price_refresher_heartbeat
+    ref_hb_age    = round(now_t - ref_hb, 1) if ref_hb > 0 else None
 
     # Sell monitor thread health
-    sm_hb      = _te._sell_monitor_heartbeat
-    sm_alive   = bool(sm_hb > 0 and (now_t - sm_hb) < 10.0)
-    sm_hb_age  = round(now_t - sm_hb, 1) if sm_hb > 0 else None
+    sm_hb         = _te._sell_monitor_heartbeat
+    sm_alive      = bool(sm_hb > 0 and (now_t - sm_hb) < 10.0)
+    sm_hb_age     = round(now_t - sm_hb, 1) if sm_hb > 0 else None
 
     # Per-symbol price info for open positions
     try:
-        ws_ts_map = _te._last_ws_price_ts
-        rest_px   = _te._rest_px
+        ws_ts_map  = _te._last_ws_price_ts
+        rest_px    = _te._rest_px
         rest_px_ts = _te._rest_px_ts
     except Exception:
-        ws_ts_map = {}
-        rest_px   = {}
+        ws_ts_map  = {}
+        rest_px    = {}
         rest_px_ts = 0.0
 
-    positions = _get_positions()
-    sym_info = []
-    for p in positions:
-        sym   = p["symbol"]
-        ws_ts = ws_ts_map.get(sym, 0)
-        sym_info.append({
-            "symbol":          sym,
-            "ws_price":        round(live_prices.get(sym, 0), 8),
-            "rest_price":      round(rest_px.get(sym, 0), 8),
-            "price_age_sec":   round(now_t - ws_ts, 1) if ws_ts > 0 else None,
-            "rest_cache_age":  round(now_t - rest_px_ts, 1) if rest_px_ts > 0 else None,
-        })
+    held_symbols = [p.get("symbol") for p in _te._positions if p.get("symbol")]
 
     return {
-        "ok": True,
-        "price_refresher": {
-            "alive":          ref_alive,
-            "heartbeat_age":  ref_hb_age,
+        "refresher_alive":      held_alive,
+        "thread_name":          held_name,
+        "held_positions_count": len(held_symbols),
+        "held_symbols":         held_symbols,
+        "price_freshness": [
+            {
+                "symbol":      sym,
+                "price":       round(live_prices.get(sym, 0), 8),
+                "age_seconds": round(now_t - ws_ts_map[sym], 1) if sym in ws_ts_map else "never",
+            }
+            for sym in held_symbols
+        ],
+        "background_refresher": {
+            "alive":         ref_alive,
+            "heartbeat_age": ref_hb_age,
         },
         "sell_monitor": {
-            "alive":          sm_alive,
-            "heartbeat_age":  sm_hb_age,
+            "alive":         sm_alive,
+            "heartbeat_age": sm_hb_age,
         },
         "rest_cache_age_sec": round(now_t - rest_px_ts, 1) if rest_px_ts > 0 else None,
-        "symbols": sym_info,
     }
 
 
