@@ -120,6 +120,10 @@ _stop_loss_mult:   float = 1.0 - 0.02           # default: -2% stop loss
 _loss_cooldown: Dict[str, float] = {}
 _LOSS_COOLDOWN_SEC = 1800  # 30 minutes
 
+# WebSocket price freshness — updated by data_collector on every @trade or @miniTicker event.
+# Used by the pre-sell check to decide whether a REST re-fetch is needed.
+_last_ws_price_ts: Dict[str, float] = {}
+
 # New exit-mode flags (strategy.json controlled)
 _take_profit_enabled: bool = True    # False → exit at breakeven (fees covered) only
 _smart_hold_enabled:  bool = False   # True  → hold if signals still bullish; trail then exit
@@ -899,10 +903,16 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     # FINAL SAFETY GATE — never lose money on a take-profit sell.
     # Stop-loss and force-sell bypass this check (they're meant to fire even at a loss).
     if reason not in ("stop-loss", "force-sell", "manual", "user-initiated"):
-        # Get the freshest available price (WebSocket tick may have moved since trigger)
+        # Get the freshest available price.
+        # With miniTicker subscribed, WS price should be <1.5s old — skip REST fetch
+        # in that case to avoid adding API weight and latency to every sell.
+        ws_age = time.time() - _last_ws_price_ts.get(sym, 0)
         try:
             from data_collector import prices as _live_px
-            freshest = _live_px.get(sym, 0) or _rest_px.get(sym, 0) or price
+            if ws_age <= 1.5:
+                freshest = _live_px.get(sym, 0) or price
+            else:
+                freshest = _live_px.get(sym, 0) or _rest_px.get(sym, 0) or price
         except Exception:
             freshest = price
         if not _profitable_sell_check(pos, freshest):
