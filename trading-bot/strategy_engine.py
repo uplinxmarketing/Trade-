@@ -243,6 +243,19 @@ def run_strategy_once():
         if not strategy or "approved_coins" not in strategy:
             raise ValueError("Claude returned invalid strategy")
 
+        # Preserve the user's coin selection — never let Claude overwrite it.
+        # If the existing strategy has approved_coins set by the user (identified
+        # by a "user_selected" flag written when coins are saved via /api/strategy),
+        # restore those coins verbatim so the user's watchlist survives every cycle.
+        try:
+            with open(config.STRATEGY_FILE) as _fcoin:
+                _ecoin = json.load(_fcoin)
+            if _ecoin.get("user_selected_coins") and _ecoin.get("approved_coins"):
+                strategy["approved_coins"] = _ecoin["approved_coins"]
+                strategy["user_selected_coins"] = True
+        except Exception:
+            pass
+
         # Preserve ALL user-configured fields — Claude's schema only contains
         # approved_coins / trading_active / next_review_seconds; anything else
         # (risk settings, budget, notes) must survive every Claude write.

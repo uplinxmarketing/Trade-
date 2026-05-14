@@ -848,12 +848,13 @@ def api_status():
     strategy = _load_strategy()
     # Use aggregated SQL so total/wins/losses/pnl/trades_today all cover the
     # same full dataset — not just the last 500 rows returned by get_recent_trades.
-    stats    = database.get_trade_stats(mode=get_mode())
-    balance  = round(_get_usdt_balance(), 2)
-    initial  = _get_initial_balance() or balance
-    approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
-    wins     = stats["wins"]
-    total    = stats["total"]
+    stats      = database.get_trade_stats(mode=get_mode())
+    all_stats  = database.get_trade_stats_all_modes()
+    balance    = round(_get_usdt_balance(), 2)
+    initial    = _get_initial_balance() or balance
+    approved   = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
+    wins       = stats["wins"]
+    total      = stats["total"]
     return {
         "running":                strategy.get("trading_active", False),
         "mode":                   get_mode(),
@@ -872,10 +873,13 @@ def api_status():
         "today_realized_pnl":  round(stats["today_realized_pnl"], 4),
         "locked_profit":       round(stats["locked_profit"], 4),
         "total_fees":          round(stats["total_fees"], 4),
+        "all_time_trades":     all_stats["total"],
+        "all_time_realized_pnl": round(all_stats["realized_pnl"], 4),
+        "all_time_win_rate":   all_stats["win_rate"],
         "watched_coins":       approved or config.WATCHED_COINS,
         "data_dir":            database._DATA_DIR,
         "db_path":             database.DB_PATH,
-        "data_persistent":     database._DATA_DIR == "/data",
+        "data_persistent":     database.is_data_persistent(),
         "sell_monitor_alive":  _sell_monitor_alive(),
     }
 
@@ -936,7 +940,7 @@ def api_set_coins(req: CoinsRequest):
             "confidence":     cfg.get("confidence", 0.5),
             "reason":         cfg.get("reason", "Updated via dashboard"),
         })
-    _write_strategy_patch({"approved_coins": new_approved})
+    _write_strategy_patch({"approved_coins": new_approved, "user_selected_coins": True})
 
     # Persist coin list to Supabase so it survives Railway redeploys
     try:
@@ -1366,6 +1370,7 @@ def api_all():
     # get_recent_trades(limit=500) was causing total_trades/wins/pnl/trades_today to
     # describe different subsets (500 rows vs. full table) making them inconsistent.
     stats     = database.get_trade_stats(mode=get_mode())
+    all_stats = database.get_trade_stats_all_modes()
     wins      = stats["wins"]
     total     = stats["total"]
     balance   = round(_get_usdt_display_balance(), 2)
@@ -1393,8 +1398,11 @@ def api_all():
             "today_realized_pnl": round(stats["today_realized_pnl"], 4),
             "locked_profit":      round(stats["locked_profit"], 4),
             "total_fees":         round(stats["total_fees"], 4),
+            "all_time_trades":    all_stats["total"],
+            "all_time_realized_pnl": round(all_stats["realized_pnl"], 4),
+            "all_time_win_rate":  all_stats["win_rate"],
             "watched_coins":      approved or config.WATCHED_COINS,
-            "data_persistent": database._DATA_DIR == "/data",
+            "data_persistent": database.is_data_persistent(),
             "data_dir":        database._DATA_DIR,
             "stop_loss_enabled":   strategy.get("stop_loss_enabled",   False),
             "stop_loss_pct":       strategy.get("stop_loss_pct",       2.0),
@@ -1418,6 +1426,50 @@ def api_all():
     _API_ALL_CACHE["ts"]   = now_ts
     _API_ALL_CACHE["data"] = payload
     return payload
+
+
+@app.get("/api/backup/export")
+def api_backup_export():
+    """Download a JSON snapshot of strategy.json + all trade history."""
+    import io
+    strategy = _load_strategy()
+    trades   = database.get_recent_trades(limit=100_000)
+    payload  = {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "strategy":    strategy,
+        "trades":      trades,
+    }
+    body = json.dumps(payload, indent=2)
+    from fastapi.responses import Response
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=tradebot_backup.json"},
+    )
+
+
+class BackupImportRequest(BaseModel):
+    strategy: Optional[dict] = None
+    trades:   Optional[list] = None
+
+
+@app.post("/api/backup/import")
+def api_backup_import(req: BackupImportRequest):
+    """Restore strategy and/or trade history from a previous export snapshot."""
+    imported = {"strategy": False, "trades": 0}
+    if req.strategy:
+        try:
+            _write_strategy_patch(req.strategy)
+            imported["strategy"] = True
+        except Exception as e:
+            return {"ok": False, "error": f"strategy import failed: {e}"}
+    if req.trades:
+        try:
+            count = database.import_trades(req.trades)
+            imported["trades"] = count
+        except Exception as e:
+            return {"ok": False, "error": f"trades import failed: {e}"}
+    return {"ok": True, "imported": imported}
 
 
 @app.get("/api/debug")
