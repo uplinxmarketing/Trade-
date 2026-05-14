@@ -132,6 +132,8 @@ interface OpenPosition {
   profitable?: boolean;
   hold_human?: string;
   hold_minutes?: number;
+  breakeven_price_real?: number;
+  real_bep_gap_pct?: number;
 }
 
 interface TradeRow {
@@ -697,6 +699,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       profitable: p.profitable,
       hold_human: p.hold_human,
       hold_minutes: p.hold_minutes !== undefined ? Number(p.hold_minutes) : undefined,
+      breakeven_price_real: p.breakeven_price_real !== undefined ? Number(p.breakeven_price_real) : undefined,
+      real_bep_gap_pct: p.real_bep_gap_pct !== undefined ? Number(p.real_bep_gap_pct) : undefined,
     }));
     setPositions(rawPos);
     positionsRef.current = rawPos;
@@ -1461,6 +1465,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                                 : 'loading…'}
                           </span>
                         </div>
+                        {/* Real breakeven — shown only when it differs meaningfully from trigger price */}
+                        {pos.breakeven_price_real && pos.breakeven_price_real > exitTarget * 1.001 && (
+                          <div className="text-[8px] text-amber-500/80 font-mono">
+                            Real target: ${pos.breakeven_price_real.toFixed(6)}
+                            {pos.real_bep_gap_pct !== undefined && pos.real_bep_gap_pct > 0 && (
+                              <span className="ml-1">(+{pos.real_bep_gap_pct.toFixed(2)}% needed)</span>
+                            )}
+                          </div>
+                        )}
                       </div>
                     );
                   })}

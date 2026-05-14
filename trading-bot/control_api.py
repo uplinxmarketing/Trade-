@@ -271,7 +271,7 @@ def _get_positions():
                 _bep_pos = target
             pnl    = (price - entry) * qty if price and entry else 0
             dist   = ((price - target) / target * 100) if target and price else 0
-            out.append(_enrich_position({
+            row = _enrich_position({
                 **p,
                 "avg_entry_price": entry,
                 "current_price":   price,
@@ -281,7 +281,18 @@ def _get_positions():
                 "dist_to_exit_pct": round(dist, 4),
                 "dist_to_bep_pct":  round(((price - _bep_pos) / _bep_pos * 100) if _bep_pos and price else 0, 4),
                 "profitable":      price >= _bep_pos if price and _bep_pos else False,
-            }))
+            })
+            try:
+                import trade_engine as _te_rbep
+                _real_bep = _te_rbep.compute_real_breakeven_price(p)
+                if _real_bep > 0:
+                    row["breakeven_price_real"] = round(_real_bep, 8)
+                    if price > 0:
+                        row["real_bep_gap_pct"]        = round((_real_bep - price) / price * 100, 4)
+                        row["real_bep_distance_usdt"]  = round((_real_bep - price) * float(p.get("quantity", 0)), 4)
+            except Exception:
+                pass
+            out.append(row)
         return out
     except Exception:
         return []
@@ -1283,6 +1294,16 @@ def api_sell_monitor():
             "sl_hit":          (price <= sl) if (sl_on and price and sl) else False,
             "price_age_sec":   ws_age,
         })
+        try:
+            import trade_engine as _te_sm
+            _real_bep_sm = _te_sm.compute_real_breakeven_price(p)
+            if _real_bep_sm > 0:
+                checks[-1]["breakeven_price_real"]     = round(_real_bep_sm, 8)
+                if price > 0:
+                    checks[-1]["real_bep_gap_pct"]     = round((_real_bep_sm - price) / price * 100, 4)
+                    checks[-1]["real_bep_distance_usdt"] = round((_real_bep_sm - price) * float(p.get("quantity", 0)), 4)
+        except Exception:
+            pass
 
     return {
         "sell_monitor_alive": alive,
