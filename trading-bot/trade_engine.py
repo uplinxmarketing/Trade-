@@ -2197,23 +2197,6 @@ def _sell_monitor_loop():
                 sym   = pos["symbol"]
                 price = prices.get(sym, 0.0)
 
-                # FIX B: if price is >10s stale, do an inline REST fetch for this symbol
-                # before evaluating triggers — guards against refresher hiccups.
-                _pa_sm = now_monitor - _last_ws_price_ts.get(sym, 0)
-                if _pa_sm > 10.0:
-                    try:
-                        _inline = _fetch_rest_prices([sym])
-                        if _inline and _inline.get(sym, 0) > 0:
-                            _fp = _inline[sym]
-                            prices[sym] = _fp
-                            price = _fp
-                            import data_collector as _dc_sm
-                            _dc_sm.prices[sym] = _fp
-                            _rest_px[sym] = _fp
-                            _last_ws_price_ts[sym] = now_monitor
-                    except Exception:
-                        pass
-
                 if price <= 0:
                     continue
                 with _selling_lock:
