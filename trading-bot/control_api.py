@@ -375,6 +375,36 @@ def _overall_win_rate() -> float:
     return stats["wins"] / total if total else 0.0
 
 
+def _get_initial_balance() -> float:
+    """Return the appropriate starting balance baseline for the current mode.
+    - Paper mode: use saved paper_starting_balance or STARTING_PAPER_USDT env var
+    - Live mode:  use live_starting_balance (first-seen balance after going live);
+                  snapshots current balance on first call so P&L is measured from
+                  when live mode actually started, not the paper default of $10,000.
+    """
+    if get_mode() == "live":
+        live_start = database.get_setting("live_starting_balance")
+        if live_start:
+            return float(live_start)
+        # First time in live mode — snapshot current balance as the baseline
+        try:
+            from trade_engine import _get_usdt_balance as _teb, get_open_positions as _gop
+            usdt = _teb()
+            pos_value = sum(p.get("budget_usdt", 0) for p in _gop())
+            baseline = usdt + pos_value
+            if baseline > 0:
+                database.save_setting("live_starting_balance", str(baseline))
+                return baseline
+        except Exception:
+            pass
+        return 0.0
+    # Paper mode (unchanged)
+    starting_str = database.get_setting("paper_starting_balance")
+    if starting_str:
+        return float(starting_str)
+    return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -763,9 +793,8 @@ def api_wallet():
         _mode        = get_mode()
         realized_pnl = database.get_realized_pnl(mode=_mode)
 
-        # Session P&L: current total portfolio value minus the balance at last reset
-        starting_str  = database.get_setting("paper_starting_balance")
-        starting_bal  = float(starting_str) if starting_str else float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+        # Session P&L: current total portfolio value minus the mode-appropriate starting balance
+        starting_bal  = _get_initial_balance()
         session_pnl   = round(total_value - starting_bal, 4)
 
         _paper_fallback = is_using_paper_fallback()
@@ -786,6 +815,26 @@ def api_wallet():
                 "realized_pnl": 0.0, "session_pnl": 0.0, "mode": get_mode(), "error": str(e)}
 
 
+@app.post("/api/wallet/reset_live_baseline")
+def api_reset_live_baseline():
+    """Snapshot current live balance as the new P&L starting baseline.
+    Call this after switching to live mode so session P&L starts from your
+    real balance instead of the $10,000 paper default."""
+    if get_mode() != "live":
+        return {"error": "Not in live mode"}
+    try:
+        from trade_engine import _get_usdt_balance as _teb, get_open_positions as _gop
+        usdt = _teb()
+        pos_value = sum(p.get("budget_usdt", 0) for p in _gop())
+        baseline = usdt + pos_value
+        if baseline <= 0:
+            return {"error": "Cannot determine balance"}
+        database.save_setting("live_starting_balance", str(baseline))
+        return {"ok": True, "live_starting_balance": round(baseline, 4)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/bot-dashboard", response_class=HTMLResponse)
 def dashboard():
     """Python bot dashboard — accessible at /bot-dashboard when React app is at /."""
@@ -800,8 +849,8 @@ def api_status():
     # Use aggregated SQL so total/wins/losses/pnl/trades_today all cover the
     # same full dataset — not just the last 500 rows returned by get_recent_trades.
     stats    = database.get_trade_stats(mode=get_mode())
-    initial  = float(strategy.get("initial_balance_usdt", 0))
     balance  = round(_get_usdt_balance(), 2)
+    initial  = _get_initial_balance() or balance
     approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
     wins     = stats["wins"]
     total    = stats["total"]
@@ -812,7 +861,7 @@ def api_status():
         "using_paper_fallback":   is_using_paper_fallback(),
         "balance_usdt":        balance,
         "paper_balance":       balance,
-        "initial_balance":     initial or balance,
+        "initial_balance":     initial,
         "open_positions":      len(_get_positions()),
         "trades_today":        stats["trades_today"],
         "win_rate":            round(wins / total, 3) if total else 0.0,
@@ -1319,8 +1368,8 @@ def api_all():
     stats     = database.get_trade_stats(mode=get_mode())
     wins      = stats["wins"]
     total     = stats["total"]
-    initial   = float(strategy.get("initial_balance_usdt", 0))
     balance   = round(_get_usdt_display_balance(), 2)
+    initial   = _get_initial_balance() or balance
     approved  = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
     positions = _get_positions()
     _API_ALL_CACHE["has_positions"] = len(positions) > 0
@@ -1333,7 +1382,7 @@ def api_all():
             "using_paper_fallback":   is_using_paper_fallback(),
             "balance_usdt":           balance,
             "paper_balance":      balance,
-            "initial_balance":    initial or balance,
+            "initial_balance":    initial,
             "open_positions":     len(positions),
             "trades_today":       stats["trades_today"],
             "win_rate":           round(wins / total, 3) if total else 0.0,
