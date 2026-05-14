@@ -1717,6 +1717,35 @@ def api_diagnostics():
     }
 
 
+@app.get("/api/buy-rejections")
+def api_buy_rejections():
+    """Per-reason count of rejected buy candidates (score >= 3) since last reset."""
+    import trade_engine as _te
+    stats = _te.get_rejection_stats()
+    total = sum(stats["counts"].values())
+    sorted_by_count = sorted(stats["counts"].items(), key=lambda x: -x[1])
+    return {
+        "total_rejections": total,
+        "by_reason": [
+            {
+                "reason": reason,
+                "count": count,
+                "pct_of_total": round(100 * count / total, 1) if total > 0 else 0,
+                "examples": stats["examples"].get(reason, [])[-3:],
+            }
+            for reason, count in sorted_by_count
+        ],
+    }
+
+
+@app.post("/api/buy-rejections/reset")
+def api_buy_rejections_reset():
+    """Clear the buy-rejection counters and return how many were cleared."""
+    import trade_engine as _te
+    n = _te.clear_rejection_stats()
+    return {"ok": True, "cleared": n}
+
+
 @app.post("/api/diagnostics/reset")
 def api_diagnostics_reset():
     """Reset Binance REST and Claude API error counters."""
