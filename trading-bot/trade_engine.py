@@ -1747,12 +1747,16 @@ def _price_refresher_loop():
                 if fetched:
                     _rest_px.update(fetched)
                     _rest_px_ts = time.time()
-                    # Inject into _dc.prices for position symbols that aren't in the
-                    # backend WebSocket subscription — ensures realtime_monitor and
-                    # the sell monitor both have prices for all held coins.
+                    # Always update _dc.prices for held positions when WS is stale (>3s).
+                    # Previously only injected when price was zero — that left INJUSDT-type
+                    # coins stuck at a 1.2% stale price, blocking breakeven sells.
+                    _now_rf = time.time()
                     for s, p in fetched.items():
-                        if s not in _dc.prices or _dc.prices[s] <= 0:
+                        ws_age = _now_rf - _last_ws_price_ts.get(s, 0)
+                        if s not in _dc.prices or _dc.prices[s] <= 0 or ws_age > 3.0:
                             _dc.prices[s] = p
+                            if ws_age > 3.0:
+                                _last_ws_price_ts[s] = _now_rf  # mark as fresh so pre-sell gate uses in-memory
                 else:
                     # REST unavailable — log once per minute so Railway logs show it
                     now_rf = time.time()
