@@ -134,6 +134,7 @@ interface OpenPosition {
   hold_minutes?: number;
   breakeven_price_real?: number;
   real_bep_gap_pct?: number;
+  is_trapped?: boolean;
 }
 
 interface TradeRow {
@@ -701,6 +702,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       hold_minutes: p.hold_minutes !== undefined ? Number(p.hold_minutes) : undefined,
       breakeven_price_real: p.breakeven_price_real !== undefined ? Number(p.breakeven_price_real) : undefined,
       real_bep_gap_pct: p.real_bep_gap_pct !== undefined ? Number(p.real_bep_gap_pct) : undefined,
+      is_trapped: p.is_trapped === true,
     }));
     setPositions(rawPos);
     positionsRef.current = rawPos;
@@ -1472,6 +1474,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                             {pos.real_bep_gap_pct !== undefined && pos.real_bep_gap_pct > 0 && (
                               <span className="ml-1">(+{pos.real_bep_gap_pct.toFixed(2)}% needed)</span>
                             )}
+                          </div>
+                        )}
+                        {/* Trapped warning — lot-step rounding requires >2% move to break even */}
+                        {pos.is_trapped && pos.real_bep_gap_pct !== undefined && (
+                          <div className="text-xs text-yellow-500 mt-1 flex items-center gap-1">
+                            <span>⚠</span>
+                            <span>Trapped: needs +{pos.real_bep_gap_pct.toFixed(2)}% to break even{pos.breakeven_price_real ? ` (real target $${pos.breakeven_price_real.toFixed(6)})` : ''}</span>
                           </div>
                         )}
                       </div>

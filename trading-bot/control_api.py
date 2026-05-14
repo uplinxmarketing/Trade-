@@ -288,8 +288,10 @@ def _get_positions():
                 if _real_bep > 0:
                     row["breakeven_price_real"] = round(_real_bep, 8)
                     if price > 0:
-                        row["real_bep_gap_pct"]        = round((_real_bep - price) / price * 100, 4)
+                        _gap_pct = round((_real_bep - price) / price * 100, 4)
+                        row["real_bep_gap_pct"]        = _gap_pct
                         row["real_bep_distance_usdt"]  = round((_real_bep - price) * float(p.get("quantity", 0)), 4)
+                        row["is_trapped"]              = bool(_gap_pct > 2.0)
             except Exception:
                 pass
             out.append(row)
@@ -1300,8 +1302,10 @@ def api_sell_monitor():
             if _real_bep_sm > 0:
                 checks[-1]["breakeven_price_real"]     = round(_real_bep_sm, 8)
                 if price > 0:
-                    checks[-1]["real_bep_gap_pct"]     = round((_real_bep_sm - price) / price * 100, 4)
+                    _gap_pct_sm = round((_real_bep_sm - price) / price * 100, 4)
+                    checks[-1]["real_bep_gap_pct"]       = _gap_pct_sm
                     checks[-1]["real_bep_distance_usdt"] = round((_real_bep_sm - price) * float(p.get("quantity", 0)), 4)
+                    checks[-1]["is_trapped"]             = bool(_gap_pct_sm > 2.0)
         except Exception:
             pass
 
