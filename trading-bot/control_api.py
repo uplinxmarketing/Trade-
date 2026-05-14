@@ -287,11 +287,15 @@ def _get_positions():
                 _real_bep = _te_rbep.compute_real_breakeven_price(p)
                 if _real_bep > 0:
                     row["breakeven_price_real"] = round(_real_bep, 8)
+                    # Override simple BEP with real BEP so UI reflects actual sell threshold
+                    row["breakeven_price"] = round(_real_bep, 8)
+                    row["profitable"] = bool(price >= _real_bep) if price else False
                     if price > 0:
                         _gap_pct = round((_real_bep - price) / price * 100, 4)
                         row["real_bep_gap_pct"]        = _gap_pct
                         row["real_bep_distance_usdt"]  = round((_real_bep - price) * float(p.get("quantity", 0)), 4)
                         row["is_trapped"]              = bool(_gap_pct > 2.0)
+                        row["dist_to_bep_pct"]        = round((price - _real_bep) / _real_bep * 100, 4)
             except Exception:
                 pass
             out.append(row)
@@ -1620,6 +1624,51 @@ def api_debug():
         "recent_errors":   errors[:5],
         "startup_log":     [e for e in last_logs if "Deploy started" in e.get("message","") or "Bot ready" in e.get("message","") or "STARTUP ERROR" in e.get("message","")],
     }
+
+
+@app.get("/api/debug-sell")
+def api_debug_sell():
+    """Sell-trigger diagnostic: shows real BEP, current price, and cooldowns for every open position."""
+    try:
+        import trade_engine as _te_ds
+        import data_collector as _dc_ds
+        positions = _te_ds.get_open_positions()
+        rows = []
+        _now = time.time()
+        for p in positions:
+            sym    = p.get("symbol", "")
+            entry  = p.get("entry_price", 0)
+            qty    = p.get("quantity", 0)
+            budget = p.get("budget_usdt", 0)
+            cur    = _dc_ds.prices.get(sym, 0) or _te_ds._rest_px.get(sym, 0)
+            real_bep   = _te_ds.compute_real_breakeven_price(p)
+            _bep_m     = p.get("breakeven_mult_at_buy") or _te_ds._get_breakeven_mult(entry, sym) if entry else 0
+            simple_bep = entry * _bep_m if entry and _bep_m else 0
+            cd         = _te_ds._loss_cooldown.get(sym, 0)
+            rows.append({
+                "symbol":          sym,
+                "entry":           round(entry, 8),
+                "quantity":        qty,
+                "budget_usdt":     budget,
+                "current_price":   round(cur, 8),
+                "simple_bep":      round(simple_bep, 8),
+                "real_bep":        round(real_bep, 8),
+                "above_real_bep":  bool(cur >= real_bep) if (cur and real_bep) else False,
+                "real_bep_gap_pct": round((real_bep - cur) / cur * 100, 4) if (cur and real_bep) else None,
+                "loss_cooldown_remaining_s": round(max(0.0, cd - _now), 1),
+                "take_profit_enabled": _te_ds._take_profit_enabled,
+                "take_profit_mult":    round(_te_ds._user_tp_mult, 6),
+                "opened_at_ts":    p.get("opened_at_ts", 0),
+                "hold_sec":        round(_now - p.get("opened_at_ts", _now), 1),
+            })
+        return {
+            "positions": rows,
+            "_take_profit_enabled": _te_ds._take_profit_enabled,
+            "_user_tp_mult":        round(_te_ds._user_tp_mult, 6),
+            "_stop_loss_mult":      round(_te_ds._stop_loss_mult, 6),
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 class ChatRequest(BaseModel):
