@@ -112,7 +112,8 @@ def compute_real_breakeven_price(pos: dict, min_profit: float = 0.003) -> float:
     """Return the REAL price at which selling pos would net at least min_profit USDT.
 
     Accounts for quantity rounding loss, buy fee already paid, and sell fee.
-    DIAGNOSTIC ONLY — not called from any sell-decision code path.
+    Used as the sell trigger in both realtime_monitor and _sell_monitor_loop so
+    trigger and profit gate use identical math and never disagree.
     """
     try:
         budget   = float(pos.get("budget_usdt", 0))
@@ -141,6 +142,9 @@ _LOSS_COOLDOWN_SEC = 1800  # 30 minutes
 # Abort-log throttle — SELL ABORTED fires every 250ms per stuck position; cap to 1/min per symbol
 _last_abort_log_ts: Dict[str, float] = {}
 _ABORT_LOG_THROTTLE_SEC = 60.0
+
+# Minimum hold time after a buy — prevents race-condition sells within seconds of entry
+_MIN_HOLD_SEC = 10.0
 
 # WebSocket price freshness — updated by data_collector on every @trade or @miniTicker event.
 # Used by the pre-sell check to decide whether a REST re-fetch is needed.
@@ -1381,6 +1385,28 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             database.log_activity(f"{sym}: buy skipped — no price available", "warn")
             continue
 
+        # Lot-step rounding guard: skip if rounding would waste >1% of capital.
+        # Catches BTC/ETH-tier coins where a small budget gets floored to far fewer coins
+        # than expected, creating a trapped position that needs a 5%+ move to break even.
+        _ideal_qty_pre = budget / price
+        _actual_qty_pre = _floor_qty(_ideal_qty_pre, sym)
+        if _actual_qty_pre <= 0:
+            database.log_activity(
+                f"[SKIP] {sym}: lot-step too large for ${budget:.2f} at ${price:.4f} — "
+                f"would receive 0 qty. Increase budget or remove this coin.", "warn"
+            )
+            continue
+        _qty_loss_pct = (_ideal_qty_pre - _actual_qty_pre) / _ideal_qty_pre * 100
+        if _qty_loss_pct > 1.0:
+            database.log_activity(
+                f"[SKIP] {sym}: lot-step rounding wastes {_qty_loss_pct:.2f}% of capital "
+                f"(ideal={_ideal_qty_pre:.8f}, actual={_actual_qty_pre:.8f}, "
+                f"step={_lot_step_cache.get(sym, '?')}). "
+                f"Price ${price:.4f} too high for ${budget:.2f} budget — skipping.",
+                "warn"
+            )
+            continue
+
         client.update_price(sym, price)
 
         buy_cfg = {**approved[sym], "symbol": sym, "budget_usdt": budget}
@@ -1494,6 +1520,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             "quantity":           qty,
             "budget_usdt":        budget,
             "buy_fee_usdt":       buy_fee_usdt,
+            "opened_at_ts":       time.time(),  # for minimum-hold-time guard
             "timestamp":          ts_now,
             "mode":               mode,
             "entry_rsi":          entry_rsi,
@@ -1613,19 +1640,24 @@ def realtime_monitor(prices: Dict[str, float]):
                          else _SELL_RETRY_COOLDOWN_PROFIT)
             if (now - last_fail) < _cooldown:
                 continue
+        # Minimum hold: never sell within 10 s of buy — prevents race-condition flips
+        opened_ts = pos.get("opened_at_ts", 0)
+        if opened_ts > 0 and (now - opened_ts) < _MIN_HOLD_SEC:
+            continue
         entry  = pos["entry_price"]
-        # Per-position breakeven: uses stored multiplier from buy time if available,
-        # else recomputes from current entry price via adaptive tier function.
-        _bep_m = pos.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
-        breakeven = entry * _bep_m
+        # Real breakeven trigger: accounts for qty rounding, buy fee, sell fee.
+        # Uses same math as _profitable_sell_check so trigger and gate never disagree.
+        real_target = compute_real_breakeven_price(pos)
+        if real_target <= 0:
+            continue
         stop   = entry * _stop_loss_mult
-        # Effective TP target: max(breakeven, entry * user_tp setting) when TP enabled
+        # Effective TP target: max(real_target, entry * user_tp setting) when TP enabled
         if _take_profit_enabled:
-            target = max(breakeven, entry * _user_tp_mult)
+            target = max(real_target, entry * _user_tp_mult)
         else:
-            target = breakeven
+            target = real_target
 
-        if price >= breakeven and _profitable_sell_check(pos, price):
+        if price >= real_target and _profitable_sell_check(pos, price):
             # ABSOLUTE PROFIT GATE: only proceed if selling at this exact price would
             # net at least take_profit_pct% of budget after fees. Eliminates loss
             # from market-order slippage — if price drops between trigger and fill,
@@ -1633,7 +1665,7 @@ def realtime_monitor(prices: Dict[str, float]):
             with _selling_lock:
                 already = sym in _selling
             if not already:
-                if _smart_hold_enabled and price >= target and target > breakeven:
+                if _smart_hold_enabled and price >= target and target > real_target:
                     _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
                     peak = _pos_peaks[sym]
                     trail_stop = peak * (1.0 - _trailing_stop_pct / 100.0)
@@ -1927,20 +1959,26 @@ def _sell_monitor_loop():
                                  else _SELL_RETRY_COOLDOWN_PROFIT)
                     if (now_monitor - last_fail) < _cooldown:
                         continue
+                # Minimum hold: never sell within 10 s of buy
+                opened_ts3 = pos.get("opened_at_ts", 0)
+                if opened_ts3 > 0 and (now_monitor - opened_ts3) < _MIN_HOLD_SEC:
+                    continue
                 entry  = pos["entry_price"]
-                _bep_m3   = pos.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
-                breakeven3 = entry * _bep_m3
+                # Real breakeven trigger — same math as _profitable_sell_check
+                real_target3 = compute_real_breakeven_price(pos)
+                if real_target3 <= 0:
+                    continue
                 stop       = entry * _stop_loss_mult
                 if _take_profit_enabled:
-                    target = max(breakeven3, entry * _user_tp_mult)
+                    target = max(real_target3, entry * _user_tp_mult)
                 else:
-                    target = breakeven3
+                    target = real_target3
 
                 sell_reason3: Optional[str] = None
 
-                if price >= breakeven3 and _profitable_sell_check(pos, price):
+                if price >= real_target3 and _profitable_sell_check(pos, price):
                     # Profit gate — see realtime_monitor for rationale
-                    if _smart_hold_enabled and price >= target and target > breakeven3:
+                    if _smart_hold_enabled and price >= target and target > real_target3:
                         _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
                         peak = _pos_peaks[sym]
                         trail_stop = peak * (1.0 - _trailing_stop_pct / 100.0)
