@@ -76,19 +76,49 @@ def _fills_fee_usdt(fills: list, fallback_usdt: float) -> tuple:
                 # Price unavailable — fall back to estimate for entire order
                 return fallback_usdt, "estimated"
     return total, first_asset
-# Breakeven floor: 0.999² covers both 0.1% fees exactly (≈1.002003 multiplier).
-# Additional 0.10% buffer accounts for typical Binance market-order slippage
-# on liquid USDT pairs. Combined: entry × 1.003005 — only 0.30% gain needed.
-# Reduced from 1.0025 (0.45% required) which was leaving positions stuck at
-# 80% of target for hours. Real slippage on top-50 USDT pairs is <0.05%;
-# 0.10% is a comfortable safety margin. Tunable via slippage_buffer_pct setting.
-_breakeven_mult = 1.0 / (0.999 ** 2) * 1.0010
+_FEE_FLOOR = 1.0 / (0.999 ** 2)  # ~1.002003 — exact cost of two 0.1% Binance fees
+
+# Per-coin override buffers: {"SHIBUSDT": 0.30, ...} — populated from strategy.json
+_BUFFER_OVERRIDES: Dict[str, float] = {}
+
+def _get_breakeven_mult(entry_price: float, symbol: str = "") -> float:
+    """Adaptive sell threshold multiplier based on coin price tier.
+
+    Tier  | Price range    | Buffer  | Total required gain
+    ------|----------------|---------|--------------------
+    ultra | >= $1 000      | 0.08%   | ~0.28%
+    high  | $10 - $1 000   | 0.10%   | ~0.30%
+    mid   | $0.10 - $10    | 0.15%   | ~0.35%
+    sub   | $0.001 - $0.10 | 0.20%   | ~0.40%
+    micro | < $0.001       | 0.30%   | ~0.50%
+
+    Per-coin overrides in strategy.json key "slippage_buffer_overrides" take priority.
+    """
+    if symbol and symbol in _BUFFER_OVERRIDES:
+        buf = float(_BUFFER_OVERRIDES[symbol])
+    elif entry_price >= 1000.0:
+        buf = 0.08
+    elif entry_price >= 10.0:
+        buf = 0.10
+    elif entry_price >= 0.1:
+        buf = 0.15
+    elif entry_price >= 0.001:
+        buf = 0.20
+    else:
+        buf = 0.30
+    return _FEE_FLOOR * (1.0 + buf / 100.0)
 
 # Configurable exit multipliers — refreshed from strategy.json every buy/sell cycle.
-# _take_profit_mult: price must reach entry * this to trigger a sell (>=_breakeven_mult).
+# _user_tp_mult:    raw user TP target (1 + tp_pct/100); compared to per-position breakeven.
+# _take_profit_mult: kept for UI/diagnostic exports; updated by _refresh_risk_params.
 # _stop_loss_mult:   price must fall to entry * this to trigger a stop-loss sell.
-_take_profit_mult: float = _breakeven_mult   # default: break-even
-_stop_loss_mult:   float = 1.0 - 0.02        # default: -2% stop loss
+_user_tp_mult:    float = 1.001              # 0.1% above entry; updated by _refresh_risk_params
+_take_profit_mult: float = _FEE_FLOOR * 1.0010  # kept for legacy compat; updated each cycle
+_stop_loss_mult:   float = 1.0 - 0.02           # default: -2% stop loss
+
+# Post-loss cooldown: after a confirmed slippage-loss fill, skip re-buying that coin for 30 min
+_loss_cooldown: Dict[str, float] = {}
+_LOSS_COOLDOWN_SEC = 1800  # 30 minutes
 
 # New exit-mode flags (strategy.json controlled)
 _take_profit_enabled: bool = True    # False → exit at breakeven (fees covered) only
@@ -251,7 +281,7 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
 
 def _refresh_risk_params():
     """Read stop_loss_enabled/pct, take_profit_pct and new exit flags from strategy.json."""
-    global _take_profit_mult, _stop_loss_mult, _take_profit_enabled, _smart_hold_enabled, _trailing_stop_pct, _breakeven_mult
+    global _user_tp_mult, _take_profit_mult, _stop_loss_mult, _take_profit_enabled, _smart_hold_enabled, _trailing_stop_pct, _BUFFER_OVERRIDES
     strategy = _load_strategy()
     tp_pct = float(strategy.get("take_profit_pct", 0.1))   # e.g. 0.5 → 0.5%
     sl_pct = float(strategy.get("stop_loss_pct",   2.0))   # e.g. 2.0 → 2.0%
@@ -260,17 +290,17 @@ def _refresh_risk_params():
     _smart_hold_enabled  = bool(strategy.get("smart_hold_enabled",  False))
     _trailing_stop_pct   = float(strategy.get("trailing_stop_pct",  0.5))
 
-    # User-tunable slippage buffer (default 0.10%). Lower = sell more aggressively.
-    # Clamped [0.05%, 0.50%] to prevent accidentally removing the safety margin.
-    buffer_pct = float(strategy.get("slippage_buffer_pct", 0.10))
-    buffer_pct = max(0.05, min(0.50, buffer_pct))
-    _breakeven_mult = 1.0 / (0.999 ** 2) * (1.0 + buffer_pct / 100.0)
+    # Per-coin buffer overrides from strategy.json (e.g. {"SHIBUSDT": 0.30, "BTCUSDT": 0.08})
+    overrides = strategy.get("slippage_buffer_overrides", {})
+    if isinstance(overrides, dict):
+        _BUFFER_OVERRIDES = {k: float(v) for k, v in overrides.items()}
 
-    tp_mult = 1.0 + (tp_pct / 100.0)
-    # When TP is disabled → exit exactly at breakeven (fees covered, no extra target).
-    # When TP is enabled  → exit at max(breakeven, entry × (1 + tp_pct/100)).
-    _take_profit_mult = (_breakeven_mult if not _take_profit_enabled
-                         else max(_breakeven_mult, tp_mult))
+    # User TP raw multiplier — per-position breakeven is computed by _get_breakeven_mult
+    _user_tp_mult = 1.0 + (tp_pct / 100.0)
+
+    # _take_profit_mult kept for legacy exports/diagnostics — use a mid-range reference price
+    _take_profit_mult = (_FEE_FLOOR * 1.0010 if not _take_profit_enabled
+                         else max(_FEE_FLOOR * 1.0010, _user_tp_mult))
     # Stop loss: set to 0.0 when disabled so the check (price <= 0.0) never fires
     _stop_loss_mult   = (1.0 - sl_pct / 100.0) if sl_on else 0.0
 
@@ -305,7 +335,7 @@ def _profitable_sell_check(pos: dict, price: float) -> bool:
         min_profit = max(0.003, budget * (tp_pct / 100.0))
     else:
         # TP disabled: lock in tiniest profit above slippage buffer.
-        # $0.003 fires on every +0.30% move, matching the new _breakeven_mult.
+        # $0.003 fires on every +0.30% move, matching the adaptive breakeven tier.
         min_profit = 0.003
     estimated_profit = net_returned - total_cost
     return estimated_profit >= min_profit
@@ -539,7 +569,7 @@ def load_positions_from_db():
                     # Recreate position using current price as estimated entry.
                     # Entry is unknown after a DB wipe — current price is the safest
                     # default: the bot will monitor from here and exit on TP/SL.
-                    exit_target = round(price * _breakeven_mult, 8)
+                    exit_target = round(price * _get_breakeven_mult(price, sym), 8)
                     pos_record = {
                         "symbol":       sym,
                         "entry_price":  price,
@@ -969,6 +999,17 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         usdt_returned = raw_quote - sell_fee
         net_profit    = usdt_returned - budget - buy_fee
 
+    # Post-fill integrity check: if a "take-profit" sell actually lost money
+    # (market-order slippage filled below breakeven), relabel it so the trade
+    # history is honest, and apply a 30-min cooldown to avoid re-buying immediately.
+    if net_profit < 0 and reason == "take-profit":
+        reason = "slippage-loss"
+        _loss_cooldown[sym] = time.time() + _LOSS_COOLDOWN_SEC
+        database.log_activity(
+            f"SLIPPAGE-LOSS {sym}: fill at ${fill_price:.6f} returned ${net_profit:.4f} USDT "
+            f"— relabeled 'slippage-loss', cooldown {_LOSS_COOLDOWN_SEC // 60}min", "warn"
+        )
+
     buy_ts  = pos.get("timestamp", now)
     sell_ts = now
     try:
@@ -1003,6 +1044,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         "day_of_week":        buy_dt.weekday(),
         "timestamp_buy":      buy_ts,
         "timestamp_sell":     sell_ts,
+        "sell_reason":        reason,
     }
     # Remove position from memory and DB immediately — sell is confirmed on Binance.
     # Supabase sync and learning run after so a slow network never delays cleanup.
@@ -1181,6 +1223,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             continue
         if _in_cooldown(sym):
             database.log_activity(f"{sym}: buy skipped — in cooldown", "info")
+            continue
+        if _loss_cooldown.get(sym, 0) > time.time():
+            rem = int(_loss_cooldown[sym] - time.time())
+            database.log_activity(f"{sym}: buy skipped — post-slippage-loss cooldown ({rem}s remaining)", "info")
             continue
 
         with _positions_lock:
@@ -1382,12 +1428,18 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         except Exception:
             pass
 
-        exit_target = round(fill_price * _take_profit_mult, 8)
+        _bep_mult_buy = _get_breakeven_mult(fill_price, sym)
+        if _take_profit_enabled:
+            _eff_tp_mult = max(_bep_mult_buy, _user_tp_mult)
+        else:
+            _eff_tp_mult = _bep_mult_buy
+        exit_target = round(fill_price * _eff_tp_mult, 8)
         _pos_peaks.pop(sym, None)
         pos_record = {
             "symbol":             sym,
             "entry_price":        fill_price,
             "exit_target":        exit_target,
+            "breakeven_mult_at_buy": round(_bep_mult_buy, 8),
             "quantity":           qty,
             "budget_usdt":        budget,
             "buy_fee_usdt":       buy_fee_usdt,
@@ -1511,12 +1563,17 @@ def realtime_monitor(prices: Dict[str, float]):
             if (now - last_fail) < _cooldown:
                 continue
         entry  = pos["entry_price"]
-        # Use configurable take-profit multiplier (refreshed from strategy.json every buy cycle).
-        # Must be at least _breakeven_mult so we never sell at a loss via take-profit.
-        target = entry * _take_profit_mult
+        # Per-position breakeven: uses stored multiplier from buy time if available,
+        # else recomputes from current entry price via adaptive tier function.
+        _bep_m = pos.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
+        breakeven = entry * _bep_m
         stop   = entry * _stop_loss_mult
+        # Effective TP target: max(breakeven, entry * user_tp setting) when TP enabled
+        if _take_profit_enabled:
+            target = max(breakeven, entry * _user_tp_mult)
+        else:
+            target = breakeven
 
-        breakeven = entry * _breakeven_mult
         if price >= breakeven and _profitable_sell_check(pos, price):
             # ABSOLUTE PROFIT GATE: only proceed if selling at this exact price would
             # net at least take_profit_pct% of budget after fees. Eliminates loss
@@ -1778,7 +1835,9 @@ def _sell_monitor_loop():
                         no_price_syms.append(sym)
                         lines.append(f"{sym} NO_PRICE(entry={entry:.4f})")
                         continue
-                    actual = entry * _take_profit_mult   # real sell threshold
+                    _bep_m_diag = p.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
+                    _bep_diag   = entry * _bep_m_diag
+                    actual = max(_bep_diag, entry * _user_tp_mult) if _take_profit_enabled else _bep_diag  # real sell threshold
                     pct    = ((price - entry) / entry * 100) if entry else 0
                     gap_pct  = ((actual - price) / price * 100) if price > 0 and actual > price else 0.0
                     qty_held = p.get("quantity", 0)
@@ -1814,11 +1873,15 @@ def _sell_monitor_loop():
                     if (now_monitor - last_fail) < _cooldown:
                         continue
                 entry  = pos["entry_price"]
-                target = entry * _take_profit_mult
-                stop   = entry * _stop_loss_mult
+                _bep_m3   = pos.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
+                breakeven3 = entry * _bep_m3
+                stop       = entry * _stop_loss_mult
+                if _take_profit_enabled:
+                    target = max(breakeven3, entry * _user_tp_mult)
+                else:
+                    target = breakeven3
 
                 sell_reason3: Optional[str] = None
-                breakeven3 = entry * _breakeven_mult
 
                 if price >= breakeven3 and _profitable_sell_check(pos, price):
                     # Profit gate — see realtime_monitor for rationale

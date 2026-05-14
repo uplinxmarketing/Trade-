@@ -244,10 +244,13 @@ def _get_positions():
             entry  = p.get("entry_price", 0)
             qty    = p.get("quantity", 0)
             try:
-                from trade_engine import _take_profit_mult as _tpm
+                from trade_engine import _get_breakeven_mult as _gbm, _user_tp_mult as _utpm, _take_profit_enabled as _tpe
+                _bep_m_pos = p.get("breakeven_mult_at_buy") or (_gbm(entry, p.get("symbol", "")) if entry else 1.002)
+                _bep_pos   = entry * _bep_m_pos if entry else 0
+                target     = p.get("exit_target") or (max(_bep_pos, entry * _utpm) if _tpe and entry else _bep_pos)
             except Exception:
-                _tpm = 1.0 / (0.999 ** 2) * 1.0015
-            target = p.get("exit_target") or (entry * _tpm if entry else 0)
+                target = p.get("exit_target") or (entry * 1.003 if entry else 0)
+                _bep_pos = target
             pnl    = (price - entry) * qty if price and entry else 0
             dist   = ((price - target) / target * 100) if target and price else 0
             out.append({
@@ -255,11 +258,11 @@ def _get_positions():
                 "avg_entry_price": entry,
                 "current_price":   price,
                 "exit_target":     round(target, 8),
-                "breakeven_price": round(target, 6),
+                "breakeven_price": round(_bep_pos, 6),
                 "unrealized_pnl":  round(pnl, 4),
                 "dist_to_exit_pct": round(dist, 4),
-                "dist_to_bep_pct":  round(dist, 4),
-                "profitable":      price >= target if price and target else False,
+                "dist_to_bep_pct":  round(((price - _bep_pos) / _bep_pos * 100) if _bep_pos and price else 0, 4),
+                "profitable":      price >= _bep_pos if price and _bep_pos else False,
             })
         return out
     except Exception:
@@ -1018,7 +1021,7 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
     sym = symbol.upper()
     try:
         from trade_engine import (get_budget_for_coin, _positions, _positions_lock,
-                                    _breakeven_mult, _rebuild_pos_index)
+                                    _get_breakeven_mult, _rebuild_pos_index)
         from connection import client as _client
         from data_collector import prices as live_prices
 
@@ -1046,11 +1049,13 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
         if qty <= 0:
             return {"ok": False, "error": "Order returned 0 quantity"}
 
-        exit_target = round(fill_price * _breakeven_mult, 8)
+        _bep_m_fb = _get_breakeven_mult(fill_price, sym)
+        exit_target = round(fill_price * _bep_m_fb, 8)
         pos = {
             "symbol": sym, "entry_price": fill_price, "quantity": qty,
             "budget_usdt": budget, "timestamp": datetime.now(timezone.utc).isoformat(),
             "mode": get_mode(), "exit_target": exit_target,
+            "breakeven_mult_at_buy": round(_bep_m_fb, 8),
         }
         pos["id"] = database.save_position(pos)
         with _positions_lock:
@@ -1093,9 +1098,10 @@ def api_force_sell(symbol: str, req: Optional[ForceSellRequest] = None):
         price = hint_price or live_prices.get(sym, 0) or pos.get("entry_price", 0)
         if not price:
             return {"ok": False, "error": f"No live price for {sym}"}
-        from trade_engine import _breakeven_mult
+        from trade_engine import _get_breakeven_mult
         entry = pos.get("entry_price", 0)
-        breakeven_floor = round(entry * _breakeven_mult, 8) if entry else 0
+        _bep_m_fs = pos.get("breakeven_mult_at_buy") or (_get_breakeven_mult(entry, sym) if entry else 1.002)
+        breakeven_floor = round(entry * _bep_m_fs, 8) if entry else 0
         from trade_engine import _selling, _selling_lock, _selling_ts
         import time as _time
         with _selling_lock:
@@ -1196,7 +1202,6 @@ def api_sell_monitor():
     age   = round(time.time() - hb, 1) if hb > 0 else None
 
     fee_rate = config.FEE_RATE
-    bep_mult = 1.0 / (0.999 ** 2)  # exact breakeven multiplier
 
     positions = _get_positions()
     checks = []
@@ -1204,7 +1209,9 @@ def api_sell_monitor():
         sym   = p["symbol"]
         entry = p.get("entry_price", 0)
         price = live_prices.get(sym, 0)
-        bep   = entry * bep_mult if entry else 0
+        # Use the stored multiplier from buy time if available; else adaptive tier
+        bep_m = p.get("breakeven_mult_at_buy") or (_te._get_breakeven_mult(entry, sym) if entry else 1.002)
+        bep   = entry * bep_m if entry else 0
         sl    = entry * (1.0 - config.STOP_LOSS_PCT) if entry else 0
         pct   = ((price - entry) / entry * 100) if entry else 0
         checks.append({
@@ -1213,6 +1220,7 @@ def api_sell_monitor():
             "current":         price,
             "pct_from_entry":  round(pct, 4),
             "breakeven_price": round(bep, 6),
+            "breakeven_mult":  round(bep_m, 6),
             "stop_loss":       round(sl, 6),
             "profitable":      price > bep if price and bep else False,
             "sl_hit":          price <= sl if price and sl else False,
@@ -1223,7 +1231,7 @@ def api_sell_monitor():
         "heartbeat_age_sec":  age,
         "breakeven_pct":      round(fee_rate * 2 * 100, 4),
         "stop_loss_pct":      config.STOP_LOSS_PCT * 100,
-        "sell_trigger":       "price > entry × (1 + buy_fee + sell_fee)",
+        "sell_trigger":       "price >= entry × adaptive_breakeven_mult (tier-based)",
         "open_positions":     len(checks),
         "positions":          checks,
     }
@@ -1481,10 +1489,10 @@ def api_debug():
     strategy = _load_strategy()
     approved = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
     try:
-        from trade_engine import get_open_positions, _sell_monitor_heartbeat, _breakeven_mult
+        from trade_engine import get_open_positions, _sell_monitor_heartbeat, _FEE_FLOOR
         pos_count = len(get_open_positions())
         sm_alive  = (time.time() - _sell_monitor_heartbeat) < 10 if _sell_monitor_heartbeat else False
-        bep_mult  = _breakeven_mult
+        bep_mult  = _FEE_FLOOR * 1.0010  # reference mid-price tier (high/$10-$1000)
     except Exception as e:
         pos_count = -1; sm_alive = False; bep_mult = 0
         database.log_activity(f"debug endpoint trade_engine error: {e}", "warn")
