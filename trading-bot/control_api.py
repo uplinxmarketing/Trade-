@@ -215,6 +215,24 @@ def _write_strategy_patch(patch: dict):
         pass
 
 
+def _enrich_position(pos: dict) -> dict:
+    """Add hold_minutes and hold_human to a position dict in-place."""
+    ts = pos.get("timestamp")
+    if ts:
+        try:
+            ts_str = ts.replace("Z", "+00:00") if isinstance(ts, str) else None
+            if ts_str:
+                opened  = datetime.fromisoformat(ts_str)
+                age_sec = (datetime.now(timezone.utc) - opened).total_seconds()
+                pos["hold_minutes"] = round(age_sec / 60, 1)
+                hours = int(age_sec // 3600)
+                mins  = int((age_sec % 3600) // 60)
+                pos["hold_human"] = f"{hours}h {mins}m" if hours > 0 else f"{mins}m"
+        except Exception:
+            pass
+    return pos
+
+
 def _get_positions():
     try:
         from trade_engine import get_open_positions, _rest_px, _signal_cache, _signal_cache_lock
@@ -253,7 +271,7 @@ def _get_positions():
                 _bep_pos = target
             pnl    = (price - entry) * qty if price and entry else 0
             dist   = ((price - target) / target * 100) if target and price else 0
-            out.append({
+            out.append(_enrich_position({
                 **p,
                 "avg_entry_price": entry,
                 "current_price":   price,
@@ -263,7 +281,7 @@ def _get_positions():
                 "dist_to_exit_pct": round(dist, 4),
                 "dist_to_bep_pct":  round(((price - _bep_pos) / _bep_pos * 100) if _bep_pos and price else 0, 4),
                 "profitable":      price >= _bep_pos if price and _bep_pos else False,
-            })
+            }))
         return out
     except Exception:
         return []
@@ -847,6 +865,35 @@ def dashboard():
 # ── Start as daemon thread ───────────────────────────────────────────────────────────────
 
 @app.get("/api/status")
+def _get_market_health() -> dict:
+    """Summarise current signal cache into a market-health verdict."""
+    try:
+        from trade_engine import _signal_cache, _signal_cache_lock
+        with _signal_cache_lock:
+            snap = dict(_signal_cache)
+        total = len(snap)
+        if total == 0:
+            return {"verdict": "UNKNOWN", "explanation": "Signal cache empty"}
+        healthy_5m      = sum(1 for s in snap.values() if s.get("5m_ok"))
+        downtrend_pct   = round((total - healthy_5m) / total * 100, 1)
+        avg_score       = round(sum(s.get("score", 0) for s in snap.values()) / total, 1)
+        verdict = ("BEARISH" if downtrend_pct > 60 else "BULLISH" if downtrend_pct < 30 else "MIXED")
+        explanation = (
+            f"{downtrend_pct}% of coins in 5m downtrend — sells may be delayed"
+            if downtrend_pct > 60 else
+            f"Market mixed, avg score {avg_score}/6 — normal trading"
+        )
+        return {
+            "downtrend_5m_pct": downtrend_pct,
+            "avg_signal_score": avg_score,
+            "coins_tracked":    total,
+            "verdict":          verdict,
+            "explanation":      explanation,
+        }
+    except Exception:
+        return {}
+
+
 def api_status():
     strategy = _load_strategy()
     # Use aggregated SQL so total/wins/losses/pnl/trades_today all cover the
@@ -884,6 +931,7 @@ def api_status():
         "db_path":             database.DB_PATH,
         "data_persistent":     database.is_data_persistent(),
         "sell_monitor_alive":  _sell_monitor_alive(),
+        "market_health":       _get_market_health(),
     }
 
 
@@ -1373,6 +1421,21 @@ def _format_trades(raw: list) -> list:
     return result
 
 
+def _append_fresh_prices(payload: dict) -> dict:
+    """Inject per-symbol live prices from data_collector into every /api/all response.
+    These bypass the cache so the frontend always gets sub-100ms-fresh prices even
+    when the rest of the payload (positions, trades) is served from cache."""
+    try:
+        import data_collector as _dc_fp
+        syms = {p.get("symbol") for p in payload.get("positions", []) if p.get("symbol")}
+        if syms:
+            fresh = {s: float(_dc_fp.prices[s]) for s in syms if s in _dc_fp.prices}
+            return {**payload, "fresh_prices": fresh, "fresh_prices_ts": time.time()}
+    except Exception:
+        pass
+    return payload
+
+
 @app.get("/api/all")
 def api_all():
     """Single endpoint returning status + positions + trades + activity.
@@ -1381,7 +1444,7 @@ def api_all():
     cached = _API_ALL_CACHE.get("data")
     _ttl = 0.1 if _API_ALL_CACHE.get("has_positions") else 0.8
     if cached is not None and (now_ts - _API_ALL_CACHE["ts"]) < _ttl:
-        return cached
+        return _append_fresh_prices(cached)
 
     strategy = _load_strategy()
     # Use aggregated SQL stats — covers ALL trades, not just the last 500.
@@ -1436,14 +1499,15 @@ def api_all():
             "budget_fixed_usdt":  strategy.get("budget_fixed_usdt",   config.BUDGET_FIXED_USDT),
             "bot_allocation_usdt": strategy.get("bot_allocation_usdt", config.BOT_ALLOCATION_USDT),
         },
-        "positions": positions,
-        "trades":    _format_trades(trades[:200]),
-        "activity":  database.get_activity_log(limit=100),
-        "signals":   _get_signal_snapshot(),
+        "positions":     positions,
+        "trades":        _format_trades(trades[:200]),
+        "activity":      database.get_activity_log(limit=100),
+        "signals":       _get_signal_snapshot(),
+        "market_health": _get_market_health(),
     }
     _API_ALL_CACHE["ts"]   = now_ts
     _API_ALL_CACHE["data"] = payload
-    return payload
+    return _append_fresh_prices(payload)
 
 
 @app.get("/api/backup/export")
