@@ -76,7 +76,13 @@ def _fills_fee_usdt(fills: list, fallback_usdt: float) -> tuple:
                 # Price unavailable — fall back to estimate for entire order
                 return fallback_usdt, "estimated"
     return total, first_asset
-_breakeven_mult = 1.0 / (0.999 ** 2) * 1.0025  # 0.25% buffer — accounts for Binance slippage on volatile coins
+# Breakeven floor: 0.999² covers both 0.1% fees exactly (≈1.002003 multiplier).
+# Additional 0.10% buffer accounts for typical Binance market-order slippage
+# on liquid USDT pairs. Combined: entry × 1.003005 — only 0.30% gain needed.
+# Reduced from 1.0025 (0.45% required) which was leaving positions stuck at
+# 80% of target for hours. Real slippage on top-50 USDT pairs is <0.05%;
+# 0.10% is a comfortable safety margin. Tunable via slippage_buffer_pct setting.
+_breakeven_mult = 1.0 / (0.999 ** 2) * 1.0010
 
 # Configurable exit multipliers — refreshed from strategy.json every buy/sell cycle.
 # _take_profit_mult: price must reach entry * this to trigger a sell (>=_breakeven_mult).
@@ -239,7 +245,7 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
 
 def _refresh_risk_params():
     """Read stop_loss_enabled/pct, take_profit_pct and new exit flags from strategy.json."""
-    global _take_profit_mult, _stop_loss_mult, _take_profit_enabled, _smart_hold_enabled, _trailing_stop_pct
+    global _take_profit_mult, _stop_loss_mult, _take_profit_enabled, _smart_hold_enabled, _trailing_stop_pct, _breakeven_mult
     strategy = _load_strategy()
     tp_pct = float(strategy.get("take_profit_pct", 0.1))   # e.g. 0.5 → 0.5%
     sl_pct = float(strategy.get("stop_loss_pct",   2.0))   # e.g. 2.0 → 2.0%
@@ -247,6 +253,13 @@ def _refresh_risk_params():
     _take_profit_enabled = bool(strategy.get("take_profit_enabled", True))
     _smart_hold_enabled  = bool(strategy.get("smart_hold_enabled",  False))
     _trailing_stop_pct   = float(strategy.get("trailing_stop_pct",  0.5))
+
+    # User-tunable slippage buffer (default 0.10%). Lower = sell more aggressively.
+    # Clamped [0.05%, 0.50%] to prevent accidentally removing the safety margin.
+    buffer_pct = float(strategy.get("slippage_buffer_pct", 0.10))
+    buffer_pct = max(0.05, min(0.50, buffer_pct))
+    _breakeven_mult = 1.0 / (0.999 ** 2) * (1.0 + buffer_pct / 100.0)
+
     tp_mult = 1.0 + (tp_pct / 100.0)
     # When TP is disabled → exit exactly at breakeven (fees covered, no extra target).
     # When TP is enabled  → exit at max(breakeven, entry × (1 + tp_pct/100)).
@@ -280,11 +293,14 @@ def _profitable_sell_check(pos: dict, price: float) -> bool:
     tp_enabled = bool(strategy.get("take_profit_enabled", True))
     tp_pct = float(strategy.get("take_profit_pct", 0.1))
     if tp_enabled:
-        # Strict floor: must clear configured TP % of budget OR $0.005, whichever larger
-        min_profit = max(0.005, budget * (tp_pct / 100.0))
+        # When TP enabled: enforce user's configured profit target as the floor.
+        # Absolute minimum $0.003 (0.027% on $11 trade) — avoids blocking
+        # near-breakeven sells due to fee-estimation rounding.
+        min_profit = max(0.003, budget * (tp_pct / 100.0))
     else:
-        # TP disabled: just clear breakeven + tiny safety buffer
-        min_profit = 0.005
+        # TP disabled: lock in tiniest profit above slippage buffer.
+        # $0.003 fires on every +0.30% move, matching the new _breakeven_mult.
+        min_profit = 0.003
     estimated_profit = net_returned - total_cost
     return estimated_profit >= min_profit
 
@@ -1645,9 +1661,16 @@ def _sell_monitor_loop():
                         continue
                     actual = entry * _take_profit_mult   # real sell threshold
                     pct    = ((price - entry) / entry * 100) if entry else 0
+                    gap_pct  = ((actual - price) / price * 100) if price > 0 and actual > price else 0.0
+                    qty_held = p.get("quantity", 0)
+                    budget   = p.get("budget_usdt", 0)
+                    buy_fee  = float(p.get("buy_fee_usdt") or budget * _fee_rate)
+                    gross_now = price * qty_held
+                    est_profit = gross_now * (1 - _fee_rate) - budget - buy_fee
                     lines.append(
                         f"{sym} entry={entry:.4f} cur={price:.4f}({pct:+.3f}%) "
-                        f"target={actual:.4f}({'SELL' if price >= actual else 'hold'})"
+                        f"target={actual:.4f} ({'SELL' if price >= actual else f'need +{gap_pct:.3f}%'}) "
+                        f"est=${est_profit:+.3f}"
                     )
                 msg = f"Sell monitor: {len(snap)} open — " + " | ".join(lines)
                 if no_price_syms:

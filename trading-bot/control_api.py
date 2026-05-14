@@ -1253,16 +1253,17 @@ def api_get_settings():
 
 
 class SettingsRequest(BaseModel):
-    stop_loss_enabled:  Optional[bool]  = None
-    stop_loss_pct:      Optional[float] = None
-    take_profit_enabled:Optional[bool]  = None
-    take_profit_pct:    Optional[float] = None
-    smart_hold_enabled: Optional[bool]  = None
-    trailing_stop_pct:  Optional[float] = None
-    reinvest_profits:   Optional[bool]  = None
-    max_positions:      Optional[int]   = None
-    min_signals:        Optional[int]   = None
-    strategy_notes:     Optional[str]   = None
+    stop_loss_enabled:   Optional[bool]  = None
+    stop_loss_pct:       Optional[float] = None
+    take_profit_enabled: Optional[bool]  = None
+    take_profit_pct:     Optional[float] = None
+    smart_hold_enabled:  Optional[bool]  = None
+    trailing_stop_pct:   Optional[float] = None
+    reinvest_profits:    Optional[bool]  = None
+    max_positions:       Optional[int]   = None
+    min_signals:         Optional[int]   = None
+    strategy_notes:      Optional[str]   = None
+    slippage_buffer_pct: Optional[float] = None  # 0.05–0.50%, default 0.10%
 
 
 @app.post("/api/settings")
@@ -1280,6 +1281,7 @@ def api_save_settings(req: SettingsRequest):
         if req.max_positions       is not None: patch["max_positions"]      = max(1,   min(100,  req.max_positions))
         if req.min_signals         is not None: patch["min_signals"]        = max(1,   min(6,    req.min_signals))
         if req.strategy_notes      is not None: patch["strategy_notes"]     = req.strategy_notes[:2000]
+        if req.slippage_buffer_pct is not None: patch["slippage_buffer_pct"] = max(0.05, min(0.50, req.slippage_buffer_pct))
         if not patch:
             return {"ok": False, "error": "No valid settings provided"}
         _write_strategy_patch(patch)
