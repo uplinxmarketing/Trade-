@@ -139,9 +139,14 @@ def _call_claude(market_data: dict, recent_trades: list, win_rates: dict,
                  avg_durations: dict, patterns: list, open_positions: list,
                  usdt_balance: float) -> dict:
     import anthropic
+    from trade_engine import _record_claude_error, is_claude_disabled
 
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
+        return {}
+
+    if is_claude_disabled():
+        print("[StrategyEngine] Claude disabled due to repeated auth failures — skipping")
         return {}
 
     strategy_notes = _load_strategy().get("strategy_notes", "")
@@ -201,12 +206,20 @@ Respond ONLY with valid JSON matching this exact schema (no text outside JSON):
   "next_review_seconds": {config.DECISION_INTERVAL_SEC}
 }}"""
 
-    aclient = anthropic.Anthropic(api_key=api_key)
-    msg = aclient.messages.create(
-        model=config.CLAUDE_MODEL,
-        max_tokens=config.CLAUDE_MAX_TOKENS,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    try:
+        aclient = anthropic.Anthropic(api_key=api_key)
+        msg = aclient.messages.create(
+            model=config.CLAUDE_MODEL,
+            max_tokens=config.CLAUDE_MAX_TOKENS,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except anthropic.AuthenticationError as auth_err:
+        _record_claude_error(str(auth_err), is_auth_error=True)
+        raise
+    except Exception as api_err:
+        _record_claude_error(str(api_err), is_auth_error=False)
+        raise
+
     text = msg.content[0].text.strip()
 
     # Strip markdown code fences if present

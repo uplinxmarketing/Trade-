@@ -1456,17 +1456,25 @@ def api_diagnostics():
             "warn_count":     len(_te.get_diag_log(limit=50, severity_filter="warn")),
             "total_buffered": len(_te._diag_log),
         },
+        "claude_api": {
+            "error_count":      bh["claude_error_count"],
+            "last_error_age_sec": round(now - bh["claude_last_error_ts"], 1) if bh["claude_last_error_ts"] else None,
+            "last_error_msg":   bh["claude_last_error_msg"],
+            "disabled":         now < bh["claude_disabled_until"],
+            "disabled_until":   bh["claude_disabled_until"] if bh["claude_disabled_until"] > now else None,
+        },
     }
 
 
 @app.post("/api/diagnostics/reset")
 def api_diagnostics_reset():
-    """Reset REST error counters in the diagnostics health dict."""
+    """Reset Binance REST and Claude API error counters."""
     import trade_engine as _te
     with _te._binance_health_lock:
         _te._binance_health["rest_error_count"] = 0
         _te._binance_health["last_error_ts"]    = 0.0
         _te._binance_health["last_error_msg"]   = ""
+    _te.reset_claude_errors()
     return {"ok": True, "reset": True}
 
 
