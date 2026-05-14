@@ -336,6 +336,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [balance, setBalance]     = useState(0);
   const [initialBalance, setInitialBalance] = useState(0);
   const [positions, setPositions] = useState<OpenPosition[]>([]);
+  const [freshPrices, setFreshPrices] = useState<Record<string, number>>({});
   const [trades, setTrades]       = useState<TradeRow[]>([]);
   const [coinSignals, setCoinSignals] = useState<CoinSignal[]>([]);
   const [cycleCountdown, setCycleCountdown] = useState(0);
@@ -695,6 +696,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     }));
     setPositions(rawPos);
     positionsRef.current = rawPos;
+    if (data.fresh_prices && typeof data.fresh_prices === 'object') {
+      setFreshPrices(data.fresh_prices as Record<string, number>);
+    }
 
     // Trades
     const railwayTrades: TradeRow[] = [];
@@ -1381,9 +1385,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 <div className="space-y-2">
                   {(showAllPositions ? positions : positions.slice(0, 5)).map(pos => {
                     const entry = pos.avg_entry_price > 0 ? pos.avg_entry_price : 0;
-                    const cur   = (isServerMode && pos.current_price && pos.current_price > 0)
-                      ? pos.current_price
-                      : (prices[pos.symbol] ?? entry);
+                    // Priority: fresh_prices (injected per-poll outside cache) > local WS > cached server price
+                    const cur   = freshPrices[pos.symbol]
+                      ?? (isServerMode && pos.current_price && pos.current_price > 0 ? pos.current_price : undefined)
+                      ?? prices[pos.symbol]
+                      ?? entry;
                     const pnl = entry > 0 ? (cur - entry) * pos.quantity : 0;
                     const pct = entry > 0 ? ((cur - entry) / entry) * 100 : 0;
                     // exit_target comes from server; fallback to entry × breakeven (0.15% above)
@@ -1408,7 +1414,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                           </div>
                           <div className="text-right">
                             <p className="text-[9px] font-mono text-foreground/80">
-                              Now: <span className="font-semibold">${cur > 0 ? cur.toFixed(6) : '…'}</span>
+                              Now: <span
+                                key={`${pos.symbol}-${Math.round(cur * 1e5)}`}
+                                className={`font-semibold rounded px-0.5 ${pct >= 0 ? 'animate-flash-green' : 'animate-flash-red'}`}
+                              >${cur > 0 ? cur.toFixed(6) : '…'}</span>
                             </p>
                             <p className={`text-[9px] font-mono ${pnl >= 0 ? 'text-gain' : 'text-loss'}`}>
                               {pnl >= 0 ? '+' : ''}{pnl.toFixed(4)} USDT ({pct >= 0 ? '+' : ''}{pct.toFixed(3)}%)

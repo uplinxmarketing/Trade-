@@ -1373,6 +1373,21 @@ def _format_trades(raw: list) -> list:
     return result
 
 
+def _append_fresh_prices(payload: dict) -> dict:
+    """Inject per-symbol live prices from data_collector into every /api/all response.
+    These bypass the cache so the frontend always gets sub-100ms-fresh prices even
+    when the rest of the payload (positions, trades) is served from cache."""
+    try:
+        import data_collector as _dc_fp
+        syms = {p.get("symbol") for p in payload.get("positions", []) if p.get("symbol")}
+        if syms:
+            fresh = {s: float(_dc_fp.prices[s]) for s in syms if s in _dc_fp.prices}
+            return {**payload, "fresh_prices": fresh, "fresh_prices_ts": time.time()}
+    except Exception:
+        pass
+    return payload
+
+
 @app.get("/api/all")
 def api_all():
     """Single endpoint returning status + positions + trades + activity.
@@ -1381,7 +1396,7 @@ def api_all():
     cached = _API_ALL_CACHE.get("data")
     _ttl = 0.1 if _API_ALL_CACHE.get("has_positions") else 0.8
     if cached is not None and (now_ts - _API_ALL_CACHE["ts"]) < _ttl:
-        return cached
+        return _append_fresh_prices(cached)
 
     strategy = _load_strategy()
     # Use aggregated SQL stats — covers ALL trades, not just the last 500.
@@ -1443,7 +1458,7 @@ def api_all():
     }
     _API_ALL_CACHE["ts"]   = now_ts
     _API_ALL_CACHE["data"] = payload
-    return payload
+    return _append_fresh_prices(payload)
 
 
 @app.get("/api/backup/export")
