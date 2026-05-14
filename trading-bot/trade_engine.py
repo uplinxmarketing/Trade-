@@ -1732,8 +1732,7 @@ def _sell_monitor_loop():
                 database.log_activity(f"Sell monitor error: {exc}", "error")
             except Exception:
                 pass
-        # No blocking I/O here — 0.5 s gives ~0.5 s worst-case exit delay.
-        time.sleep(0.5)
+        time.sleep(0.25)  # 250ms cycle — halves worst-case sell delay
 
 
 async def position_guardian():

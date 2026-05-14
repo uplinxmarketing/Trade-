@@ -947,21 +947,32 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     setForcingSell(pos.symbol);
     try {
       if (isServerMode) {
-        // Send current price so backend uses accurate data, not stale WebSocket cache.
         const cur = (pos.current_price && pos.current_price > 0)
           ? pos.current_price
           : (prices[pos.symbol] ?? 0);
-        const res = await fetch(`${railwayUrl}/api/force-sell/${pos.symbol}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ price: cur }),
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
-        addLog(`FORCE SELL ${pos.symbol} @ ${Number(data.price).toFixed(4)} USDT`);
-        toast.success(`Sold ${pos.symbol}`);
-        await pollRailway();
+
+        // Optimistic UI: remove position immediately so the panel feels instant.
+        // If the backend fails, the next pollRailway restores it automatically.
+        const positionBackup = positions.find(p => p.symbol === pos.symbol);
+        setPositions(prev => prev.filter(p => p.symbol !== pos.symbol));
+
+        try {
+          const res = await fetch(`${railwayUrl}/api/force-sell/${pos.symbol}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ price: cur }),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          if (data.error) throw new Error(data.error);
+          addLog(`FORCE SELL ${pos.symbol} @ ${Number(data.price).toFixed(4)} USDT`);
+          toast.success(`Sold ${pos.symbol}`);
+          setTimeout(() => pollRailway(), 200);
+        } catch (sellErr) {
+          // Sell failed — restore position so user can retry
+          if (positionBackup) setPositions(prev => [...prev, positionBackup]);
+          throw sellErr;
+        }
         return;
       }
       // Local mode
@@ -986,7 +997,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     } finally {
       setForcingSell(null);
     }
-  }, [isServerMode, railwayUrl, prices, addLog, loadData]);
+  }, [isServerMode, railwayUrl, prices, positions, addLog, loadData, pollRailway]);
 
   // ── Reset wallet ──────────────────────────────────────────────────────────
   const handleReset = useCallback(async () => {
