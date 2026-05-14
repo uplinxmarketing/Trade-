@@ -237,7 +237,7 @@ const Index = () => {
             {/* Bot Watch List */}
             <div className="trading-card p-3">
               <div className="text-xs font-medium text-muted-foreground mb-2">Bot Watch List</div>
-              <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} maxCoins={55} />
+              <CoinSelector selected={selectedCoins} onChange={setSelectedCoins} maxCoins={100} />
             </div>
 
             {/* Reports */}
