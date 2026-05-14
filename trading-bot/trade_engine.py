@@ -1066,7 +1066,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     call except when a buy is actually about to fire. Throttled to at most once
     every 3 s to avoid hammering get_account() on every WebSocket tick.
     """
-    global _last_buy_check, _buys_this_scan
+    global _last_buy_check, _buys_this_scan, _last_buy_ts
     _buys_this_scan = 0  # reset per-scan counter each invocation
 
     # Fast pre-check: any coin signalling BUY? (no lock needed for scalar read)
@@ -1221,7 +1221,6 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             continue
 
         # ── Stagger gate — max _MAX_BUYS_PER_SCAN buys per cycle ──────────────
-        global _last_buy_ts, _buys_this_scan
         if _buys_this_scan >= _MAX_BUYS_PER_SCAN:
             database.log_activity(
                 f"Buy scan: capped at {_MAX_BUYS_PER_SCAN} buys this cycle — "
