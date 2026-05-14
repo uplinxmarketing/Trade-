@@ -234,8 +234,19 @@ Respond ONLY with valid JSON matching this exact schema (no text outside JSON):
 
 def run_strategy_once():
     """Run one strategy cycle. Writes strategy.json. Returns the strategy dict."""
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+
+    # Respect the claude_agent_enabled toggle — silently skip if disabled
+    try:
+        strategy_check = _load_strategy()
+        claude_enabled = bool(strategy_check.get("claude_agent_enabled", True))
+    except Exception:
+        claude_enabled = True
+
+    if not claude_enabled:
+        return _load_strategy()  # keep existing strategy, no API call, no log
+
+    if not api_key or api_key.startswith("#"):
         return write_default_strategy()
 
     print("[StrategyEngine] Running Claude analysis…")

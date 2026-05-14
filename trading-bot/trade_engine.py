@@ -1158,6 +1158,7 @@ def _execute_sell(pos: dict, price: float, reason: str):
     Caller MUST have already added pos['symbol'] to _selling before submitting
     to the executor — this function just verifies and executes."""
     from datetime import timezone as _tz
+    pos["_sell_picked_up_ts"] = time.time()
     sym  = pos["symbol"]
     qty  = _floor_qty(pos["quantity"], pos["symbol"])
     mode = get_mode()
@@ -1255,6 +1256,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             )
 
     _is_paper = (mode != "live")
+    pos["_sell_gate_start_ts"] = time.time()
     # FINAL SAFETY GATE — never lose money on a take-profit sell.
     # Stop-loss and force-sell bypass this check (they're meant to fire even at a loss).
     if reason not in ("stop-loss", "force-sell", "manual", "user-initiated"):
@@ -1281,6 +1283,8 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         # as the paper-mode execution price so the fill reflects current market
         price = _rest_px.get(sym, 0) or price
 
+    pos["_sell_gate_done_ts"] = time.time()
+    pos["_sell_binance_start_ts"] = time.time()
     try:
         # Paper mode: pass the trigger price directly so concurrent WebSocket/REST
         # updates cannot cause the sell to execute at the wrong price.
@@ -1288,7 +1292,9 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             result = client.order_market_sell(symbol=sym, quantity=qty, price=price)
         else:
             result = client.order_market_sell(symbol=sym, quantity=qty)
+        pos["_sell_binance_done_ts"] = time.time()
     except Exception as e:
+        pos["_sell_binance_done_ts"] = time.time()
         err_str = str(e)
         msg = f"SELL failed {sym} ({reason}): {e}"
         print(f"[TradeEngine] {msg}")
@@ -1413,6 +1419,35 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         "timestamp_sell":     sell_ts,
         "sell_reason":        reason,
     }
+    # ── Sell timing diagnostic ────────────────────────────────────────────────
+    try:
+        _t_done = time.time()
+        pos["_sell_complete_ts"] = _t_done
+        _trigger  = pos.get("_sell_trigger_ts", 0)
+        _pickup   = pos.get("_sell_picked_up_ts", 0)
+        _gate_s   = pos.get("_sell_gate_start_ts", 0)
+        _gate_e   = pos.get("_sell_gate_done_ts", 0)
+        _bin_s    = pos.get("_sell_binance_start_ts", 0)
+        _bin_e    = pos.get("_sell_binance_done_ts", _t_done)
+        if _trigger > 0:
+            stages = {
+                "trigger_to_pickup_ms": (_pickup - _trigger) * 1000 if _pickup else 0,
+                "pickup_to_gate_ms":    (_gate_s - _pickup) * 1000 if _gate_s and _pickup else 0,
+                "gate_ms":              (_gate_e - _gate_s) * 1000 if _gate_e and _gate_s else 0,
+                "gate_to_binance_ms":   (_bin_s - _gate_e) * 1000 if _bin_s and _gate_e else 0,
+                "binance_ms":           (_bin_e - _bin_s) * 1000 if _bin_e and _bin_s else 0,
+                "total_ms":             (_t_done - _trigger) * 1000,
+            }
+            detail = " | ".join(f"{k}={v:.0f}" for k, v in stages.items() if v >= 1)
+            if stages["total_ms"] > 2000:
+                log_diag_issue("sell_timing", "warn",
+                    f"{sym} sell slow: {stages['total_ms']:.0f}ms total ({reason})", detail=detail)
+            else:
+                log_diag_issue("sell_timing", "info",
+                    f"{sym} sold in {stages['total_ms']:.0f}ms ({reason})", detail=detail)
+    except Exception:
+        pass
+
     # Remove position from memory and DB immediately — sell is confirmed on Binance.
     # Supabase sync and learning run after so a slow network never delays cleanup.
     if pos.get("id"):
@@ -2012,12 +2047,16 @@ def realtime_monitor(prices: Dict[str, float]):
                             if sym not in _selling:
                                 _selling.add(sym)
                                 _selling_ts[sym] = time.time()
+                                pos["_sell_trigger_ts"] = time.time()
+                                pos["_sell_reason"] = sell_reason
                                 _sell_executor.submit(_execute_sell, pos, price, sell_reason)
                 else:
                     with _selling_lock:
                         if sym not in _selling:
                             _selling.add(sym)
                             _selling_ts[sym] = time.time()
+                            pos["_sell_trigger_ts"] = time.time()
+                            pos["_sell_reason"] = "take-profit"
                             _sell_executor.submit(_execute_sell, pos, price, "take-profit")
         elif _stop_loss_mult < 1.0 and price <= stop:
             with _selling_lock:
@@ -2025,6 +2064,8 @@ def realtime_monitor(prices: Dict[str, float]):
                     continue
                 _selling.add(sym)
                 _selling_ts[sym] = time.time()
+                pos["_sell_trigger_ts"] = time.time()
+                pos["_sell_reason"] = "stop-loss"
             _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
 
     # ── Inline signal refresh — throttled to every 30 s per coin ─────────────

@@ -886,6 +886,29 @@ def dashboard():
 
 # ── Start as daemon thread ───────────────────────────────────────────────────────────────
 
+class ClaudeToggleRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/strategy/claude-toggle")
+def api_claude_toggle(req: ClaudeToggleRequest):
+    """Enable or disable the Claude AI strategy agent without editing files."""
+    _write_strategy_patch({"claude_agent_enabled": bool(req.enabled)})
+    return {"ok": True, "claude_agent_enabled": bool(req.enabled)}
+
+
+@app.get("/api/strategy/claude-status")
+def api_claude_status():
+    """Return current Claude agent toggle state and whether a key is configured."""
+    s = _load_strategy()
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    key_ok = bool(api_key) and not api_key.startswith("#")
+    return {
+        "claude_agent_enabled": bool(s.get("claude_agent_enabled", True)),
+        "api_key_configured":   key_ok,
+    }
+
+
 @app.get("/api/status")
 def _get_market_health() -> dict:
     """Summarise current signal cache into a market-health verdict."""
@@ -1373,6 +1396,147 @@ def api_sell_monitor():
         "open_positions":     len(checks),
         "positions":          checks,
     }
+
+
+@app.get("/api/sell-queue")
+def api_sell_queue():
+    """Show positions that have a sell trigger in-flight with per-stage timing."""
+    import trade_engine as _te
+    import time as _time
+    now = _time.time()
+    queued = []
+    with _te._positions_lock:
+        snap = list(_te._positions)
+    for p in snap:
+        trig = p.get("_sell_trigger_ts", 0)
+        if trig > 0:
+            queued.append({
+                "symbol":        p.get("symbol"),
+                "reason":        p.get("_sell_reason", ""),
+                "stuck_seconds": round(now - trig, 1),
+                "stage": (
+                    "trigger"    if not p.get("_sell_picked_up_ts")   else
+                    "queued"     if not p.get("_sell_gate_start_ts")  else
+                    "gate"       if not p.get("_sell_gate_done_ts")   else
+                    "binance"    if not p.get("_sell_binance_done_ts") else
+                    "finalizing"
+                ),
+            })
+    with _te._selling_lock:
+        selling_set = list(_te._selling)
+    return {
+        "queued_count":   len(queued),
+        "in_selling_set": selling_set,
+        "items":          sorted(queued, key=lambda x: -x["stuck_seconds"]),
+    }
+
+
+@app.get("/api/positions/signal-analysis")
+def api_positions_signal_analysis():
+    """Per-position buy-signal snapshot vs post-buy price move."""
+    import trade_engine as _te
+    import sqlite3 as _sq3
+    import json as _js
+    import time as _time
+    now = _time.time()
+    out = []
+    with _te._positions_lock:
+        snap = list(_te._positions)
+    for p in snap:
+        sig = p.get("buy_signals_snapshot")
+        if not sig:
+            continue
+        entry   = p.get("entry_price") or p.get("avg_entry_price", 0)
+        current = p.get("current_price", 0) or _te._rest_px.get(p.get("symbol", ""), 0)
+        pct = round((current - entry) / entry * 100, 3) if entry > 0 else 0
+        out.append({
+            "symbol":            p.get("symbol"),
+            "status":            "open",
+            "entry":             entry,
+            "current":           current,
+            "pct_since_buy":     pct,
+            "age_min":           round((now - sig.get("ts", now)) / 60, 1) if sig.get("ts") else None,
+            "signals_at_buy":    sig,
+        })
+    try:
+        conn = _sq3.connect(database.DB_PATH)
+        conn.row_factory = _sq3.Row
+        rows = conn.execute("""
+            SELECT symbol, entry_price, exit_price, pnl, buy_signals_snapshot, created_at
+            FROM positions
+            WHERE created_at > datetime('now','-1 day') AND exit_price IS NOT NULL
+            ORDER BY id DESC LIMIT 30
+        """).fetchall()
+        conn.close()
+        for r in rows:
+            try:
+                snap_raw = r["buy_signals_snapshot"]
+                sig = (_js.loads(snap_raw) if isinstance(snap_raw, str) else snap_raw) if snap_raw else None
+            except Exception:
+                sig = None
+            if not sig:
+                continue
+            entry = r["entry_price"] or 0
+            exit_ = r["exit_price"] or 0
+            pct = round((exit_ - entry) / entry * 100, 3) if entry > 0 else 0
+            out.append({
+                "symbol": r["symbol"], "status": "closed",
+                "entry": entry, "exit": exit_,
+                "pct": pct, "pnl": round(r["pnl"] or 0, 4),
+                "signals_at_buy": sig,
+            })
+    except Exception:
+        pass
+    return {"positions": out, "count": len(out)}
+
+
+@app.get("/api/signals/quality")
+def api_signals_quality():
+    """Group closed positions by signal characteristics to find which combos win."""
+    import sqlite3 as _sq3
+    import json as _js
+    conn = _sq3.connect(database.DB_PATH)
+    conn.row_factory = _sq3.Row
+    try:
+        rows = conn.execute("""
+            SELECT entry_price, exit_price, pnl, buy_signals_snapshot
+            FROM positions
+            WHERE created_at > datetime('now','-7 days')
+              AND exit_price IS NOT NULL AND buy_signals_snapshot IS NOT NULL
+        """).fetchall()
+    finally:
+        conn.close()
+    buckets: dict = {}
+    for r in rows:
+        try:
+            snap_raw = r["buy_signals_snapshot"]
+            snap = (_js.loads(snap_raw) if isinstance(snap_raw, str) else snap_raw) if snap_raw else None
+        except Exception:
+            continue
+        if not snap:
+            continue
+        rsi_v   = snap.get("rsi_value") or snap.get("rsi", 50) or 50
+        trend5m = snap.get("5m_ok") or snap.get("trend_5m_ok")
+        knife   = snap.get("falling_knife", False)
+        rsi_b   = ("rsi<30" if rsi_v < 30 else "rsi30-40" if rsi_v < 40 else
+                   "rsi40-50" if rsi_v < 50 else "rsi50-60" if rsi_v < 60 else "rsi>60")
+        trend_b = "trend5m=Y" if trend5m else ("trend5m=N" if trend5m is False else "trend5m=?")
+        knife_b = "knife=Y" if knife else "knife=N"
+        key = f"{rsi_b}|{trend_b}|{knife_b}"
+        b = buckets.setdefault(key, {"trades": 0, "wins": 0, "total_pnl": 0.0})
+        b["trades"] += 1
+        if (r["pnl"] or 0) > 0:
+            b["wins"] += 1
+        b["total_pnl"] += (r["pnl"] or 0)
+    summary = [
+        {"characteristics": k, "trades": b["trades"],
+         "win_rate_pct": round(100 * b["wins"] / b["trades"], 1),
+         "total_pnl": round(b["total_pnl"], 4),
+         "avg_pnl": round(b["total_pnl"] / b["trades"], 4)}
+        for k, b in buckets.items() if b["trades"] >= 2
+    ]
+    summary.sort(key=lambda x: -x["avg_pnl"])
+    return {"buckets": summary, "sample_size": sum(b["trades"] for b in buckets.values())}
 
 
 @app.get("/api/proxy/binance/{path:path}")
