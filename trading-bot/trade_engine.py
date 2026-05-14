@@ -236,22 +236,31 @@ def _record_rest_health(response_headers: dict, latency_ms: float):
         pass
 
 
+_last_binance_err_log_ts: Dict[str, float] = {}
+_BINANCE_ERR_LOG_THROTTLE_SEC = 30.0
+
+
 def _record_rest_error(err_msg: str, url: str = "", response_body: str = "") -> None:
     try:
         with _binance_health_lock:
             _binance_health["rest_error_count"] += 1
             _binance_health["last_error_ts"]     = time.time()
             _binance_health["last_error_msg"]    = str(err_msg)[:200]
-        detail_parts = []
-        if url:
-            detail_parts.append(f"url={url[:300]}")
-        if response_body:
-            detail_parts.append(f"response={response_body[:300]}")
-        log_diag_issue(
-            "binance", "error",
-            f"REST: {str(err_msg)[:150]}",
-            detail=" | ".join(detail_parts) if detail_parts else "",
-        )
+        # Throttle ring-buffer writes — same error type at most once per 30s
+        err_key = str(err_msg)[:80]
+        now = time.time()
+        if now - _last_binance_err_log_ts.get(err_key, 0) >= _BINANCE_ERR_LOG_THROTTLE_SEC:
+            _last_binance_err_log_ts[err_key] = now
+            detail_parts = []
+            if url:
+                detail_parts.append(f"url={url[:300]}")
+            if response_body:
+                detail_parts.append(f"response={response_body[:300]}")
+            log_diag_issue(
+                "binance", "error",
+                f"REST: {str(err_msg)[:150]} (×{_binance_health['rest_error_count']} since start)",
+                detail=" | ".join(detail_parts) if detail_parts else "",
+            )
     except Exception:
         pass
 
@@ -462,11 +471,10 @@ def _profitable_sell_check(pos: dict, price: float, force_fresh: bool = False) -
     symbol = pos.get("symbol", "")
     if force_fresh and symbol:
         try:
-            _fresh = _fetch_rest_prices([symbol])
+            _fresh = _fetch_batch_prices([symbol])
             _fp = _fresh.get(symbol, 0) if _fresh else 0
             if _fp > 0:
                 price = _fp
-                # Keep caches consistent with this fresh price
                 _rest_px[symbol] = _fp
                 _last_ws_price_ts[symbol] = time.time()
                 try:
