@@ -1375,6 +1375,84 @@ def api_sell_monitor():
     }
 
 
+@app.get("/api/diagnostics")
+def api_diagnostics():
+    """Comprehensive bot health snapshot. Zero extra Binance calls — all data is in-memory."""
+    import trade_engine as _te
+    import data_collector as _dc
+    import threading as _thr
+
+    now = time.time()
+
+    bh = _te._binance_health
+    last_rest_age = round(now - bh["last_rest_ok_ts"], 1) if bh["last_rest_ok_ts"] else None
+
+    wh = _dc._ws_health
+    last_msg_age = round(now - wh["last_message_ts"], 1) if wh["last_message_ts"] else None
+
+    ssh = _te._signal_scanner_health
+    last_scan_age = round(now - ssh["last_refresh_ts"], 1) if ssh["last_refresh_ts"] else None
+    next_scan_in  = round(max(0.0, ssh["interval_sec"] - (last_scan_age or ssh["interval_sec"])), 1)
+    scan_progress_pct = round(
+        min(100.0, (last_scan_age or 0) / max(1, ssh["interval_sec"]) * 100), 1
+    ) if last_scan_age else 0.0
+
+    sm_hb      = getattr(_te, "_sell_monitor_heartbeat", 0)
+    sm_hb_age  = round(now - sm_hb, 1) if sm_hb else None
+
+    refresher  = getattr(_te, "_held_refresher_thread", None)
+    ref_alive  = bool(refresher and refresher.is_alive())
+
+    active_threads = [t.name for t in _thr.enumerate() if t.is_alive()]
+
+    return {
+        "server_time": now,
+        "binance": {
+            "rest_ok":            last_rest_age is not None and last_rest_age < 30,
+            "last_rest_age_sec":  last_rest_age,
+            "last_latency_ms":    bh["last_rest_latency_ms"],
+            "used_weight_1m":     bh["used_weight_1m"],
+            "used_weight_pct":    bh["used_weight_pct"],
+            "weight_limit":       6000,
+            "rest_error_count":   bh["rest_error_count"],
+            "last_error_age_sec": round(now - bh["last_error_ts"], 1) if bh["last_error_ts"] else None,
+            "last_error_msg":     bh["last_error_msg"],
+        },
+        "websocket": {
+            "connected":            wh["connected"],
+            "last_message_age_sec": last_msg_age,
+            "messages_received":    wh["messages_received"],
+            "connect_count":        wh["connect_count"],
+            "disconnect_count":     wh["disconnect_count"],
+            "subscribed_symbols":   len(_dc.prices),
+        },
+        "signal_scanner": {
+            "last_refresh_age_sec":  last_scan_age,
+            "next_refresh_in_sec":   next_scan_in,
+            "scan_progress_pct":     scan_progress_pct,
+            "interval_sec":          ssh["interval_sec"],
+            "last_duration_ms":      ssh["last_duration_ms"],
+            "scans_completed":       ssh["scans_completed"],
+            "cached_signals_count":  len(_te._signal_cache),
+        },
+        "sell_monitor": {
+            "alive":             sm_hb_age is not None and sm_hb_age < 15,
+            "heartbeat_age_sec": sm_hb_age,
+            "open_positions":    len(_te._positions),
+            "in_progress_sells": len(_te._selling),
+        },
+        "price_refresher": {
+            "alive":       ref_alive,
+            "thread_name": refresher.name if refresher else None,
+        },
+        "system": {
+            "deploy_id":            _DEPLOY_ID,
+            "active_threads_count": len(active_threads),
+            "active_threads":       active_threads,
+        },
+    }
+
+
 @app.get("/api/debug-refresher")
 def api_debug_refresher():
     """Diagnostic: price refresher threads health + per-symbol REST price ages."""

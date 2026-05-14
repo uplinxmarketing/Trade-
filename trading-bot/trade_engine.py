@@ -153,6 +153,53 @@ _sell_trace_log_ts: Dict[str, float] = {}
 # Used by the pre-sell check to decide whether a REST re-fetch is needed.
 _last_ws_price_ts: Dict[str, float] = {}
 
+# ── Binance REST health — updated by _fetch_rest_prices (zero extra calls) ────
+_binance_health: Dict = {
+    "last_rest_ok_ts":    0.0,
+    "last_rest_latency_ms": 0.0,
+    "used_weight_1m":     0,
+    "used_weight_pct":    0.0,
+    "rest_error_count":   0,
+    "last_error_ts":      0.0,
+    "last_error_msg":     "",
+}
+_binance_health_lock = threading.Lock()
+
+
+def _record_rest_health(response_headers: dict, latency_ms: float):
+    """Record health metrics from a Binance REST response. Zero cost — headers are free."""
+    try:
+        with _binance_health_lock:
+            _binance_health["last_rest_ok_ts"]      = time.time()
+            _binance_health["last_rest_latency_ms"] = round(latency_ms, 1)
+            w = (response_headers.get("x-mbx-used-weight-1m")
+                 or response_headers.get("X-MBX-USED-WEIGHT-1M"))
+            if w:
+                used = int(w)
+                _binance_health["used_weight_1m"]  = used
+                _binance_health["used_weight_pct"] = round(used / 6000.0 * 100.0, 1)
+    except Exception:
+        pass
+
+
+def _record_rest_error(err_msg: str):
+    try:
+        with _binance_health_lock:
+            _binance_health["rest_error_count"] += 1
+            _binance_health["last_error_ts"]     = time.time()
+            _binance_health["last_error_msg"]    = str(err_msg)[:200]
+    except Exception:
+        pass
+
+
+# ── Signal scanner health ──────────────────────────────────────────────────────
+_signal_scanner_health: Dict = {
+    "last_refresh_ts":  0.0,
+    "last_duration_ms": 0.0,
+    "scans_completed":  0,
+    "interval_sec":     float(30),  # will be updated at runtime from config.SCAN_INTERVAL_SEC
+}
+
 # New exit-mode flags (strategy.json controlled)
 _take_profit_enabled: bool = True    # False → exit at breakeven (fees covered) only
 _smart_hold_enabled:  bool = False   # True  → hold if signals still bullish; trail then exit
@@ -1801,12 +1848,17 @@ def _fetch_rest_prices(symbols: list) -> Dict[str, float]:
         try:
             url = f"{base}/api/v3/ticker/price?symbols={syms_param}"
             req = _ur.Request(url, headers={"User-Agent": "TradingBot/1.0"})
+            _t0 = time.time()
             with _ur.urlopen(req, timeout=2) as resp:
-                data = json.loads(resp.read())
+                _body = resp.read()
+                _hdrs = dict(resp.headers)
+            _record_rest_health(_hdrs, (time.time() - _t0) * 1000)
+            data = json.loads(_body)
             result = _parse_response(data)
             if result:
                 return result
-        except Exception:
+        except Exception as _e:
+            _record_rest_error(str(_e))
             continue
 
     # Batch endpoint failed on all bases — try individual fetches (slower but
@@ -1817,13 +1869,18 @@ def _fetch_rest_prices(symbols: list) -> Dict[str, float]:
                 try:
                     url = f"{base}/api/v3/ticker/price?symbol={sym}"
                     req = _ur.Request(url, headers={"User-Agent": "TradingBot/1.0"})
+                    _t0b = time.time()
                     with _ur.urlopen(req, timeout=2) as resp:
-                        data = json.loads(resp.read())
+                        _body = resp.read()
+                        _hdrs = dict(resp.headers)
+                    _record_rest_health(_hdrs, (time.time() - _t0b) * 1000)
+                    data = json.loads(_body)
                     parsed = _parse_response(data)
                     if parsed:
                         result.update(parsed)
                         break   # got price for this sym — next sym
-                except Exception:
+                except Exception as _e:
+                    _record_rest_error(str(_e))
                     continue
 
     return result
@@ -2224,7 +2281,9 @@ async def signal_scanner(prices: dict):
     This is the primary buy trigger — WebSocket callbacks are a fast-path
     supplement, but buys MUST fire even when WebSocket is slow or disconnected.
     """
+    _signal_scanner_health["interval_sec"] = float(config.SCAN_INTERVAL_SEC)
     while True:
+        _t0_scan = time.time()
         try:
             await _refresh_signal_cache()
             # Trigger buy checks right after refreshing — don't wait for WebSocket
@@ -2232,6 +2291,10 @@ async def signal_scanner(prices: dict):
             await loop.run_in_executor(None, _check_buys_from_cache, dict(prices))
         except Exception as e:
             print(f"[SignalScanner] Unexpected error: {e}")
+        finally:
+            _signal_scanner_health["last_refresh_ts"]  = time.time()
+            _signal_scanner_health["last_duration_ms"] = round((time.time() - _t0_scan) * 1000, 1)
+            _signal_scanner_health["scans_completed"] += 1
 
         await asyncio.sleep(config.SCAN_INTERVAL_SEC)
 

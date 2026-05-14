@@ -20,6 +20,17 @@ from connection import client
 # Shared live prices dict — imported by trade_engine and strategy_engine
 prices: Dict[str, float] = {}
 
+# ── WebSocket health counters — zero-cost, written on existing events ─────────
+_ws_health: Dict = {
+    "connected":          False,
+    "last_message_ts":    0.0,
+    "messages_received":  0,
+    "connect_count":      0,
+    "disconnect_count":   0,
+    "last_connect_ts":    0.0,
+    "last_disconnect_ts": 0.0,
+}
+
 # In-memory rolling candle buffer — filled by WebSocket kline-close events.
 # Used as the primary data source for signal computation when Binance REST
 # is geo-blocked from Railway's servers.  Holds up to 60 closed 1m candles
@@ -256,9 +267,14 @@ async def _start_websocket_loop():
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=30, open_timeout=10) as ws:
                 backoff = 1  # reset on successful connect
+                _ws_health["connected"]       = True
+                _ws_health["connect_count"]  += 1
+                _ws_health["last_connect_ts"] = time.time()
                 print("[DataCollector] WebSocket connected ✓")
 
                 async for raw in ws:
+                    _ws_health["messages_received"] += 1
+                    _ws_health["last_message_ts"]    = time.time()
                     try:
                         msg  = json.loads(raw)
                         data = msg.get("data", msg)
@@ -342,6 +358,9 @@ async def _start_websocket_loop():
                         print(f"[DataCollector] Message error: {e}")
 
         except Exception as e:
+            _ws_health["connected"]            = False
+            _ws_health["disconnect_count"]    += 1
+            _ws_health["last_disconnect_ts"]   = time.time()
             print(f"[DataCollector] WebSocket disconnected: {e}")
             print(f"[DataCollector] Reconnecting in {backoff}s…")
 
