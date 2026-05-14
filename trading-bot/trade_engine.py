@@ -1894,16 +1894,20 @@ _sell_monitor_last_rest_ts: float = 0.0   # rate-limits sell-monitor REST refres
 def _fetch_batch_prices(symbols: list) -> Dict[str, float]:
     """Single batch REST call for a list of symbols.
 
-    Uses urlencode with compact JSON (no spaces) — the format Binance expects.
-    Falls back gracefully on any error; never raises.
+    URL format matches Binance docs exactly:
+      symbols=%5B%22BTCUSDT%22%2C%22ETHUSDT%22%5D
+    Uses separators=(',',':') so json.dumps has NO spaces, then quote() with
+    safe='' so no character is left unencoded (no + for spaces, no literal commas).
     """
     import urllib.parse as _up2
     import urllib.request as _ur2
     import urllib.error as _ue2
     if not symbols:
         return {}
-    params = _up2.urlencode({"symbols": json.dumps(symbols, separators=(',', ':'))})
-    url    = f"https://api.binance.com/api/v3/ticker/price?{params}"
+    # CRITICAL: compact JSON (no spaces) → quote with safe='' → exact Binance format
+    _syms_json = json.dumps(list(symbols), separators=(',', ':'))
+    _encoded   = _up2.quote(_syms_json, safe='')
+    url = f"https://api.binance.com/api/v3/ticker/price?symbols={_encoded}"
     try:
         req = _ur2.Request(url, headers={"User-Agent": "TradingBot/1.0"})
         _t0 = time.time()
