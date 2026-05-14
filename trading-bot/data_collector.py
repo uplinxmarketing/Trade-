@@ -210,7 +210,10 @@ def download_history():
 
 def _build_ws_url(coins: list) -> str:
     streams = "/".join(
-        f"{coin.lower()}@trade/{coin.lower()}@kline_{config.CANDLE_TIMEFRAME}/{coin.lower()}@kline_5m"
+        f"{coin.lower()}@trade/"
+        f"{coin.lower()}@kline_{config.CANDLE_TIMEFRAME}/"
+        f"{coin.lower()}@kline_5m/"
+        f"{coin.lower()}@miniTicker"
         for coin in coins
     )
     return f"wss://stream.binance.com:9443/stream?streams={streams}"
@@ -320,6 +323,20 @@ async def _start_websocket_loop():
                                     closes  = [float(r[4]) for r in signal_src]
                                     volumes = [float(r[5]) for r in signal_src]
                                     _kline_callback(sym, closes, volumes)
+
+                        elif evt == "24hrMiniTicker":
+                            symbol = data["s"]
+                            close_price = float(data["c"])
+                            # miniTicker arrives every ~1s per coin — update price
+                            # only when no @trade event has updated it more recently
+                            # (trade events are sub-second; miniTicker is a 1s roll-up).
+                            prices[symbol] = close_price
+                            client.update_price(symbol, close_price)
+                            try:
+                                import trade_engine as _te_mt
+                                _te_mt._last_ws_price_ts[symbol] = time.time()
+                            except Exception:
+                                pass
 
                     except Exception as e:
                         print(f"[DataCollector] Message error: {e}")

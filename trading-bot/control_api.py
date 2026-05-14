@@ -1203,8 +1203,14 @@ def api_sell_monitor():
 
     fee_rate = config.FEE_RATE
 
+    try:
+        ws_ts_map = _te._last_ws_price_ts
+    except Exception:
+        ws_ts_map = {}
+
     positions = _get_positions()
     checks = []
+    now_t = time.time()
     for p in positions:
         sym   = p["symbol"]
         entry = p.get("entry_price", 0)
@@ -1214,6 +1220,7 @@ def api_sell_monitor():
         bep   = entry * bep_m if entry else 0
         sl    = entry * (1.0 - config.STOP_LOSS_PCT) if entry else 0
         pct   = ((price - entry) / entry * 100) if entry else 0
+        ws_age = round(now_t - ws_ts_map.get(sym, 0), 2) if ws_ts_map.get(sym) else None
         checks.append({
             "symbol":          sym,
             "entry":           entry,
@@ -1224,6 +1231,7 @@ def api_sell_monitor():
             "stop_loss":       round(sl, 6),
             "profitable":      price > bep if price and bep else False,
             "sl_hit":          price <= sl if price and sl else False,
+            "price_age_sec":   ws_age,
         })
 
     return {
