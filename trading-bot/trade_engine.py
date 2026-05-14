@@ -1276,6 +1276,22 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             )
             continue
 
+        # ── 1m BB veto: skip when price is at or above the 1m upper band ──────
+        # The 5m BB check (bb_ok above) catches medium-term tops; this catches
+        # local 1m tops that the 5m hasn't reflected yet (e.g. INJUSDT case).
+        try:
+            candles_1m = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=1)
+            if candles_1m:
+                bb_pos_1m = candles_1m[-1].get("bb_position")
+                if bb_pos_1m in ("above_upper", "at_upper"):
+                    database.log_activity(
+                        f"[SKIP] {sym}: 1m BB {bb_pos_1m} — local top, wait for pullback | "
+                        f"{sig_str} | SKIP(1m_top)", "info"
+                    )
+                    continue
+        except Exception:
+            pass
+
         # ── Stagger gate — max _MAX_BUYS_PER_SCAN buys per cycle ──────────────
         if _buys_this_scan >= _MAX_BUYS_PER_SCAN:
             database.log_activity(
