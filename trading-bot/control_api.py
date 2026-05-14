@@ -1363,7 +1363,7 @@ def api_all():
     Reduces frontend from 4 concurrent fetches to 1, cutting Railway load 4x."""
     now_ts = time.time()
     cached = _API_ALL_CACHE.get("data")
-    _ttl = 0.3 if _API_ALL_CACHE.get("has_positions") else 0.8
+    _ttl = 0.1 if _API_ALL_CACHE.get("has_positions") else 0.8
     if cached is not None and (now_ts - _API_ALL_CACHE["ts"]) < _ttl:
         return cached
 
