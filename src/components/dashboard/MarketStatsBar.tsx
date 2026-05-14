@@ -55,7 +55,7 @@ export default function MarketStatsBar({ activeCoin, prices }: Props) {
 
   useEffect(() => {
     if (!activeCoin) return;
-    fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${activeCoin}`)
+    fetch(`/api/proxy/binance/ticker/24hr?symbol=${activeCoin}`)
       .then(r => r.json())
       .then(setTicker)
       .catch(() => {});

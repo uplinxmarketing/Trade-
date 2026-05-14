@@ -12,13 +12,7 @@ const INTERVAL_MAP: Record<string, { binance: string; limit: number }> = {
   '1w':  { binance: '1w',  limit: 20 },
 };
 
-// Try CDN first — often bypasses geo-blocks that affect api.binance.com
-const BASES = [
-  'https://data-api.binance.vision',
-  'https://api.binance.com',
-  'https://api1.binance.com',
-  'https://api2.binance.com',
-];
+const BASES = ['/api/proxy/binance'];
 
 export function useBinanceKlines(symbol: string, interval: string) {
   const [klines, setKlines]   = useState<KlineData[]>([]);
@@ -44,7 +38,7 @@ export function useBinanceKlines(symbol: string, interval: string) {
     for (const base of BASES) {
       try {
         const resp = await fetch(
-          `${base}/api/v3/klines?symbol=${symbol}&interval=${cfg.binance}&limit=${cfg.limit}`,
+          `${base}/klines?symbol=${symbol}&interval=${cfg.binance}&limit=${cfg.limit}`,
           { signal: AbortSignal.timeout(8000) }
         );
         if (!resp.ok) {

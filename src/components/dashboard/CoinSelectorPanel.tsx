@@ -51,10 +51,10 @@ let _validCacheTs = 0;
 
 async function fetchValidSymbols(): Promise<Set<string>> {
   if (_validCache && Date.now() - _validCacheTs < 10 * 60 * 1000) return _validCache;
-  const bases = ['https://data-api.binance.vision', 'https://api.binance.com'];
+  const bases = ['/api/proxy/binance', '/api/proxy/binance'];
   for (const base of bases) {
     try {
-      const resp = await fetch(`${base}/api/v3/exchangeInfo?permissions=SPOT`, {
+      const resp = await fetch(`${base}/exchangeInfo?permissions=SPOT`, {
         signal: AbortSignal.timeout(10000),
       });
       if (!resp.ok) continue;
@@ -146,13 +146,13 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
   // for coins that haven't received a WebSocket tick yet.
   useEffect(() => {
     if (allCoins.length === 0) return;
-    const bases = ['https://data-api.binance.vision', 'https://api.binance.com'];
+    const bases = ['/api/proxy/binance', '/api/proxy/binance'];
     const symbols = JSON.stringify(allCoins);
     const tryFetch = async () => {
       for (const base of bases) {
         try {
           const r = await fetch(
-            `${base}/api/v3/ticker/24hr?symbols=${encodeURIComponent(symbols)}`,
+            `${base}/ticker/24hr?symbols=${encodeURIComponent(symbols)}`,
             { signal: AbortSignal.timeout(8000) }
           );
           if (!r.ok) continue;

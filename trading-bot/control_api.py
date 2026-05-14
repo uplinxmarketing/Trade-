@@ -46,7 +46,7 @@ def _read_frontend_version() -> dict:
         except Exception:
             pass
     return {"version": "unknown", "buildTime": "", "commit": ""}
-from fastapi import FastAPI, Response, Body, Query
+from fastapi import FastAPI, Response, Body, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -1373,6 +1373,27 @@ def api_sell_monitor():
         "open_positions":     len(checks),
         "positions":          checks,
     }
+
+
+@app.get("/api/proxy/binance/{path:path}")
+async def api_proxy_binance(path: str, request: Request):
+    """Server-side proxy for Binance REST API — avoids browser CORS restrictions."""
+    import urllib.request as _ur
+    import urllib.error as _ue
+    qs = str(request.query_params)
+    url = f"https://api.binance.com/api/v3/{path}"
+    if qs:
+        url += "?" + qs
+    req = _ur.Request(url, headers={"User-Agent": "WolfBot/1.0"})
+    try:
+        with _ur.urlopen(req, timeout=5.0) as r:
+            body = r.read()
+        return Response(content=body, media_type="application/json")
+    except _ue.HTTPError as he:
+        body = he.read()
+        return Response(content=body, status_code=he.code, media_type="application/json")
+    except Exception as e:
+        return Response(content=json.dumps({"error": str(e)}), status_code=502, media_type="application/json")
 
 
 @app.get("/api/diagnostics")

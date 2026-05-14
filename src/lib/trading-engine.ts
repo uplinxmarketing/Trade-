@@ -1,7 +1,7 @@
 import { SupabaseClient } from '@supabase/supabase-js';
 import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcATR, calcSMA, calcEntryScore, calcTechnicalSignal } from './indicators';
 
-const B = 'https://api.binance.com/api/v3';
+const B = '/api/proxy/binance';
 
 // ── Binance fee constants ────────────────────────────────────────────────────
 // BNB fee discount mode (BNB_FEE_MODE=True in config.py): 0.075% per leg.

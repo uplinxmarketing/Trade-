@@ -56,7 +56,7 @@ const OrderBookPanel = ({ activeCoin, prices }: Props) => {
     const fetchDepth = () => {
       if (depthAbort.current) depthAbort.current.abort();
       depthAbort.current = new AbortController();
-      fetch(`https://api.binance.com/api/v3/depth?symbol=${activeCoin}&limit=15`, { signal: depthAbort.current.signal })
+      fetch(`/api/proxy/binance/depth?symbol=${activeCoin}&limit=15`, { signal: depthAbort.current.signal })
         .then(r => r.json())
         .then((d: DepthData) => setDepth(d))
         .catch(() => {});
@@ -65,7 +65,7 @@ const OrderBookPanel = ({ activeCoin, prices }: Props) => {
     const fetchStats = () => {
       if (statsAbort.current) statsAbort.current.abort();
       statsAbort.current = new AbortController();
-      fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${activeCoin}`, { signal: statsAbort.current.signal })
+      fetch(`/api/proxy/binance/ticker/24hr?symbol=${activeCoin}`, { signal: statsAbort.current.signal })
         .then(r => r.json())
         .then((d: Stats24h) => setStats(d))
         .catch(() => {});
