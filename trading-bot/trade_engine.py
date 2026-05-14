@@ -932,16 +932,34 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     # FINAL SAFETY GATE — never lose money on a take-profit sell.
     # Stop-loss and force-sell bypass this check (they're meant to fire even at a loss).
     if reason not in ("stop-loss", "force-sell", "manual", "user-initiated"):
-        # Get the freshest available price.
-        # With miniTicker subscribed, WS price should be <1.5s old — skip REST fetch
-        # in that case to avoid adding API weight and latency to every sell.
+        # FIX C: always fetch a fresh REST price right before placing the order.
+        # Eliminates risk of stale WS/cache price passing the profitability check
+        # but the actual Binance fill being at a lower price.
         ws_age = time.time() - _last_ws_price_ts.get(sym, 0)
         try:
             from data_collector import prices as _live_px
             if ws_age <= 1.5:
+                # WS is fresh — use it directly (no extra API call)
                 freshest = _live_px.get(sym, 0) or price
             else:
-                freshest = _live_px.get(sym, 0) or _rest_px.get(sym, 0) or price
+                # WS stale — do a single-symbol REST fetch for the most accurate price
+                try:
+                    _presell_rest = _fetch_rest_prices([sym])
+                    _presell_p = _presell_rest.get(sym, 0) if _presell_rest else 0
+                except Exception:
+                    _presell_p = 0
+                if _presell_p > 0:
+                    freshest = _presell_p
+                    # Update caches so sell monitor / refresher see the fresh price
+                    _rest_px[sym] = _presell_p
+                    _last_ws_price_ts[sym] = time.time()
+                    try:
+                        from data_collector import prices as _dc_presell
+                        _dc_presell[sym] = _presell_p
+                    except Exception:
+                        pass
+                else:
+                    freshest = _live_px.get(sym, 0) or _rest_px.get(sym, 0) or price
         except Exception:
             freshest = price
         if not _profitable_sell_check(pos, freshest):
@@ -1785,17 +1803,29 @@ def _fetch_rest_prices(symbols: list) -> Dict[str, float]:
 
 _price_refresher_thread: Optional[threading.Thread] = None
 _rest_fail_log_ts: float = 0.0   # throttle REST-failure warning to once per 60 s
+_price_refresher_heartbeat: float = 0.0  # updated each loop iteration
+_price_refresher_hb_log_ts: float = 0.0  # throttle heartbeat log to once per 60 s
 
 def _price_refresher_loop():
     """
     Dedicated background thread — fetches REST prices for all open positions
     every 2 s and writes them to _rest_px.  Runs independently of the sell
     monitor so network I/O NEVER delays a sell check.
+
+    ALWAYS updates _last_ws_price_ts for every successfully fetched price so
+    that price_age_sec in /api/sell-monitor reflects REST freshness, not WS age.
     """
     import data_collector as _dc
     global _rest_px, _rest_px_ts, _rest_fail_log_ts
+    global _price_refresher_heartbeat, _price_refresher_hb_log_ts
+
+    try:
+        database.log_activity("Price refresher thread started", "info")
+    except Exception:
+        pass
 
     while True:
+        _price_refresher_heartbeat = time.time()
         try:
             with _positions_lock:
                 snap = list(_positions)
@@ -1803,20 +1833,29 @@ def _price_refresher_loop():
                 all_syms = list({p["symbol"] for p in snap})
                 fetched = _fetch_rest_prices(all_syms)
                 if fetched:
-                    _rest_px.update(fetched)
-                    _rest_px_ts = time.time()
-                    # Always update _dc.prices for held positions when WS is stale (>3s).
-                    # Previously only injected when price was zero — that left INJUSDT-type
-                    # coins stuck at a 1.2% stale price, blocking breakeven sells.
                     _now_rf = time.time()
+                    _rest_px.update(fetched)
+                    _rest_px_ts = _now_rf
                     for s, p in fetched.items():
-                        ws_age = _now_rf - _last_ws_price_ts.get(s, 0)
-                        if s not in _dc.prices or _dc.prices[s] <= 0 or ws_age > 3.0:
-                            _dc.prices[s] = p
-                            if ws_age > 3.0:
-                                _last_ws_price_ts[s] = _now_rf  # mark as fresh so pre-sell gate uses in-memory
+                        # Always inject into _dc.prices and update timestamp so
+                        # price_age_sec reflects REST freshness for low-WS-volume coins.
+                        _dc.prices[s] = p
+                        _last_ws_price_ts[s] = _now_rf
+
+                    # 60s heartbeat log — confirms refresher is alive and working
+                    _now_hb = time.time()
+                    if _now_hb - _price_refresher_hb_log_ts >= 60.0:
+                        _price_refresher_hb_log_ts = _now_hb
+                        try:
+                            database.log_activity(
+                                f"[PriceRefresher] OK — fetched {len(fetched)}/{len(all_syms)} symbols: "
+                                + ", ".join(f"{s}={v:.6f}" for s, v in list(fetched.items())[:5]),
+                                "info"
+                            )
+                        except Exception:
+                            pass
                 else:
-                    # REST unavailable — log once per minute so Railway logs show it
+                    # REST unavailable — log once per minute so logs show it
                     now_rf = time.time()
                     if now_rf - _rest_fail_log_ts >= 60.0:
                         _rest_fail_log_ts = now_rf
@@ -1846,7 +1885,7 @@ def _price_refresher_loop():
                                 _rest_px[s] = ws_p
         except Exception:
             pass
-        time.sleep(5.0)
+        time.sleep(2.0)
 
 
 def _sell_monitor_loop():
@@ -1947,6 +1986,24 @@ def _sell_monitor_loop():
             for pos in snap:
                 sym   = pos["symbol"]
                 price = prices.get(sym, 0.0)
+
+                # FIX B: if price is >10s stale, do an inline REST fetch for this symbol
+                # before evaluating triggers — guards against refresher hiccups.
+                _pa_sm = now_monitor - _last_ws_price_ts.get(sym, 0)
+                if _pa_sm > 10.0:
+                    try:
+                        _inline = _fetch_rest_prices([sym])
+                        if _inline and _inline.get(sym, 0) > 0:
+                            _fp = _inline[sym]
+                            prices[sym] = _fp
+                            price = _fp
+                            import data_collector as _dc_sm
+                            _dc_sm.prices[sym] = _fp
+                            _rest_px[sym] = _fp
+                            _last_ws_price_ts[sym] = now_monitor
+                    except Exception:
+                        pass
+
                 if price <= 0:
                     continue
                 with _selling_lock:
