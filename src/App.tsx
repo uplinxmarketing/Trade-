@@ -1,4 +1,4 @@
-import { Component, type ReactNode } from 'react';
+import { Component, type ReactNode, useEffect } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import { Toaster as Sonner } from '@/components/ui/sonner';
@@ -9,6 +9,29 @@ import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import NotFound from './pages/NotFound.tsx';
 import SetupRequired from './pages/SetupRequired.tsx';
 import { supabaseConfigured } from '@/integrations/supabase/client';
+
+declare const __APP_VERSION__: string;
+
+function VersionChecker() {
+  useEffect(() => {
+    async function check() {
+      try {
+        const r = await fetch('/version.json?t=' + Date.now(), { cache: 'no-store' });
+        const data = await r.json();
+        if (data.version && typeof __APP_VERSION__ !== 'undefined'
+            && __APP_VERSION__ !== 'unknown'
+            && data.version !== __APP_VERSION__) {
+          console.log(`[Version] server=${data.version} bundle=${__APP_VERSION__} — reloading`);
+          window.location.reload();
+        }
+      } catch { /* ignore */ }
+    }
+    check();
+    const id = setInterval(check, 60_000);
+    return () => clearInterval(id);
+  }, []);
+  return null;
+}
 
 // ── Error boundary — catches render crashes and shows a readable message ──────
 interface ErrorBoundaryState { error: Error | null }
@@ -59,6 +82,7 @@ const App = () => {
         <TooltipProvider>
           <Toaster />
           <Sonner position="top-center" richColors />
+          <VersionChecker />
           <BrowserRouter>
             <Routes>
               <Route path="/" element={<Index />} />

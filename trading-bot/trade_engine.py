@@ -1805,6 +1805,41 @@ _sell_monitor_thread: Optional[threading.Thread] = None
 _rest_px: Dict[str, float] = {}
 _rest_px_ts: float = 0.0
 _REST_PX_TTL = 5.0   # refetch REST prices every 5 s when WebSocket is down
+_sell_monitor_last_rest_ts: float = 0.0   # rate-limits sell-monitor REST refresh to 2s
+
+
+def _fetch_batch_prices(symbols: list) -> Dict[str, float]:
+    """Single batch REST call for a list of symbols.
+
+    Uses urlencode with compact JSON (no spaces) — the format Binance expects.
+    Falls back gracefully on any error; never raises.
+    """
+    import urllib.parse as _up2
+    import urllib.request as _ur2
+    if not symbols:
+        return {}
+    try:
+        params = _up2.urlencode({"symbols": json.dumps(symbols, separators=(',', ':'))})
+        url    = f"https://api.binance.com/api/v3/ticker/price?{params}"
+        req    = _ur2.Request(url, headers={"User-Agent": "TradingBot/1.0"})
+        _t0    = time.time()
+        with _ur2.urlopen(req, timeout=3.0) as resp:
+            _body = resp.read()
+            _hdrs = dict(resp.headers)
+        _record_rest_health(_hdrs, (time.time() - _t0) * 1000)
+        result: Dict[str, float] = {}
+        for entry in json.loads(_body):
+            s  = entry.get("symbol", "")
+            try:
+                px = float(entry.get("price", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if s and px > 0:
+                result[s] = px
+        return result
+    except Exception as _e:
+        _record_rest_error(str(_e))
+        return {}
 
 
 def _fetch_rest_prices(symbols: list) -> Dict[str, float]:
@@ -1908,7 +1943,7 @@ def _price_refresher_loop():
                 snap = list(_positions)
             if snap:
                 all_syms = list({p["symbol"] for p in snap})
-                fetched = _fetch_rest_prices(all_syms)
+                fetched = _fetch_batch_prices(all_syms)
                 if fetched:
                     _now_rf = time.time()
                     _rest_px.update(fetched)
@@ -1962,7 +1997,7 @@ def _price_refresher_loop():
                                 _rest_px[s] = ws_p
         except Exception:
             pass
-        time.sleep(2.0)
+        time.sleep(10.0)
 
 
 _held_refresher_thread: Optional[threading.Thread] = None
@@ -1978,7 +2013,7 @@ def _held_position_price_refresher():
     consecutive_errors = 0
 
     try:
-        database.log_activity("Held-position price refresher started (2s interval)", "info")
+        database.log_activity("Held-position price refresher started (5s interval)", "info")
     except Exception:
         pass
 
@@ -1987,10 +2022,10 @@ def _held_position_price_refresher():
             with _positions_lock:
                 held_syms = list({p.get("symbol") for p in _positions if p.get("symbol")})
             if not held_syms:
-                time.sleep(2.0)
+                time.sleep(5.0)
                 continue
 
-            fetched = _fetch_rest_prices(held_syms)
+            fetched = _fetch_batch_prices(held_syms)
             now_ts = time.time()
             if fetched:
                 for s, px in fetched.items():
@@ -2030,7 +2065,7 @@ def _held_position_price_refresher():
                     )
                 except Exception:
                     pass
-        time.sleep(max(2.0, min(10.0, 2.0 + consecutive_errors * 0.5)))
+        time.sleep(max(5.0, min(30.0, 5.0 + consecutive_errors * 1.0)))
 
 
 def start_held_position_refresher():
@@ -2070,22 +2105,22 @@ def _sell_monitor_loop():
             with _positions_lock:
                 snap = list(_positions)
 
-            # ── REST price refresh BEFORE trigger evaluation ─────────────────
+            # ── REST price refresh BEFORE trigger evaluation (rate-limited to 2s) ─
             # Fetch current prices for all held positions via a single batch REST
-            # call. This ensures trigger decisions use prices ≤3s old regardless
-            # of WebSocket activity on low-volume coins.
-            if snap:
+            # call so trigger decisions use prices ≤3s old regardless of WS activity.
+            # Rate-limited to once every 2s so 0.25s iterations don't flood Binance.
+            global _sell_monitor_last_rest_ts
+            _sm_now_t = time.time()
+            if snap and (_sm_now_t - _sell_monitor_last_rest_ts) >= 2.0:
                 _sm_syms = list({p["symbol"] for p in snap})
-                try:
-                    _sm_fetched = _fetch_rest_prices(_sm_syms)
-                    if _sm_fetched:
-                        _sm_now = time.time()
-                        for _s, _p in _sm_fetched.items():
-                            _dc.prices[_s]        = _p
-                            _rest_px[_s]          = _p
-                            _last_ws_price_ts[_s] = _sm_now
-                except Exception:
-                    pass  # non-fatal — monitor continues with cached prices
+                _sm_fetched = _fetch_batch_prices(_sm_syms)
+                if _sm_fetched:
+                    _sm_ts = time.time()
+                    for _s, _p in _sm_fetched.items():
+                        _dc.prices[_s]        = _p
+                        _rest_px[_s]          = _p
+                        _last_ws_price_ts[_s] = _sm_ts
+                    _sell_monitor_last_rest_ts = _sm_ts
 
             # ── Watchdog: force-clear _selling entries stuck > 20 s ──────────
             now_wd = time.time()
@@ -2161,23 +2196,6 @@ def _sell_monitor_loop():
             for pos in snap:
                 sym   = pos["symbol"]
                 price = prices.get(sym, 0.0)
-
-                # FIX B: if price is >10s stale, do an inline REST fetch for this symbol
-                # before evaluating triggers — guards against refresher hiccups.
-                _pa_sm = now_monitor - _last_ws_price_ts.get(sym, 0)
-                if _pa_sm > 10.0:
-                    try:
-                        _inline = _fetch_rest_prices([sym])
-                        if _inline and _inline.get(sym, 0) > 0:
-                            _fp = _inline[sym]
-                            prices[sym] = _fp
-                            price = _fp
-                            import data_collector as _dc_sm
-                            _dc_sm.prices[sym] = _fp
-                            _rest_px[sym] = _fp
-                            _last_ws_price_ts[sym] = now_monitor
-                    except Exception:
-                        pass
 
                 if price <= 0:
                     continue
