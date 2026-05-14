@@ -165,6 +165,60 @@ _binance_health: Dict = {
 }
 _binance_health_lock = threading.Lock()
 
+# ── In-memory diagnostic ring buffer — last 50 issues, never written to DB ────
+from collections import deque as _deque
+
+_diag_log: "_deque[dict]" = _deque(maxlen=50)
+_diag_log_lock = threading.Lock()
+
+
+def log_diag_issue(source: str, severity: str, message: str, detail: str = "") -> None:
+    """Append an entry to the in-memory diagnostic ring buffer.
+
+    source:   'binance' | 'websocket' | 'signal_scanner' | 'sell_monitor' |
+              'price_refresher' | 'force_sell' | 'startup' | 'system'
+    severity: 'error' | 'warn' | 'info'
+    """
+    try:
+        entry = {
+            "ts":       time.time(),
+            "iso":      datetime.now(timezone.utc).isoformat(),
+            "source":   source,
+            "severity": severity,
+            "message":  str(message)[:500],
+            "detail":   str(detail)[:1000] if detail else "",
+        }
+        with _diag_log_lock:
+            _diag_log.append(entry)
+    except Exception:
+        pass
+
+
+def get_diag_log(limit: int = 50, since_ts: float = 0.0, severity_filter: str = "") -> list:
+    """Return entries from the ring buffer, newest first."""
+    try:
+        with _diag_log_lock:
+            entries = list(_diag_log)
+        entries.reverse()
+        if since_ts:
+            entries = [e for e in entries if e["ts"] > since_ts]
+        if severity_filter:
+            entries = [e for e in entries if e["severity"] == severity_filter]
+        return entries[:limit]
+    except Exception:
+        return []
+
+
+def clear_diag_log() -> int:
+    """Clear the ring buffer. Returns count cleared."""
+    try:
+        with _diag_log_lock:
+            n = len(_diag_log)
+            _diag_log.clear()
+        return n
+    except Exception:
+        return 0
+
 
 def _record_rest_health(response_headers: dict, latency_ms: float):
     """Record health metrics from a Binance REST response. Zero cost — headers are free."""
@@ -182,12 +236,22 @@ def _record_rest_health(response_headers: dict, latency_ms: float):
         pass
 
 
-def _record_rest_error(err_msg: str):
+def _record_rest_error(err_msg: str, url: str = "", response_body: str = "") -> None:
     try:
         with _binance_health_lock:
             _binance_health["rest_error_count"] += 1
             _binance_health["last_error_ts"]     = time.time()
             _binance_health["last_error_msg"]    = str(err_msg)[:200]
+        detail_parts = []
+        if url:
+            detail_parts.append(f"url={url[:300]}")
+        if response_body:
+            detail_parts.append(f"response={response_body[:300]}")
+        log_diag_issue(
+            "binance", "error",
+            f"REST: {str(err_msg)[:150]}",
+            detail=" | ".join(detail_parts) if detail_parts else "",
+        )
     except Exception:
         pass
 
@@ -965,6 +1029,12 @@ def _execute_sell(pos: dict, price: float, reason: str):
             f"[SELL_EXCEPTION] {sym} ({reason}): {type(_exc_sell).__name__}: {_exc_sell}",
             "error"
         )
+        log_diag_issue(
+            "force_sell" if reason == "force-sell" else "sell_monitor",
+            "error",
+            f"Sell failed: {sym} ({reason}) — {type(_exc_sell).__name__}",
+            detail=str(_exc_sell),
+        )
         # Force-sell / manual: if we hit an exception, the user explicitly wanted the
         # position gone. Remove from records so retries stop rather than leaving a ghost.
         if reason in ("force-sell", "manual", "user-initiated"):
@@ -1072,6 +1142,11 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             reason_label = "market closed/delisted" if is_closed else "ghost position (no coin balance on Binance)"
             database.log_activity(
                 f"{sym}: force-closing position — {reason_label}", "warn"
+            )
+            log_diag_issue(
+                "sell_monitor", "warn",
+                f"{sym}: force-closed — {reason_label}",
+                detail=err_str[:400],
             )
             with _positions_lock:
                 before = len(_positions)
@@ -1816,13 +1891,14 @@ def _fetch_batch_prices(symbols: list) -> Dict[str, float]:
     """
     import urllib.parse as _up2
     import urllib.request as _ur2
+    import urllib.error as _ue2
     if not symbols:
         return {}
+    params = _up2.urlencode({"symbols": json.dumps(symbols, separators=(',', ':'))})
+    url    = f"https://api.binance.com/api/v3/ticker/price?{params}"
     try:
-        params = _up2.urlencode({"symbols": json.dumps(symbols, separators=(',', ':'))})
-        url    = f"https://api.binance.com/api/v3/ticker/price?{params}"
-        req    = _ur2.Request(url, headers={"User-Agent": "TradingBot/1.0"})
-        _t0    = time.time()
+        req = _ur2.Request(url, headers={"User-Agent": "TradingBot/1.0"})
+        _t0 = time.time()
         with _ur2.urlopen(req, timeout=3.0) as resp:
             _body = resp.read()
             _hdrs = dict(resp.headers)
@@ -1837,8 +1913,15 @@ def _fetch_batch_prices(symbols: list) -> Dict[str, float]:
             if s and px > 0:
                 result[s] = px
         return result
+    except _ue2.HTTPError as _he:
+        try:
+            _rb = _he.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            _rb = ""
+        _record_rest_error(f"HTTP {_he.code}: {_he.reason}", url=url, response_body=_rb)
+        return {}
     except Exception as _e:
-        _record_rest_error(str(_e))
+        _record_rest_error(str(_e), url=url)
         return {}
 
 
@@ -2065,6 +2148,11 @@ def _held_position_price_refresher():
                     )
                 except Exception:
                     pass
+                log_diag_issue(
+                    "price_refresher", "error",
+                    f"Held refresher failed ({consecutive_errors} consecutive)",
+                    detail=f"{type(_e).__name__}: {_e}",
+                )
         time.sleep(max(5.0, min(30.0, 5.0 + consecutive_errors * 1.0)))
 
 
@@ -2271,6 +2359,11 @@ def _sell_monitor_loop():
                 database.log_activity(f"Sell monitor error: {exc}", "error")
             except Exception:
                 pass
+            log_diag_issue(
+                "sell_monitor", "error",
+                f"Monitor loop exception: {type(exc).__name__}",
+                detail=str(exc),
+            )
         time.sleep(0.25)  # 250ms cycle — halves worst-case sell delay
 
 
@@ -2318,6 +2411,11 @@ async def signal_scanner(prices: dict):
             await loop.run_in_executor(None, _check_buys_from_cache, dict(prices))
         except Exception as e:
             print(f"[SignalScanner] Unexpected error: {e}")
+            log_diag_issue(
+                "signal_scanner", "error",
+                f"Scan iteration failed: {type(e).__name__}",
+                detail=str(e),
+            )
         finally:
             _signal_scanner_health["last_refresh_ts"]  = time.time()
             _signal_scanner_health["last_duration_ms"] = round((time.time() - _t0_scan) * 1000, 1)

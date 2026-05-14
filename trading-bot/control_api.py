@@ -1450,6 +1450,12 @@ def api_diagnostics():
             "active_threads_count": len(active_threads),
             "active_threads":       active_threads,
         },
+        "issues": {
+            "recent":         _te.get_diag_log(limit=25),
+            "error_count":    len(_te.get_diag_log(limit=50, severity_filter="error")),
+            "warn_count":     len(_te.get_diag_log(limit=50, severity_filter="warn")),
+            "total_buffered": len(_te._diag_log),
+        },
     }
 
 
@@ -1462,6 +1468,61 @@ def api_diagnostics_reset():
         _te._binance_health["last_error_ts"]    = 0.0
         _te._binance_health["last_error_msg"]   = ""
     return {"ok": True, "reset": True}
+
+
+@app.get("/api/diagnostics/log")
+def api_diagnostics_log(limit: int = 50, since: float = 0.0, severity: str = ""):
+    """Query the in-memory diagnostic ring buffer with optional filtering."""
+    import trade_engine as _te
+    return {
+        "entries":        _te.get_diag_log(limit=limit, since_ts=since, severity_filter=severity),
+        "total_buffered": len(_te._diag_log),
+    }
+
+
+@app.post("/api/diagnostics/log/clear")
+def api_diagnostics_log_clear():
+    """Clear the in-memory issue log. Doesn't affect bot operation."""
+    import trade_engine as _te
+    n = _te.clear_diag_log()
+    return {"ok": True, "cleared": n}
+
+
+@app.get("/api/diagnostics/log/text")
+def api_diagnostics_log_text(limit: int = 50, severity: str = ""):
+    """Plain-text diagnostic report — paste directly into chat or save to file."""
+    from fastapi.responses import Response as _Resp
+    import trade_engine as _te
+    import data_collector as _dc
+    from datetime import datetime as _dt, timezone as _tz
+
+    entries = _te.get_diag_log(limit=limit, severity_filter=severity)
+    try:
+        bh = _te._binance_health
+        wh = _dc._ws_health
+        header = [
+            f"=== WolfBot Diagnostic Report — {_dt.now(_tz.utc).isoformat()} ===",
+            f"Deploy: {_DEPLOY_ID}",
+            f"Binance REST: weight={bh.get('used_weight_1m',0)}/6000  "
+            f"latency={bh.get('last_rest_latency_ms',0):.0f}ms  "
+            f"errors={bh.get('rest_error_count',0)}",
+            f"WebSocket: connected={wh.get('connected',False)}  "
+            f"msgs={wh.get('messages_received',0)}  "
+            f"disconnects={wh.get('disconnect_count',0)}",
+            f"Open positions: {len(_te._positions)}  "
+            f"In-progress sells: {len(_te._selling)}",
+            f"--- Recent issues ({len(entries)}) ---",
+        ]
+    except Exception:
+        header = ["=== WolfBot Diagnostic Report ==="]
+
+    body = []
+    for e in entries:
+        body.append(f"[{e['iso']}] [{e['severity'].upper():5}] [{e['source']}] {e['message']}")
+        if e.get("detail"):
+            body.append(f"        ↳ {e['detail']}")
+
+    return _Resp(content="\n".join(header + body), media_type="text/plain")
 
 
 @app.get("/api/debug-refresher")
