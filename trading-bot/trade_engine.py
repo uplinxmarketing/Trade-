@@ -128,6 +128,12 @@ _last_no_signal_log: float = 0.0   # throttle "no coins ready" log to once per 6
 _last_buy_scan_log: float = 0.0    # throttle "Buy scan: ..." to once per 30 s
 _last_at_capacity_log: float = 0.0 # throttle "at max capacity" log to once per 60 s
 
+# Buy stagger — prevents mass simultaneous buys on stale cache signals
+_last_buy_ts: float = 0.0
+_buys_this_scan: int = 0
+_BUY_STAGGER_SEC  = 15.0  # minimum seconds between consecutive buys
+_MAX_BUYS_PER_SCAN = 2    # max buys per scan cycle
+
 # Per-coin timestamp of last inline tick-driven signal refresh
 _tick_signal_ts: Dict[str, float] = {}
 _TICK_REFRESH_SEC = 1.0   # recompute at most every 1 s per coin from price ticks
@@ -767,12 +773,16 @@ def update_coin_signals(symbol: str, closes: list, volumes: list):
             for c, v in zip(closes, volumes)
         ]
         signals = evaluate_signals(candles)
+        # ATR requires real high/low data — tick candles have high=low=close so ATR=0.
+        # Preserve the last REST-computed ATR value instead of overwriting with False.
+        with _signal_cache_lock:
+            prev = _signal_cache.get(symbol, {})
+        signals["atr"] = prev.get("signals", {}).get("atr", False)
         score   = sum(signals.values())
         rsi_list    = indicators.calc_rsi(closes, 14)
         rsi_display = rsi_list[-2] if rsi_list[-2] is not None else 0.0
 
         with _signal_cache_lock:
-            prev = _signal_cache.get(symbol, {})
             _signal_cache[symbol] = {
                 "signals":  signals,
                 "score":    score,
@@ -1056,7 +1066,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     call except when a buy is actually about to fire. Throttled to at most once
     every 3 s to avoid hammering get_account() on every WebSocket tick.
     """
-    global _last_buy_check
+    global _last_buy_check, _buys_this_scan
+    _buys_this_scan = 0  # reset per-scan counter each invocation
 
     # Fast pre-check: any coin signalling BUY? (no lock needed for scalar read)
     with _signal_cache_lock:
@@ -1209,6 +1220,61 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             )
             continue
 
+        # ── Stagger gate — max _MAX_BUYS_PER_SCAN buys per cycle ──────────────
+        global _last_buy_ts, _buys_this_scan
+        if _buys_this_scan >= _MAX_BUYS_PER_SCAN:
+            database.log_activity(
+                f"Buy scan: capped at {_MAX_BUYS_PER_SCAN} buys this cycle — "
+                f"remaining coins evaluated next cycle", "info"
+            )
+            break
+        if time.time() - _last_buy_ts < _BUY_STAGGER_SEC:
+            continue  # this slot too soon — try next coin in case it's been longer
+
+        # ── Falling knife filter ───────────────────────────────────────────────
+        # Block buys when price has dropped >0.4% in the last 3 minutes of samples.
+        # Prevents buying mid-crash where "RSI oversold" triggers but momentum is
+        # still strongly negative.
+        try:
+            import data_collector as _dc_fk
+            recent_closes = list(_dc_fk.price_samples.get(sym, []))
+            if len(recent_closes) >= 180:
+                price_now     = recent_closes[-1]
+                price_3min    = recent_closes[-180]
+                pct_3min      = (price_now - price_3min) / price_3min * 100 if price_3min > 0 else 0
+                if pct_3min < -0.4:
+                    database.log_activity(
+                        f"[SKIP] {sym}: falling knife — down {pct_3min:.2f}% in 3min | "
+                        f"{sig_str} | SKIP(downward momentum)", "info"
+                    )
+                    continue
+        except Exception:
+            pass
+
+        # ── Trend health gate ──────────────────────────────────────────────────
+        # Block buys when price is below MA20 AND RSI is not deeply oversold (<35).
+        # Also block when volume trend is decreasing (no buying pressure).
+        try:
+            _th_candles = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=1)
+            if _th_candles:
+                _last_c = _th_candles[-1]
+                _ma_pos  = _last_c.get("ma_position") or _derive_ma_pos(price, _last_c.get("ma20"))
+                _vol_tr  = _last_c.get("volume_trend")
+                if _ma_pos == "below" and rsi_v > 35:
+                    database.log_activity(
+                        f"[SKIP] {sym}: below MA20 with RSI {rsi_v:.0f} (not oversold) | "
+                        f"{sig_str} | SKIP(downtrend)", "info"
+                    )
+                    continue
+                if _vol_tr == "decreasing":
+                    database.log_activity(
+                        f"[SKIP] {sym}: volume decreasing — no buying pressure | "
+                        f"{sig_str} | SKIP(weak volume)", "info"
+                    )
+                    continue
+        except Exception:
+            pass
+
         budget = get_budget_for_coin(sym, usdt_balance)
         if budget <= 0:
             database.log_activity(f"{sym}: buy skipped — budget=0 (mode={mode}, usdt={usdt_balance:.2f})", "warn")
@@ -1237,6 +1303,45 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             database.log_activity(
                 f"{sym}: buy skipped — budget ${budget:.2f} < $10 Binance minimum notional "
                 f"(increase trade size in Settings)", "warn"
+            )
+            continue
+
+        # ── Fresh signal re-check before committing ────────────────────────────
+        # Cache can be 30-60s stale. A single REST kline fetch verifies signals
+        # are still valid at execution time — eliminates stale-cache buys.
+        try:
+            import urllib.request as _fresh_ur
+            _fresh_url = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval=1m&limit=30"
+            with _fresh_ur.urlopen(_fresh_url, timeout=2) as _fr:
+                _raw = json.loads(_fr.read())
+            _fresh_closes  = [float(k[4]) for k in _raw]
+            _fresh_volumes = [float(k[5]) for k in _raw]
+            _fresh_candles = [
+                {"high": float(k[2]), "low": float(k[3]),
+                 "close": float(k[4]), "volume": float(k[5])}
+                for k in _raw
+            ]
+            _fresh_sigs  = evaluate_signals(_fresh_candles)
+            _fresh_score = sum(_fresh_sigs.values())
+            if _fresh_score < min_sigs:
+                cache_age = round(time.time() - cached.get("ts", 0), 1)
+                database.log_activity(
+                    f"[SKIP] {sym}: fresh re-check FAILED — score {_fresh_score}/6 < {min_sigs} "
+                    f"(cache had {score}/6, age={cache_age}s)", "warn"
+                )
+                continue
+            _live_price = _fresh_closes[-1]
+            if price > 0 and abs(_live_price - price) / price > 0.005:
+                database.log_activity(
+                    f"[SKIP] {sym}: price moved {(_live_price - price)/price*100:.2f}% "
+                    f"since cache (${price:.4f} → ${_live_price:.4f}) — skipping", "warn"
+                )
+                continue
+            price = _live_price
+            client.update_price(sym, price)
+        except Exception as _fresh_e:
+            database.log_activity(
+                f"[SKIP] {sym}: fresh re-check failed ({_fresh_e}) — skipping for safety", "warn"
             )
             continue
 
@@ -1279,8 +1384,6 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             pass
 
         exit_target = round(fill_price * _take_profit_mult, 8)
-        # Fresh position — clear any stale smart-hold peak left over from a prior
-        # sell on this symbol so the trailing stop starts from this entry alone.
         _pos_peaks.pop(sym, None)
         pos_record = {
             "symbol":             sym,
@@ -1295,7 +1398,23 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             "entry_ma_position":  entry_ma,
             "entry_bb_position":  entry_bb,
             "entry_volume_trend": entry_vol,
+            "buy_signals_snapshot": {
+                "score":         score,
+                "trend":         sigs.get("trend"),
+                "rsi":           sigs.get("rsi"),
+                "rsi_value":     rsi_v,
+                "macd":          sigs.get("macd"),
+                "volume":        sigs.get("volume"),
+                "obv":           sigs.get("obv"),
+                "atr":           sigs.get("atr"),
+                "bb_ok":         bb_ok,
+                "5m_ok":         five_ok,
+                "cache_age_sec": round(time.time() - cached.get("ts", 0), 1),
+            },
         }
+        # Update stagger tracking
+        _last_buy_ts = time.time()
+        _buys_this_scan += 1
         pos_id = database.save_position(pos_record)
         pos_record["id"] = pos_id
 
@@ -1317,11 +1436,12 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         usdt_balance -= budget + buy_fee_usdt
 
-        mode_tag = "LIVE" if mode == "live" else "PAPER"
+        mode_tag  = "LIVE" if mode == "live" else "PAPER"
+        cache_age = round(time.time() - cached.get("ts", 0), 1)
         msg = (
             f"[{mode_tag}] BOUGHT {sym} @ ${fill_price:.4f} "
             f"| qty={qty:.6f} | EXIT TARGET=${exit_target:.4f} "
-            f"| {sig_str} | {bb_str} {m5_str} | count:{score}/6"
+            f"| {sig_str} | {bb_str} {m5_str} | count:{score}/6 | cache_age:{cache_age}s"
         )
         print(f"[RealtimeBuy] {msg}")
         database.log_activity(msg, "info")
