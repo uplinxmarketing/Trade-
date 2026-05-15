@@ -135,6 +135,9 @@ _user_tp_mult:    float = 1.001              # 0.1% above entry; updated by _ref
 _take_profit_mult: float = _FEE_FLOOR * 1.0010  # kept for legacy compat; updated each cycle
 _stop_loss_mult:   float = 1.0 - 0.02           # default: -2% stop loss
 
+_stop_loss_confirmation: Dict[str, int] = {}
+_STOP_LOSS_CONFIRMATION_TICKS = 2
+
 # Post-loss cooldown: after a confirmed slippage-loss fill, skip re-buying that coin for 30 min
 _loss_cooldown: Dict[str, float] = {}
 _LOSS_COOLDOWN_SEC = 1800  # 30 minutes
@@ -1019,10 +1022,14 @@ from collections import defaultdict
 _rejection_counts: dict = defaultdict(int)
 _rejection_examples: dict = {}  # reason -> last 5 examples
 _rejection_lock = threading.Lock()
+_rejection_reset_ts: float = 0.0
 
 def _record_rejection(symbol: str, score: int, reason: str, detail: str = ""):
     """Count rejected buy candidates (score >= 3) so we can see which filters fire most."""
-    if score < 3:
+    try:
+        if int(score or 0) < 3:
+            return
+    except Exception:
         return
     try:
         with _rejection_lock:
@@ -1031,7 +1038,7 @@ def _record_rejection(symbol: str, score: int, reason: str, detail: str = ""):
             ex_list.append({
                 "ts": time.time(),
                 "symbol": symbol,
-                "score": score,
+                "score": int(score or 0),
                 "detail": str(detail)[:200],
             })
             if len(ex_list) > 5:
@@ -1043,16 +1050,111 @@ def get_rejection_stats() -> dict:
     with _rejection_lock:
         return {
             "counts": dict(_rejection_counts),
-            "examples": dict(_rejection_examples),
+            "examples": {k: list(v) for k, v in _rejection_examples.items()},
         }
 
 def clear_rejection_stats() -> int:
+    global _rejection_reset_ts
     with _rejection_lock:
         n = sum(_rejection_counts.values())
         _rejection_counts.clear()
         _rejection_examples.clear()
+        _rejection_reset_ts = time.time()
         return n
 
+
+# ── BTC market regime filter ───────────────────────────────────────────────────
+_market_regime_cache: dict = {"ts": 0.0, "regime": "unknown", "details": {}}
+_MARKET_REGIME_TTL_SEC = 120.0
+
+def _fetch_btc_1h_klines() -> Optional[List[dict]]:
+    try:
+        import urllib.request, json as _json
+        url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=24"
+        with urllib.request.urlopen(url, timeout=4.0) as r:
+            data = _json.loads(r.read())
+        return [{"open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in data]
+    except Exception as e:
+        try:
+            log_diag_issue("market_regime", "warn", f"BTC kline fetch failed: {e}")
+        except (NameError, Exception):
+            pass
+        return None
+
+def _ema_calc(values: List[float], period: int) -> float:
+    if not values or period <= 0:
+        return 0.0
+    k = 2.0 / (period + 1.0)
+    ema_val = values[0]
+    for v in values[1:]:
+        ema_val = v * k + ema_val * (1 - k)
+    return ema_val
+
+def get_market_regime() -> dict:
+    """Returns regime: 'bullish'|'choppy'|'bearish'|'unknown'. Cached 2 min."""
+    now = time.time()
+    if (now - _market_regime_cache["ts"]) < _MARKET_REGIME_TTL_SEC:
+        return _market_regime_cache
+    klines = _fetch_btc_1h_klines()
+    if not klines or len(klines) < 12:
+        _market_regime_cache.update({"ts": now, "regime": "unknown", "details": {"error": "no_data"}})
+        return _market_regime_cache
+    closes = [k["close"] for k in klines]
+    ema_8  = _ema_calc(closes, 8)
+    ema_24 = _ema_calc(closes, 24)
+    pct_24h = (closes[-1] - closes[0]) / closes[0] * 100 if closes[0] > 0 else 0
+    pct_4h  = (closes[-1] - closes[-4]) / closes[-4] * 100 if closes[-4] > 0 else 0
+    if ema_8 > ema_24 and pct_24h > 0.5:
+        regime = "bullish"
+    elif ema_8 < ema_24 and pct_24h < -2.0:
+        regime = "bearish"
+    elif pct_4h < -1.5:
+        regime = "bearish"
+    else:
+        regime = "choppy"
+    details = {"btc_price": closes[-1], "ema_8": round(ema_8, 2), "ema_24": round(ema_24, 2), "pct_24h": round(pct_24h, 3), "pct_4h": round(pct_4h, 3), "ts": now}
+    _market_regime_cache.update({"ts": now, "regime": regime, "details": details})
+    return _market_regime_cache
+
+
+# ── Reversal confirmation ──────────────────────────────────────────────────────
+_reversal_cache: dict = {}
+_REVERSAL_TTL_SEC = 30.0
+
+def _fetch_1m_klines_rc(symbol: str, limit: int = 5) -> Optional[List[dict]]:
+    try:
+        import urllib.request, json as _json
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
+        with urllib.request.urlopen(url, timeout=3.0) as r:
+            data = _json.loads(r.read())
+        return [{"open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in data]
+    except Exception:
+        return None
+
+def is_reversal_confirmed(symbol: str) -> tuple:
+    """Returns (confirmed: bool, reason: str). Requires green candle + volume surge."""
+    now = time.time()
+    cached_rc = _reversal_cache.get(symbol)
+    if cached_rc and (now - cached_rc["ts"]) < _REVERSAL_TTL_SEC:
+        return cached_rc["confirmed"], cached_rc.get("reason", "cached")
+    klines = _fetch_1m_klines_rc(symbol, limit=5)
+    if not klines or len(klines) < 5:
+        _reversal_cache[symbol] = {"ts": now, "confirmed": False, "reason": "no_data"}
+        return False, "no_data"
+    last = klines[-1]
+    if last["close"] <= last["open"]:
+        _reversal_cache[symbol] = {"ts": now, "confirmed": False, "reason": "last_candle_red"}
+        return False, "last_candle_red"
+    avg_prev_vol = sum(c["volume"] for c in klines[:-1]) / 4.0
+    if avg_prev_vol > 0 and last["volume"] < avg_prev_vol * 1.15:
+        _reversal_cache[symbol] = {"ts": now, "confirmed": False, "reason": "weak_volume"}
+        return False, "weak_volume"
+    recent_low = min(c["low"] for c in klines[:-1])
+    if last["close"] <= recent_low:
+        _reversal_cache[symbol] = {"ts": now, "confirmed": False, "reason": "still_below_lows"}
+        return False, "still_below_lows"
+    _reversal_cache[symbol] = {"ts": now, "confirmed": True, "reason": "ok"}
+    return True, "ok"
 
 def _floor_qty(qty: float, symbol: str = "", decimals: int = 8) -> float:
     """Floor quantity to the symbol's LOT_SIZE stepSize to avoid Binance -1111 errors.
@@ -1690,6 +1792,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _record_rejection(sym, cached["score"], "already_held")
             continue
 
+        # ── Market regime gate ─────────────────────────────────────────────────
+        if bool(strategy.get("market_regime_filter_enabled", True)):
+            _regime = get_market_regime()
+            if _regime.get("regime") == "bearish":
+                _record_rejection(sym, cached["score"], "market_bearish",
+                    f"pct_24h={_regime['details'].get('pct_24h')}% pct_4h={_regime['details'].get('pct_4h')}%")
+                continue
+
         # ── Hard veto checks: BB position and 5m trend ────────────────────
         # Both are populated by the REST scan (_refresh_one) every 60 s and
         # preserved across kline-close updates.  Default True = not blocking.
@@ -1896,6 +2006,13 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"[SKIP] {sym}: fresh re-check failed ({_fresh_e}) — skipping for safety", "warn"
             )
             continue
+
+        # ── Reversal confirmation ──────────────────────────────────────────────
+        if bool(strategy.get("reversal_confirmation_enabled", True)):
+            _rev_ok, _rev_reason = is_reversal_confirmed(sym)
+            if not _rev_ok:
+                _record_rejection(sym, score, "no_reversal_confirmed", _rev_reason)
+                continue
 
         # Atomic claim — prevents concurrent buy for the same symbol
         with _buying_lock:
@@ -2144,14 +2261,19 @@ def realtime_monitor(prices: Dict[str, float]):
                             pos["_sell_reason"] = "take-profit"
                             _sell_executor.submit(_execute_sell, pos, price, "take-profit")
         elif _stop_loss_mult < 1.0 and price <= stop:
-            with _selling_lock:
-                if sym in _selling:
-                    continue
-                _selling.add(sym)
-                _selling_ts[sym] = time.time()
-                pos["_sell_trigger_ts"] = time.time()
-                pos["_sell_reason"] = "stop-loss"
-            _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
+            _stop_loss_confirmation[sym] = _stop_loss_confirmation.get(sym, 0) + 1
+            if _stop_loss_confirmation[sym] >= _STOP_LOSS_CONFIRMATION_TICKS:
+                _stop_loss_confirmation.pop(sym, None)
+                with _selling_lock:
+                    if sym in _selling:
+                        continue
+                    _selling.add(sym)
+                    _selling_ts[sym] = time.time()
+                    pos["_sell_trigger_ts"] = time.time()
+                    pos["_sell_reason"] = "stop-loss"
+                _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
+        else:
+            _stop_loss_confirmation.pop(sym, None)
 
     # ── Inline signal refresh — throttled to every 30 s per coin ─────────────
     for sym, price in prices.items():
@@ -2445,6 +2567,88 @@ def start_held_position_refresher():
     _held_refresher_thread.start()
 
 
+# ── Auto-recycle capital ───────────────────────────────────────────────────────
+_capital_recycler_thread: Optional[threading.Thread] = None
+_AUTO_RECYCLE_AGE_HOURS = 24.0
+_AUTO_RECYCLE_GAP_PCT   = 3.0
+
+
+def _capital_recycler_loop():
+    """Every 30 min, force-sell positions that have been underwater >24h with >3% gap.
+    Only runs if 'auto_recycle_enabled' is true in strategy.json (default OFF)."""
+    while True:
+        try:
+            time.sleep(1800)
+            strategy = _load_strategy()
+            if not bool(strategy.get("auto_recycle_enabled", False)):
+                continue
+            age_h_thresh = float(strategy.get("auto_recycle_age_hours", _AUTO_RECYCLE_AGE_HOURS))
+            gap_thresh   = float(strategy.get("auto_recycle_gap_pct",   _AUTO_RECYCLE_GAP_PCT))
+            with _positions_lock:
+                snap = list(_positions)
+            now = time.time()
+            for pos in snap:
+                sym = pos.get("symbol")
+                if not sym:
+                    continue
+                with _selling_lock:
+                    if sym in _selling:
+                        continue
+                opened_ts = pos.get("opened_at_ts", 0)
+                if opened_ts <= 0:
+                    continue
+                age_h = (now - opened_ts) / 3600
+                if age_h < age_h_thresh:
+                    continue
+                real_bep = compute_real_breakeven_price(pos)
+                if real_bep <= 0:
+                    continue
+                import data_collector as _dc_rc
+                cur_price = _dc_rc.prices.get(sym, 0)
+                if cur_price <= 0:
+                    cur_price = pos.get("current_price") or 0
+                if cur_price <= 0:
+                    continue
+                gap_pct = (real_bep - cur_price) / cur_price * 100
+                if gap_pct < gap_thresh:
+                    continue
+                database.log_activity(
+                    f"AUTO_RECYCLE {sym}: held {age_h:.1f}h, needs +{gap_pct:.2f}% to break even — force-selling to free capital",
+                    "warn"
+                )
+                try:
+                    log_diag_issue("auto_recycle", "info",
+                        f"{sym}: held {age_h:.1f}h gap=+{gap_pct:.2f}% — recycling")
+                except (NameError, Exception):
+                    pass
+                with _selling_lock:
+                    if sym in _selling:
+                        continue
+                    _selling.add(sym)
+                    _selling_ts[sym] = now
+                import data_collector as _dc_rc2
+                _sell_price = _dc_rc2.prices.get(sym, cur_price)
+                _sell_executor.submit(_execute_sell, pos, _sell_price, "auto-recycle")
+        except Exception as _re:
+            try:
+                log_diag_issue("auto_recycle", "warn", f"recycler loop error: {_re}")
+            except (NameError, Exception):
+                pass
+            time.sleep(60)
+
+
+def start_capital_recycler():
+    global _capital_recycler_thread
+    if _capital_recycler_thread is not None and _capital_recycler_thread.is_alive():
+        return
+    _capital_recycler_thread = threading.Thread(
+        target=_capital_recycler_loop,
+        name="capital_recycler",
+        daemon=True,
+    )
+    _capital_recycler_thread.start()
+
+
 def _sell_monitor_loop():
     """
     Fallback daemon thread — wakes every 0.5 s and checks sell conditions.
@@ -2620,7 +2824,12 @@ def _sell_monitor_loop():
                     else:
                         sell_reason3 = "take-profit"
                 elif _stop_loss_mult < 1.0 and price <= stop:
-                    sell_reason3 = "stop-loss"
+                    _stop_loss_confirmation[sym] = _stop_loss_confirmation.get(sym, 0) + 1
+                    if _stop_loss_confirmation[sym] >= _STOP_LOSS_CONFIRMATION_TICKS:
+                        _stop_loss_confirmation.pop(sym, None)
+                        sell_reason3 = "stop-loss"
+                else:
+                    _stop_loss_confirmation.pop(sym, None)
 
                 if sell_reason3:
                     with _selling_lock:
