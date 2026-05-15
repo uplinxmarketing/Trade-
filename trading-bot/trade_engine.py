@@ -1029,12 +1029,11 @@ _lot_step_cache: Dict[str, float] = {}
 from collections import defaultdict
 
 _rejection_counts: dict = defaultdict(int)
-_rejection_examples: dict = {}  # reason -> last 5 examples
+_rejection_examples: dict = {}
 _rejection_lock = threading.Lock()
-_rejection_reset_ts: float = 0.0
+_rejection_reset_ts: float = time.time()
 
-def _record_rejection(symbol: str, score: int, reason: str, detail: str = ""):
-    """Count rejected buy candidates (score >= 3) so we can see which filters fire most."""
+def _record_rejection(symbol: str, score, reason: str, detail: str = ""):
     try:
         if int(score or 0) < 3:
             return
@@ -1058,9 +1057,11 @@ def _record_rejection(symbol: str, score: int, reason: str, detail: str = ""):
 def get_rejection_stats() -> dict:
     with _rejection_lock:
         return {
-            "counts": dict(_rejection_counts),
+            "counts":   dict(_rejection_counts),
             "examples": {k: list(v) for k, v in _rejection_examples.items()},
+            "reset_ts": _rejection_reset_ts,
         }
+
 
 def clear_rejection_stats() -> int:
     global _rejection_reset_ts
@@ -1794,6 +1795,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             rem = int(_loss_cooldown[sym] - time.time())
             _record_rejection(sym, cached["score"], "loss_cooldown", f"{rem}s remaining")
             database.log_activity(f"{sym}: buy skipped — post-slippage-loss cooldown ({rem}s remaining)", "info")
+            _record_rejection(sym, cached["score"], "loss_cooldown", f"{rem}s remaining")
             continue
 
         with _positions_lock:
@@ -1835,6 +1837,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"[SKIP] {sym}: price near upper Bollinger Band | "
                 f"{sig_str} | {bb_str} | SKIP(upper band)", "info"
             )
+            _record_rejection(sym, score, "bb_upper")
             continue
         if not five_ok:
             _record_rejection(sym, score, "5m_downtrend", sig_str)
@@ -1842,6 +1845,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"[SKIP] {sym}: 5m downtrend | "
                 f"{sig_str} | {bb_str} {m5_str} | SKIP(5m downtrend)", "info"
             )
+            _record_rejection(sym, score, "5m_downtrend")
             continue
 
         # ── 1m BB veto: skip when price is at or above the 1m upper band ──────
@@ -1857,6 +1861,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         f"[SKIP] {sym}: 1m BB {bb_pos_1m} — local top, wait for pullback | "
                         f"{sig_str} | SKIP(1m_top)", "info"
                     )
+                    _record_rejection(sym, score, "bb_upper", f"1m bb_position={bb_pos_1m}")
                     continue
         except Exception:
             pass
@@ -1888,6 +1893,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         f"[SKIP] {sym}: falling knife — down {pct_3min:.2f}% in 3min | "
                         f"{sig_str} | SKIP(downward momentum)", "info"
                     )
+                    _record_rejection(sym, score, "falling_knife", f"{pct_3min:.2f}% in 3min")
                     continue
         except Exception:
             pass
@@ -1907,6 +1913,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         f"[SKIP] {sym}: below MA20 with RSI {rsi_v:.0f} (not oversold) | "
                         f"{sig_str} | SKIP(downtrend)", "info"
                     )
+                    _record_rejection(sym, score, "trend_health", f"below MA20 RSI={rsi_v:.0f}")
                     continue
                 if _vol_tr == "decreasing":
                     _record_rejection(sym, score, "volume_decreasing", f"vol_trend={_vol_tr}")
@@ -1914,6 +1921,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         f"[SKIP] {sym}: volume decreasing — no buying pressure | "
                         f"{sig_str} | SKIP(weak volume)", "info"
                     )
+                    _record_rejection(sym, score, "volume_decreasing", f"vol_trend={_vol_tr}")
                     continue
         except Exception:
             pass
@@ -1922,12 +1930,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         if budget <= 0:
             _record_rejection(sym, score, "no_capital", f"usdt={usdt_balance:.2f}")
             database.log_activity(f"{sym}: buy skipped — budget=0 (mode={mode}, usdt={usdt_balance:.2f})", "warn")
+            _record_rejection(sym, score, "no_capital", f"usdt={usdt_balance:.2f}")
             continue
 
         price = prices.get(sym) or cached["price"]
         if not price:
             _record_rejection(sym, score, "no_price")
             database.log_activity(f"{sym}: buy skipped — no price available", "warn")
+            _record_rejection(sym, score, "no_price")
             continue
 
         # Lot-step rounding guard: skip if rounding would waste >1% of capital.
@@ -1941,6 +1951,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"[SKIP] {sym}: lot-step too large for ${budget:.2f} at ${price:.4f} — "
                 f"would receive 0 qty. Increase budget or remove this coin.", "warn"
             )
+            _record_rejection(sym, score, "lot_step_loss", f"budget=${budget:.2f} price=${price:.4f} qty=0")
             continue
         _qty_loss_pct = (_ideal_qty_pre - _actual_qty_pre) / _ideal_qty_pre * 100
         if _qty_loss_pct > 1.0:
@@ -1952,6 +1963,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"Price ${price:.4f} too high for ${budget:.2f} budget — skipping.",
                 "warn"
             )
+            _record_rejection(sym, score, "lot_step_loss", f"{_qty_loss_pct:.2f}% waste budget=${budget:.2f} price=${price:.4f}")
             continue
 
         client.update_price(sym, price)
@@ -2002,6 +2014,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     f"[SKIP] {sym}: fresh re-check FAILED — score {_fresh_score}/6 < {min_sigs} "
                     f"(cache had {score}/6, age={cache_age}s)", "warn"
                 )
+                _record_rejection(sym, score, "stale_signals", f"fresh={_fresh_score} cache={score} age={cache_age}s")
                 continue
             _live_price = _fresh_closes[-1]
             if price > 0 and abs(_live_price - price) / price > 0.005:
@@ -2034,6 +2047,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 _buying_ts.pop(_s, None)
             if sym in _buying:
                 database.log_activity(f"{sym}: buy skipped — concurrent buy already in flight", "info")
+                _record_rejection(sym, score, "in_progress_buy")
                 continue
             _buying.add(sym)
             _buying_ts[sym] = _now_b
