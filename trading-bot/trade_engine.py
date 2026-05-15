@@ -472,6 +472,15 @@ _SELL_RETRY_COOLDOWN_LOSS   = 0.0   # stop-loss / force-sell: retry immediately
 # Each position gets its own worker thread; _selling guard prevents duplicates.
 _sell_executor = ThreadPoolExecutor(max_workers=12, thread_name_prefix="sell-worker")
 
+# ── Buy-check executor — keeps REST calls off the event loop thread ───────────
+# _check_buys_from_cache calls _get_usdt_balance() which is a blocking Binance
+# REST call in live mode. Running it inline on the WS event loop starves sell
+# triggers during WS reconnect bursts (observed: 21s trigger-to-noticed gap).
+# 2 workers is plenty — buy checks are throttled to 0.1s internally.
+_buy_check_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="buy-check")
+_buy_check_in_flight: bool = False
+_buy_check_lock = threading.Lock()
+
 # ── Real-time signal cache — updated on every kline close ────────────────────
 _signal_cache: Dict[str, dict] = {}
 _signal_cache_lock = threading.Lock()
@@ -1580,8 +1589,10 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         _gate_e   = pos.get("_sell_gate_done_ts", 0)
         _bin_s    = pos.get("_sell_binance_start_ts", 0)
         _bin_e    = pos.get("_sell_binance_done_ts", _t_done)
+        _crossed = pos.get("_sell_target_crossed_ts", 0)
         if _trigger > 0:
             stages = {
+                "target_crossed_to_trigger_ms": (_trigger - _crossed) * 1000 if _crossed and _crossed <= _trigger else 0,
                 "trigger_to_pickup_ms": (_pickup - _trigger) * 1000 if _pickup else 0,
                 "pickup_to_gate_ms":    (_gate_s - _pickup) * 1000 if _gate_s and _pickup else 0,
                 "gate_ms":              (_gate_e - _gate_s) * 1000 if _gate_e and _gate_s else 0,
@@ -2229,6 +2240,12 @@ def realtime_monitor(prices: Dict[str, float]):
             target = real_target
 
         if price >= real_target:
+            # Record first-seen crossing time — distinct from _sell_trigger_ts (which is
+            # set when we actually call .submit()). The gap between these two timestamps
+            # reveals event-loop starvation: if target_crossed_to_trigger_ms >> 0, sells
+            # are being delayed by blocking work elsewhere on the event loop thread.
+            if pos.get("_sell_target_crossed_ts") is None:
+                pos["_sell_target_crossed_ts"] = now
             with _selling_lock:
                 already = sym in _selling
             if not already:
@@ -2264,6 +2281,8 @@ def realtime_monitor(prices: Dict[str, float]):
             _stop_loss_confirmation[sym] = _stop_loss_confirmation.get(sym, 0) + 1
             if _stop_loss_confirmation[sym] >= _STOP_LOSS_CONFIRMATION_TICKS:
                 _stop_loss_confirmation.pop(sym, None)
+                if pos.get("_sell_target_crossed_ts") is None:
+                    pos["_sell_target_crossed_ts"] = now
                 with _selling_lock:
                     if sym in _selling:
                         continue
@@ -2283,8 +2302,24 @@ def realtime_monitor(prices: Dict[str, float]):
             _tick_signal_ts[sym] = now
             _inline_refresh_from_ticks(sym, price)
 
-    # ── Real-time buy check — throttled to 1 s ──────────────────────────────────
-    _check_buys_from_cache(prices)
+    # ── Real-time buy check — dispatched to background thread, never blocks event loop ──
+    # _check_buys_from_cache calls _get_usdt_balance() (blocking Binance REST in live
+    # mode). Running it inline here would stall sell-trigger detection during WS reconnect
+    # bursts. If a check is already in flight we skip — the in-flight check covers the same
+    # coins, and during reconnect storms we'd otherwise queue 50 redundant REST calls.
+    global _buy_check_in_flight
+    with _buy_check_lock:
+        if not _buy_check_in_flight:
+            _buy_check_in_flight = True
+            _prices_snap = dict(prices)
+            def _run_buy_check():
+                global _buy_check_in_flight
+                try:
+                    _check_buys_from_cache(_prices_snap)
+                finally:
+                    with _buy_check_lock:
+                        _buy_check_in_flight = False
+            _buy_check_executor.submit(_run_buy_check)
 
 
 # ── Sell monitor — daemon thread, independent of asyncio ─────────────────────
@@ -2837,6 +2872,9 @@ def _sell_monitor_loop():
                             continue
                         _selling.add(sym)
                         _selling_ts[sym] = time.time()
+                        pos["_sell_trigger_ts"] = time.time()
+                        if pos.get("_sell_target_crossed_ts") is None:
+                            pos["_sell_target_crossed_ts"] = time.time()
                     _sell_executor.submit(_execute_sell, pos, price, sell_reason3)
 
         except Exception as exc:

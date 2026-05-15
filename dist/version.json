@@ -1,5 +1,10 @@
 {
   "version": "0.2.1",
+<<<<<<< HEAD
   "buildTime": "2026-05-14T23:30:00.344Z",
   "commit": "f43fd7d"
+=======
+  "buildTime": "2026-05-15T00:46:31.978Z",
+  "commit": "a7d2725"
+>>>>>>> 4d02890 (fix: decouple buy-check REST calls from event loop to prevent sell starvation)
 }
