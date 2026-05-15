@@ -472,6 +472,15 @@ _SELL_RETRY_COOLDOWN_LOSS   = 0.0   # stop-loss / force-sell: retry immediately
 # Each position gets its own worker thread; _selling guard prevents duplicates.
 _sell_executor = ThreadPoolExecutor(max_workers=12, thread_name_prefix="sell-worker")
 
+# ── Buy-check executor — keeps REST calls off the event loop thread ───────────
+# _check_buys_from_cache calls _get_usdt_balance() which is a blocking Binance
+# REST call in live mode. Running it inline on the WS event loop starves sell
+# triggers during WS reconnect bursts (observed: 21s trigger-to-noticed gap).
+# 2 workers is plenty — buy checks are throttled to 0.1s internally.
+_buy_check_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="buy-check")
+_buy_check_in_flight: bool = False
+_buy_check_lock = threading.Lock()
+
 # ── Real-time signal cache — updated on every kline close ────────────────────
 _signal_cache: Dict[str, dict] = {}
 _signal_cache_lock = threading.Lock()
@@ -1020,12 +1029,11 @@ _lot_step_cache: Dict[str, float] = {}
 from collections import defaultdict
 
 _rejection_counts: dict = defaultdict(int)
-_rejection_examples: dict = {}  # reason -> last 5 examples
+_rejection_examples: dict = {}
 _rejection_lock = threading.Lock()
-_rejection_reset_ts: float = 0.0
+_rejection_reset_ts: float = time.time()
 
-def _record_rejection(symbol: str, score: int, reason: str, detail: str = ""):
-    """Count rejected buy candidates (score >= 3) so we can see which filters fire most."""
+def _record_rejection(symbol: str, score, reason: str, detail: str = ""):
     try:
         if int(score or 0) < 3:
             return
@@ -1049,9 +1057,11 @@ def _record_rejection(symbol: str, score: int, reason: str, detail: str = ""):
 def get_rejection_stats() -> dict:
     with _rejection_lock:
         return {
-            "counts": dict(_rejection_counts),
+            "counts":   dict(_rejection_counts),
             "examples": {k: list(v) for k, v in _rejection_examples.items()},
+            "reset_ts": _rejection_reset_ts,
         }
+
 
 def clear_rejection_stats() -> int:
     global _rejection_reset_ts
@@ -1580,8 +1590,10 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         _gate_e   = pos.get("_sell_gate_done_ts", 0)
         _bin_s    = pos.get("_sell_binance_start_ts", 0)
         _bin_e    = pos.get("_sell_binance_done_ts", _t_done)
+        _crossed = pos.get("_sell_target_crossed_ts", 0)
         if _trigger > 0:
             stages = {
+                "target_crossed_to_trigger_ms": (_trigger - _crossed) * 1000 if _crossed and _crossed <= _trigger else 0,
                 "trigger_to_pickup_ms": (_pickup - _trigger) * 1000 if _pickup else 0,
                 "pickup_to_gate_ms":    (_gate_s - _pickup) * 1000 if _gate_s and _pickup else 0,
                 "gate_ms":              (_gate_e - _gate_s) * 1000 if _gate_e and _gate_s else 0,
@@ -1783,6 +1795,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             rem = int(_loss_cooldown[sym] - time.time())
             _record_rejection(sym, cached["score"], "loss_cooldown", f"{rem}s remaining")
             database.log_activity(f"{sym}: buy skipped — post-slippage-loss cooldown ({rem}s remaining)", "info")
+            _record_rejection(sym, cached["score"], "loss_cooldown", f"{rem}s remaining")
             continue
 
         with _positions_lock:
@@ -1824,6 +1837,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"[SKIP] {sym}: price near upper Bollinger Band | "
                 f"{sig_str} | {bb_str} | SKIP(upper band)", "info"
             )
+            _record_rejection(sym, score, "bb_upper")
             continue
         if not five_ok:
             _record_rejection(sym, score, "5m_downtrend", sig_str)
@@ -1831,6 +1845,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"[SKIP] {sym}: 5m downtrend | "
                 f"{sig_str} | {bb_str} {m5_str} | SKIP(5m downtrend)", "info"
             )
+            _record_rejection(sym, score, "5m_downtrend")
             continue
 
         # ── 1m BB veto: skip when price is at or above the 1m upper band ──────
@@ -1846,6 +1861,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         f"[SKIP] {sym}: 1m BB {bb_pos_1m} — local top, wait for pullback | "
                         f"{sig_str} | SKIP(1m_top)", "info"
                     )
+                    _record_rejection(sym, score, "bb_upper", f"1m bb_position={bb_pos_1m}")
                     continue
         except Exception:
             pass
@@ -1877,6 +1893,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         f"[SKIP] {sym}: falling knife — down {pct_3min:.2f}% in 3min | "
                         f"{sig_str} | SKIP(downward momentum)", "info"
                     )
+                    _record_rejection(sym, score, "falling_knife", f"{pct_3min:.2f}% in 3min")
                     continue
         except Exception:
             pass
@@ -1896,6 +1913,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         f"[SKIP] {sym}: below MA20 with RSI {rsi_v:.0f} (not oversold) | "
                         f"{sig_str} | SKIP(downtrend)", "info"
                     )
+                    _record_rejection(sym, score, "trend_health", f"below MA20 RSI={rsi_v:.0f}")
                     continue
                 if _vol_tr == "decreasing":
                     _record_rejection(sym, score, "volume_decreasing", f"vol_trend={_vol_tr}")
@@ -1903,6 +1921,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         f"[SKIP] {sym}: volume decreasing — no buying pressure | "
                         f"{sig_str} | SKIP(weak volume)", "info"
                     )
+                    _record_rejection(sym, score, "volume_decreasing", f"vol_trend={_vol_tr}")
                     continue
         except Exception:
             pass
@@ -1911,12 +1930,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         if budget <= 0:
             _record_rejection(sym, score, "no_capital", f"usdt={usdt_balance:.2f}")
             database.log_activity(f"{sym}: buy skipped — budget=0 (mode={mode}, usdt={usdt_balance:.2f})", "warn")
+            _record_rejection(sym, score, "no_capital", f"usdt={usdt_balance:.2f}")
             continue
 
         price = prices.get(sym) or cached["price"]
         if not price:
             _record_rejection(sym, score, "no_price")
             database.log_activity(f"{sym}: buy skipped — no price available", "warn")
+            _record_rejection(sym, score, "no_price")
             continue
 
         # Lot-step rounding guard: skip if rounding would waste >1% of capital.
@@ -1930,6 +1951,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"[SKIP] {sym}: lot-step too large for ${budget:.2f} at ${price:.4f} — "
                 f"would receive 0 qty. Increase budget or remove this coin.", "warn"
             )
+            _record_rejection(sym, score, "lot_step_loss", f"budget=${budget:.2f} price=${price:.4f} qty=0")
             continue
         _qty_loss_pct = (_ideal_qty_pre - _actual_qty_pre) / _ideal_qty_pre * 100
         if _qty_loss_pct > 1.0:
@@ -1941,6 +1963,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"Price ${price:.4f} too high for ${budget:.2f} budget — skipping.",
                 "warn"
             )
+            _record_rejection(sym, score, "lot_step_loss", f"{_qty_loss_pct:.2f}% waste budget=${budget:.2f} price=${price:.4f}")
             continue
 
         client.update_price(sym, price)
@@ -1991,6 +2014,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     f"[SKIP] {sym}: fresh re-check FAILED — score {_fresh_score}/6 < {min_sigs} "
                     f"(cache had {score}/6, age={cache_age}s)", "warn"
                 )
+                _record_rejection(sym, score, "stale_signals", f"fresh={_fresh_score} cache={score} age={cache_age}s")
                 continue
             _live_price = _fresh_closes[-1]
             if price > 0 and abs(_live_price - price) / price > 0.005:
@@ -2023,6 +2047,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 _buying_ts.pop(_s, None)
             if sym in _buying:
                 database.log_activity(f"{sym}: buy skipped — concurrent buy already in flight", "info")
+                _record_rejection(sym, score, "in_progress_buy")
                 continue
             _buying.add(sym)
             _buying_ts[sym] = _now_b
@@ -2229,6 +2254,12 @@ def realtime_monitor(prices: Dict[str, float]):
             target = real_target
 
         if price >= real_target:
+            # Record first-seen crossing time — distinct from _sell_trigger_ts (which is
+            # set when we actually call .submit()). The gap between these two timestamps
+            # reveals event-loop starvation: if target_crossed_to_trigger_ms >> 0, sells
+            # are being delayed by blocking work elsewhere on the event loop thread.
+            if pos.get("_sell_target_crossed_ts") is None:
+                pos["_sell_target_crossed_ts"] = now
             with _selling_lock:
                 already = sym in _selling
             if not already:
@@ -2264,6 +2295,8 @@ def realtime_monitor(prices: Dict[str, float]):
             _stop_loss_confirmation[sym] = _stop_loss_confirmation.get(sym, 0) + 1
             if _stop_loss_confirmation[sym] >= _STOP_LOSS_CONFIRMATION_TICKS:
                 _stop_loss_confirmation.pop(sym, None)
+                if pos.get("_sell_target_crossed_ts") is None:
+                    pos["_sell_target_crossed_ts"] = now
                 with _selling_lock:
                     if sym in _selling:
                         continue
@@ -2283,8 +2316,24 @@ def realtime_monitor(prices: Dict[str, float]):
             _tick_signal_ts[sym] = now
             _inline_refresh_from_ticks(sym, price)
 
-    # ── Real-time buy check — throttled to 1 s ──────────────────────────────────
-    _check_buys_from_cache(prices)
+    # ── Real-time buy check — dispatched to background thread, never blocks event loop ──
+    # _check_buys_from_cache calls _get_usdt_balance() (blocking Binance REST in live
+    # mode). Running it inline here would stall sell-trigger detection during WS reconnect
+    # bursts. If a check is already in flight we skip — the in-flight check covers the same
+    # coins, and during reconnect storms we'd otherwise queue 50 redundant REST calls.
+    global _buy_check_in_flight
+    with _buy_check_lock:
+        if not _buy_check_in_flight:
+            _buy_check_in_flight = True
+            _prices_snap = dict(prices)
+            def _run_buy_check():
+                global _buy_check_in_flight
+                try:
+                    _check_buys_from_cache(_prices_snap)
+                finally:
+                    with _buy_check_lock:
+                        _buy_check_in_flight = False
+            _buy_check_executor.submit(_run_buy_check)
 
 
 # ── Sell monitor — daemon thread, independent of asyncio ─────────────────────
@@ -2837,6 +2886,9 @@ def _sell_monitor_loop():
                             continue
                         _selling.add(sym)
                         _selling_ts[sym] = time.time()
+                        pos["_sell_trigger_ts"] = time.time()
+                        if pos.get("_sell_target_crossed_ts") is None:
+                            pos["_sell_target_crossed_ts"] = time.time()
                     _sell_executor.submit(_execute_sell, pos, price, sell_reason3)
 
         except Exception as exc:

@@ -2059,6 +2059,35 @@ def api_ping():
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
 
 
+@app.get("/api/buy-rejections")
+def api_buy_rejections():
+    import trade_engine as _te
+    stats = _te.get_rejection_stats()
+    total = sum(stats["counts"].values())
+    sorted_reasons = sorted(stats["counts"].items(), key=lambda x: -x[1])
+    return {
+        "total_rejections": total,
+        "since_reset_ts":   stats["reset_ts"],
+        "since_reset_age_sec": round(time.time() - stats["reset_ts"], 1),
+        "by_reason": [
+            {
+                "reason":          reason,
+                "count":           count,
+                "pct_of_total":    round(100 * count / total, 1) if total > 0 else 0,
+                "recent_examples": stats["examples"].get(reason, [])[-3:],
+            }
+            for reason, count in sorted_reasons
+        ],
+    }
+
+
+@app.post("/api/buy-rejections/reset")
+def api_buy_rejections_reset():
+    import trade_engine as _te
+    n = _te.clear_rejection_stats()
+    return {"ok": True, "cleared": n}
+
+
 # Tiny response cache — coalesces overlapping polls (the frontend has both a 5 s
 # and a 1 s interval; without this they each issue a full DB sweep, which holds
 # the global SQLite lock and starves the sell monitor for ~50 ms each call).
