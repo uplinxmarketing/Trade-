@@ -1127,6 +1127,45 @@ def get_market_regime() -> dict:
     return _market_regime_cache
 
 
+# ── BTC macro gate state — simpler thresholds, 5-min TTL ─────────────────────
+# Used by the pre-loop macro gate in _check_buys_from_cache.
+# Bearish = pct_24h < -3% OR pct_4h < -2% (clear dump, not just chop).
+# Called from _buy_check_executor thread — NEVER from event loop.
+_btc_state_cache: dict = {"ts": 0.0, "data": None}
+_BTC_STATE_TTL_SEC = 300.0
+
+def get_btc_state() -> Optional[dict]:
+    """BTC macro state for macro gate. 5-min cache. Must run on buy-check thread."""
+    now = time.time()
+    if _btc_state_cache["data"] and (now - _btc_state_cache["ts"]) < _BTC_STATE_TTL_SEC:
+        return _btc_state_cache["data"]
+    klines = _fetch_btc_1h_klines()
+    if not klines or len(klines) < 12:
+        return _btc_state_cache.get("data")
+    closes = [k["close"] for k in klines]
+    ema_8  = _ema_calc(closes, 8)
+    ema_24 = _ema_calc(closes, 24)
+    pct_24h = (closes[-1] - closes[0]) / closes[0] * 100 if closes[0] > 0 else 0
+    pct_4h  = (closes[-1] - closes[-4]) / closes[-4] * 100 if closes[-4] > 0 else 0
+    if pct_24h < -3.0 or pct_4h < -2.0:
+        regime = "bearish"
+    elif ema_8 > ema_24 and pct_24h > 1.0:
+        regime = "bullish"
+    else:
+        regime = "choppy"
+    data = {
+        "price":   closes[-1],
+        "ema_8":   round(ema_8, 2),
+        "ema_24":  round(ema_24, 2),
+        "pct_4h":  round(pct_4h, 3),
+        "pct_24h": round(pct_24h, 3),
+        "regime":  regime,
+    }
+    _btc_state_cache["ts"]   = now
+    _btc_state_cache["data"] = data
+    return data
+
+
 # ── Reversal confirmation ──────────────────────────────────────────────────────
 _reversal_cache: dict = {}
 _REVERSAL_TTL_SEC = 30.0
@@ -1774,6 +1813,25 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             "info"
         )
 
+    # ── BTC macro gate — checked once per scan, not per symbol ────────────────
+    macro_gate_enabled = bool(strategy.get("macro_gate_enabled", True))
+    if macro_gate_enabled:
+        _btc = get_btc_state()
+        if _btc and _btc.get("regime") == "bearish":
+            database.log_activity(
+                f"MACRO GATE: BTC bearish (24h={_btc['pct_24h']}% 4h={_btc['pct_4h']}%) — all buys paused",
+                "warn"
+            )
+            for _s, _c in cache_snapshot.items():
+                if _s in approved:
+                    _record_rejection(_s, _c.get("score", 0), "btc_bearish_regime",
+                                      f"pct_24h={_btc['pct_24h']} pct_4h={_btc['pct_4h']}")
+            return
+
+    # Read mandatory signal thresholds once (hot-reloadable from strategy.json)
+    mandatory_enabled = bool(strategy.get("mandatory_signals_enabled", True))
+    rsi_threshold     = float(strategy.get("rsi_buy_threshold", 40.0))
+
     for sym, cached in cache_snapshot.items():
         # Re-check capacity before every individual buy — the pre-loop check only
         # guards the entry; without this, all ready coins buy in sequence and blow
@@ -1805,17 +1863,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _record_rejection(sym, cached["score"], "already_held")
             continue
 
-        # ── Market regime gate ─────────────────────────────────────────────────
-        if bool(strategy.get("market_regime_filter_enabled", True)):
-            _regime = get_market_regime()
-            if _regime.get("regime") == "bearish":
-                _record_rejection(sym, cached["score"], "market_bearish",
-                    f"pct_24h={_regime['details'].get('pct_24h')}% pct_4h={_regime['details'].get('pct_4h')}%")
-                continue
-
-        # ── Hard veto checks: BB position and 5m trend ────────────────────
-        # Both are populated by the REST scan (_refresh_one) every 60 s and
-        # preserved across kline-close updates.  Default True = not blocking.
+        # ── Extract signal snapshot for this symbol ────────────────────────────
         sigs    = cached.get("signals", {})
         bb_ok   = cached.get("bb_ok",  True)
         five_ok = cached.get("5m_ok",  True)
@@ -1831,13 +1879,27 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         )
         bb_str  = "BB:PASS" if bb_ok   else "BB:FAIL"
         m5_str  = "5m:PASS" if five_ok else "5m:FAIL"
+
+        # ── Mandatory signal layer — both must fire before any buy ─────────────
+        # Mandatory 1: EMA trend up (EMA9 > EMA21) — don't buy into a downtrend.
+        # Mandatory 2: RSI below threshold — require a real dip, not mid-channel noise.
+        # Thresholds are hot-reloadable from strategy.json.
+        if mandatory_enabled:
+            if not sigs.get("trend", False):
+                _record_rejection(sym, score, "mandatory_ema_down", "EMA9 < EMA21")
+                continue
+            if rsi_v <= 0 or rsi_v >= rsi_threshold:
+                _record_rejection(sym, score, "mandatory_rsi_too_high",
+                                  f"rsi={rsi_v:.1f} threshold={rsi_threshold}")
+                continue
+
+        # ── Hard veto checks: BB position and 5m trend ────────────────────────
         if not bb_ok:
-            _record_rejection(sym, score, "bb_upper_5m", sig_str)
+            _record_rejection(sym, score, "bb_upper", sig_str)
             database.log_activity(
                 f"[SKIP] {sym}: price near upper Bollinger Band | "
                 f"{sig_str} | {bb_str} | SKIP(upper band)", "info"
             )
-            _record_rejection(sym, score, "bb_upper")
             continue
         if not five_ok:
             _record_rejection(sym, score, "5m_downtrend", sig_str)
@@ -1845,7 +1907,6 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"[SKIP] {sym}: 5m downtrend | "
                 f"{sig_str} | {bb_str} {m5_str} | SKIP(5m downtrend)", "info"
             )
-            _record_rejection(sym, score, "5m_downtrend")
             continue
 
         # ── 1m BB veto: skip when price is at or above the 1m upper band ──────
@@ -1856,12 +1917,11 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             if candles_1m:
                 bb_pos_1m = candles_1m[-1].get("bb_position")
                 if bb_pos_1m in ("above_upper", "at_upper"):
-                    _record_rejection(sym, score, "bb_upper_1m", bb_pos_1m)
+                    _record_rejection(sym, score, "bb_upper", f"1m {bb_pos_1m}")
                     database.log_activity(
                         f"[SKIP] {sym}: 1m BB {bb_pos_1m} — local top, wait for pullback | "
                         f"{sig_str} | SKIP(1m_top)", "info"
                     )
-                    _record_rejection(sym, score, "bb_upper", f"1m bb_position={bb_pos_1m}")
                     continue
         except Exception:
             pass
@@ -1893,7 +1953,6 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         f"[SKIP] {sym}: falling knife — down {pct_3min:.2f}% in 3min | "
                         f"{sig_str} | SKIP(downward momentum)", "info"
                     )
-                    _record_rejection(sym, score, "falling_knife", f"{pct_3min:.2f}% in 3min")
                     continue
         except Exception:
             pass
@@ -1908,12 +1967,11 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 _ma_pos  = _last_c.get("ma_position") or _derive_ma_pos(price, _last_c.get("ma20"))
                 _vol_tr  = _last_c.get("volume_trend")
                 if _ma_pos == "below" and rsi_v > 35:
-                    _record_rejection(sym, score, "trend_health", f"below MA20, RSI={rsi_v:.0f}")
+                    _record_rejection(sym, score, "trend_health", f"below MA20 RSI={rsi_v:.0f}")
                     database.log_activity(
                         f"[SKIP] {sym}: below MA20 with RSI {rsi_v:.0f} (not oversold) | "
                         f"{sig_str} | SKIP(downtrend)", "info"
                     )
-                    _record_rejection(sym, score, "trend_health", f"below MA20 RSI={rsi_v:.0f}")
                     continue
                 if _vol_tr == "decreasing":
                     _record_rejection(sym, score, "volume_decreasing", f"vol_trend={_vol_tr}")
@@ -1921,7 +1979,6 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         f"[SKIP] {sym}: volume decreasing — no buying pressure | "
                         f"{sig_str} | SKIP(weak volume)", "info"
                     )
-                    _record_rejection(sym, score, "volume_decreasing", f"vol_trend={_vol_tr}")
                     continue
         except Exception:
             pass
@@ -1930,14 +1987,12 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         if budget <= 0:
             _record_rejection(sym, score, "no_capital", f"usdt={usdt_balance:.2f}")
             database.log_activity(f"{sym}: buy skipped — budget=0 (mode={mode}, usdt={usdt_balance:.2f})", "warn")
-            _record_rejection(sym, score, "no_capital", f"usdt={usdt_balance:.2f}")
             continue
 
         price = prices.get(sym) or cached["price"]
         if not price:
             _record_rejection(sym, score, "no_price")
             database.log_activity(f"{sym}: buy skipped — no price available", "warn")
-            _record_rejection(sym, score, "no_price")
             continue
 
         # Lot-step rounding guard: skip if rounding would waste >1% of capital.
@@ -1946,16 +2001,15 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         _ideal_qty_pre = budget / price
         _actual_qty_pre = _floor_qty(_ideal_qty_pre, sym)
         if _actual_qty_pre <= 0:
-            _record_rejection(sym, score, "lot_step_zero_qty", f"budget=${budget:.2f} price=${price:.4f}")
+            _record_rejection(sym, score, "lot_step_loss", f"budget=${budget:.2f} price=${price:.4f} qty=0")
             database.log_activity(
                 f"[SKIP] {sym}: lot-step too large for ${budget:.2f} at ${price:.4f} — "
                 f"would receive 0 qty. Increase budget or remove this coin.", "warn"
             )
-            _record_rejection(sym, score, "lot_step_loss", f"budget=${budget:.2f} price=${price:.4f} qty=0")
             continue
         _qty_loss_pct = (_ideal_qty_pre - _actual_qty_pre) / _ideal_qty_pre * 100
         if _qty_loss_pct > 1.0:
-            _record_rejection(sym, score, "lot_step_loss", f"{_qty_loss_pct:.2f}% waste")
+            _record_rejection(sym, score, "lot_step_loss", f"{_qty_loss_pct:.2f}% waste budget=${budget:.2f} price=${price:.4f}")
             database.log_activity(
                 f"[SKIP] {sym}: lot-step rounding wastes {_qty_loss_pct:.2f}% of capital "
                 f"(ideal={_ideal_qty_pre:.8f}, actual={_actual_qty_pre:.8f}, "
@@ -1963,7 +2017,6 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"Price ${price:.4f} too high for ${budget:.2f} budget — skipping.",
                 "warn"
             )
-            _record_rejection(sym, score, "lot_step_loss", f"{_qty_loss_pct:.2f}% waste budget=${budget:.2f} price=${price:.4f}")
             continue
 
         client.update_price(sym, price)
@@ -2158,10 +2211,18 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         mode_tag  = "LIVE" if mode == "live" else "PAPER"
         cache_age = round(time.time() - cached.get("ts", 0), 1)
+        _btc_now  = get_btc_state()
+        _regime_tag = _btc_now.get("regime", "?") if _btc_now else "?"
+        _rsi_thr_tag = f"<{rsi_threshold:.0f}" if mandatory_enabled else "any"
         msg = (
             f"[{mode_tag}] BOUGHT {sym} @ ${fill_price:.4f} "
-            f"| qty={qty:.6f} | EXIT TARGET=${exit_target:.4f} "
-            f"| {sig_str} | {bb_str} {m5_str} | count:{score}/6 | cache_age:{cache_age}s"
+            f"| MANDATORY[EMA↑ RSI:{rsi_v:.0f}{_rsi_thr_tag}] "
+            f"| SCORED[MACD{'+'  if sigs.get('macd')   else '-'} "
+            f"Vol{'✓'   if sigs.get('volume') else '✗'} "
+            f"OBV{'✓'   if sigs.get('obv')    else '✗'} "
+            f"ATR{'✓'   if sigs.get('atr')    else '✗'}] "
+            f"| score:{score}/6 regime:{_regime_tag} | EXIT TARGET=${exit_target:.4f} "
+            f"| qty={qty:.6f} | cache_age:{cache_age}s"
         )
         print(f"[RealtimeBuy] {msg}")
         database.log_activity(msg, "info")
