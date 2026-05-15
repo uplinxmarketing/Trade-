@@ -94,6 +94,8 @@ async def lifespan(app: FastAPI):
         #     low-WS-volume coins that can go minutes stale without this)
         trade_engine.start_held_position_refresher()
         steps.append("held_price_refresher OK")
+        trade_engine.start_capital_recycler()
+        steps.append("capital_recycler OK")
 
         # 4. Apply startup defaults and auto-resume logic.
         #    stop_loss and smart_hold are ALWAYS forced OFF on every deploy —
@@ -1721,6 +1723,15 @@ def api_diagnostics():
             "disabled":         now < bh["claude_disabled_until"],
             "disabled_until":   bh["claude_disabled_until"] if bh["claude_disabled_until"] > now else None,
         },
+        "market_regime": (lambda r: {
+            "current":       r.get("regime"),
+            "btc_price":     r.get("details", {}).get("btc_price"),
+            "pct_4h":        r.get("details", {}).get("pct_4h"),
+            "pct_24h":       r.get("details", {}).get("pct_24h"),
+            "ema_8":         r.get("details", {}).get("ema_8"),
+            "ema_24":        r.get("details", {}).get("ema_24"),
+            "blocking_buys": r.get("regime") == "bearish",
+        })(_te.get_market_regime()),
     }
 
 
@@ -1763,6 +1774,35 @@ def api_diagnostics_reset():
         _te._binance_health["last_error_msg"]   = ""
     _te.reset_claude_errors()
     return {"ok": True, "reset": True}
+
+
+@app.get("/api/buy-rejections")
+def api_buy_rejections():
+    """Per-reason count of rejected buy candidates (score >= 3) since last reset."""
+    import trade_engine as _te
+    stats = _te.get_rejection_stats()
+    total = sum(stats["counts"].values())
+    sorted_reasons = sorted(stats["counts"].items(), key=lambda x: -x[1])
+    return {
+        "total_rejections": total,
+        "since_last_reset_ts": getattr(_te, "_rejection_reset_ts", 0),
+        "by_reason": [
+            {
+                "reason": reason,
+                "count": count,
+                "pct_of_total": round(100 * count / total, 1) if total > 0 else 0,
+                "recent_examples": stats["examples"].get(reason, [])[-3:],
+            }
+            for reason, count in sorted_reasons
+        ],
+    }
+
+
+@app.post("/api/buy-rejections/reset")
+def api_buy_rejections_reset():
+    import trade_engine as _te
+    n = _te.clear_rejection_stats()
+    return {"ok": True, "cleared": n}
 
 
 @app.get("/api/diagnostics/log")
