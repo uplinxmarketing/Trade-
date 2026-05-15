@@ -1723,15 +1723,15 @@ def api_diagnostics():
             "disabled":         now < bh["claude_disabled_until"],
             "disabled_until":   bh["claude_disabled_until"] if bh["claude_disabled_until"] > now else None,
         },
-        "market_regime": (lambda r: {
-            "current":       r.get("regime"),
-            "btc_price":     r.get("details", {}).get("btc_price"),
-            "pct_4h":        r.get("details", {}).get("pct_4h"),
-            "pct_24h":       r.get("details", {}).get("pct_24h"),
-            "ema_8":         r.get("details", {}).get("ema_8"),
-            "ema_24":        r.get("details", {}).get("ema_24"),
-            "blocking_buys": r.get("regime") == "bearish",
-        })(_te.get_market_regime()),
+        "market_regime": (lambda b: {
+            "regime":      b.get("regime", "unknown") if b else "unknown",
+            "btc_price":   b.get("price")   if b else None,
+            "pct_4h":      b.get("pct_4h")  if b else None,
+            "pct_24h":     b.get("pct_24h") if b else None,
+            "ema_8":       b.get("ema_8")   if b else None,
+            "ema_24":      b.get("ema_24")  if b else None,
+            "buys_paused": (b.get("regime") == "bearish") if b else False,
+        })(_te.get_btc_state()),
     }
 
 
