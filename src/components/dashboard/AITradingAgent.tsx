@@ -14,6 +14,7 @@ import type { LivePrices } from '@/lib/trading-engine';
 import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcSMA } from '@/lib/indicators';
 import { formatTime, formatPnL } from '@/lib/format';
 import { SignalEnginePanel } from './SignalEnginePanel';
+import { DiagnosticsTab } from './DiagnosticsTab';
 
 // ── Simple 4-signal analyser (no API key, Binance public data only) ────────────────────
 const BIN = '/api/proxy/binance';
@@ -408,6 +409,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [showPositionsSection, setShowPositionsSection] = useState(true);
   const [showTradesSection, setShowTradesSection] = useState(true);
   const [showSignalEngine, setShowSignalEngine] = useState(false);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [signalRegistry, setSignalRegistry] = useState<{id: string; category: string; description: string; role: string}[]>([]);
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
@@ -1717,6 +1719,28 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           {showSignalEngine && (
             <div className="px-4 pb-4">
               <SignalEnginePanel baseUrl={railwayUrl} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Diagnostics (server mode only) */}
+      {isServerMode && (
+        <div className="border-t border-border">
+          <button
+            onClick={() => setShowDiagnostics(!showDiagnostics)}
+            className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/20 transition-colors">
+            <div className="flex items-center gap-2">
+              <Activity className="w-3.5 h-3.5 text-muted-foreground" />
+              <span className="text-xs font-semibold">Diagnostics</span>
+            </div>
+            {showDiagnostics
+              ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
+              : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
+          </button>
+          {showDiagnostics && (
+            <div className="px-4 pb-4">
+              <DiagnosticsTab baseUrl={railwayUrl} />
             </div>
           )}
         </div>
