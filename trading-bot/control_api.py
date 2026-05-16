@@ -57,6 +57,118 @@ import database
 from connection import get_mode, get_live_error, is_using_paper_fallback
 
 
+# ── Phase 5+6: DB migrations ─────────────────────────────────────────────────
+
+import sqlite3 as _sqlite3_migrations
+
+def _migrate_signal_snapshot_columns():
+    try:
+        conn = _sqlite3_migrations.connect(database.DB_PATH)
+        cur = conn.cursor()
+        for table in ("trades", "positions"):
+            cur.execute(f"PRAGMA table_info({table})")
+            cols = [c[1] for c in cur.fetchall()]
+            if "signal_snapshot" not in cols:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN signal_snapshot TEXT")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        import logging as _log_mg
+        _log_mg.getLogger(__name__).warning("signal_snapshot migration failed: %s", e)
+
+def _migrate_strategy_audit_table():
+    try:
+        conn = _sqlite3_migrations.connect(database.DB_PATH)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                field_key TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                source TEXT
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_audit_ts ON strategy_audit(timestamp)")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        import logging as _log_mg
+        _log_mg.getLogger(__name__).warning("strategy_audit migration failed: %s", e)
+
+def _migrate_alerts_table():
+    try:
+        conn = _sqlite3_migrations.connect(database.DB_PATH)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                category TEXT NOT NULL,
+                message TEXT NOT NULL,
+                metadata TEXT,
+                acknowledged INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        import logging as _log_mg
+        _log_mg.getLogger(__name__).warning("alerts migration failed: %s", e)
+
+# Run all migrations at module load time
+_migrate_signal_snapshot_columns()
+_migrate_strategy_audit_table()
+_migrate_alerts_table()
+
+# ── Strategy audit tracker ────────────────────────────────────────────────────
+
+_last_strategy_snapshot: dict = {}
+_strategy_audit_lock = threading.Lock()
+
+
+def _flatten_dict(d: dict, prefix: str = "") -> dict:
+    """Flatten nested dict to dot-notation keys."""
+    out = {}
+    for k, v in d.items():
+        key = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            out.update(_flatten_dict(v, key))
+        else:
+            out[key] = v
+    return out
+
+
+def _log_strategy_changes(new_strategy: dict, source: str) -> None:
+    global _last_strategy_snapshot
+    with _strategy_audit_lock:
+        old_flat = _flatten_dict(_last_strategy_snapshot)
+        new_flat = _flatten_dict(new_strategy)
+        all_keys = set(old_flat) | set(new_flat)
+        changes = []
+        for key in all_keys:
+            old_v = old_flat.get(key)
+            new_v = new_flat.get(key)
+            if old_v != new_v:
+                changes.append((key, str(old_v) if old_v is not None else None,
+                                str(new_v) if new_v is not None else None))
+        if changes:
+            now_ts = datetime.now(timezone.utc).isoformat()
+            try:
+                conn = _sqlite3_migrations.connect(database.DB_PATH)
+                conn.executemany(
+                    "INSERT INTO strategy_audit (timestamp, field_key, old_value, new_value, source) VALUES (?,?,?,?,?)",
+                    [(now_ts, key, old_v, new_v, source) for key, old_v, new_v in changes]
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+        _last_strategy_snapshot = dict(new_strategy)
+
+
 # ── Lifespan: start the full trading bot after HTTP server is ready ───────────
 
 @asynccontextmanager
@@ -130,6 +242,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(trade_engine.signal_scanner(data_collector.prices))
         asyncio.create_task(trade_engine.position_guardian())
         asyncio.create_task(_supabase_periodic_sync())
+        asyncio.create_task(_anomaly_checker())
         steps.append("async tasks launched")
 
         # 8. Futures paper-trading agent (completely separate parallel process)
@@ -184,12 +297,81 @@ async def _supabase_periodic_sync():
             print(f"[PeriodicSync] Supabase sync error: {e}")
 
 
+async def _anomaly_checker():
+    """Background task: check for trading anomalies every 300s and insert alerts."""
+    import asyncio as _aio
+    import sqlite3 as _sq_ac
+    while True:
+        await _aio.sleep(300)
+        try:
+            now_ts = datetime.now(timezone.utc).isoformat()
+            conn = _sq_ac.connect(database.DB_PATH)
+            conn.row_factory = _sq_ac.Row
+
+            # 1. Win rate drop: compare last 4h vs prior 7 days
+            try:
+                r4h = conn.execute("""
+                    SELECT COUNT(*) AS total,
+                           SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) AS wins
+                    FROM trades WHERE timestamp_sell > datetime('now', '-4 hours')
+                    AND side IS NULL OR side = 'SELL' OR sell_reason IS NOT NULL
+                """).fetchone()
+                r7d = conn.execute("""
+                    SELECT COUNT(*) AS total,
+                           SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) AS wins
+                    FROM trades WHERE timestamp_sell > datetime('now', '-7 days')
+                    AND timestamp_sell <= datetime('now', '-4 hours')
+                """).fetchone()
+                if r4h and r7d and r4h["total"] >= 3 and r7d["total"] >= 3:
+                    wr4h = (r4h["wins"] or 0) / r4h["total"] * 100
+                    wr7d = (r7d["wins"] or 0) / r7d["total"] * 100
+                    if wr7d > 0 and (wr7d - wr4h) > 20:
+                        msg = (f"Win rate drop detected: last 4h={wr4h:.1f}% vs prior 7d={wr7d:.1f}% "
+                               f"(drop={wr7d - wr4h:.1f}%)")
+                        conn.execute(
+                            "INSERT INTO alerts (timestamp, severity, category, message, metadata) VALUES (?,?,?,?,?)",
+                            (now_ts, "warn", "win_rate_drop", msg,
+                             json.dumps({"wr_4h": round(wr4h, 1), "wr_7d": round(wr7d, 1)}))
+                        )
+            except Exception:
+                pass
+
+            # 2. Consecutive losses
+            try:
+                recent = conn.execute("""
+                    SELECT net_profit FROM trades
+                    ORDER BY id DESC LIMIT 10
+                """).fetchall()
+                consec = 0
+                for row in recent:
+                    if (row["net_profit"] or 0) <= 0:
+                        consec += 1
+                    else:
+                        break
+                if consec >= 5:
+                    msg = f"Consecutive losing trades: {consec} in a row"
+                    conn.execute(
+                        "INSERT INTO alerts (timestamp, severity, category, message, metadata) VALUES (?,?,?,?,?)",
+                        (now_ts, "warn", "consecutive_losses", msg,
+                         json.dumps({"consecutive_losses": consec}))
+                    )
+            except Exception:
+                pass
+
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[AnomalyChecker] error: {e}")
+
+
 # ── Internal helpers ─────────────────────────────────────────────
 
 def _load_strategy() -> dict:
     try:
         with open(config.STRATEGY_FILE) as f:
-            return json.load(f)
+            s = json.load(f)
+        _log_strategy_changes(s, "hot_reload")
+        return s
     except Exception:
         return {}
 
@@ -1810,6 +1992,174 @@ def api_signal_registry():
         }
     except Exception as e:
         return {"available": False, "signals": [], "error": str(e)}
+
+
+# ── Phase 5+6: Diagnostic endpoints ──────────────────────────────────────────
+
+@app.get("/api/diagnostics/signal-rates")
+def api_diag_signal_rates(window_hours: float = 1.0):
+    """Per-signal firing rate over a rolling window."""
+    try:
+        import signal_registry as _sr
+        return {"signal_rates": _sr.get_signal_fire_rates(window_hours), "window_hours": window_hours}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/diagnostics/coin-trace/{symbol}")
+def api_diag_coin_trace(symbol: str, hours: float = 1.0):
+    """Per-coin evaluation history trace."""
+    try:
+        import signal_registry as _sr
+        return _sr.get_coin_trace(symbol.upper(), hours)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/diagnostics/signal-win-rates")
+def api_diag_signal_win_rates(days: int = 7):
+    """Win rates grouped by signal_snapshot for completed trades."""
+    import sqlite3 as _sq_swr
+    import json as _js_swr
+    days = max(1, min(90, int(days)))
+    try:
+        conn = _sq_swr.connect(database.DB_PATH)
+        conn.row_factory = _sq_swr.Row
+        rows = conn.execute("""
+            SELECT signal_snapshot, net_profit
+            FROM trades
+            WHERE timestamp_sell > datetime('now', ?)
+              AND signal_snapshot IS NOT NULL
+        """, (f"-{days} days",)).fetchall()
+        conn.close()
+    except Exception as e:
+        return {"error": str(e)}
+
+    buckets: dict = {}
+    for r in rows:
+        try:
+            snap = _js_swr.loads(r["signal_snapshot"])
+            fired = tuple(sorted(snap.get("fired_signals", [])))
+            score = snap.get("score", 0)
+            engine = snap.get("engine_enabled", False)
+            key = f"score={score}|engine={'on' if engine else 'off'}"
+        except Exception:
+            continue
+        b = buckets.setdefault(key, {"trades": 0, "wins": 0, "total_pnl": 0.0})
+        b["trades"] += 1
+        if (r["net_profit"] or 0) > 0:
+            b["wins"] += 1
+        b["total_pnl"] += (r["net_profit"] or 0)
+
+    summary = [
+        {"key": k, "trades": b["trades"],
+         "win_rate_pct": round(100 * b["wins"] / b["trades"], 1),
+         "total_pnl": round(b["total_pnl"], 4),
+         "avg_pnl": round(b["total_pnl"] / b["trades"], 4)}
+        for k, b in buckets.items() if b["trades"] >= 1
+    ]
+    summary.sort(key=lambda x: -x["avg_pnl"])
+    return {"days": days, "buckets": summary, "sample_size": sum(b["trades"] for b in buckets.values())}
+
+
+@app.get("/api/diagnostics/sell-timing")
+def api_diag_sell_timing(hours: float = 24.0):
+    """Sell timing histogram with percentile breakdown from sell_timing diag log."""
+    import sqlite3 as _sq_st
+    hours = max(1.0, min(168.0, float(hours)))
+    try:
+        conn = _sq_st.connect(database.DB_PATH)
+        conn.row_factory = _sq_st.Row
+        rows = conn.execute("""
+            SELECT duration_seconds FROM trades
+            WHERE timestamp_sell > datetime('now', ?)
+              AND duration_seconds IS NOT NULL
+              AND duration_seconds > 0
+        """, (f"-{hours} hours",)).fetchall()
+        conn.close()
+    except Exception as e:
+        return {"error": str(e)}
+
+    durations = sorted(r["duration_seconds"] for r in rows)
+    if not durations:
+        return {"hours": hours, "count": 0, "percentiles": {}}
+
+    def _pct(data, p):
+        if not data:
+            return None
+        idx = max(0, int(len(data) * p / 100) - 1)
+        return round(data[idx], 1)
+
+    return {
+        "hours": hours,
+        "count": len(durations),
+        "percentiles": {
+            "p50": _pct(durations, 50),
+            "p90": _pct(durations, 90),
+            "p95": _pct(durations, 95),
+            "p99": _pct(durations, 99),
+        },
+        "min_sec": round(durations[0], 1),
+        "max_sec": round(durations[-1], 1),
+        "avg_sec": round(sum(durations) / len(durations), 1),
+    }
+
+
+@app.get("/api/diagnostics/strategy-audit")
+def api_diag_strategy_audit(limit: int = 50):
+    """Recent strategy field changes."""
+    import sqlite3 as _sq_sa
+    limit = max(1, min(500, int(limit)))
+    try:
+        conn = _sq_sa.connect(database.DB_PATH)
+        conn.row_factory = _sq_sa.Row
+        rows = conn.execute("""
+            SELECT id, timestamp, field_key, old_value, new_value, source
+            FROM strategy_audit
+            ORDER BY id DESC LIMIT ?
+        """, (limit,)).fetchall()
+        conn.close()
+        return {"count": len(rows), "changes": [dict(r) for r in rows]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/alerts")
+def api_alerts(limit: int = 50, only_unacknowledged: bool = False):
+    """List recent alerts."""
+    import sqlite3 as _sq_al
+    limit = max(1, min(500, int(limit)))
+    try:
+        conn = _sq_al.connect(database.DB_PATH)
+        conn.row_factory = _sq_al.Row
+        where = "WHERE acknowledged = 0" if only_unacknowledged else ""
+        rows = conn.execute(
+            f"SELECT id, timestamp, severity, category, message, metadata, acknowledged "
+            f"FROM alerts {where} ORDER BY id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        conn.close()
+        return {"count": len(rows), "alerts": [dict(r) for r in rows]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/alerts/{alert_id}/acknowledge")
+def api_alert_acknowledge(alert_id: int):
+    """Acknowledge an alert by ID."""
+    import sqlite3 as _sq_ack
+    try:
+        conn = _sq_ack.connect(database.DB_PATH)
+        cur = conn.cursor()
+        cur.execute("UPDATE alerts SET acknowledged = 1 WHERE id = ?", (alert_id,))
+        conn.commit()
+        affected = cur.rowcount
+        conn.close()
+        if affected == 0:
+            return {"ok": False, "error": f"Alert {alert_id} not found"}
+        return {"ok": True, "alert_id": alert_id}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/api/proxy/binance/{path:path}")

@@ -16,6 +16,7 @@ update_coin_signals: Called by data_collector on every 1-minute kline close
 
 import asyncio
 import json
+import json as _json
 import os
 import time
 import math
@@ -1732,6 +1733,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         "timestamp_buy":      buy_ts,
         "timestamp_sell":     sell_ts,
         "sell_reason":        reason,
+        "signal_snapshot":    pos.get("signal_snapshot"),
     }
     # ── Sell timing diagnostic ────────────────────────────────────────────────
     try:
@@ -2001,6 +2003,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         m5_str  = "5m:PASS" if five_ok else "5m:FAIL"
 
         # ── Buy decision: new signal engine OR legacy mandatory/score path ───────
+        _buy_decision: dict = {}  # populated below for signal_snapshot capture
         if signal_engine_active:
             _sig_data = {
                 **sigs,
@@ -2011,6 +2014,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 "stoch_rsi_value": cached.get("stoch_rsi_val"),
             }
             _dec = _sr_evaluate_buy_decision(sym, _sig_data, strategy)
+            _buy_decision = _dec
             if not _dec["allowed"]:
                 _record_rejection(sym, score, _dec["reason"],
                                   f"score={_dec['score']} fired={_dec['fired_signals']}")
@@ -2338,6 +2342,12 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 "5m_ok":         five_ok,
                 "cache_age_sec": round(time.time() - cached.get("ts", 0), 1),
             },
+            "signal_snapshot": _json.dumps({
+                "fired_signals":   _buy_decision.get("fired_signals", []),
+                "score":           _buy_decision.get("score", 0),
+                "mandatory_pass":  all(fired for _, fired in _buy_decision.get("mandatory_results", [])),
+                "engine_enabled":  bool(strategy.get("signal_engine", {}).get("enabled", False)),
+            }),
         }
         # Update stagger tracking
         _last_buy_ts = time.time()
