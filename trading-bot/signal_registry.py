@@ -14,7 +14,9 @@ Phase 2: 5 new signals — P1, R1, E1, TM1, M2.
 """
 from __future__ import annotations
 
+import collections
 import logging
+import threading as _threading
 import time
 import urllib.request
 import json as _json
@@ -22,6 +24,77 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
+
+# Per-signal firing tracker (rolling window)
+_signal_fire_history: dict = {}
+_signal_fire_lock = _threading.Lock()
+_SIGNAL_HISTORY_MAX_PER_SIGNAL = 50000
+
+# Per-coin evaluation history
+_coin_evaluation_history: dict = {}
+_coin_eval_lock = _threading.Lock()
+_COIN_EVAL_MAX_PER_SYMBOL = 500
+
+
+def record_signal_fire(signal_id: str, fired: bool) -> None:
+    now = time.time()
+    with _signal_fire_lock:
+        if signal_id not in _signal_fire_history:
+            _signal_fire_history[signal_id] = collections.deque(maxlen=_SIGNAL_HISTORY_MAX_PER_SIGNAL)
+        _signal_fire_history[signal_id].append((now, fired))
+
+
+def get_signal_fire_rates(window_hours: float = 1.0) -> dict:
+    now = time.time()
+    cutoff = now - (window_hours * 3600)
+    result = {}
+    with _signal_fire_lock:
+        for sig_id, history in _signal_fire_history.items():
+            in_window = [(ts, f) for ts, f in history if ts >= cutoff]
+            if not in_window:
+                result[sig_id] = {"evaluations": 0, "fires": 0, "fire_rate_pct": 0.0, "window_hours": window_hours}
+                continue
+            total = len(in_window)
+            fires = sum(1 for _, f in in_window if f)
+            result[sig_id] = {"evaluations": total, "fires": fires, "fire_rate_pct": round(fires / total * 100, 2), "window_hours": window_hours}
+    return result
+
+
+def record_coin_evaluation(symbol: str, evaluation: dict) -> None:
+    now = time.time()
+    with _coin_eval_lock:
+        if symbol not in _coin_evaluation_history:
+            _coin_evaluation_history[symbol] = collections.deque(maxlen=_COIN_EVAL_MAX_PER_SYMBOL)
+        _coin_evaluation_history[symbol].append({
+            "ts": now,
+            "fired_signals": evaluation.get("fired_signals", []),
+            "score": evaluation.get("score", 0),
+            "allowed": evaluation.get("allowed", False),
+            "reason": evaluation.get("reason", ""),
+            "mandatory_results": evaluation.get("mandatory_results", []),
+            "scored_results": evaluation.get("scored_results", []),
+            "veto_results": evaluation.get("veto_results", []),
+        })
+
+
+def get_coin_trace(symbol: str, hours: float = 1.0) -> dict:
+    now = time.time()
+    cutoff = now - (hours * 3600)
+    with _coin_eval_lock:
+        history = list(_coin_evaluation_history.get(symbol, []))
+    in_window = [e for e in history if e["ts"] >= cutoff]
+    if not in_window:
+        return {"symbol": symbol, "evaluations_count": 0, "buy_allowed_count": 0, "rejection_reasons": {}, "recent_snapshots": []}
+    reasons = collections.Counter(e["reason"] for e in in_window if not e["allowed"])
+    buy_allowed_count = sum(1 for e in in_window if e["allowed"])
+    return {
+        "symbol": symbol,
+        "window_hours": hours,
+        "evaluations_count": len(in_window),
+        "buy_allowed_count": buy_allowed_count,
+        "rejection_reasons": dict(reasons.most_common()),
+        "recent_snapshots": in_window[-5:],
+    }
 
 
 # ── Registry ──────────────────────────────────────────────────────────────────
@@ -291,11 +364,13 @@ def evaluate_signals(symbol: str, signal_data: dict, strategy: dict) -> Dict[str
         try:
             did_fire, raw = sig_def.compute_fn(symbol, signal_data, strategy)
             results[signal_id] = {"fired": did_fire, "raw_value": raw}
+            record_signal_fire(signal_id, did_fire)
             if did_fire:
                 fired.append(signal_id)
         except Exception as e:
             log.warning("Signal %s failed for %s: %s", signal_id, symbol, e)
             results[signal_id] = {"fired": False, "raw_value": None, "error": str(e)}
+            record_signal_fire(signal_id, False)
     return {"fired_signals": fired, "all_results": results}
 
 
@@ -335,12 +410,14 @@ def evaluate_buy_decision(symbol: str, signal_data: dict, strategy: dict) -> Dic
         fired = sig_id in fired_ids
         veto_results.append((sig_id, fired))
         if fired:
-            return {
+            _veto_result = {
                 "allowed": False, "reason": f"veto_{sig_id}_fired",
                 "mandatory_results": [], "scored_results": [],
                 "veto_results": veto_results, "score": 0,
                 "fired_signals": list(fired_ids),
             }
+            record_coin_evaluation(symbol, _veto_result)
+            return _veto_result
 
     # 2. Mandatory gate
     mandatory_results: List[Tuple[str, bool]] = []
@@ -348,12 +425,14 @@ def evaluate_buy_decision(symbol: str, signal_data: dict, strategy: dict) -> Dic
         did_fire = sig_id in fired_ids
         mandatory_results.append((sig_id, did_fire))
         if not did_fire:
-            return {
+            _mandatory_result = {
                 "allowed": False, "reason": f"mandatory_{sig_id}_not_fired",
                 "mandatory_results": mandatory_results, "scored_results": [],
                 "veto_results": veto_results, "score": 0,
                 "fired_signals": list(fired_ids),
             }
+            record_coin_evaluation(symbol, _mandatory_result)
+            return _mandatory_result
 
     # 3. Score gate
     scored_results: List[Tuple[str, bool]] = []
@@ -365,16 +444,20 @@ def evaluate_buy_decision(symbol: str, signal_data: dict, strategy: dict) -> Dic
             score += 1
 
     if score < min_scored:
-        return {
+        _score_result = {
             "allowed": False, "reason": f"score_{score}_below_min_{min_scored}",
             "mandatory_results": mandatory_results, "scored_results": scored_results,
             "veto_results": veto_results, "score": score,
             "fired_signals": list(fired_ids),
         }
+        record_coin_evaluation(symbol, _score_result)
+        return _score_result
 
-    return {
+    _success_result = {
         "allowed": True, "reason": "all_checks_passed",
         "mandatory_results": mandatory_results, "scored_results": scored_results,
         "veto_results": veto_results, "score": score,
         "fired_signals": list(fired_ids),
     }
+    record_coin_evaluation(symbol, _success_result)
+    return _success_result

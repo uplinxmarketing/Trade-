@@ -312,8 +312,8 @@ def log_trade(trade: dict):
                  buy_fee, sell_fee, net_profit, profitable, duration_seconds,
                  entry_rsi, entry_ma_position, entry_bb_position,
                  entry_volume_trend, hour_of_day, day_of_week,
-                 timestamp_buy, timestamp_sell, sell_reason)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 timestamp_buy, timestamp_sell, sell_reason, signal_snapshot)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             trade.get("coin"), trade.get("mode"), trade.get("entry_price"),
             trade.get("exit_price"), trade.get("quantity"), trade.get("budget_usdt"),
@@ -323,7 +323,7 @@ def log_trade(trade: dict):
             trade.get("entry_bb_position"), trade.get("entry_volume_trend"),
             trade.get("hour_of_day"), trade.get("day_of_week"),
             trade.get("timestamp_buy"), trade.get("timestamp_sell"),
-            trade.get("sell_reason"),
+            trade.get("sell_reason"), trade.get("signal_snapshot"),
         ))
         conn.commit()
         conn.close()
