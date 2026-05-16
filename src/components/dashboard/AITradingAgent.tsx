@@ -1641,29 +1641,45 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             {railwaySignals.map((sig: any) => {
               const bools = [!!sig.trend, !!sig.rsi_ok, !!sig.macd, !!sig.volume, !!sig.obv, !!sig.atr];
               const score = typeof sig.score === 'number' ? sig.score : bools.filter(Boolean).length;
-              const bbBlock   = sig.bb_ok === false;
-              const fiveBlock = sig['5m_ok'] === false;
-              const isBuy      = score >= 4 && !bbBlock && !fiveBlock;
-              const isReady    = score >= 3 && !bbBlock && !fiveBlock;
-              const isVetoBb   = score >= 3 && bbBlock;
-              const isVetoFive = score >= 3 && !bbBlock && fiveBlock;
-              const isDowntrend = !sig.trend && score < 3;
 
+              // Use server-computed bot_will_buy if present; fall back to local heuristic
+              const willBuy: { ready: boolean; reason: string } | undefined = sig.bot_will_buy;
+              const botReady  = willBuy ? willBuy.ready : (score >= 4 && sig.bb_ok !== false && sig['5m_ok'] !== false);
+              const blockReason = willBuy ? willBuy.reason : '';
+
+              // Derive label from server verdict
               let label: string;
               let labelColor: string;
-              if (isBuy)        { label = 'BUY';     labelColor = 'bg-gain/20 text-gain'; }
-              else if (isReady) { label = 'READY';   labelColor = 'bg-gain/10 text-gain'; }
-              else if (isVetoBb)   { label = 'VETO·BB'; labelColor = 'bg-orange-500/20 text-orange-400'; }
-              else if (isVetoFive) { label = 'VETO·5m'; labelColor = 'bg-orange-500/20 text-orange-400'; }
-              else if (isDowntrend){ label = 'DOWN';    labelColor = 'bg-loss/20 text-loss'; }
-              else if (score === 2){ label = 'WAIT';    labelColor = 'bg-yellow-500/20 text-yellow-400'; }
-              else                 { label = 'HOLD';    labelColor = 'bg-muted/30 text-muted-foreground'; }
+              if (botReady) {
+                label = 'BUY'; labelColor = 'bg-gain/20 text-gain';
+              } else if (blockReason === 'ok' || !blockReason) {
+                // No server data — fall back to local score heuristic
+                if (score >= 3 && sig.bb_ok !== false && sig['5m_ok'] !== false)
+                  { label = 'READY'; labelColor = 'bg-gain/10 text-gain'; }
+                else if (score >= 3 && sig.bb_ok === false)
+                  { label = 'VETO·BB'; labelColor = 'bg-orange-500/20 text-orange-400'; }
+                else if (score >= 3 && sig['5m_ok'] === false)
+                  { label = 'VETO·5m'; labelColor = 'bg-orange-500/20 text-orange-400'; }
+                else if (score === 2)
+                  { label = 'WAIT'; labelColor = 'bg-yellow-500/20 text-yellow-400'; }
+                else
+                  { label = 'HOLD'; labelColor = 'bg-muted/30 text-muted-foreground'; }
+              } else if (blockReason.startsWith('BB'))  { label = 'VETO·BB';  labelColor = 'bg-orange-500/20 text-orange-400'; }
+              else if (blockReason.startsWith('5m'))    { label = 'VETO·5m';  labelColor = 'bg-orange-500/20 text-orange-400'; }
+              else if (blockReason.startsWith('EMA'))   { label = 'EMA↓';     labelColor = 'bg-loss/20 text-loss'; }
+              else if (blockReason.startsWith('RSI'))   { label = 'RSI↑';     labelColor = 'bg-yellow-500/20 text-yellow-400'; }
+              else if (blockReason.startsWith('BTC'))   { label = 'BTC↓';     labelColor = 'bg-orange-500/20 text-orange-400'; }
+              else if (blockReason.startsWith('score')) { label = 'LOW';      labelColor = 'bg-muted/30 text-muted-foreground'; }
+              else                                       { label = 'HOLD';     labelColor = 'bg-muted/30 text-muted-foreground'; }
 
               return (
                 <div key={sig.symbol} className="grid items-center py-0.5 border-b border-border/20 last:border-0"
                   style={{gridTemplateColumns:'4rem 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 2rem 3rem'}}>
                   <div className="flex items-center gap-1 min-w-0">
-                    <span className={`text-[7px] font-bold px-0.5 rounded shrink-0 ${labelColor}`}>{label}</span>
+                    <span
+                      className={`text-[7px] font-bold px-0.5 rounded shrink-0 ${labelColor}`}
+                      title={blockReason && blockReason !== 'ok' ? blockReason : undefined}
+                    >{label}</span>
                     <span className="text-[9px] font-mono font-semibold truncate">{sig.symbol?.replace('USDT','')}</span>
                   </div>
                   {bools.map((v, i) => (
@@ -1688,7 +1704,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 </div>
               );
             })}
-            <p className="text-[7px] text-muted-foreground pt-1 leading-relaxed">EMA=9/21 · RSI=45–65 · MACD=hist↑ · VOL=&gt;1.3× · OBV=pressure · ATR=range · BB=middle/lower · 5m=uptrend</p>
+            <p className="text-[7px] text-muted-foreground pt-1 leading-relaxed">EMA=9/21 · RSI&lt;threshold · MACD=hist↑ · VOL=&gt;1.3× · OBV=pressure · ATR=range · BB=middle/lower · 5m=uptrend · hover label for block reason</p>
           </div>
         ) : (
           <div className="space-y-0.5">
