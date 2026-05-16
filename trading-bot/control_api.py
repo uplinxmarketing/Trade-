@@ -1637,6 +1637,25 @@ async def api_proxy_ticker_24hr(symbols: str = None):
     return all_results
 
 
+@app.get("/api/signal-registry")
+def api_signal_registry():
+    """List all registered signals (Phase 1: 6 existing signals + foundation for future)."""
+    try:
+        import signal_registry as _sr
+        signals = [
+            {"id": sig_id, "category": sig_def.category, "description": sig_def.description}
+            for sig_id, sig_def in _sr.SIGNAL_REGISTRY.items()
+        ]
+        return {
+            "available": True,
+            "total": len(signals),
+            "categories": sorted({s["category"] for s in signals}),
+            "signals": signals,
+        }
+    except Exception as e:
+        return {"available": False, "signals": [], "error": str(e)}
+
+
 @app.get("/api/proxy/binance/{path:path}")
 async def api_proxy_binance(path: str, request: Request):
     """Server-side proxy for Binance REST API — avoids browser CORS restrictions."""
