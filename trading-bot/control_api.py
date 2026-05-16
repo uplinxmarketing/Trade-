@@ -1639,18 +1639,42 @@ async def api_proxy_ticker_24hr(symbols: str = None):
 
 @app.get("/api/signal-registry")
 def api_signal_registry():
-    """List all registered signals (Phase 1: 6 existing signals + foundation for future)."""
+    """List all registered signals with their current role in the signal engine."""
     try:
         import signal_registry as _sr
-        signals = [
-            {"id": sig_id, "category": sig_def.category, "description": sig_def.description}
-            for sig_id, sig_def in _sr.SIGNAL_REGISTRY.items()
-        ]
+        strategy      = _load_strategy()
+        engine_cfg    = strategy.get("signal_engine", {})
+        engine_active = bool(engine_cfg.get("enabled", False))
+
+        mandatory_ids = engine_cfg.get("mandatory_signals", _sr.DEFAULT_SIGNAL_ENGINE["mandatory_signals"])
+        scored_ids    = engine_cfg.get("scored_signals",    _sr.DEFAULT_SIGNAL_ENGINE["scored_signals"])
+        veto_ids      = engine_cfg.get("veto_signals",      _sr.DEFAULT_SIGNAL_ENGINE["veto_signals"])
+
+        signals_info = []
+        for sig_id, sig_def in _sr.SIGNAL_REGISTRY.items():
+            if sig_id in mandatory_ids:
+                role = "mandatory"
+            elif sig_id in scored_ids:
+                role = "scored"
+            elif sig_id in veto_ids:
+                role = "veto"
+            else:
+                role = "disabled"
+            signals_info.append({
+                "id":          sig_id,
+                "category":    sig_def.category,
+                "description": sig_def.description,
+                "role":        role,
+            })
+
         return {
-            "available": True,
-            "total": len(signals),
-            "categories": sorted({s["category"] for s in signals}),
-            "signals": signals,
+            "available":      True,
+            "engine_enabled": engine_active,
+            "total":          len(signals_info),
+            "categories":     sorted({s["category"] for s in signals_info}),
+            "min_scored":     int(engine_cfg.get("min_scored", _sr.DEFAULT_SIGNAL_ENGINE["min_scored"])),
+            "thresholds":     strategy.get("signal_thresholds", _sr.DEFAULT_SIGNAL_THRESHOLDS),
+            "signals":        signals_info,
         }
     except Exception as e:
         return {"available": False, "signals": [], "error": str(e)}
