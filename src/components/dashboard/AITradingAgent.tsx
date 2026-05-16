@@ -121,6 +121,20 @@ async function analyseCoin(sym: string): Promise<CoinSignal> {
   }
 }
 
+const SIGNAL_SHORT_LABELS: Record<string, string> = {
+  T1_ema_short_long:       'EMA',
+  M1_rsi_below_threshold:  'RSI',
+  M3_macd_rising:          'MACD',
+  V1_volume_above_average: 'VOL',
+  V2_obv_rising:           'OBV',
+  X1_atr_sufficient:       'ATR',
+  P1_near_24h_low:         'NLow',
+  R1_reversal_confirmed:   'Rev',
+  E1_spread_too_wide:      'Sprd',
+  TM1_bad_hour:            'Hour',
+  M2_stoch_rsi_oversold:   'SRSI',
+};
+
 const INSTRUCTIONS_KEY  = 'ai_agent_instructions';
 const AGENT_CYCLE_MS    = 30_000;
 const MAX_LOG_LINES     = 200;
@@ -356,6 +370,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [showPositionsSection, setShowPositionsSection] = useState(true);
   const [showTradesSection, setShowTradesSection] = useState(true);
   const [showSignalEngine, setShowSignalEngine] = useState(false);
+  const [signalRegistry, setSignalRegistry] = useState<{id: string; category: string; description: string; role: string}[]>([]);
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -777,6 +792,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     serverPollRef.current = setInterval(pollRailway, 3_000);
     return () => { if (serverPollRef.current) clearInterval(serverPollRef.current); };
   }, [isServerMode, pollRailway]); // eslint-disable-line
+
+  // Fetch signal registry once on mount (server mode only)
+  useEffect(() => {
+    if (!isServerMode) return;
+    fetch(`${railwayUrl}/api/signal-registry`)
+      .then(r => r.json())
+      .then(d => { if (d.signals) setSignalRegistry(d.signals); })
+      .catch(() => {});
+  }, [isServerMode, railwayUrl]); // eslint-disable-line
 
   // Uses `current_price` from the server API response (not WebSocket prices)
   useEffect(() => {
@@ -1650,71 +1674,74 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       {/* Signal scanner */}
       <div className="border-t border-border px-4 py-3">
         <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Market Signals</p>
-        {/* In server mode: show bot's 6-signal cache if available, else JS scan */}
-        {(isServerMode && railwaySignals.length > 0) ? (
-          <div className="space-y-0">
-            {/* Header row */}
-            <div className="grid pb-1 border-b border-border/60" style={{gridTemplateColumns:'4rem 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 2rem 3rem'}}>
-              <span className="text-[8px] text-muted-foreground font-semibold">COIN</span>
-              {(['EMA','RSI','MACD','VOL','OBV','ATR','BB','5m'] as const).map(lbl => (
-                <span key={lbl} className="text-[8px] text-muted-foreground text-center">{lbl}</span>
-              ))}
-              <span className="text-[8px] text-muted-foreground text-center">SCR</span>
-              <span className="text-[8px] text-muted-foreground text-right">PRICE</span>
-            </div>
-            {railwaySignals.map((sig: any) => {
-              const bools = [!!sig.trend, !!sig.rsi_ok, !!sig.macd, !!sig.volume, !!sig.obv, !!sig.atr];
-              const score = typeof sig.score === 'number' ? sig.score : bools.filter(Boolean).length;
-              const bbBlock   = sig.bb_ok === false;
-              const fiveBlock = sig['5m_ok'] === false;
-              const isBuy      = score >= 4 && !bbBlock && !fiveBlock;
-              const isReady    = score >= 3 && !bbBlock && !fiveBlock;
-              const isVetoBb   = score >= 3 && bbBlock;
-              const isVetoFive = score >= 3 && !bbBlock && fiveBlock;
-              const isDowntrend = !sig.trend && score < 3;
+        {/* Dynamic registry-driven table (server mode) */}
+        {(isServerMode && railwaySignals.length > 0 && signalRegistry.length > 0) ? (() => {
+          const cols = `4.5rem ${signalRegistry.map(() => '1fr').join(' ')} 2.5rem 3rem`;
+          return (
+            <div className="space-y-0 overflow-x-auto">
+              {/* Header */}
+              <div className="grid pb-1 border-b border-border/60" style={{gridTemplateColumns: cols}}>
+                <span className="text-[8px] text-muted-foreground font-semibold">COIN</span>
+                {signalRegistry.map(reg => (
+                  <span key={reg.id} className="text-[8px] text-muted-foreground text-center" title={`${reg.description} [${reg.role}]`}>
+                    {SIGNAL_SHORT_LABELS[reg.id] ?? reg.id.split('_')[0]}
+                  </span>
+                ))}
+                <span className="text-[8px] text-muted-foreground text-center">BUY</span>
+                <span className="text-[8px] text-muted-foreground text-right">PRICE</span>
+              </div>
+              {railwaySignals.map((sig: any) => {
+                const results = sig.signal_results ?? {};
+                const allowed = sig.buy_allowed;
+                const reason  = sig.buy_reason ?? '';
 
-              let label: string;
-              let labelColor: string;
-              if (isBuy)        { label = 'BUY';     labelColor = 'bg-gain/20 text-gain'; }
-              else if (isReady) { label = 'READY';   labelColor = 'bg-gain/10 text-gain'; }
-              else if (isVetoBb)   { label = 'VETO·BB'; labelColor = 'bg-orange-500/20 text-orange-400'; }
-              else if (isVetoFive) { label = 'VETO·5m'; labelColor = 'bg-orange-500/20 text-orange-400'; }
-              else if (isDowntrend){ label = 'DOWN';    labelColor = 'bg-loss/20 text-loss'; }
-              else if (score === 2){ label = 'WAIT';    labelColor = 'bg-yellow-500/20 text-yellow-400'; }
-              else                 { label = 'HOLD';    labelColor = 'bg-muted/30 text-muted-foreground'; }
+                let label: string;
+                let labelColor: string;
+                if (allowed) {
+                  label = 'BUY';  labelColor = 'bg-gain/20 text-gain';
+                } else if (reason.startsWith('veto_')) {
+                  label = 'VETO'; labelColor = 'bg-orange-500/20 text-orange-400';
+                } else if (reason.startsWith('mandatory_')) {
+                  label = 'MAND'; labelColor = 'bg-red-500/20 text-red-400';
+                } else if (reason.startsWith('score_')) {
+                  label = 'WAIT'; labelColor = 'bg-yellow-500/20 text-yellow-400';
+                } else {
+                  label = 'HOLD'; labelColor = 'bg-muted/30 text-muted-foreground';
+                }
 
-              return (
-                <div key={sig.symbol} className="grid items-center py-0.5 border-b border-border/20 last:border-0"
-                  style={{gridTemplateColumns:'4rem 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 2rem 3rem'}}>
-                  <div className="flex items-center gap-1 min-w-0">
-                    <span className={`text-[7px] font-bold px-0.5 rounded shrink-0 ${labelColor}`}>{label}</span>
+                return (
+                  <div key={sig.symbol} className="grid items-center py-0.5 border-b border-border/20 last:border-0"
+                    style={{gridTemplateColumns: cols}}>
                     <span className="text-[9px] font-mono font-semibold truncate">{sig.symbol?.replace('USDT','')}</span>
+                    {signalRegistry.map(reg => {
+                      const r = results[reg.id];
+                      const fired = r?.fired ?? false;
+                      const isVeto = reg.role === 'veto';
+                      const dotColor = isVeto
+                        ? (fired ? 'bg-loss' : 'bg-gain/60')
+                        : (fired ? 'bg-gain' : 'bg-muted/40');
+                      return (
+                        <div key={reg.id} className="flex justify-center"
+                          title={`${reg.id}: ${r?.raw_value ?? 'n/a'}`}>
+                          <div className={`w-2 h-2 rounded-full ${dotColor}`} />
+                        </div>
+                      );
+                    })}
+                    <span className={`text-[7px] font-bold text-center px-0.5 rounded ${labelColor}`}
+                      title={reason}>
+                      {label}
+                    </span>
+                    <span className="text-[9px] font-mono text-muted-foreground text-right">
+                      {sig.price ? (sig.price > 100
+                        ? Number(sig.price).toLocaleString('en-US',{maximumFractionDigits:0})
+                        : Number(sig.price).toFixed(4)) : ''}
+                    </span>
                   </div>
-                  {bools.map((v, i) => (
-                    <div key={i} className="flex justify-center">
-                      <div className={`w-2 h-2 rounded-full ${v ? 'bg-gain' : 'bg-muted/40'}`} />
-                    </div>
-                  ))}
-                  <div className="flex justify-center" title="BB veto">
-                    <div className={`w-2 h-2 rounded-full ${sig.bb_ok !== false ? 'bg-gain' : 'bg-loss'}`} />
-                  </div>
-                  <div className="flex justify-center" title="5m trend veto">
-                    <div className={`w-2 h-2 rounded-full ${sig['5m_ok'] !== false ? 'bg-gain' : 'bg-loss'}`} />
-                  </div>
-                  <span className={`text-[9px] font-bold text-center ${score >= 4 ? 'text-gain' : score === 3 ? 'text-yellow-400' : 'text-muted-foreground'}`}>
-                    {score}/6
-                  </span>
-                  <span className="text-[9px] font-mono text-muted-foreground text-right">
-                    {sig.price ? (sig.price > 100
-                      ? Number(sig.price).toLocaleString('en-US',{maximumFractionDigits:0})
-                      : Number(sig.price).toFixed(4)) : ''}
-                  </span>
-                </div>
-              );
-            })}
-            <p className="text-[7px] text-muted-foreground pt-1 leading-relaxed">EMA=9/21 · RSI=45–65 · MACD=hist↑ · VOL=&gt;1.3× · OBV=pressure · ATR=range · BB=middle/lower · 5m=uptrend</p>
-          </div>
-        ) : (
+                );
+              })}
+            </div>
+          );
+        })() : (
           <div className="space-y-0.5">
             {/* Header row */}
             <div className="flex items-center justify-between pb-1 border-b border-border/60">
