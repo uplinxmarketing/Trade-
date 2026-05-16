@@ -1610,6 +1610,33 @@ def api_signals_quality():
     return {"buckets": summary, "sample_size": sum(b["trades"] for b in buckets.values())}
 
 
+@app.get("/api/proxy/binance/ticker/24hr")
+async def api_proxy_ticker_24hr(symbols: str = None):
+    """Chunked proxy for Binance 24hr ticker — avoids 400s from large symbol lists."""
+    import urllib.request as _ur
+    if not symbols:
+        return JSONResponse(status_code=400, content={"error": "symbols required"})
+    try:
+        symbol_list = json.loads(symbols)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid symbols format"})
+    if not isinstance(symbol_list, list):
+        return JSONResponse(status_code=400, content={"error": "symbols must be a list"})
+
+    CHUNK_SIZE = 20
+    all_results: list = []
+    for i in range(0, len(symbol_list), CHUNK_SIZE):
+        chunk = symbol_list[i:i + CHUNK_SIZE]
+        try:
+            url = f"https://api.binance.com/api/v3/ticker/24hr?symbols={json.dumps(chunk)}"
+            req = _ur.Request(url, headers={"User-Agent": "WolfBot/1.0"})
+            with _ur.urlopen(req, timeout=5.0) as r:
+                all_results.extend(json.loads(r.read()))
+        except Exception:
+            continue  # partial results preferred over full failure
+    return all_results
+
+
 @app.get("/api/proxy/binance/{path:path}")
 async def api_proxy_binance(path: str, request: Request):
     """Server-side proxy for Binance REST API — avoids browser CORS restrictions."""
