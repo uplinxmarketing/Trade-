@@ -140,6 +140,42 @@ const AGENT_CYCLE_MS    = 30_000;
 const MAX_LOG_LINES     = 200;
 const isServerMode      = true; // always use VPS bot REST API
 
+function useDataFetcher<T>(url: string, intervalMs: number, initial: T, enabled = true) {
+  const [data, setData] = useState<T>(initial);
+  const [loading, setLoading] = useState(true);
+  const [lastUpdate, setLastUpdate] = useState(0);
+
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    const run = async () => {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        if (!cancelled) { setData(d); setLoading(false); setLastUpdate(Date.now()); }
+      } catch { if (!cancelled) setLoading(false); }
+    };
+    run();
+    const iv = setInterval(run, intervalMs);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [url, intervalMs, enabled]);
+
+  return { data, loading, lastUpdate };
+}
+
+function FreshnessIndicator({ lastUpdate }: { lastUpdate: number }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  if (!lastUpdate) return null;
+  const age = Math.floor((now - lastUpdate) / 1000);
+  const color = age < 4 ? 'text-gain' : age < 10 ? 'text-yellow-400' : 'text-loss';
+  return <span className={`text-[8px] ${color}`}>{age}s ago</span>;
+}
+
 interface OpenPosition {
   symbol: string;
   quantity: number;
@@ -153,6 +189,8 @@ interface OpenPosition {
   breakeven_price_real?: number;
   real_bep_gap_pct?: number;
   is_trapped?: boolean;
+  dist_to_exit_pct?: number;
+  dist_to_bep_pct?: number;
 }
 
 interface TradeRow {
@@ -439,6 +477,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [railwaySignals, setRailwaySignals] = useState<any[]>([]);
   const [usingPaperFallback, setUsingPaperFallback] = useState(false);
   const [liveErrorMsg, setLiveErrorMsg] = useState<string | null>(null);
+
+  // Independent polling for positions and signals tables
+  const { data: positionsData, loading: positionsLoading, lastUpdate: positionsUpdated } =
+    useDataFetcher(`${railwayUrl}/api/positions`, 2000, { positions: [] as any[] }, isServerMode);
+  const { data: signalsData, loading: signalsLoading, lastUpdate: signalsUpdated } =
+    useDataFetcher(`${railwayUrl}/api/signals-summary?limit=30`, 5000, { signals: [] as any[], total_tracked: 0 }, isServerMode);
 
   const addLog = useCallback((msg: string) => {
     setActLog(prev => [msg, ...prev].slice(0, MAX_LOG_LINES));
@@ -1412,21 +1456,28 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 {formatPnL(unrealizedPnl, 2)} USDT
               </span>
             )}
+            <FreshnessIndicator lastUpdate={positionsUpdated} />
           </div>
           {showPositionsSection ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" /> : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
         </button>
 
         {showPositionsSection && (
           <div className="px-4 pb-3">
-            {positions.length === 0 ? (
+            {positionsLoading && positions.length === 0 ? (
+              <div className="space-y-2">
+                {[1,2,3].map(i => (
+                  <div key={i} className="h-16 bg-muted/20 rounded animate-pulse" />
+                ))}
+              </div>
+            ) : positions.length === 0 ? (
               <p className="text-[10px] text-muted-foreground py-2">No open positions</p>
             ) : (
               <>
                 <div className="space-y-2">
                   <AnimatePresence initial={false}>
                   {(showAllPositions
-                    ? [...positions].sort((a, b) => (b.dist_to_bep_pct ?? -999) - (a.dist_to_bep_pct ?? -999))
-                    : [...positions].sort((a, b) => (b.dist_to_bep_pct ?? -999) - (a.dist_to_bep_pct ?? -999)).slice(0, 5)
+                    ? [...positions].sort((a, b) => (b.dist_to_exit_pct ?? -999) - (a.dist_to_exit_pct ?? -999))
+                    : [...positions].sort((a, b) => (b.dist_to_exit_pct ?? -999) - (a.dist_to_exit_pct ?? -999)).slice(0, 5)
                   ).map(pos => {
                     const entry = pos.avg_entry_price > 0 ? pos.avg_entry_price : 0;
                     // Priority: fresh_prices (injected per-poll outside cache) > local WS > cached server price
@@ -1673,9 +1724,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
       {/* Signal scanner */}
       <div className="border-t border-border px-4 py-3">
-        <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Market Signals</p>
+        <div className="flex items-center justify-between mb-2">
+          <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Market Signals</p>
+          <FreshnessIndicator lastUpdate={signalsUpdated} />
+        </div>
         {/* Dynamic registry-driven table (server mode) */}
-        {(isServerMode && railwaySignals.length > 0 && signalRegistry.length > 0) ? (() => {
+        {(isServerMode && signalsData.signals.length > 0 && signalRegistry.length > 0) ? (() => {
           const cols = `4.5rem ${signalRegistry.map(() => '1fr').join(' ')} 2.5rem 3rem`;
           return (
             <div className="space-y-0 overflow-x-auto">
@@ -1690,7 +1744,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 <span className="text-[8px] text-muted-foreground text-center">BUY</span>
                 <span className="text-[8px] text-muted-foreground text-right">PRICE</span>
               </div>
-              {railwaySignals.map((sig: any) => {
+              {signalsLoading && signalsData.signals.length === 0 && (
+                <div className="space-y-1">
+                  {[1,2,3,4,5].map(i => (
+                    <div key={i} className="h-5 bg-muted/20 rounded animate-pulse" />
+                  ))}
+                </div>
+              )}
+              <AnimatePresence mode="popLayout">
+              {signalsData.signals.map((sig: any) => {
                 const results = sig.signal_results ?? {};
                 const allowed = sig.buy_allowed;
                 const reason  = sig.buy_reason ?? '';
@@ -1710,7 +1772,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 }
 
                 return (
-                  <div key={sig.symbol} className="grid items-center py-0.5 border-b border-border/20 last:border-0"
+                  <motion.div key={sig.symbol} layout layoutId={sig.symbol}
+                    initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+                    transition={{ layout: { duration: 0.5, ease: 'easeInOut' }, opacity: { duration: 0.2 } }}
+                    className="grid items-center py-0.5 border-b border-border/20 last:border-0"
                     style={{gridTemplateColumns: cols}}>
                     <span className="text-[9px] font-mono font-semibold truncate">{sig.symbol?.replace('USDT','')}</span>
                     {signalRegistry.map(reg => {
@@ -1736,12 +1801,19 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                         ? Number(sig.price).toLocaleString('en-US',{maximumFractionDigits:0})
                         : Number(sig.price).toFixed(4)) : ''}
                     </span>
-                  </div>
+                  </motion.div>
                 );
               })}
+              </AnimatePresence>
             </div>
           );
-        })() : (
+        })() : (isServerMode && signalsLoading && signalsData.signals.length === 0) ? (
+          <div className="space-y-1">
+            {[1,2,3,4,5].map(i => (
+              <div key={i} className="h-5 bg-muted/20 rounded animate-pulse" />
+            ))}
+          </div>
+        ) : (
           <div className="space-y-0.5">
             {/* Header row */}
             <div className="flex items-center justify-between pb-1 border-b border-border/60">

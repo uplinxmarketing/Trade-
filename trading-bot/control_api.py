@@ -49,6 +49,7 @@ def _read_frontend_version() -> dict:
 from fastapi import FastAPI, Response, Body, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 
 import config
@@ -158,6 +159,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Trading Bot Control API", version="1.0", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1043,7 +1045,11 @@ def api_status():
 
 @app.get("/api/positions")
 def api_positions():
-    return {"positions": _get_positions()}
+    """Lightweight open positions snapshot."""
+    try:
+        return {"positions": _get_positions(), "ts": time.time()}
+    except Exception as e:
+        return {"positions": [], "ts": time.time(), "error": str(e)}
 
 
 @app.get("/api/trades")
@@ -1664,6 +1670,76 @@ def api_signals_quality():
     ]
     summary.sort(key=lambda x: -x["avg_pnl"])
     return {"buckets": summary, "sample_size": sum(b["trades"] for b in buckets.values())}
+
+
+_signals_summary_cache: dict = {"ts": 0.0, "data": None}
+_SIGNALS_SUMMARY_TTL = 3.0
+
+@app.get("/api/signals-summary")
+def api_signals_summary(limit: int = 30):
+    """Top N coins by score with full signal results. Cached 3s."""
+    global _signals_summary_cache
+    now = time.time()
+    cached = _signals_summary_cache
+    if cached["data"] and (now - cached["ts"]) < _SIGNALS_SUMMARY_TTL:
+        data = cached["data"]
+        return {"signals": data["signals"][:limit], "total_tracked": data["total_tracked"], "ts": data["ts"], "cached": True}
+
+    try:
+        from trade_engine import _signal_cache, _signal_cache_lock
+        import signal_registry as _sr
+        with _signal_cache_lock:
+            snap = dict(_signal_cache)
+        strategy = _load_strategy()
+        _SNAPSHOT_SKIP = {"E1_spread_too_wide"}
+
+        signals_list = []
+        for sym, entry in snap.items():
+            try:
+                sig = entry.get("signals", {})
+                signal_data = {
+                    "trend": sig.get("trend", False),
+                    "rsi": sig.get("rsi", False),
+                    "macd": sig.get("macd", False),
+                    "volume": sig.get("volume", False),
+                    "obv": sig.get("obv", False),
+                    "atr": sig.get("atr", False),
+                    "rsi_value": entry.get("rsi_val"),
+                    "stoch_rsi_value": entry.get("stoch_rsi_val"),
+                    "low_24h": entry.get("low_24h"),
+                    "current_price": entry.get("price"),
+                    "klines_1m": entry.get("klines_1m", []),
+                }
+                signal_results = {}
+                for sig_id, sig_def in _sr.SIGNAL_REGISTRY.items():
+                    if sig_id in _SNAPSHOT_SKIP:
+                        signal_results[sig_id] = {"fired": False, "raw_value": "snapshot_skipped"}
+                        continue
+                    try:
+                        fired, raw = sig_def.compute_fn(sym, signal_data, strategy)
+                        signal_results[sig_id] = {"fired": bool(fired), "raw_value": raw}
+                    except Exception:
+                        signal_results[sig_id] = {"fired": False, "raw_value": None}
+
+                decision = _sr.evaluate_buy_decision(sym, signal_data, strategy)
+                signals_list.append({
+                    "symbol": sym,
+                    "score": entry.get("score", 0),
+                    "price": entry.get("price"),
+                    "signal_results": signal_results,
+                    "buy_allowed": bool(decision.get("allowed", False)),
+                    "buy_reason": decision.get("reason", ""),
+                    "ts": entry.get("ts", 0),
+                })
+            except Exception:
+                continue
+
+        signals_list.sort(key=lambda x: (0 if x["buy_allowed"] else 1, -(x["score"] or 0)))
+        result = {"signals": signals_list, "total_tracked": len(signals_list), "ts": now}
+        _signals_summary_cache = {"ts": now, "data": result}
+        return {"signals": signals_list[:limit], "total_tracked": len(signals_list), "ts": now, "cached": False}
+    except Exception as e:
+        return {"signals": [], "total_tracked": 0, "ts": now, "error": str(e)}
 
 
 @app.get("/api/proxy/binance/ticker/24hr")
