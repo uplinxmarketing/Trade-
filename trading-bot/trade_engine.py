@@ -1897,6 +1897,12 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # Enforce configurable min_signals threshold (overrides config.MIN_SIGNALS_TO_BUY)
     min_sigs = int(strategy.get("min_signals", config.MIN_SIGNALS_TO_BUY))
 
+    # Phase 2+3: new signal engine — active only when strategy["signal_engine"]["enabled"]=True
+    signal_engine_active = (
+        SIGNAL_REGISTRY_AVAILABLE
+        and bool(strategy.get("signal_engine", {}).get("enabled", False))
+    )
+
     approved = {
         c["symbol"]: c
         for c in strategy.get("approved_coins", [])
@@ -1956,7 +1962,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         if sym not in approved:
             continue
-        if cached["score"] < min_sigs:
+        if not signal_engine_active and cached["score"] < min_sigs:
             _record_rejection(sym, cached["score"], "below_min_signals", f"needed {min_sigs}, got {cached['score']}")
             continue
         if _in_cooldown(sym):
@@ -1994,18 +2000,34 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         bb_str  = "BB:PASS" if bb_ok   else "BB:FAIL"
         m5_str  = "5m:PASS" if five_ok else "5m:FAIL"
 
-        # ── Mandatory signal layer — both must fire before any buy ─────────────
-        # Mandatory 1: EMA trend up (EMA9 > EMA21) — don't buy into a downtrend.
-        # Mandatory 2: RSI below threshold — require a real dip, not mid-channel noise.
-        # Thresholds are hot-reloadable from strategy.json.
-        if mandatory_enabled:
-            if not sigs.get("trend", False):
-                _record_rejection(sym, score, "mandatory_ema_down", "EMA9 < EMA21")
+        # ── Buy decision: new signal engine OR legacy mandatory/score path ───────
+        if signal_engine_active:
+            _sig_data = {
+                **sigs,
+                "rsi_value":      rsi_v,
+                "current_price":  cached.get("price", 0.0),
+                "low_24h":        cached.get("low_24h"),
+                "klines_1m":      cached.get("klines_1m", []),
+                "stoch_rsi_value": cached.get("stoch_rsi_val"),
+            }
+            _dec = _sr_evaluate_buy_decision(sym, _sig_data, strategy)
+            if not _dec["allowed"]:
+                _record_rejection(sym, score, _dec["reason"],
+                                  f"score={_dec['score']} fired={_dec['fired_signals']}")
                 continue
-            if rsi_v <= 0 or rsi_v >= rsi_threshold:
-                _record_rejection(sym, score, "mandatory_rsi_too_high",
-                                  f"rsi={rsi_v:.1f} threshold={rsi_threshold}")
-                continue
+            # Passed new engine — fall through to existing veto checks below
+        else:
+            # ── Legacy mandatory signal layer ──────────────────────────────────
+            # Mandatory 1: EMA trend up (EMA9 > EMA21) — don't buy into a downtrend.
+            # Mandatory 2: RSI below threshold — require a real dip, not mid-channel noise.
+            if mandatory_enabled:
+                if not sigs.get("trend", False):
+                    _record_rejection(sym, score, "mandatory_ema_down", "EMA9 < EMA21")
+                    continue
+                if rsi_v <= 0 or rsi_v >= rsi_threshold:
+                    _record_rejection(sym, score, "mandatory_rsi_too_high",
+                                      f"rsi={rsi_v:.1f} threshold={rsi_threshold}")
+                    continue
 
         # ── Hard veto checks: BB position and 5m trend ────────────────────────
         if not bb_ok:
@@ -3307,16 +3329,51 @@ async def _refresh_signal_cache():
             five_m_ok = prev.get("5m_ok", True)
             _5m_ts    = prev.get("5m_ts", 0)
 
+        # Phase 2: extra fields for new signal registry
+        # low_24h — minimum low over last 24h from DB candles (no new REST call)
+        try:
+            _db_rows_24h = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=1440)
+            if len(_db_rows_24h) >= 60:
+                low_24h = min(float(r.get("low") or r["close"]) for r in _db_rows_24h)
+            else:
+                low_24h = min(c["low"] for c in candles) if candles else None
+        except Exception:
+            low_24h = None
+
+        # klines_1m — last 5 candles with OHLCV for R1 reversal check
+        try:
+            if raw and len(raw) >= 5:
+                klines_1m = [
+                    {"open": float(k[1]), "high": float(k[2]),
+                     "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])}
+                    for k in raw[-5:]
+                ]
+            elif candles and len(candles) >= 5:
+                klines_1m = candles[-5:]
+            else:
+                klines_1m = prev.get("klines_1m", [])
+        except Exception:
+            klines_1m = prev.get("klines_1m", [])
+
+        # stoch_rsi_val — Stochastic RSI from existing closes data
+        try:
+            stoch_rsi_val = indicators.calc_stoch_rsi(closes)
+        except Exception:
+            stoch_rsi_val = None
+
         with _signal_cache_lock:
             _signal_cache[sym] = {
-                "signals":  signals,
-                "score":    score,
-                "price":    closes[-1],
-                "rsi_val":  rsi_display,
-                "bb_ok":    bb_ok,
-                "5m_ok":    five_m_ok,
-                "5m_ts":    _5m_ts,
-                "ts":       time.time(),
+                "signals":       signals,
+                "score":         score,
+                "price":         closes[-1],
+                "rsi_val":       rsi_display,
+                "bb_ok":         bb_ok,
+                "5m_ok":         five_m_ok,
+                "5m_ts":         _5m_ts,
+                "ts":            time.time(),
+                "low_24h":       low_24h,
+                "klines_1m":     klines_1m,
+                "stoch_rsi_val": stoch_rsi_val,
             }
         return True
 

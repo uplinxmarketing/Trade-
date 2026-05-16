@@ -249,3 +249,18 @@ def obv_is_bullish(candles: list, lookback: int = 3) -> bool:
     if len(obv) < lookback + 1:
         return False
     return obv[-1] > obv[-lookback - 1]
+
+
+def calc_stoch_rsi(closes: List[float], rsi_period: int = 14, stoch_period: int = 14) -> Optional[float]:
+    """Stochastic RSI: normalises RSI within its own range over stoch_period bars.
+    Returns a value in [0, 100], or None if insufficient data."""
+    rsi_vals = calc_rsi(closes, rsi_period)
+    valid = [v for v in rsi_vals if v is not None]
+    if len(valid) < stoch_period:
+        return None
+    window = valid[-stoch_period:]
+    lo = min(window)
+    hi = max(window)
+    if hi == lo:
+        return 50.0  # flat RSI → neutral
+    return (window[-1] - lo) / (hi - lo) * 100.0
