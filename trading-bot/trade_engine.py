@@ -177,6 +177,35 @@ _binance_health_lock = threading.Lock()
 _consecutive_400_count: int = 0
 _circuit_breaker_until: float = 0.0
 
+# ── Per-source exponential backoff — dampens timeout cascades ─────────────────
+# Keyed by the `source` tag passed to _binance_request (e.g. "batch_prices",
+# "btc_klines"). On consecutive failures the caller is skipped for an
+# increasing window: 2s → 4 → 8 → 16 → 32 → 60s (cap). First success resets.
+_rest_backoff: dict = {}
+_REST_BACKOFF_BASE_SEC = 2.0
+_REST_BACKOFF_MAX_SEC  = 60.0
+_REST_BACKOFF_LOCK     = threading.Lock()
+
+
+def _backoff_should_skip(source: str) -> bool:
+    with _REST_BACKOFF_LOCK:
+        s = _rest_backoff.get(source)
+        return bool(s and s["failures"] > 0 and time.time() < s["next_retry_ts"])
+
+
+def _backoff_record_failure(source: str) -> None:
+    with _REST_BACKOFF_LOCK:
+        s = _rest_backoff.setdefault(source, {"failures": 0, "next_retry_ts": 0.0})
+        s["failures"] += 1
+        delay = min(_REST_BACKOFF_BASE_SEC * (2 ** (s["failures"] - 1)), _REST_BACKOFF_MAX_SEC)
+        s["next_retry_ts"] = time.time() + delay
+
+
+def _backoff_record_success(source: str) -> None:
+    with _REST_BACKOFF_LOCK:
+        if source in _rest_backoff:
+            _rest_backoff[source] = {"failures": 0, "next_retry_ts": 0.0}
+
 
 def _check_circuit_breaker() -> bool:
     return time.time() < _circuit_breaker_until
@@ -215,6 +244,8 @@ def _binance_request(url: str, timeout: float = 3.0, source: str = "unknown"):
 
     if _check_circuit_breaker():
         return (False, None, {}, 0.0)
+    if _backoff_should_skip(source):
+        return (False, None, {}, 0.0)
 
     t0 = time.time()
     try:
@@ -228,6 +259,7 @@ def _binance_request(url: str, timeout: float = 3.0, source: str = "unknown"):
         except Exception:
             pass
         _reset_circuit_breaker()
+        _backoff_record_success(source)
         return (True, json.loads(body), hdrs, latency_ms)
     except _ue_b.HTTPError as he:
         latency_ms = (time.time() - t0) * 1000
@@ -256,6 +288,7 @@ def _binance_request(url: str, timeout: float = 3.0, source: str = "unknown"):
     except Exception as e:
         latency_ms = (time.time() - t0) * 1000
         tb = _tb_b.format_exc()[-400:]
+        _backoff_record_failure(source)
         try:
             _record_rest_error(f"[{source}] {type(e).__name__}: {e}", url=url, response_body=tb)
         except TypeError:
@@ -1078,17 +1111,14 @@ _market_regime_cache: dict = {"ts": 0.0, "regime": "unknown", "details": {}}
 _MARKET_REGIME_TTL_SEC = 120.0
 
 def _fetch_btc_1h_klines() -> Optional[List[dict]]:
+    url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=24"
+    ok, data, _, _ = _binance_request(url, timeout=4.0, source="btc_klines")
+    if not ok or not isinstance(data, list):
+        return None
     try:
-        import urllib.request, json as _json
-        url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=24"
-        with urllib.request.urlopen(url, timeout=4.0) as r:
-            data = _json.loads(r.read())
-        return [{"open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in data]
-    except Exception as e:
-        try:
-            log_diag_issue("market_regime", "warn", f"BTC kline fetch failed: {e}")
-        except (NameError, Exception):
-            pass
+        return [{"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+                 "close": float(k[4]), "volume": float(k[5])} for k in data]
+    except Exception:
         return None
 
 def _ema_calc(values: List[float], period: int) -> float:
@@ -1171,12 +1201,13 @@ _reversal_cache: dict = {}
 _REVERSAL_TTL_SEC = 30.0
 
 def _fetch_1m_klines_rc(symbol: str, limit: int = 5) -> Optional[List[dict]]:
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
+    ok, data, _, _ = _binance_request(url, timeout=3.0, source="reversal_klines")
+    if not ok or not isinstance(data, list):
+        return None
     try:
-        import urllib.request, json as _json
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
-        with urllib.request.urlopen(url, timeout=3.0) as r:
-            data = _json.loads(r.read())
-        return [{"open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in data]
+        return [{"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+                 "close": float(k[4]), "volume": float(k[5])} for k in data]
     except Exception:
         return None
 
@@ -2411,11 +2442,25 @@ _sell_monitor_last_rest_ts: float = 0.0   # rate-limits sell-monitor REST refres
 
 
 def _fetch_batch_prices(symbols: list) -> Dict[str, float]:
-    """Batch ticker price fetch via _binance_request (source-tagged, circuit-broken)."""
+    """Batch ticker price fetch via _binance_request (source-tagged, circuit-broken).
+    Uses single-symbol endpoint (weight=1) when only one symbol requested,
+    batch endpoint (weight=2) otherwise."""
     import urllib.parse as _up2
     if not symbols:
         return {}
-    _syms_json = json.dumps(list(symbols), separators=(',', ':'))
+    symbols = list(symbols)
+    if len(symbols) == 1:
+        # Single-symbol endpoint: weight=1 vs batch weight=2
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbols[0]}"
+        ok, data, _, _ = _binance_request(url, timeout=3.0, source="batch_prices")
+        if not ok or not isinstance(data, dict):
+            return {}
+        try:
+            px = float(data.get("price", 0) or 0)
+            return {data["symbol"]: px} if px > 0 and data.get("symbol") else {}
+        except Exception:
+            return {}
+    _syms_json = json.dumps(symbols, separators=(',', ':'))
     _encoded   = _up2.quote(_syms_json, safe='')
     url = f"https://api.binance.com/api/v3/ticker/price?symbols={_encoded}"
     ok, data, _, _ = _binance_request(url, timeout=3.0, source="batch_prices")
