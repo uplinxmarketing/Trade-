@@ -2092,9 +2092,9 @@ class SettingsRequest(BaseModel):
 
 class _SignalEngineConfig(BaseModel):
     enabled:           bool
-    mandatory_signals: List[str]
-    scored_signals:    List[str]
-    veto_signals:      List[str]
+    mandatory_signals: list[str]
+    scored_signals:    list[str]
+    veto_signals:      list[str]
     min_scored:        int
 
 class _SignalThresholdsUpdate(BaseModel):
