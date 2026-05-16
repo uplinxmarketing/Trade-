@@ -22,7 +22,7 @@ import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import config
 import database
@@ -1056,6 +1056,45 @@ def _get_usdt_balance() -> float:
     return 0.0
 
 
+def _get_actual_balance(symbol: str) -> float:
+    """Return free+locked balance for the base asset of symbol, or 0.0 on error."""
+    try:
+        base = symbol.replace("USDT", "").replace("usdt", "")
+        acc = client.get_account()
+        for b in acc.get("balances", []):
+            if b["asset"] == base:
+                return float(b.get("free", 0)) + float(b.get("locked", 0))
+    except Exception as e:
+        log_diag_issue("ghost_check", "warn", f"_get_actual_balance failed for {symbol}: {e}")
+    return 0.0
+
+
+def _is_truly_ghost_position(symbol: str, expected_qty: float) -> Tuple[bool, str]:
+    """Verify whether a -2010 sell failure means the position is truly gone.
+
+    Returns (is_ghost, reason). Only returns is_ghost=True when the asset
+    balance on Binance is genuinely zero — not when the bot just has the wrong
+    quantity on record.  Errors during the check return (False, 'check_failed')
+    so uncertainty never causes an accidental force-close.
+    """
+    try:
+        base = symbol.replace("USDT", "").replace("usdt", "")
+        acc = client.get_account()
+        for b in acc.get("balances", []):
+            if b["asset"] == base:
+                total = float(b.get("free", 0)) + float(b.get("locked", 0))
+                if total <= 1e-8:
+                    return True, "zero_balance"
+                if total < expected_qty * 0.95:
+                    return False, f"qty_mismatch (have {total:.6f}, expected {expected_qty:.6f})"
+                return False, "balance_ok"
+        # Asset absent from balance list → genuinely not owned
+        return True, "asset_not_in_account"
+    except Exception as e:
+        log_diag_issue("ghost_check", "error", f"Balance check failed for {symbol}: {e}")
+        return False, "check_failed"
+
+
 _lot_step_cache: Dict[str, float] = {}
 
 # ── Buy-rejection instrumentation — pure observation, no logic changes ────────
@@ -1534,20 +1573,55 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         _sell_last_failed_reason[sym] = reason
 
         # -1013: market closed/delisted — blacklist and force-close
-        # -2010: insufficient balance — ghost position (paper position carried into live),
-        #        bot doesn't actually own the coin; force-close so retries stop
-        is_ghost = "-2010" in err_str or "insufficient balance" in err_str.lower()
+        # -2010: insufficient balance — could be ghost OR a quantity/lot-size
+        #        mismatch on a real position. Verify with a balance check first.
+        is_possible_ghost = "-2010" in err_str or "insufficient balance" in err_str.lower()
         is_closed = "-1013" in err_str or "Market is closed" in err_str
         if is_closed:
             _bad_symbols.add(sym)
-        if is_closed or is_ghost:
-            reason_label = "market closed/delisted" if is_closed else "ghost position (no coin balance on Binance)"
+
+        should_force_close = is_closed
+        force_close_label = ""
+
+        if is_possible_ghost and not is_closed:
+            is_ghost, ghost_reason = _is_truly_ghost_position(sym, float(pos.get("quantity", 0)))
+            if is_ghost:
+                # Genuinely zero — safe to force-close
+                database.log_activity(
+                    f"[GHOST CONFIRMED] {sym}: balance={ghost_reason} — closing position tracker", "warn"
+                )
+                should_force_close = True
+                force_close_label = f"ghost position ({ghost_reason})"
+            else:
+                # Real position — quantity mismatch or lot-size issue
+                if ghost_reason == "check_failed":
+                    database.log_activity(
+                        f"[GHOST CHECK FAILED] {sym}: -2010 but balance check inconclusive — retrying next cycle", "warn"
+                    )
+                    log_diag_issue("sell_monitor", "warn",
+                                   f"{sym}: -2010 balance check failed, will retry", detail=err_str[:400])
+                else:
+                    actual_qty = _get_actual_balance(sym)
+                    database.log_activity(
+                        f"[GHOST FALSE ALARM] {sym}: {ghost_reason} — updating qty to {actual_qty:.6f}", "warn"
+                    )
+                    log_diag_issue("sell_monitor", "warn",
+                                   f"{sym}: qty mismatch ({ghost_reason}), adjusted to {actual_qty:.6f}",
+                                   detail=err_str[:400])
+                    if actual_qty > 0:
+                        with _positions_lock:
+                            pos["quantity"] = actual_qty
+                return  # let sell retry next tick with corrected qty
+        elif is_closed:
+            force_close_label = "market closed/delisted"
+
+        if should_force_close:
             database.log_activity(
-                f"{sym}: force-closing position — {reason_label}", "warn"
+                f"{sym}: force-closing position — {force_close_label}", "warn"
             )
             log_diag_issue(
                 "sell_monitor", "warn",
-                f"{sym}: force-closed — {reason_label}",
+                f"{sym}: force-closed — {force_close_label}",
                 detail=err_str[:400],
             )
             with _positions_lock:
