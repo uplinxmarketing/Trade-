@@ -2088,6 +2088,26 @@ class SettingsRequest(BaseModel):
     reinvest_profits:    Optional[bool]  = None
     max_positions:       Optional[int]   = None
     min_signals:         Optional[int]   = None
+
+
+class _SignalEngineConfig(BaseModel):
+    enabled:           bool
+    mandatory_signals: List[str]
+    scored_signals:    List[str]
+    veto_signals:      List[str]
+    min_scored:        int
+
+class _SignalThresholdsUpdate(BaseModel):
+    rsi_buy_threshold:             Optional[float] = None
+    near_low_pct:                  Optional[float] = None
+    reversal_volume_multiplier:    Optional[float] = None
+    spread_max_pct:                Optional[float] = None
+    allowed_trading_hours_utc:     Optional[str]   = None
+    stoch_rsi_threshold:           Optional[float] = None
+
+class SignalEngineUpdate(BaseModel):
+    signal_engine:     Optional[_SignalEngineConfig]     = None
+    signal_thresholds: Optional[_SignalThresholdsUpdate] = None
     strategy_notes:      Optional[str]   = None
     slippage_buffer_pct: Optional[float] = None  # 0.05–0.50%, default 0.10%
 
@@ -2494,6 +2514,86 @@ async def api_chat(req: ChatRequest):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.get("/api/signal-engine/config")
+def api_signal_engine_config_get():
+    """Return current signal engine configuration plus full signal registry."""
+    try:
+        import signal_registry as _sr
+        strategy   = _load_strategy()
+        engine_cfg = strategy.get("signal_engine", {})
+        registry   = [
+            {"id": sid, "category": sd.category, "description": sd.description}
+            for sid, sd in _sr.SIGNAL_REGISTRY.items()
+        ]
+        return {
+            "registry":   registry,
+            "config":     engine_cfg if engine_cfg else _sr.DEFAULT_SIGNAL_ENGINE,
+            "thresholds": strategy.get("signal_thresholds", _sr.DEFAULT_SIGNAL_THRESHOLDS),
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/api/signal-engine/config")
+def api_signal_engine_config_post(update: SignalEngineUpdate):
+    """Validate and save signal engine configuration to strategy.json."""
+    try:
+        import signal_registry as _sr
+        valid_ids = set(_sr.SIGNAL_REGISTRY.keys())
+
+        strategy_path = config.STRATEGY_FILE
+        with open(strategy_path) as f:
+            strategy = json.load(f)
+
+        if update.signal_engine is not None:
+            cfg = update.signal_engine.dict()
+            # Signal IDs must exist in registry
+            for role in ("mandatory_signals", "scored_signals", "veto_signals"):
+                for sid in cfg.get(role, []):
+                    if sid not in valid_ids:
+                        return JSONResponse(status_code=400,
+                                            content={"error": f"Unknown signal: {sid}", "role": role})
+            # min_scored must not exceed scored count
+            if cfg["min_scored"] > len(cfg["scored_signals"]):
+                return JSONResponse(status_code=400,
+                                    content={"error": "min_scored cannot exceed scored_signals count"})
+            # No signal in multiple roles
+            used = cfg["mandatory_signals"] + cfg["scored_signals"] + cfg["veto_signals"]
+            if len(used) != len(set(used)):
+                return JSONResponse(status_code=400,
+                                    content={"error": "A signal cannot be in multiple roles"})
+            strategy["signal_engine"] = cfg
+
+        if update.signal_thresholds is not None:
+            new_t = update.signal_thresholds.dict(exclude_none=True)
+            if "rsi_buy_threshold" in new_t and not (10 <= new_t["rsi_buy_threshold"] <= 90):
+                return JSONResponse(status_code=400, content={"error": "rsi_buy_threshold must be 10–90"})
+            if "near_low_pct" in new_t and not (0.1 <= new_t["near_low_pct"] <= 20):
+                return JSONResponse(status_code=400, content={"error": "near_low_pct must be 0.1–20"})
+            if "spread_max_pct" in new_t and not (0.01 <= new_t["spread_max_pct"] <= 5):
+                return JSONResponse(status_code=400, content={"error": "spread_max_pct must be 0.01–5"})
+            existing_t = strategy.get("signal_thresholds", {})
+            existing_t.update(new_t)
+            strategy["signal_thresholds"] = existing_t
+
+        tmp = strategy_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(strategy, f, indent=2)
+        os.replace(tmp, strategy_path)
+
+        enabled = strategy.get("signal_engine", {}).get("enabled", False)
+        database.log_activity(
+            f"Signal engine config saved via UI: enabled={enabled}", "info"
+        )
+        return {
+            "ok":         True,
+            "config":     strategy.get("signal_engine"),
+            "thresholds": strategy.get("signal_thresholds"),
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.get("/api/version")
