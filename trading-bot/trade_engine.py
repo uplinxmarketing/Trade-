@@ -30,6 +30,15 @@ import indicators
 import learning
 from connection import client, get_mode
 
+# Phase 1: Signal registry — shadow mode only (use_new_signal_engine=False by default).
+# Falls back gracefully if the file is absent so a partial deploy can't break the bot.
+try:
+    from signal_registry import evaluate_buy_decision as _sr_evaluate_buy_decision
+    from signal_registry import SIGNAL_REGISTRY, list_all_signal_ids
+    SIGNAL_REGISTRY_AVAILABLE = True
+except Exception as _sr_import_err:
+    SIGNAL_REGISTRY_AVAILABLE = False
+
 _positions: List[dict] = []
 _positions_lock = threading.Lock()
 
@@ -2087,6 +2096,24 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     continue
         except Exception:
             pass
+
+        # ── Shadow evaluation — compare old vs new signal engine (Phase 1) ────────
+        # Runs AFTER all veto/gate checks so it sees the same yes/no that the old
+        # engine sees at the moment a buy would fire.  Logs any disagreement but
+        # does NOT alter the buy decision — the old code path remains authoritative.
+        if SIGNAL_REGISTRY_AVAILABLE and bool(strategy.get("shadow_evaluate_signals", True)):
+            try:
+                _shadow_data = dict(sigs)
+                _shadow_data["rsi_value"] = rsi_v
+                _new_dec = _sr_evaluate_buy_decision(sym, _shadow_data, strategy)
+                _old_allowed = True  # reached this point → old engine approved
+                if _old_allowed != _new_dec["allowed"]:
+                    log_diag_issue(
+                        "signal_shadow", "warn",
+                        f"{sym}: old=True new={_new_dec['allowed']} reason={_new_dec['reason']}",
+                    )
+            except Exception as _shadow_exc:
+                log_diag_issue("signal_shadow", "warn", f"Shadow eval failed for {sym}: {_shadow_exc}")
 
         budget = get_budget_for_coin(sym, usdt_balance)
         if budget <= 0:

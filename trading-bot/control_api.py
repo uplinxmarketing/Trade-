@@ -314,76 +314,29 @@ def _get_positions():
         return []
 
 
-def _evaluate_buy_readiness(entry: dict, strategy: dict, btc_bearish: bool) -> dict:
-    """Mirror the actual buy-decision gates from _check_buys_from_cache.
-    Returns {ready: bool, reason: str} — no side effects, pure read."""
-    sig       = entry.get("signals", {})
-    score     = int(entry.get("score", 0))
-    rsi_val   = float(entry.get("rsi_val", 0) or 0)
-    bb_ok     = entry.get("bb_ok", True)
-    five_ok   = entry.get("5m_ok", True)
-    min_sigs  = int(strategy.get("min_signals", 4))
-
-    # 1. Mandatory tier — checked before score
-    if strategy.get("mandatory_signals_enabled", True):
-        if not sig.get("trend"):
-            return {"ready": False, "reason": "EMA down"}
-        rsi_threshold = float(strategy.get("rsi_buy_threshold", 40.0))
-        if rsi_val <= 0 or rsi_val >= rsi_threshold:
-            return {"ready": False, "reason": f"RSI {rsi_val:.0f}>={rsi_threshold:.0f}"}
-
-    # 2. Score gate
-    if score < min_sigs:
-        return {"ready": False, "reason": f"score {score}<{min_sigs}"}
-
-    # 3. Vetoes
-    if bb_ok is False:
-        return {"ready": False, "reason": "BB upper veto"}
-    if five_ok is False:
-        return {"ready": False, "reason": "5m downtrend veto"}
-
-    # 4. Macro gate
-    if btc_bearish and strategy.get("macro_gate_enabled", True):
-        return {"ready": False, "reason": "BTC bearish gate"}
-
-    return {"ready": True, "reason": "ok"}
-
-
-def _get_signal_snapshot(strategy: dict | None = None) -> list:
+def _get_signal_snapshot() -> list:
     """Return a compact snapshot of the live signal cache for each watched coin."""
     try:
-        from trade_engine import _signal_cache, _signal_cache_lock, get_btc_state
+        from trade_engine import _signal_cache, _signal_cache_lock
         with _signal_cache_lock:
             snap = dict(_signal_cache)
-
-        if strategy is None:
-            strategy = _load_strategy()
-
-        # Fetch BTC state once — shared across all rows to avoid redundant REST calls
-        try:
-            btc = get_btc_state()
-            btc_bearish = bool(btc and btc.get("regime") == "bearish")
-        except Exception:
-            btc_bearish = False
-
         result = []
         for sym, entry in snap.items():
             sig  = entry.get("signals", {})
             result.append({
-                "symbol":      sym,
-                "price":       entry.get("price", 0),
-                "score":       entry.get("score", 0),
-                "rsi":         entry.get("rsi_val", 0),
-                "bb_ok":       entry.get("bb_ok", True),
-                "5m_ok":       entry.get("5m_ok", True),
-                "trend":       bool(sig.get("trend")),
-                "rsi_ok":      bool(sig.get("rsi")),
-                "macd":        bool(sig.get("macd")),
-                "volume":      bool(sig.get("volume")),
-                "obv":         bool(sig.get("obv")),
-                "atr":         bool(sig.get("atr")),
-                "ts":          entry.get("ts", 0),
-                "bot_will_buy": _evaluate_buy_readiness(entry, strategy, btc_bearish),
+                "symbol":  sym,
+                "price":   entry.get("price", 0),
+                "score":   entry.get("score", 0),
+                "rsi":     entry.get("rsi_val", 0),
+                "bb_ok":   entry.get("bb_ok", True),
+                "5m_ok":   entry.get("5m_ok", True),
+                "trend":   bool(sig.get("trend")),
+                "rsi_ok":  bool(sig.get("rsi")),
+                "macd":    bool(sig.get("macd")),
+                "volume":  bool(sig.get("volume")),
+                "obv":     bool(sig.get("obv")),
+                "atr":     bool(sig.get("atr")),
+                "ts":      entry.get("ts", 0),
             })
         return result
     except Exception:
@@ -1657,6 +1610,52 @@ def api_signals_quality():
     return {"buckets": summary, "sample_size": sum(b["trades"] for b in buckets.values())}
 
 
+@app.get("/api/proxy/binance/ticker/24hr")
+async def api_proxy_ticker_24hr(symbols: str = None):
+    """Chunked proxy for Binance 24hr ticker — avoids 400s from large symbol lists."""
+    import urllib.request as _ur
+    if not symbols:
+        return JSONResponse(status_code=400, content={"error": "symbols required"})
+    try:
+        symbol_list = json.loads(symbols)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid symbols format"})
+    if not isinstance(symbol_list, list):
+        return JSONResponse(status_code=400, content={"error": "symbols must be a list"})
+
+    CHUNK_SIZE = 20
+    all_results: list = []
+    for i in range(0, len(symbol_list), CHUNK_SIZE):
+        chunk = symbol_list[i:i + CHUNK_SIZE]
+        try:
+            url = f"https://api.binance.com/api/v3/ticker/24hr?symbols={json.dumps(chunk)}"
+            req = _ur.Request(url, headers={"User-Agent": "WolfBot/1.0"})
+            with _ur.urlopen(req, timeout=5.0) as r:
+                all_results.extend(json.loads(r.read()))
+        except Exception:
+            continue  # partial results preferred over full failure
+    return all_results
+
+
+@app.get("/api/signal-registry")
+def api_signal_registry():
+    """List all registered signals (Phase 1: 6 existing signals + foundation for future)."""
+    try:
+        import signal_registry as _sr
+        signals = [
+            {"id": sig_id, "category": sig_def.category, "description": sig_def.description}
+            for sig_id, sig_def in _sr.SIGNAL_REGISTRY.items()
+        ]
+        return {
+            "available": True,
+            "total": len(signals),
+            "categories": sorted({s["category"] for s in signals}),
+            "signals": signals,
+        }
+    except Exception as e:
+        return {"available": False, "signals": [], "error": str(e)}
+
+
 @app.get("/api/proxy/binance/{path:path}")
 async def api_proxy_binance(path: str, request: Request):
     """Server-side proxy for Binance REST API — avoids browser CORS restrictions."""
@@ -2270,7 +2269,7 @@ def api_all():
         "positions":     positions,
         "trades":        _format_trades(trades[:200]),
         "activity":      database.get_activity_log(limit=100),
-        "signals":       _get_signal_snapshot(strategy),
+        "signals":       _get_signal_snapshot(),
         "market_health": _get_market_health(),
     }
     _API_ALL_CACHE["ts"]   = now_ts
