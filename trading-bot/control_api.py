@@ -320,24 +320,80 @@ def _get_signal_snapshot() -> list:
         from trade_engine import _signal_cache, _signal_cache_lock
         with _signal_cache_lock:
             snap = dict(_signal_cache)
+
+        # Load once for all coins
+        strategy = _load_strategy()
+
+        try:
+            import signal_registry as _sr
+            _registry_available = True
+        except Exception:
+            _registry_available = False
+
+        # Signals to skip in snapshot (E1 makes a live REST call per coin)
+        _SNAPSHOT_SKIP = {"E1_spread_too_wide"}
+
         result = []
         for sym, entry in snap.items():
-            sig  = entry.get("signals", {})
-            result.append({
-                "symbol":  sym,
-                "price":   entry.get("price", 0),
-                "score":   entry.get("score", 0),
-                "rsi":     entry.get("rsi_val", 0),
-                "bb_ok":   entry.get("bb_ok", True),
-                "5m_ok":   entry.get("5m_ok", True),
-                "trend":   bool(sig.get("trend")),
-                "rsi_ok":  bool(sig.get("rsi")),
-                "macd":    bool(sig.get("macd")),
-                "volume":  bool(sig.get("volume")),
-                "obv":     bool(sig.get("obv")),
-                "atr":     bool(sig.get("atr")),
-                "ts":      entry.get("ts", 0),
-            })
+            sig = entry.get("signals", {})
+
+            # Legacy fields — kept for backward compatibility
+            row = {
+                "symbol": sym,
+                "price":  entry.get("price", 0),
+                "score":  entry.get("score", 0),
+                "rsi":    entry.get("rsi_val", 0),
+                "bb_ok":  entry.get("bb_ok", True),
+                "5m_ok":  entry.get("5m_ok", True),
+                "trend":  bool(sig.get("trend")),
+                "rsi_ok": bool(sig.get("rsi")),
+                "macd":   bool(sig.get("macd")),
+                "volume": bool(sig.get("volume")),
+                "obv":    bool(sig.get("obv")),
+                "atr":    bool(sig.get("atr")),
+                "ts":     entry.get("ts", 0),
+            }
+
+            if _registry_available:
+                # Build the signal_data dict the registry expects
+                signal_data = {
+                    "trend":         sig.get("trend", False),
+                    "rsi":           sig.get("rsi", False),
+                    "macd":          sig.get("macd", False),
+                    "volume":        sig.get("volume", False),
+                    "obv":           sig.get("obv", False),
+                    "atr":           sig.get("atr", False),
+                    "rsi_value":     entry.get("rsi_val"),
+                    "stoch_rsi_value": entry.get("stoch_rsi_val"),
+                    "low_24h":       entry.get("low_24h"),
+                    "current_price": entry.get("price"),
+                    "klines_1m":     entry.get("klines_1m", []),
+                }
+
+                # Evaluate all signals, skipping REST-heavy veto signals
+                signal_results: dict = {}
+                for sig_id, sig_def in _sr.SIGNAL_REGISTRY.items():
+                    if sig_id in _SNAPSHOT_SKIP:
+                        signal_results[sig_id] = {"fired": False, "raw_value": "snapshot_skipped"}
+                        continue
+                    try:
+                        fired, raw = sig_def.compute_fn(sym, signal_data, strategy)
+                        signal_results[sig_id] = {"fired": bool(fired), "raw_value": raw}
+                    except Exception:
+                        signal_results[sig_id] = {"fired": False, "raw_value": None}
+
+                # Buy decision (uses cached signal_results, no extra REST calls)
+                try:
+                    decision = _sr.evaluate_buy_decision(sym, signal_data, strategy)
+                    row["buy_allowed"] = bool(decision.get("allowed", False))
+                    row["buy_reason"]  = decision.get("reason", "")
+                except Exception:
+                    row["buy_allowed"] = False
+                    row["buy_reason"]  = "eval_error"
+
+                row["signal_results"] = signal_results
+
+            result.append(row)
         return result
     except Exception:
         return []
