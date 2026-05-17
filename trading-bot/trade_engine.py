@@ -1461,6 +1461,13 @@ def _execute_sell(pos: dict, price: float, reason: str):
     from datetime import timezone as _tz
     pos["_sell_picked_up_ts"] = time.time()
     sym  = pos["symbol"]
+    try:
+        database.log_activity(
+            f"[SELL_START] {sym} ({reason}): raw_qty={pos.get('quantity')} price={price}",
+            "info"
+        )
+    except Exception:
+        pass
     qty  = _floor_qty(pos["quantity"], pos["symbol"])
     mode = get_mode()
     now  = datetime.now(_tz.utc).isoformat()
@@ -1699,6 +1706,11 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
                     if actual_qty > 0:
                         with _positions_lock:
                             pos["quantity"] = actual_qty
+                if reason in ("force-sell", "manual", "user-initiated"):
+                    raise RuntimeError(
+                        f"force-sell rejected by Binance (-2010): {err_str[:200]} — "
+                        f"ghost_reason={ghost_reason}"
+                    )
                 return  # let sell retry next tick with corrected qty
         elif is_closed:
             force_close_label = "market closed/delisted"
