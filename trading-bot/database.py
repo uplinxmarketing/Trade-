@@ -234,6 +234,10 @@ def init_db():
             "ALTER TABLE trades ADD COLUMN duration_seconds   INTEGER",
             "ALTER TABLE trades ADD COLUMN profitable         INTEGER",
             "ALTER TABLE trades ADD COLUMN sell_reason        TEXT",
+            "ALTER TABLE trades ADD COLUMN signal_snapshot     TEXT",
+            "ALTER TABLE trades ADD COLUMN target_crossed_to_trigger_ms INTEGER",
+            "ALTER TABLE trades ADD COLUMN trigger_to_filled_ms         INTEGER",
+            "ALTER TABLE trades ADD COLUMN target_crossed_ts            TEXT",
         ]
         for sql in migrations:
             try:
@@ -303,7 +307,10 @@ def candles_table_empty() -> bool:
 
 # ── Trades ────────────────────────────────────────────────────────────────────
 
-def log_trade(trade: dict):
+def log_trade(trade: dict, *,
+              target_crossed_to_trigger_ms: Optional[int] = None,
+              trigger_to_filled_ms: Optional[int] = None,
+              target_crossed_ts: Optional[str] = None):
     with _lock:
         conn = _conn()
         conn.execute("""
@@ -312,8 +319,9 @@ def log_trade(trade: dict):
                  buy_fee, sell_fee, net_profit, profitable, duration_seconds,
                  entry_rsi, entry_ma_position, entry_bb_position,
                  entry_volume_trend, hour_of_day, day_of_week,
-                 timestamp_buy, timestamp_sell, sell_reason, signal_snapshot)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 timestamp_buy, timestamp_sell, sell_reason, signal_snapshot,
+                 target_crossed_to_trigger_ms, trigger_to_filled_ms, target_crossed_ts)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             trade.get("coin"), trade.get("mode"), trade.get("entry_price"),
             trade.get("exit_price"), trade.get("quantity"), trade.get("budget_usdt"),
@@ -324,6 +332,7 @@ def log_trade(trade: dict):
             trade.get("hour_of_day"), trade.get("day_of_week"),
             trade.get("timestamp_buy"), trade.get("timestamp_sell"),
             trade.get("sell_reason"), trade.get("signal_snapshot"),
+            target_crossed_to_trigger_ms, trigger_to_filled_ms, target_crossed_ts,
         ))
         conn.commit()
         conn.close()

@@ -1778,8 +1778,33 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     _rebuild_pos_index()
     _pos_peaks.pop(sym, None)
 
+    # ── Sell latency for DB ───────────────────────────────────────────────────
     try:
-        database.log_trade(trade_record)
+        _fill_ts = time.time()
+        _target_crossed_ts_val = pos.get("_sell_target_crossed_ts")
+        _trigger_ts_val        = pos.get("_sell_trigger_ts")
+
+        _target_to_trigger_ms: Optional[int] = None
+        _trigger_to_filled_ms: Optional[int] = None
+        _target_crossed_iso:   Optional[str] = None
+
+        if _target_crossed_ts_val and _trigger_ts_val:
+            _target_to_trigger_ms = int((_trigger_ts_val - _target_crossed_ts_val) * 1000)
+        if _trigger_ts_val:
+            _trigger_to_filled_ms = int((_fill_ts - _trigger_ts_val) * 1000)
+        if _target_crossed_ts_val:
+            from datetime import datetime as _dt2, timezone as _tz2
+            _target_crossed_iso = _dt2.fromtimestamp(_target_crossed_ts_val, tz=_tz2.utc).isoformat()
+    except Exception:
+        _target_to_trigger_ms = None
+        _trigger_to_filled_ms = None
+        _target_crossed_iso   = None
+
+    try:
+        database.log_trade(trade_record,
+                           target_crossed_to_trigger_ms=_target_to_trigger_ms,
+                           trigger_to_filled_ms=_trigger_to_filled_ms,
+                           target_crossed_ts=_target_crossed_iso)
         try:
             import supabase_sync
             # Paper mode: read balance from memory (instant, no network call).
