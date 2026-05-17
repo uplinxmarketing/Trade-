@@ -38,14 +38,15 @@ interface CoinTrace {
   window_hours?: number;
 }
 
-interface SellTiming {
-  sells_count: number;
-  stats: {
-    min_ms: number; max_ms: number;
-    p50_ms: number; p90_ms: number;
-    p95_ms: number; p99_ms: number;
-  };
-  slow_sells: Array<{ symbol: string; timing_ms: number; reason: string; ts: string }>;
+interface SellTimingResponse {
+  window_hours: number;
+  trades_count: number;
+  target_to_trigger_count: number;
+  trigger_to_filled_count: number;
+  target_to_trigger_ms: { min: number|null; max: number|null; p50: number|null; p90: number|null; p95: number|null; p99: number|null; };
+  trigger_to_filled_ms: { min: number|null; max: number|null; p50: number|null; p90: number|null; p95: number|null; p99: number|null; };
+  slow_target_to_trigger: Array<{ coin: string; target_to_trigger_ms: number; reason: string; ts: string }>;
+  slow_trigger_to_filled: Array<{ coin: string; trigger_to_filled_ms: number; reason: string; ts: string }>;
 }
 
 interface AuditEntry {
@@ -348,7 +349,7 @@ function CoinTraceLookup({ baseUrl }: { baseUrl: string }) {
 // ── Sell Timing ───────────────────────────────────────────────────────────
 
 function SellTimingHistogram({ baseUrl }: { baseUrl: string }) {
-  const [data, setData] = useState<SellTiming | null>(null);
+  const [data, setData] = useState<SellTimingResponse | null>(null);
   const [hours, setHours] = useState(24);
 
   useEffect(() => {
@@ -358,8 +359,19 @@ function SellTimingHistogram({ baseUrl }: { baseUrl: string }) {
       .catch(() => {});
   }, [baseUrl, hours]);
 
+  const StatGrid = ({ stats }: { stats: SellTimingResponse['target_to_trigger_ms'] }) => (
+    <div className="grid grid-cols-4 gap-2">
+      {(['p50','p90','p95','p99'] as const).map(k => (
+        <div key={k} className="bg-muted/20 rounded px-2 py-1 text-center">
+          <p className="text-[8px] text-muted-foreground">{k}</p>
+          <p className={`text-[11px] font-bold ${ms_color((stats as any)[k])}`}>{fmt_ms((stats as any)[k])}</p>
+        </div>
+      ))}
+    </div>
+  );
+
   return (
-    <div className="space-y-2">
+    <div className="space-y-3">
       <div className="flex items-center justify-between">
         <p className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Sell Execution Timing</p>
         <select value={hours} onChange={e => setHours(parseInt(e.target.value))}
@@ -370,37 +382,50 @@ function SellTimingHistogram({ baseUrl }: { baseUrl: string }) {
         </select>
       </div>
 
-      {!data || data.sells_count === 0 ? (
-        <p className="text-[9px] text-muted-foreground italic">No sells in window</p>
+      {!data || data.trades_count === 0 ? (
+        <p className="text-[9px] text-muted-foreground italic">No trades in window</p>
       ) : (
         <>
-          <div className="grid grid-cols-3 gap-2">
-            {[
-              { label: 'p50', val: data.stats?.p50_ms },
-              { label: 'p95', val: data.stats?.p95_ms },
-              { label: 'p99', val: data.stats?.p99_ms },
-            ].map(({ label, val }) => (
-              <div key={label} className="bg-muted/20 rounded px-2 py-1 text-center">
-                <p className="text-[8px] text-muted-foreground">{label}</p>
-                <p className={`text-[11px] font-bold ${ms_color(val)}`}>{fmt_ms(val)}</p>
-              </div>
-            ))}
-          </div>
-          <p className="text-[8px] text-muted-foreground">{data.sells_count} sells · range {fmt_ms(data.stats?.min_ms)}–{fmt_ms(data.stats?.max_ms)}</p>
+          <p className="text-[8px] text-muted-foreground">{data.trades_count} trades · latency data on {data.target_to_trigger_count} sells</p>
 
-          {data.slow_sells?.length > 0 && (
-            <div>
-              <p className="text-[8px] font-semibold text-muted-foreground mb-0.5">Slow sells (&gt;1s):</p>
-              <div className="space-y-0.5">
-                {data.slow_sells.map((s, i) => (
-                  <div key={i} className="flex gap-2 text-[8px]">
-                    <span className="font-mono w-20 shrink-0">{s.symbol}</span>
-                    <span className={`font-bold ${ms_color(s.timing_ms)}`}>{fmt_ms(s.timing_ms)}</span>
-                    <span className="text-muted-foreground truncate">{s.reason}</span>
+          <div className="space-y-2">
+            <p className="text-[8px] font-semibold text-muted-foreground">Stage 1: Target hit → executor dispatch</p>
+            {data.target_to_trigger_count === 0
+              ? <p className="text-[8px] text-muted-foreground italic">No data yet (populates after next sell)</p>
+              : <StatGrid stats={data.target_to_trigger_ms} />
+            }
+            <p className="text-[7px] text-muted-foreground">High = event-loop blocking before sell dispatched</p>
+          </div>
+
+          <div className="space-y-2 pt-1 border-t border-border/40">
+            <p className="text-[8px] font-semibold text-muted-foreground">Stage 2: Executor dispatch → Binance fill</p>
+            {data.trigger_to_filled_count === 0
+              ? <p className="text-[8px] text-muted-foreground italic">No data yet</p>
+              : <StatGrid stats={data.trigger_to_filled_ms} />
+            }
+            <p className="text-[7px] text-muted-foreground">High = Binance API or network latency</p>
+          </div>
+
+          {(data.slow_target_to_trigger.length > 0 || data.slow_trigger_to_filled.length > 0) && (
+            <details className="text-[8px]">
+              <summary className="cursor-pointer text-muted-foreground hover:text-foreground">Slow sells (&gt;1s)</summary>
+              <div className="mt-1 space-y-1">
+                {data.slow_target_to_trigger.map((s, i) => (
+                  <div key={i} className="flex gap-2">
+                    <span className="font-mono w-20 shrink-0">{s.coin}</span>
+                    <span className={`font-bold ${ms_color(s.target_to_trigger_ms)}`}>{fmt_ms(s.target_to_trigger_ms)}</span>
+                    <span className="text-muted-foreground truncate">dispatch lag · {s.reason}</span>
+                  </div>
+                ))}
+                {data.slow_trigger_to_filled.map((s, i) => (
+                  <div key={i} className="flex gap-2">
+                    <span className="font-mono w-20 shrink-0">{s.coin}</span>
+                    <span className={`font-bold ${ms_color(s.trigger_to_filled_ms)}`}>{fmt_ms(s.trigger_to_filled_ms)}</span>
+                    <span className="text-muted-foreground truncate">fill lag · {s.reason}</span>
                   </div>
                 ))}
               </div>
-            </div>
+            </details>
           )}
         </>
       )}

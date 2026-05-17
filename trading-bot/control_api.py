@@ -2063,45 +2063,65 @@ def api_diag_signal_win_rates(days: int = 7):
 
 
 @app.get("/api/diagnostics/sell-timing")
-def api_diag_sell_timing(hours: float = 24.0):
-    """Sell timing histogram with percentile breakdown from sell_timing diag log."""
+def api_diag_sell_timing(hours: int = 24):
+    """Two-stage sell execution latency: target→trigger and trigger→fill."""
     import sqlite3 as _sq_st
-    hours = max(1.0, min(168.0, float(hours)))
+    hours = max(1, min(168, int(hours)))
     try:
         conn = _sq_st.connect(database.DB_PATH)
         conn.row_factory = _sq_st.Row
         rows = conn.execute("""
-            SELECT duration_seconds FROM trades
+            SELECT coin, target_crossed_to_trigger_ms, trigger_to_filled_ms,
+                   sell_reason, timestamp_sell
+            FROM trades
             WHERE timestamp_sell > datetime('now', ?)
-              AND duration_seconds IS NOT NULL
-              AND duration_seconds > 0
-        """, (f"-{hours} hours",)).fetchall()
+        """, (f'-{hours} hours',)).fetchall()
         conn.close()
     except Exception as e:
         return {"error": str(e)}
 
-    durations = sorted(r["duration_seconds"] for r in rows)
-    if not durations:
-        return {"hours": hours, "count": 0, "percentiles": {}}
+    rows = [dict(r) for r in rows]
 
-    def _pct(data, p):
-        if not data:
+    def pct(values, p):
+        s = sorted(v for v in values if v is not None)
+        if not s:
             return None
-        idx = max(0, int(len(data) * p / 100) - 1)
-        return round(data[idx], 1)
+        return s[min(int(len(s) * p / 100), len(s) - 1)]
+
+    t2t = [r["target_crossed_to_trigger_ms"] for r in rows if r["target_crossed_to_trigger_ms"] is not None]
+    t2f = [r["trigger_to_filled_ms"]         for r in rows if r["trigger_to_filled_ms"]         is not None]
+
+    slow_t2t = sorted(
+        [{"coin": r["coin"], "target_to_trigger_ms": r["target_crossed_to_trigger_ms"],
+          "reason": r["sell_reason"], "ts": r["timestamp_sell"]}
+         for r in rows if r["target_crossed_to_trigger_ms"] is not None and r["target_crossed_to_trigger_ms"] > 1000],
+        key=lambda x: -x["target_to_trigger_ms"]
+    )[:10]
+
+    slow_t2f = sorted(
+        [{"coin": r["coin"], "trigger_to_filled_ms": r["trigger_to_filled_ms"],
+          "reason": r["sell_reason"], "ts": r["timestamp_sell"]}
+         for r in rows if r["trigger_to_filled_ms"] is not None and r["trigger_to_filled_ms"] > 1000],
+        key=lambda x: -x["trigger_to_filled_ms"]
+    )[:10]
 
     return {
-        "hours": hours,
-        "count": len(durations),
-        "percentiles": {
-            "p50": _pct(durations, 50),
-            "p90": _pct(durations, 90),
-            "p95": _pct(durations, 95),
-            "p99": _pct(durations, 99),
+        "window_hours":            hours,
+        "trades_count":            len(rows),
+        "target_to_trigger_count": len(t2t),
+        "trigger_to_filled_count": len(t2f),
+        "target_to_trigger_ms": {
+            "min": min(t2t) if t2t else None, "max": max(t2t) if t2t else None,
+            "p50": pct(t2t, 50), "p90": pct(t2t, 90),
+            "p95": pct(t2t, 95), "p99": pct(t2t, 99),
         },
-        "min_sec": round(durations[0], 1),
-        "max_sec": round(durations[-1], 1),
-        "avg_sec": round(sum(durations) / len(durations), 1),
+        "trigger_to_filled_ms": {
+            "min": min(t2f) if t2f else None, "max": max(t2f) if t2f else None,
+            "p50": pct(t2f, 50), "p90": pct(t2f, 90),
+            "p95": pct(t2f, 95), "p99": pct(t2f, 99),
+        },
+        "slow_target_to_trigger": slow_t2t,
+        "slow_trigger_to_filled": slow_t2f,
     }
 
 
