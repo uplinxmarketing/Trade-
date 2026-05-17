@@ -480,6 +480,93 @@ function StrategyAuditLog({ baseUrl }: { baseUrl: string }) {
   );
 }
 
+// ── Orphan Check ──────────────────────────────────────────────────────────
+
+interface OrphanIssue {
+  type: 'orphan_on_binance' | 'orphan_in_db' | 'qty_mismatch';
+  symbol: string;
+  binance_qty: number;
+  db_qty: number | null;
+  diff_pct?: number;
+  value_usdt: number | null;
+}
+
+interface OrphanCheckResponse {
+  issues_count: number;
+  total_value_usdt: number;
+  issues: OrphanIssue[];
+  error?: string;
+}
+
+function OrphanCheck({ baseUrl }: { baseUrl: string }) {
+  const [data, setData] = useState<OrphanCheckResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const run = useCallback(() => {
+    setLoading(true);
+    fetch(`${baseUrl}/api/diagnostics/orphan-check`)
+      .then(r => r.json())
+      .then(d => { setData(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [baseUrl]);
+
+  const TYPE_LABEL: Record<string, string> = {
+    orphan_on_binance: 'On Binance, not in bot DB',
+    orphan_in_db: 'In bot DB, not on Binance',
+    qty_mismatch: 'Qty mismatch',
+  };
+  const TYPE_COLOR: Record<string, string> = {
+    orphan_on_binance: 'bg-yellow-500/10 border-yellow-500/30 text-yellow-400',
+    orphan_in_db: 'bg-loss/10 border-loss/30 text-loss',
+    qty_mismatch: 'bg-orange-500/10 border-orange-500/30 text-orange-400',
+  };
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <p className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Position Sync Check</p>
+        <button onClick={run} disabled={loading}
+          className="text-[8px] px-2 py-0.5 border border-accent/40 text-accent rounded hover:bg-accent/10 disabled:opacity-50">
+          {loading ? 'Checking…' : 'Run Check'}
+        </button>
+      </div>
+
+      {data?.error && (
+        <p className="text-[9px] text-loss">{data.error}</p>
+      )}
+
+      {data && !data.error && (
+        data.issues_count === 0 ? (
+          <div className="flex items-center gap-2 text-[9px] text-gain bg-gain/10 border border-gain/30 rounded px-2 py-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-gain shrink-0" />
+            All positions synced &mdash; no orphans detected
+          </div>
+        ) : (
+          <div className="space-y-1">
+            <p className="text-[8px] text-muted-foreground">{data.issues_count} issue(s) &middot; ~${data.total_value_usdt.toFixed(2)} stranded</p>
+            {data.issues.map((issue, i) => (
+              <div key={i} className={`flex justify-between border rounded px-2 py-1 ${TYPE_COLOR[issue.type]}`}>
+                <div>
+                  <p className="text-[8px] font-semibold font-mono">{issue.symbol}</p>
+                  <p className="text-[7px] opacity-80">{TYPE_LABEL[issue.type]}</p>
+                </div>
+                <div className="text-right">
+                  <p className="text-[8px] font-mono">B:{issue.binance_qty?.toFixed?.(4) ?? '—'} DB:{issue.db_qty?.toFixed?.(4) ?? '—'}</p>
+                  {issue.value_usdt != null && <p className="text-[7px] opacity-70">${issue.value_usdt.toFixed(2)}</p>}
+                </div>
+              </div>
+            ))}
+          </div>
+        )
+      )}
+
+      {!data && !loading && (
+        <p className="text-[9px] text-muted-foreground italic">Click &ldquo;Run Check&rdquo; to compare Binance balances vs bot DB</p>
+      )}
+    </div>
+  );
+}
+
 // ── Main export ───────────────────────────────────────────────────────────
 
 export function DiagnosticsTab({ baseUrl = '' }: { baseUrl?: string }) {
@@ -500,6 +587,9 @@ export function DiagnosticsTab({ baseUrl = '' }: { baseUrl?: string }) {
       </div>
       <div className="border-t border-border/50 pt-3">
         <StrategyAuditLog baseUrl={baseUrl} />
+      </div>
+      <div className="border-t border-border/50 pt-3">
+        <OrphanCheck baseUrl={baseUrl} />
       </div>
     </div>
   );

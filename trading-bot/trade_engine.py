@@ -1028,6 +1028,15 @@ def get_open_positions() -> List[dict]:
         return list(_positions)
 
 
+# ── exchangeInfo cache warm-up ─────────────────────────────────────────
+try:
+    from exchange_info import get_symbol_filters as _warmup_gsf
+    _warmup_gsf("BTCUSDT")  # warms the exchangeInfo cache at startup
+    del _warmup_gsf
+except Exception:
+    pass
+
+
 # ── Strategy loader ────────────────────────────────────────────────────
 
 def _load_strategy() -> dict:
@@ -1453,6 +1462,27 @@ def _execute_sell(pos: dict, price: float, reason: str):
             _selling.discard(sym)
             _selling_ts.pop(sym, None)
         return
+
+    # ── Lot-step rounding (toggleable via strategy.use_lot_step_rounding) ───
+    _strategy_ls = _load_strategy()
+    if _strategy_ls.get("use_lot_step_rounding", True):
+        try:
+            from exchange_info import compute_sell_quantity
+            _ls_qty, _ls_leftover, _ls_reason = compute_sell_quantity(sym, qty)
+            if _ls_qty <= 0:
+                database.log_activity(
+                    f"[SELL_SKIPPED] {sym} ({reason}): lot_step — {_ls_reason} (raw_qty={qty})",
+                    "warn"
+                )
+                with _selling_lock:
+                    _selling.discard(sym)
+                    _selling_ts.pop(sym, None)
+                return
+            if _ls_leftover > 0.0:
+                log.info("%s: lot_step rounding sells %s (leftover %s)", sym, _ls_qty, _ls_leftover)
+            qty = _ls_qty
+        except Exception as _ls_exc:
+            log.warning("%s: lot_step rounding failed (%s), using raw qty", sym, _ls_exc)
 
     # Verify position still exists — another executor task may have already sold it
     # (e.g. force-sell came in while we were queued).
