@@ -1490,6 +1490,42 @@ def _execute_sell(pos: dict, price: float, reason: str):
         except Exception as _ls_exc:
             log.warning("%s: lot_step rounding failed (%s), using raw qty", sym, _ls_exc)
 
+    # ── Clamp to actual Binance free balance (prevents APIError -2010) ─────
+    if get_mode() == "live":
+        try:
+            _asset = sym[:-4]  # e.g. "XRP" from "XRPUSDT"
+            _acc = client.get_account()
+            _free = next(
+                (float(b["free"]) for b in _acc.get("balances", []) if b["asset"] == _asset),
+                None
+            )
+            if _free is not None:
+                if abs(qty - _free) > qty * 0.001:  # > 0.1% mismatch — log it
+                    log.warning(
+                        "%s: qty mismatch — db=%s, binance_free=%s, using %s for sell (%s)",
+                        sym, qty, _free, min(qty, _free), reason
+                    )
+                qty = min(qty, _free)
+                # Re-apply lot-step rounding after balance clamp
+                if _strategy_ls.get("use_lot_step_rounding", True):
+                    try:
+                        from exchange_info import compute_sell_quantity
+                        _clamped_qty, _, _cr = compute_sell_quantity(sym, qty)
+                        if _clamped_qty <= 0:
+                            database.log_activity(
+                                f"[SELL_SKIPPED] {sym} ({reason}): after balance clamp — {_cr}",
+                                "warn"
+                            )
+                            with _selling_lock:
+                                _selling.discard(sym)
+                                _selling_ts.pop(sym, None)
+                            return
+                        qty = _clamped_qty
+                    except Exception:
+                        pass
+        except Exception as _bal_exc:
+            log.warning("%s: failed to fetch Binance balance for sell clamp: %s", sym, _bal_exc)
+
     # Verify position still exists — another executor task may have already sold it
     # (e.g. force-sell came in while we were queued).
     with _positions_lock:
