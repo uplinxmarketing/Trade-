@@ -52,6 +52,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 
+from concurrent.futures import TimeoutError as _ConcurrentTimeoutError
+
 import config
 import database
 from connection import get_mode, get_live_error, is_using_paper_fallback
@@ -1513,10 +1515,19 @@ def api_force_sell(symbol: str, req: Optional[ForceSellRequest] = None):
                 return {"ok": False, "error": f"Sell already in progress for {sym}"}
             _selling.add(sym)
             _selling_ts[sym] = _time.time()
-        # Dispatch to executor so this HTTP handler returns immediately.
-        # _execute_sell handles all logging, DB cleanup, and _selling.discard in its finally.
-        _sell_executor.submit(_execute_sell, pos, price, "force-sell")
-        return {"ok": True, "symbol": sym, "price": price, "breakeven": breakeven_floor}
+        # Wait for completion so the caller sees the actual outcome, not a silent fire-and-forget.
+        future = _sell_executor.submit(_execute_sell, pos, price, "force-sell")
+        try:
+            future.result(timeout=15.0)
+            return {"ok": True, "symbol": sym, "price": price, "breakeven": breakeven_floor, "completed": True}
+        except _ConcurrentTimeoutError:
+            return {"ok": True, "symbol": sym, "price": price, "breakeven": breakeven_floor,
+                    "completed": False, "note": "sell submitted but not completed in 15s — check activity log"}
+        except Exception as _fs_exc:
+            with _selling_lock:
+                _selling.discard(sym)
+                _selling_ts.pop(sym, None)
+            return {"ok": False, "symbol": sym, "error": f"{type(_fs_exc).__name__}: {_fs_exc}", "completed": False}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 

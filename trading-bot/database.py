@@ -734,7 +734,7 @@ def log_activity(message: str, level: str = "info"):
         conn.execute("""
             DELETE FROM activity_log
             WHERE id NOT IN (
-                SELECT id FROM activity_log ORDER BY id DESC LIMIT 500
+                SELECT id FROM activity_log ORDER BY id DESC LIMIT 5000
             )
         """)
         conn.commit()
