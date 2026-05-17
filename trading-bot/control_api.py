@@ -2467,6 +2467,74 @@ def api_diagnostics_errors_summary():
     }
 
 
+@app.get("/api/diagnostics/orphan-check")
+def api_orphan_check(min_value_usdt: float = 0.10):
+    """Compare Binance balances to bot DB positions. Reports orphans and mismatches."""
+    import sqlite3 as _sq
+
+    # Get Binance balances using existing account cache helper
+    try:
+        acc = _get_cached_account()
+        raw_balances = {b["asset"]: float(b["free"]) + float(b["locked"])
+                        for b in acc.get("balances", [])
+                        if float(b["free"]) + float(b["locked"]) > 0}
+    except Exception as e:
+        return {"error": f"Failed to fetch Binance balances: {e}"}
+
+    # Get current prices
+    prices = {}
+    try:
+        from trade_engine import _signal_cache, _signal_cache_lock
+        with _signal_cache_lock:
+            prices = {sym: entry.get("price", 0) for sym, entry in _signal_cache.items()}
+    except Exception:
+        pass
+
+    # Get DB positions
+    conn = _sq.connect(database.DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT symbol, quantity FROM positions")
+    db_positions = {row[0]: float(row[1]) for row in cur.fetchall()}
+    conn.close()
+
+    stables = {"USDT", "BUSD", "USDC", "FDUSD", "TUSD", "DAI", "USDP", "BNB"}
+    issues = []
+
+    for asset, qty in raw_balances.items():
+        if asset in stables or qty <= 0:
+            continue
+        symbol = f"{asset}USDT"
+        price = prices.get(symbol, 0)
+        value_usdt = round(qty * price, 4) if price > 0 else None
+        if value_usdt is not None and value_usdt < min_value_usdt:
+            continue
+        db_qty = db_positions.get(symbol)
+        if db_qty is None:
+            issues.append({"type": "orphan_on_binance", "symbol": symbol,
+                           "binance_qty": qty, "db_qty": None, "value_usdt": value_usdt})
+        else:
+            diff = abs(qty - db_qty)
+            diff_pct = (diff / db_qty * 100) if db_qty > 0 else 100
+            if diff_pct > 5.0 and (price or 0) * diff > min_value_usdt:
+                issues.append({"type": "qty_mismatch", "symbol": symbol,
+                               "binance_qty": qty, "db_qty": db_qty,
+                               "diff_pct": round(diff_pct, 2), "value_usdt": value_usdt})
+
+    for symbol, db_qty in db_positions.items():
+        asset = symbol.replace("USDT", "")
+        binance_qty = raw_balances.get(asset, 0.0)
+        if binance_qty == 0 and db_qty > 0:
+            price = prices.get(symbol, 0)
+            value_usdt = round(db_qty * price, 4) if price > 0 else None
+            if value_usdt is None or value_usdt > min_value_usdt:
+                issues.append({"type": "orphan_in_db", "symbol": symbol,
+                               "binance_qty": 0.0, "db_qty": db_qty, "value_usdt": value_usdt})
+
+    total_value = sum((i.get("value_usdt") or 0) for i in issues)
+    return {"issues_count": len(issues), "total_value_usdt": round(total_value, 4),
+            "min_value_usdt_filter": min_value_usdt, "issues": issues}
+
+
 @app.get("/api/stats/daily")
 def api_stats_daily(days: int = 7):
     """Daily trade summary — buys, sells, PnL, win rate per day."""
