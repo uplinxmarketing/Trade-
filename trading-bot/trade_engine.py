@@ -121,18 +121,24 @@ def _get_breakeven_mult(entry_price: float, symbol: str = "") -> float:
 def compute_real_breakeven_price(pos: dict, min_profit: float = 0.003) -> float:
     """Return the REAL price at which selling pos would net at least min_profit USDT.
 
+    Uses ACTUAL deployed capital (qty * entry_price), not the requested budget.
+    This matters when lot-step rounding reduces the actual quantity below what
+    the budget would have bought — the position only needs to recover what was
+    actually spent, plus fees, plus min_profit.
+
     Accounts for quantity rounding loss, buy fee already paid, and sell fee.
     Used as the sell trigger in both realtime_monitor and _sell_monitor_loop so
     trigger and profit gate use identical math and never disagree.
     """
     try:
-        budget   = float(pos.get("budget_usdt", 0))
-        buy_fee  = float(pos.get("buy_fee_usdt") or 0)
-        qty      = float(pos.get("quantity", 0))
-        if qty <= 0 or budget <= 0:
+        entry_price = float(pos.get("entry_price") or pos.get("avg_entry_price") or 0)
+        buy_fee     = float(pos.get("buy_fee_usdt") or 0)
+        qty         = float(pos.get("quantity", 0))
+        if qty <= 0 or entry_price <= 0:
             return 0.0
-        # qty * price * (1 - 0.001) >= budget + buy_fee + min_profit
-        return (budget + buy_fee + min_profit) / (qty * (1.0 - 0.001))
+        actual_cost = qty * entry_price + buy_fee
+        # qty * price * (1 - 0.001) >= actual_cost + min_profit
+        return (actual_cost + min_profit) / (qty * (1.0 - 0.001))
     except Exception:
         return 0.0
 
