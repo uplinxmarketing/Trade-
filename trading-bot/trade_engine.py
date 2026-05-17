@@ -17,6 +17,7 @@ update_coin_signals: Called by data_collector on every 1-minute kline close
 import asyncio
 import json
 import json as _json
+import logging
 import os
 import time
 import math
@@ -30,6 +31,8 @@ import database
 import indicators
 import learning
 from connection import client, get_mode
+
+log = logging.getLogger(__name__)
 
 # Phase 1: Signal registry — shadow mode only (use_new_signal_engine=False by default).
 # Falls back gracefully if the file is absent so a partial deploy can't break the bot.
