@@ -686,14 +686,18 @@ def _refresh_risk_params():
 
 
 def _profitable_sell_check(pos: dict, price: float, force_fresh: bool = False) -> bool:
-    """Return True only when selling at `price` is mathematically profitable in USDT.
+    """Return True only when selling at `price` nets at least min_profit + small slippage cushion.
+
+    Uses ACTUAL deployed capital (qty * entry_price) — same basis as the trigger
+    in compute_real_breakeven_price — so the trigger and the safety gate cannot
+    disagree on what 'profitable' means.
 
     When force_fresh=True, does a single-symbol REST fetch and overrides the
-    passed price with the freshest available — used in the final pre-order gate
-    to ensure the profitability check is never based on a stale price.
+    passed price with the freshest available.
 
-    Profit floor includes a 0.15% slippage buffer so even a bad market-order fill
-    (low-volume coin book slippage) still nets positive after fees.
+    Keeps a 0.05% slippage cushion (reduced from 0.15%) — calibrated for the
+    liquid coins the bot trades. Any take-profit sell that passes this check
+    should never result in a net loss.
     """
     symbol = pos.get("symbol", "")
     if force_fresh and symbol:
@@ -712,27 +716,26 @@ def _profitable_sell_check(pos: dict, price: float, force_fresh: bool = False) -
         except Exception:
             pass  # fall through to use passed price
 
-    entry  = pos.get("entry_price", 0)
-    qty    = pos.get("quantity", 0)
-    budget = pos.get("budget_usdt", 0)
-    buy_fee = float(pos.get("buy_fee_usdt") or budget * _fee_rate)
-    if entry <= 0 or qty <= 0 or budget <= 0 or price <= 0:
+    entry   = float(pos.get("entry_price") or pos.get("avg_entry_price") or 0)
+    qty     = float(pos.get("quantity", 0))
+    buy_fee = float(pos.get("buy_fee_usdt") or 0)
+    if entry <= 0 or qty <= 0 or price <= 0:
         return False
-    gross_quote    = price * qty
-    est_sell_fee   = gross_quote * _fee_rate
-    net_returned   = gross_quote - est_sell_fee
-    total_cost     = budget + buy_fee
-    strategy       = _load_strategy()
-    tp_enabled     = bool(strategy.get("take_profit_enabled", True))
-    tp_pct         = float(strategy.get("take_profit_pct", 0.1))
-    # 0.15% slippage buffer — absorbs worst-case market-order book slippage on
-    # low-volume coins so a bad fill can't push a "profitable" trade into a loss.
-    slippage_buf   = budget * 0.0015
+    # Use ACTUAL deployed capital (matches compute_real_breakeven_price)
+    actual_cost   = qty * entry + buy_fee
+    gross_quote   = price * qty
+    est_sell_fee  = gross_quote * _fee_rate
+    net_returned  = gross_quote - est_sell_fee
+    # 0.05% slippage cushion — realistic for liquid coins, prevents zero/negative trades
+    slippage_buf  = actual_cost * 0.0005
+    strategy   = _load_strategy()
+    tp_enabled = bool(strategy.get("take_profit_enabled", True))
+    tp_pct     = float(strategy.get("take_profit_pct", 0.25))
     if tp_enabled:
-        min_profit = max(0.003 + slippage_buf, budget * (tp_pct / 100.0))
+        min_profit = max(0.003 + slippage_buf, actual_cost * (tp_pct / 100.0))
     else:
         min_profit = 0.003 + slippage_buf
-    estimated_profit = net_returned - total_cost
+    estimated_profit = net_returned - actual_cost
     return estimated_profit >= min_profit
 
 
