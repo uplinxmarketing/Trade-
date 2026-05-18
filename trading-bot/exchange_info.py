@@ -3,6 +3,7 @@ import json
 import math
 import time
 import logging
+from decimal import Decimal, ROUND_DOWN
 from threading import Lock
 
 log = logging.getLogger(__name__)
@@ -69,8 +70,12 @@ def get_symbol_filters(symbol: str) -> dict:
 def round_quantity_to_step(quantity: float, step_size: float) -> float:
     if step_size <= 0 or quantity <= 0:
         return quantity
-    multiples = math.floor(quantity / step_size)
-    return multiples * step_size
+    # Use Decimal via str() to avoid float artifacts that cause Binance -1111.
+    # Example: 6.14 / 0.01 in float gives 6.140000000000001; Decimal gives 6.14.
+    q = Decimal(str(quantity))
+    s = Decimal(str(step_size))
+    multiples = (q / s).to_integral_value(rounding=ROUND_DOWN)
+    return float((multiples * s).quantize(s))
 
 
 def compute_sell_quantity(symbol: str, requested_qty: float):
