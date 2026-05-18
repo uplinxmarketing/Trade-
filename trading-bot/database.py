@@ -394,14 +394,14 @@ def save_position(pos: dict) -> Optional[int]:
             INSERT INTO positions
                 (symbol, entry_price, exit_target, quantity, budget_usdt, timestamp, mode,
                  entry_rsi, entry_ma_position, entry_bb_position, entry_volume_trend,
-                 buy_fee_usdt)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                 buy_fee_usdt, signal_snapshot)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             pos["symbol"], pos["entry_price"], pos.get("exit_target"),
             pos["quantity"], pos["budget_usdt"], pos["timestamp"], pos.get("mode", "paper"),
             pos.get("entry_rsi"), pos.get("entry_ma_position"),
             pos.get("entry_bb_position"), pos.get("entry_volume_trend"),
-            pos.get("buy_fee_usdt"),
+            pos.get("buy_fee_usdt"), pos.get("signal_snapshot"),
         ))
         conn.commit()
         row = conn.execute("SELECT last_insert_rowid() AS id").fetchone()
