@@ -32,6 +32,11 @@ import indicators
 import learning
 from connection import client, get_mode
 
+try:
+    import thread_health as _thread_health
+except Exception:
+    _thread_health = None
+
 log = logging.getLogger(__name__)
 
 # Phase 1: Signal registry — shadow mode only (use_new_signal_engine=False by default).
@@ -2600,6 +2605,12 @@ def realtime_monitor(prices: Dict[str, float]):
     """
     now = time.time()
 
+    try:
+        if _thread_health:
+            _thread_health.heartbeat("realtime_monitor")
+    except Exception:
+        pass
+
     # ── Real-time sell check — fires within ~100 ms of price crossing threshold ──
     # Reads the pre-built symbol→position index (no lock needed for dict reads).
     pos_index = _pos_by_symbol   # local ref; atomically replaced on each mutation
@@ -2944,6 +2955,11 @@ def _held_position_price_refresher():
 
     while True:
         try:
+            if _thread_health:
+                _thread_health.heartbeat("held_price_refresher")
+        except Exception:
+            pass
+        try:
             with _positions_lock:
                 held_syms = list({p.get("symbol") for p in _positions if p.get("symbol")})
             if not held_syms:
@@ -3022,6 +3038,8 @@ def _capital_recycler_loop():
     Only runs if 'auto_recycle_enabled' is true in strategy.json (default OFF)."""
     while True:
         try:
+            if _thread_health:
+                _thread_health.heartbeat("capital_recycler")
             time.sleep(1800)
             strategy = _load_strategy()
             if not bool(strategy.get("auto_recycle_enabled", False)):
@@ -3113,6 +3131,11 @@ def _sell_monitor_loop():
 
     while True:
         _sell_monitor_heartbeat = time.time()
+        try:
+            if _thread_health:
+                _thread_health.heartbeat("sell_monitor")
+        except Exception:
+            pass
         try:
             with _positions_lock:
                 snap = list(_positions)

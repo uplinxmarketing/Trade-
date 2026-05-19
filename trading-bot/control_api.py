@@ -2546,6 +2546,15 @@ def api_orphan_check(min_value_usdt: float = 0.10):
             "min_value_usdt_filter": min_value_usdt, "issues": issues}
 
 
+@app.get("/api/diagnostics/thread_health")
+def get_thread_health():
+    try:
+        import thread_health as _th
+        return _th.get_health()
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/stats/daily")
 def api_stats_daily(days: int = 7):
     """Daily trade summary — buys, sells, PnL, win rate per day."""

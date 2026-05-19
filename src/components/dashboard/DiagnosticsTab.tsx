@@ -71,6 +71,66 @@ function ms_color(ms: number | null | undefined): string {
   return 'text-loss';
 }
 
+// ── Thread Health ─────────────────────────────────────────────────────────
+
+interface ThreadStatus {
+  last_beat_ago_seconds: number;
+  alive: boolean;
+  status: 'alive' | 'warn' | 'stuck';
+}
+
+function ThreadHealth({ baseUrl }: { baseUrl: string }) {
+  const [health, setHealth] = useState<Record<string, ThreadStatus>>({});
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    fetch(`${baseUrl}/api/diagnostics/thread_health`)
+      .then(r => r.json())
+      .then(d => {
+        if (d.error) { setError(d.error); return; }
+        setError(null);
+        setHealth(d);
+      })
+      .catch(e => setError(String(e)));
+  }, [baseUrl]);
+
+  useEffect(() => {
+    load();
+    const iv = setInterval(load, 10_000);
+    return () => clearInterval(iv);
+  }, [load]);
+
+  const dotColor = (status: string) =>
+    status === 'alive' ? 'bg-gain' : status === 'warn' ? 'bg-yellow-400' : 'bg-loss';
+  const textColor = (status: string) =>
+    status === 'alive' ? 'text-gain' : status === 'warn' ? 'text-yellow-400' : 'text-loss';
+
+  const entries = Object.entries(health);
+
+  return (
+    <div className="space-y-2">
+      <p className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Thread Health</p>
+      {error ? (
+        <p className="text-[9px] text-loss">{error}</p>
+      ) : entries.length === 0 ? (
+        <p className="text-[9px] text-muted-foreground italic">No heartbeats received yet</p>
+      ) : (
+        <div className="grid grid-cols-2 gap-1">
+          {entries.map(([name, stat]) => (
+            <div key={name} className="flex items-center gap-2 bg-muted/20 rounded px-2 py-1">
+              <span className={`w-2 h-2 rounded-full shrink-0 ${dotColor(stat.status)}`} />
+              <span className="text-[8px] font-mono flex-1 truncate">{name}</span>
+              <span className={`text-[8px] font-bold shrink-0 ${textColor(stat.status)}`}>
+                {stat.last_beat_ago_seconds}s ago
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Alerts Banner ─────────────────────────────────────────────────────────
 
 function AlertsBanner({ baseUrl }: { baseUrl: string }) {
@@ -572,7 +632,10 @@ function OrphanCheck({ baseUrl }: { baseUrl: string }) {
 export function DiagnosticsTab({ baseUrl = '' }: { baseUrl?: string }) {
   return (
     <div className="space-y-4">
-      <AlertsBanner baseUrl={baseUrl} />
+      <ThreadHealth baseUrl={baseUrl} />
+      <div className="border-t border-border/50 pt-3">
+        <AlertsBanner baseUrl={baseUrl} />
+      </div>
       <div className="border-t border-border/50 pt-3">
         <SignalFireRates baseUrl={baseUrl} />
       </div>
