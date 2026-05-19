@@ -211,6 +211,8 @@ async def lifespan(app: FastAPI):
         steps.append("held_price_refresher OK")
         trade_engine.start_capital_recycler()
         steps.append("capital_recycler OK")
+        trade_engine.start_phantom_checker()
+        steps.append("phantom_checker OK")
 
         # 4. Apply startup defaults and auto-resume logic.
         #    stop_loss and smart_hold are ALWAYS forced OFF on every deploy —
@@ -2544,6 +2546,121 @@ def api_orphan_check(min_value_usdt: float = 0.10):
     total_value = sum((i.get("value_usdt") or 0) for i in issues)
     return {"issues_count": len(issues), "total_value_usdt": round(total_value, 4),
             "min_value_usdt_filter": min_value_usdt, "issues": issues}
+
+
+@app.get("/api/diagnostics/fill_quality")
+def get_fill_quality(hours: int = 24):
+    import sqlite3 as _sq
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    try:
+        conn = _sq.connect(database.DB_PATH)
+        conn.row_factory = _sq.Row
+        rows = conn.execute(
+            "SELECT coin, buy_slippage_pct, sell_slippage_pct, intended_buy_price, entry_price, intended_sell_price, exit_price, quantity, timestamp_sell FROM trades WHERE timestamp_sell >= ? AND exit_price IS NOT NULL",
+            (cutoff,)
+        ).fetchall()
+        conn.close()
+        buy_slips  = [r["buy_slippage_pct"]  for r in rows if r["buy_slippage_pct"]  is not None]
+        sell_slips = [r["sell_slippage_pct"] for r in rows if r["sell_slippage_pct"] is not None]
+
+        def percentiles(vals):
+            if not vals:
+                return {"p50": None, "p90": None, "p99": None, "avg": None}
+            s = sorted(vals)
+            n = len(s)
+            return {
+                "p50": round(s[int(n * 0.5)], 4),
+                "p90": round(s[int(n * 0.9)], 4),
+                "p99": round(s[min(int(n * 0.99), n - 1)], 4),
+                "avg": round(sum(s) / n, 4),
+            }
+
+        worst = sorted(
+            [dict(r) for r in rows if r["sell_slippage_pct"] is not None],
+            key=lambda x: abs(x["sell_slippage_pct"] or 0), reverse=True
+        )[:10]
+        return {
+            "window_hours": hours,
+            "trade_count": len(rows),
+            "buy_slippage": percentiles(buy_slips),
+            "sell_slippage": percentiles(sell_slips),
+            "worst_fills": worst,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/diagnostics/phantoms")
+def get_phantoms():
+    import sqlite3 as _sq
+    try:
+        conn = _sq.connect(database.DB_PATH)
+        conn.row_factory = _sq.Row
+        rows = conn.execute(
+            "SELECT id, timestamp, symbol, db_qty, binance_qty, resolved FROM phantom_alerts WHERE resolved=0 ORDER BY id DESC LIMIT 50"
+        ).fetchall()
+        conn.close()
+        return {"phantoms": [dict(r) for r in rows], "count": len(rows)}
+    except Exception as e:
+        return {"error": str(e), "phantoms": [], "count": 0}
+
+
+@app.post("/api/diagnostics/phantoms/{alert_id}/resolve")
+def resolve_phantom(alert_id: int):
+    import sqlite3 as _sq
+    try:
+        conn = _sq.connect(database.DB_PATH)
+        conn.execute("UPDATE phantom_alerts SET resolved=1 WHERE id=?", (alert_id,))
+        conn.commit()
+        conn.close()
+        return {"ok": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/diagnostics/thread_health")
+def get_thread_health():
+    try:
+        import thread_health as _th
+        return _th.get_health()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/diagnostics/buy_rejections")
+def get_buy_rejections(hours: int = 1):
+    from datetime import timedelta
+    import sqlite3 as _sq
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    try:
+        conn = _sq.connect(database.DB_PATH)
+        conn.row_factory = _sq.Row
+        total = conn.execute("SELECT COUNT(*) as c FROM buy_rejections WHERE timestamp >= ?", (cutoff,)).fetchone()["c"]
+        by_reason_rows = conn.execute(
+            "SELECT reason, COUNT(*) as cnt FROM buy_rejections WHERE timestamp >= ? GROUP BY reason ORDER BY cnt DESC LIMIT 20",
+            (cutoff,)
+        ).fetchall()
+        by_coin_rows = conn.execute(
+            "SELECT coin, COUNT(*) as rejections FROM buy_rejections WHERE timestamp >= ? GROUP BY coin ORDER BY rejections DESC LIMIT 20",
+            (cutoff,)
+        ).fetchall()
+        recent = conn.execute(
+            "SELECT timestamp, coin, reason, detail, score, rsi_value FROM buy_rejections WHERE timestamp >= ? ORDER BY id DESC LIMIT 50",
+            (cutoff,)
+        ).fetchall()
+        conn.close()
+        by_reason = [{"reason": r["reason"], "count": r["cnt"], "pct": round(r["cnt"]/total*100, 1) if total else 0} for r in by_reason_rows]
+        by_coin = [{"coin": r["coin"], "rejections": r["rejections"]} for r in by_coin_rows]
+        return {
+            "window_hours": hours,
+            "total_rejections": total,
+            "by_reason": by_reason,
+            "by_coin": by_coin,
+            "recent": [dict(r) for r in recent],
+        }
+    except Exception as e:
+        return {"error": str(e), "total_rejections": 0, "by_reason": [], "by_coin": [], "recent": []}
 
 
 @app.get("/api/stats/daily")

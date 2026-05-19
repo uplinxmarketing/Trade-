@@ -71,6 +71,66 @@ function ms_color(ms: number | null | undefined): string {
   return 'text-loss';
 }
 
+// ── Thread Health ─────────────────────────────────────────────────────────
+
+interface ThreadStatus {
+  last_beat_ago_seconds: number;
+  alive: boolean;
+  status: 'alive' | 'warn' | 'stuck';
+}
+
+function ThreadHealth({ baseUrl }: { baseUrl: string }) {
+  const [health, setHealth] = useState<Record<string, ThreadStatus>>({});
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    fetch(`${baseUrl}/api/diagnostics/thread_health`)
+      .then(r => r.json())
+      .then(d => {
+        if (d.error) { setError(d.error); return; }
+        setError(null);
+        setHealth(d);
+      })
+      .catch(e => setError(String(e)));
+  }, [baseUrl]);
+
+  useEffect(() => {
+    load();
+    const iv = setInterval(load, 10_000);
+    return () => clearInterval(iv);
+  }, [load]);
+
+  const dotColor = (status: string) =>
+    status === 'alive' ? 'bg-gain' : status === 'warn' ? 'bg-yellow-400' : 'bg-loss';
+  const textColor = (status: string) =>
+    status === 'alive' ? 'text-gain' : status === 'warn' ? 'text-yellow-400' : 'text-loss';
+
+  const entries = Object.entries(health);
+
+  return (
+    <div className="space-y-2">
+      <p className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Thread Health</p>
+      {error ? (
+        <p className="text-[9px] text-loss">{error}</p>
+      ) : entries.length === 0 ? (
+        <p className="text-[9px] text-muted-foreground italic">No heartbeats received yet</p>
+      ) : (
+        <div className="grid grid-cols-2 gap-1">
+          {entries.map(([name, stat]) => (
+            <div key={name} className="flex items-center gap-2 bg-muted/20 rounded px-2 py-1">
+              <span className={`w-2 h-2 rounded-full shrink-0 ${dotColor(stat.status)}`} />
+              <span className="text-[8px] font-mono flex-1 truncate">{name}</span>
+              <span className={`text-[8px] font-bold shrink-0 ${textColor(stat.status)}`}>
+                {stat.last_beat_ago_seconds}s ago
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Alerts Banner ─────────────────────────────────────────────────────────
 
 function AlertsBanner({ baseUrl }: { baseUrl: string }) {
@@ -567,17 +627,318 @@ function OrphanCheck({ baseUrl }: { baseUrl: string }) {
   );
 }
 
+// ── Fill Quality ──────────────────────────────────────────────────────────
+
+interface FillQualityData {
+  window_hours: number;
+  trade_count: number;
+  buy_slippage: { p50: number|null; p90: number|null; p99: number|null; avg: number|null };
+  sell_slippage: { p50: number|null; p90: number|null; p99: number|null; avg: number|null };
+  worst_fills: Array<{ coin: string; buy_slippage_pct: number|null; sell_slippage_pct: number|null; timestamp_sell: string }>;
+  error?: string;
+}
+
+function FillQuality({ baseUrl }: { baseUrl: string }) {
+  const [hours, setHours] = useState(24);
+  const [data, setData] = useState<FillQualityData | null>(null);
+
+  useEffect(() => {
+    fetch(`${baseUrl}/api/diagnostics/fill_quality?hours=${hours}`)
+      .then(r => r.json())
+      .then(setData)
+      .catch(() => {});
+  }, [baseUrl, hours]);
+
+  const slip_color = (v: number | null) => {
+    if (v == null) return 'text-muted-foreground';
+    if (Math.abs(v) < 0.05) return 'text-gain';
+    if (Math.abs(v) < 0.2) return 'text-yellow-400';
+    return 'text-loss';
+  };
+
+  const SlipTile = ({ label, val }: { label: string; val: number | null }) => (
+    <div className="bg-muted/20 rounded px-2 py-1 text-center">
+      <p className="text-[8px] text-muted-foreground">{label}</p>
+      <p className={`text-[11px] font-bold ${slip_color(val)}`}>
+        {val == null ? '—' : `${val > 0 ? '+' : ''}${val.toFixed(3)}%`}
+      </p>
+    </div>
+  );
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <p className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Fill Quality</p>
+        <select value={hours} onChange={e => setHours(parseInt(e.target.value))}
+          className="text-[8px] bg-background border border-border rounded px-1 py-0.5 text-foreground">
+          <option value={4}>4h</option>
+          <option value={24}>24h</option>
+          <option value={168}>7d</option>
+        </select>
+      </div>
+
+      {data?.error ? (
+        <p className="text-[9px] text-loss">{data.error}</p>
+      ) : !data ? (
+        <p className="text-[9px] text-muted-foreground">Loading…</p>
+      ) : data.trade_count === 0 ? (
+        <p className="text-[9px] text-muted-foreground italic">No trades in window</p>
+      ) : (
+        <div className="space-y-3">
+          <p className="text-[8px] text-muted-foreground">{data.trade_count} trades</p>
+          <div>
+            <p className="text-[8px] font-semibold text-muted-foreground mb-1">Buy Slippage</p>
+            <div className="grid grid-cols-4 gap-1">
+              <SlipTile label="avg" val={data.buy_slippage.avg} />
+              <SlipTile label="p50" val={data.buy_slippage.p50} />
+              <SlipTile label="p90" val={data.buy_slippage.p90} />
+              <SlipTile label="p99" val={data.buy_slippage.p99} />
+            </div>
+          </div>
+          <div>
+            <p className="text-[8px] font-semibold text-muted-foreground mb-1">Sell Slippage</p>
+            <div className="grid grid-cols-4 gap-1">
+              <SlipTile label="avg" val={data.sell_slippage.avg} />
+              <SlipTile label="p50" val={data.sell_slippage.p50} />
+              <SlipTile label="p90" val={data.sell_slippage.p90} />
+              <SlipTile label="p99" val={data.sell_slippage.p99} />
+            </div>
+          </div>
+          {data.worst_fills.length > 0 && (
+            <details>
+              <summary className="cursor-pointer text-[8px] text-muted-foreground hover:text-foreground">
+                Worst fills ({data.worst_fills.length})
+              </summary>
+              <div className="mt-1 overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-border/50">
+                      {['Coin', 'Buy slip', 'Sell slip', 'When'].map(h => (
+                        <th key={h} className="text-[8px] text-muted-foreground font-semibold text-left pb-0.5 pr-2">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.worst_fills.map((r, i) => (
+                      <tr key={i} className="border-b border-border/20 last:border-0">
+                        <td className="text-[8px] font-mono py-0.5 pr-2">{r.coin?.replace('USDT', '')}</td>
+                        <td className={`text-[8px] pr-2 ${slip_color(r.buy_slippage_pct)}`}>
+                          {r.buy_slippage_pct == null ? '—' : `${r.buy_slippage_pct > 0 ? '+' : ''}${r.buy_slippage_pct?.toFixed(3)}%`}
+                        </td>
+                        <td className={`text-[8px] pr-2 ${slip_color(r.sell_slippage_pct)}`}>
+                          {r.sell_slippage_pct == null ? '—' : `${r.sell_slippage_pct > 0 ? '+' : ''}${r.sell_slippage_pct?.toFixed(3)}%`}
+                        </td>
+                        <td className="text-[7px] text-muted-foreground">{r.timestamp_sell ? new Date(r.timestamp_sell).toLocaleString() : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Buy Decision Telemetry ────────────────────────────────────────────────
+
+interface BuyRejectionData {
+  window_hours: number;
+  total_rejections: number;
+  by_reason: Array<{ reason: string; count: number; pct: number }>;
+  by_coin: Array<{ coin: string; rejections: number }>;
+  recent: Array<{ timestamp: string; coin: string; reason: string; detail: string | null; score: number | null; rsi_value: number | null }>;
+  error?: string;
+}
+
+function BuyDecisionTelemetry({ baseUrl }: { baseUrl: string }) {
+  const [hours, setHours] = useState(1);
+  const [data, setData] = useState<BuyRejectionData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [showRecent, setShowRecent] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    fetch(`${baseUrl}/api/diagnostics/buy_rejections?hours=${hours}`)
+      .then(r => r.json())
+      .then(d => { setData(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [baseUrl, hours]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const windowLabel = (h: number) => h < 1 ? `${h * 60 | 0}min` : `${h}h`;
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <p className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Buy Decision Telemetry</p>
+        <div className="flex gap-1">
+          {[0.25, 1, 4, 24].map(h => (
+            <button key={h} onClick={() => setHours(h)}
+              className={`text-[8px] px-1.5 py-0.5 border rounded ${hours === h ? 'border-accent text-accent' : 'border-border text-muted-foreground hover:border-accent/50'}`}>
+              {windowLabel(h)}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {loading ? (
+        <p className="text-[9px] text-muted-foreground">Loading…</p>
+      ) : data?.error ? (
+        <p className="text-[9px] text-loss">{data.error}</p>
+      ) : !data ? null : (
+        <div className="space-y-3">
+          <p className="text-[8px] text-muted-foreground">{data.total_rejections} rejections in last {hours}h</p>
+
+          {data.by_reason.length > 0 && (
+            <div>
+              <p className="text-[8px] font-semibold text-muted-foreground mb-1">By Reason</p>
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-border/50">
+                      {['Reason', 'Count', '%'].map(h => (
+                        <th key={h} className="text-[8px] text-muted-foreground font-semibold text-left pb-0.5 pr-2">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.by_reason.map((r, i) => (
+                      <tr key={i} className="border-b border-border/20 last:border-0">
+                        <td className="text-[8px] font-mono py-0.5 pr-2 truncate max-w-[10rem]">{r.reason}</td>
+                        <td className="text-[8px] text-right pr-2">{r.count}</td>
+                        <td className="text-[8px] text-right text-muted-foreground">{r.pct}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {data.by_coin.length > 0 && (
+            <div>
+              <p className="text-[8px] font-semibold text-muted-foreground mb-1">Most Rejected Coins</p>
+              <div className="flex flex-wrap gap-1">
+                {data.by_coin.slice(0, 10).map((c, i) => (
+                  <span key={i} className="text-[8px] font-mono bg-muted/20 rounded px-1.5 py-0.5">
+                    {c.coin.replace('USDT', '')} <span className="text-muted-foreground">{c.rejections}</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {data.recent.length > 0 && (
+            <details open={showRecent} onToggle={e => setShowRecent((e.target as HTMLDetailsElement).open)}>
+              <summary className="cursor-pointer text-[8px] text-muted-foreground hover:text-foreground">
+                Recent Rejections ({data.recent.length})
+              </summary>
+              <div className="mt-1 space-y-0.5 max-h-40 overflow-y-auto">
+                {data.recent.slice(0, 20).map((r, i) => (
+                  <div key={i} className="flex gap-2 text-[7px] border-b border-border/10 py-0.5">
+                    <span className="text-muted-foreground shrink-0 w-16 truncate">{new Date(r.timestamp).toLocaleTimeString()}</span>
+                    <span className="font-mono w-16 truncate shrink-0">{r.coin.replace('USDT', '')}</span>
+                    <span className="text-yellow-400 truncate flex-1">{r.reason}</span>
+                    {r.score != null && <span className="text-muted-foreground shrink-0">s:{r.score}</span>}
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Phantom Position Alerts ───────────────────────────────────────────────
+
+interface PhantomAlert {
+  id: number;
+  timestamp: string;
+  symbol: string;
+  db_qty: number;
+  binance_qty: number;
+  resolved: number;
+}
+
+function PhantomAlerts({ baseUrl }: { baseUrl: string }) {
+  const [phantoms, setPhantoms] = useState<PhantomAlert[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    fetch(`${baseUrl}/api/diagnostics/phantoms`)
+      .then(r => r.json())
+      .then(d => { setPhantoms(d.phantoms || []); setError(d.error || null); })
+      .catch(e => setError(String(e)));
+  }, [baseUrl]);
+
+  useEffect(() => {
+    load();
+    const iv = setInterval(load, 30_000);
+    return () => clearInterval(iv);
+  }, [load]);
+
+  const resolve = async (id: number) => {
+    await fetch(`${baseUrl}/api/diagnostics/phantoms/${id}/resolve`, { method: 'POST' }).catch(() => {});
+    setPhantoms(prev => prev.filter(p => p.id !== id));
+    toast.success('Phantom alert resolved');
+  };
+
+  return (
+    <div className="space-y-2">
+      <p className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Phantom Position Alerts</p>
+      {error ? (
+        <p className="text-[9px] text-loss">{error}</p>
+      ) : phantoms.length === 0 ? (
+        <div className="flex items-center gap-2 text-[9px] text-gain bg-gain/10 border border-gain/30 rounded px-2 py-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-gain shrink-0" />
+          No phantom positions detected
+        </div>
+      ) : (
+        <div className="space-y-1">
+          <p className="text-[8px] text-muted-foreground">{phantoms.length} unresolved alert(s)</p>
+          {phantoms.map(p => (
+            <div key={p.id} className="flex items-center justify-between border border-loss/30 bg-loss/10 rounded px-2 py-1">
+              <div>
+                <p className="text-[8px] font-semibold font-mono text-loss">{p.symbol}</p>
+                <p className="text-[7px] text-muted-foreground">
+                  DB: {p.db_qty?.toFixed(6)} · Binance: {p.binance_qty?.toFixed(6)} · {new Date(p.timestamp).toLocaleString()}
+                </p>
+              </div>
+              <button onClick={() => resolve(p.id)}
+                className="shrink-0 ml-2 text-[8px] px-1.5 py-0.5 border border-accent/40 text-accent rounded hover:bg-accent/10">
+                Resolve
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main export ───────────────────────────────────────────────────────────
 
 export function DiagnosticsTab({ baseUrl = '' }: { baseUrl?: string }) {
   return (
     <div className="space-y-4">
-      <AlertsBanner baseUrl={baseUrl} />
+      <ThreadHealth baseUrl={baseUrl} />
+      <div className="border-t border-border/50 pt-3">
+        <AlertsBanner baseUrl={baseUrl} />
+      </div>
       <div className="border-t border-border/50 pt-3">
         <SignalFireRates baseUrl={baseUrl} />
       </div>
       <div className="border-t border-border/50 pt-3">
         <SignalWinRates baseUrl={baseUrl} />
+      </div>
+      <div className="border-t border-border/50 pt-3">
+        <BuyDecisionTelemetry baseUrl={baseUrl} />
       </div>
       <div className="border-t border-border/50 pt-3">
         <CoinTraceLookup baseUrl={baseUrl} />
@@ -586,10 +947,16 @@ export function DiagnosticsTab({ baseUrl = '' }: { baseUrl?: string }) {
         <SellTimingHistogram baseUrl={baseUrl} />
       </div>
       <div className="border-t border-border/50 pt-3">
+        <FillQuality baseUrl={baseUrl} />
+      </div>
+      <div className="border-t border-border/50 pt-3">
         <StrategyAuditLog baseUrl={baseUrl} />
       </div>
       <div className="border-t border-border/50 pt-3">
         <OrphanCheck baseUrl={baseUrl} />
+      </div>
+      <div className="border-t border-border/50 pt-3">
+        <PhantomAlerts baseUrl={baseUrl} />
       </div>
     </div>
   );

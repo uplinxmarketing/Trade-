@@ -206,6 +206,27 @@ def init_db():
                 timestamp_open   TEXT,
                 timestamp_close  TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS buy_rejections (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp  TEXT NOT NULL,
+                coin       TEXT NOT NULL,
+                reason     TEXT NOT NULL,
+                detail     TEXT,
+                score      INTEGER,
+                rsi_value  REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_buy_rejections_ts     ON buy_rejections(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_buy_rejections_reason ON buy_rejections(reason);
+
+            CREATE TABLE IF NOT EXISTS phantom_alerts (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT NOT NULL,
+                symbol      TEXT NOT NULL,
+                db_qty      REAL,
+                binance_qty REAL,
+                resolved    INTEGER DEFAULT 0
+            );
         """)
 
         # ── Schema migrations for existing databases ─────────────────────────
@@ -238,6 +259,13 @@ def init_db():
             "ALTER TABLE trades ADD COLUMN target_crossed_to_trigger_ms INTEGER",
             "ALTER TABLE trades ADD COLUMN trigger_to_filled_ms         INTEGER",
             "ALTER TABLE trades ADD COLUMN target_crossed_ts            TEXT",
+            # fill quality columns
+            "ALTER TABLE trades ADD COLUMN intended_buy_price   REAL",
+            "ALTER TABLE trades ADD COLUMN intended_sell_price  REAL",
+            "ALTER TABLE trades ADD COLUMN buy_slippage_pct     REAL",
+            "ALTER TABLE trades ADD COLUMN sell_slippage_pct    REAL",
+            "ALTER TABLE positions ADD COLUMN intended_buy_price REAL",
+            "ALTER TABLE positions ADD COLUMN buy_slippage_pct   REAL",
         ]
         for sql in migrations:
             try:
@@ -320,8 +348,9 @@ def log_trade(trade: dict, *,
                  entry_rsi, entry_ma_position, entry_bb_position,
                  entry_volume_trend, hour_of_day, day_of_week,
                  timestamp_buy, timestamp_sell, sell_reason, signal_snapshot,
-                 target_crossed_to_trigger_ms, trigger_to_filled_ms, target_crossed_ts)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 target_crossed_to_trigger_ms, trigger_to_filled_ms, target_crossed_ts,
+                 intended_buy_price, intended_sell_price, buy_slippage_pct, sell_slippage_pct)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             trade.get("coin"), trade.get("mode"), trade.get("entry_price"),
             trade.get("exit_price"), trade.get("quantity"), trade.get("budget_usdt"),
@@ -333,6 +362,8 @@ def log_trade(trade: dict, *,
             trade.get("timestamp_buy"), trade.get("timestamp_sell"),
             trade.get("sell_reason"), trade.get("signal_snapshot"),
             target_crossed_to_trigger_ms, trigger_to_filled_ms, target_crossed_ts,
+            trade.get("intended_buy_price"), trade.get("intended_sell_price"),
+            trade.get("buy_slippage_pct"), trade.get("sell_slippage_pct"),
         ))
         conn.commit()
         conn.close()
@@ -346,6 +377,19 @@ def get_recent_trades(limit: int = 20) -> List[dict]:
         """, (limit,)).fetchall()
         conn.close()
     return [dict(r) for r in rows]
+
+
+def record_buy_rejection(coin: str, reason: str, detail: str = None, score: int = None, rsi_value: float = None):
+    ts = datetime.now(timezone.utc).isoformat()
+    with _lock:
+        conn = _conn()
+        conn.execute(
+            "INSERT INTO buy_rejections (timestamp, coin, reason, detail, score, rsi_value) VALUES (?,?,?,?,?,?)",
+            (ts, coin, reason, detail, score, rsi_value)
+        )
+        conn.execute("DELETE FROM buy_rejections WHERE id NOT IN (SELECT id FROM buy_rejections ORDER BY id DESC LIMIT 50000)")
+        conn.commit()
+        conn.close()
 
 
 def get_trades_today_count() -> int:
@@ -394,14 +438,15 @@ def save_position(pos: dict) -> Optional[int]:
             INSERT INTO positions
                 (symbol, entry_price, exit_target, quantity, budget_usdt, timestamp, mode,
                  entry_rsi, entry_ma_position, entry_bb_position, entry_volume_trend,
-                 buy_fee_usdt, signal_snapshot)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 buy_fee_usdt, signal_snapshot, intended_buy_price, buy_slippage_pct)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             pos["symbol"], pos["entry_price"], pos.get("exit_target"),
             pos["quantity"], pos["budget_usdt"], pos["timestamp"], pos.get("mode", "paper"),
             pos.get("entry_rsi"), pos.get("entry_ma_position"),
             pos.get("entry_bb_position"), pos.get("entry_volume_trend"),
             pos.get("buy_fee_usdt"), pos.get("signal_snapshot"),
+            pos.get("intended_buy_price"), pos.get("buy_slippage_pct"),
         ))
         conn.commit()
         row = conn.execute("SELECT last_insert_rowid() AS id").fetchone()

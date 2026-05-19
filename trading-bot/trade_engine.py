@@ -32,7 +32,43 @@ import indicators
 import learning
 from connection import client, get_mode
 
+try:
+    import thread_health as _thread_health
+except Exception:
+    _thread_health = None
+
 log = logging.getLogger(__name__)
+
+
+def _log_order_intent(action: str, symbol: str, qty: float, intended_price: float):
+    try:
+        database.log_activity(
+            f"[ORDER_SEND] {action} {symbol} qty={qty:.6f} "
+            f"intended_price={intended_price:.6f} "
+            f"intended_notional=${qty * intended_price:.4f}",
+            "info"
+        )
+    except Exception:
+        pass
+
+
+def _log_order_result(action: str, symbol: str, intended_qty: float, intended_price: float, result: dict):
+    try:
+        fills = result.get("fills", [])
+        filled_qty = float(result.get("executedQty") or sum(float(f.get("qty", 0)) for f in fills))
+        actual_quote = float(result.get("cummulativeQuoteQty") or 0)
+        actual_avg = actual_quote / filled_qty if filled_qty > 0 else 0
+        slippage = ((actual_avg - intended_price) / intended_price * 100) if intended_price > 0 else 0
+        database.log_activity(
+            f"[ORDER_REPLY] {action} {symbol} status={result.get('status')} "
+            f"filled={filled_qty:.6f} (intended {intended_qty:.6f}) "
+            f"avg_price={actual_avg:.6f} (intended {intended_price:.6f}) "
+            f"slippage={slippage:+.3f}% quote=${actual_quote:.4f}",
+            "info"
+        )
+    except Exception:
+        pass
+
 
 # Phase 1: Signal registry — shadow mode only (use_new_signal_engine=False by default).
 # Falls back gracefully if the file is absent so a partial deploy can't break the bot.
@@ -1156,6 +1192,10 @@ def _record_rejection(symbol: str, score, reason: str, detail: str = ""):
                 ex_list.pop(0)
     except Exception:
         pass
+    try:
+        database.record_buy_rejection(symbol, reason, str(detail)[:500] if detail else None, int(score or 0), None)
+    except Exception:
+        pass
 
 def get_rejection_stats() -> dict:
     with _rejection_lock:
@@ -1689,10 +1729,12 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     try:
         # Paper mode: pass the trigger price directly so concurrent WebSocket/REST
         # updates cannot cause the sell to execute at the wrong price.
+        _log_order_intent("SELL", sym, qty, price)
         if _is_paper:
             result = client.order_market_sell(symbol=sym, quantity=qty, price=price)
         else:
             result = client.order_market_sell(symbol=sym, quantity=qty)
+        _log_order_result("SELL", sym, qty, price, result)
         pos["_sell_binance_done_ts"] = time.time()
     except Exception as e:
         pos["_sell_binance_done_ts"] = time.time()
@@ -1843,6 +1885,10 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         duration = 0
         buy_dt   = datetime.now(_tz.utc)
 
+    _intended_buy_price = pos.get("intended_buy_price")
+    _pos_buy_slippage   = pos.get("buy_slippage_pct")
+    _intended_sell_price = price
+    _sell_slippage_pct = ((fill_price - price) / price * 100) if price > 0 else None
     trade_record = {
         "coin":               sym,
         "mode":               mode,
@@ -1865,6 +1911,10 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         "timestamp_sell":     sell_ts,
         "sell_reason":        reason,
         "signal_snapshot":    pos.get("signal_snapshot"),
+        "intended_buy_price":  _intended_buy_price,
+        "intended_sell_price": _intended_sell_price,
+        "buy_slippage_pct":    _pos_buy_slippage,
+        "sell_slippage_pct":   _sell_slippage_pct,
     }
     # ── Sell timing diagnostic ────────────────────────────────────────────────
     try:
@@ -2420,7 +2470,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _buying_ts[sym] = _now_b
 
         try:
+            _log_order_intent("BUY", sym, budget / max(price, 1e-12), price)
             result = client.order_market_buy(symbol=sym, quoteOrderQty=budget)
+            _log_order_result("BUY", sym, budget / max(price, 1e-12), price, result)
         except Exception as e:
             with _buying_lock:
                 _buying.discard(sym)
@@ -2470,6 +2522,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _eff_tp_mult = _bep_mult_buy
         exit_target = round(fill_price * _eff_tp_mult, 8)
         _pos_peaks.pop(sym, None)
+        _buy_slippage_pct = ((fill_price - price) / price * 100) if price > 0 else None
         pos_record = {
             "symbol":             sym,
             "entry_price":        fill_price,
@@ -2485,6 +2538,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             "entry_ma_position":  entry_ma,
             "entry_bb_position":  entry_bb,
             "entry_volume_trend": entry_vol,
+            "intended_buy_price": price,
+            "buy_slippage_pct":   _buy_slippage_pct,
             "buy_signals_snapshot": {
                 "score":         score,
                 "trend":         sigs.get("trend"),
@@ -2599,6 +2654,12 @@ def realtime_monitor(prices: Dict[str, float]):
     daemon thread acts as a 5-second fallback in case a tick is missed.
     """
     now = time.time()
+
+    try:
+        if _thread_health:
+            _thread_health.heartbeat("realtime_monitor")
+    except Exception:
+        pass
 
     # ── Real-time sell check — fires within ~100 ms of price crossing threshold ──
     # Reads the pre-built symbol→position index (no lock needed for dict reads).
@@ -2944,6 +3005,11 @@ def _held_position_price_refresher():
 
     while True:
         try:
+            if _thread_health:
+                _thread_health.heartbeat("held_price_refresher")
+        except Exception:
+            pass
+        try:
             with _positions_lock:
                 held_syms = list({p.get("symbol") for p in _positions if p.get("symbol")})
             if not held_syms:
@@ -3022,6 +3088,8 @@ def _capital_recycler_loop():
     Only runs if 'auto_recycle_enabled' is true in strategy.json (default OFF)."""
     while True:
         try:
+            if _thread_health:
+                _thread_health.heartbeat("capital_recycler")
             time.sleep(1800)
             strategy = _load_strategy()
             if not bool(strategy.get("auto_recycle_enabled", False)):
@@ -3093,6 +3161,85 @@ def start_capital_recycler():
     _capital_recycler_thread.start()
 
 
+# ── Phantom position detector ──────────────────────────────────────────────────
+_phantom_checker_thread: Optional[threading.Thread] = None
+
+
+def _phantom_check_loop():
+    """Every 300s (live mode only), compare DB positions to Binance balances.
+    Logs mismatches to activity_log and inserts unresolved phantom_alerts rows."""
+    import sqlite3 as _sq_ph
+    while True:
+        try:
+            time.sleep(300)
+            mode = get_mode()
+            if mode != "live":
+                continue
+            with _positions_lock:
+                snap = list(_positions)
+            if not snap:
+                continue
+            try:
+                acc = client.get_account()
+                balances = {b["asset"]: float(b.get("free", 0)) + float(b.get("locked", 0))
+                            for b in acc.get("balances", [])}
+            except Exception as _be:
+                log_diag_issue("phantom_detector", "warn", f"get_account failed: {_be}")
+                continue
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for pos in snap:
+                sym = pos.get("symbol", "")
+                if not sym:
+                    continue
+                db_qty = float(pos.get("quantity", 0))
+                # Strip only trailing USDT to get base asset
+                base = sym[:-4] if sym.endswith("USDT") else sym
+                binance_qty = balances.get(base, 0.0)
+                # Only flag if Binance shows <5% of what DB expects and db_qty > dust
+                if db_qty <= 1e-8:
+                    continue
+                if binance_qty >= db_qty * 0.05:
+                    continue
+                msg = (f"[PHANTOM] {sym}: DB has qty={db_qty:.6f} but Binance has {binance_qty:.6f}")
+                try:
+                    database.log_activity(msg, "warn")
+                except Exception:
+                    pass
+                try:
+                    conn = _sq_ph.connect(database.DB_PATH)
+                    # Avoid duplicate unresolved alerts for same symbol
+                    existing = conn.execute(
+                        "SELECT id FROM phantom_alerts WHERE symbol=? AND resolved=0", (sym,)
+                    ).fetchone()
+                    if not existing:
+                        conn.execute(
+                            "INSERT INTO phantom_alerts (timestamp, symbol, db_qty, binance_qty, resolved) VALUES (?,?,?,?,0)",
+                            (now_iso, sym, db_qty, binance_qty)
+                        )
+                        conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception as _pe:
+            try:
+                log_diag_issue("phantom_detector", "warn", f"phantom loop error: {_pe}")
+            except Exception:
+                pass
+
+
+def start_phantom_checker():
+    """Idempotent — starts the phantom position detector if not already running."""
+    global _phantom_checker_thread
+    if _phantom_checker_thread is not None and _phantom_checker_thread.is_alive():
+        return
+    _phantom_checker_thread = threading.Thread(
+        target=_phantom_check_loop,
+        name="phantom-checker",
+        daemon=True,
+    )
+    _phantom_checker_thread.start()
+
+
 def _sell_monitor_loop():
     """
     Fallback daemon thread — wakes every 0.5 s and checks sell conditions.
@@ -3113,6 +3260,11 @@ def _sell_monitor_loop():
 
     while True:
         _sell_monitor_heartbeat = time.time()
+        try:
+            if _thread_health:
+                _thread_health.heartbeat("sell_monitor")
+        except Exception:
+            pass
         try:
             with _positions_lock:
                 snap = list(_positions)
