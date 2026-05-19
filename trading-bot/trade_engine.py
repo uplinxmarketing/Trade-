@@ -3161,6 +3161,85 @@ def start_capital_recycler():
     _capital_recycler_thread.start()
 
 
+# ── Phantom position detector ──────────────────────────────────────────────────
+_phantom_checker_thread: Optional[threading.Thread] = None
+
+
+def _phantom_check_loop():
+    """Every 300s (live mode only), compare DB positions to Binance balances.
+    Logs mismatches to activity_log and inserts unresolved phantom_alerts rows."""
+    import sqlite3 as _sq_ph
+    while True:
+        try:
+            time.sleep(300)
+            mode = get_mode()
+            if mode != "live":
+                continue
+            with _positions_lock:
+                snap = list(_positions)
+            if not snap:
+                continue
+            try:
+                acc = client.get_account()
+                balances = {b["asset"]: float(b.get("free", 0)) + float(b.get("locked", 0))
+                            for b in acc.get("balances", [])}
+            except Exception as _be:
+                log_diag_issue("phantom_detector", "warn", f"get_account failed: {_be}")
+                continue
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for pos in snap:
+                sym = pos.get("symbol", "")
+                if not sym:
+                    continue
+                db_qty = float(pos.get("quantity", 0))
+                # Strip only trailing USDT to get base asset
+                base = sym[:-4] if sym.endswith("USDT") else sym
+                binance_qty = balances.get(base, 0.0)
+                # Only flag if Binance shows <5% of what DB expects and db_qty > dust
+                if db_qty <= 1e-8:
+                    continue
+                if binance_qty >= db_qty * 0.05:
+                    continue
+                msg = (f"[PHANTOM] {sym}: DB has qty={db_qty:.6f} but Binance has {binance_qty:.6f}")
+                try:
+                    database.log_activity(msg, "warn")
+                except Exception:
+                    pass
+                try:
+                    conn = _sq_ph.connect(database.DB_PATH)
+                    # Avoid duplicate unresolved alerts for same symbol
+                    existing = conn.execute(
+                        "SELECT id FROM phantom_alerts WHERE symbol=? AND resolved=0", (sym,)
+                    ).fetchone()
+                    if not existing:
+                        conn.execute(
+                            "INSERT INTO phantom_alerts (timestamp, symbol, db_qty, binance_qty, resolved) VALUES (?,?,?,?,0)",
+                            (now_iso, sym, db_qty, binance_qty)
+                        )
+                        conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception as _pe:
+            try:
+                log_diag_issue("phantom_detector", "warn", f"phantom loop error: {_pe}")
+            except Exception:
+                pass
+
+
+def start_phantom_checker():
+    """Idempotent — starts the phantom position detector if not already running."""
+    global _phantom_checker_thread
+    if _phantom_checker_thread is not None and _phantom_checker_thread.is_alive():
+        return
+    _phantom_checker_thread = threading.Thread(
+        target=_phantom_check_loop,
+        name="phantom-checker",
+        daemon=True,
+    )
+    _phantom_checker_thread.start()
+
+
 def _sell_monitor_loop():
     """
     Fallback daemon thread — wakes every 0.5 s and checks sell conditions.

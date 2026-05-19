@@ -855,6 +855,73 @@ function BuyDecisionTelemetry({ baseUrl }: { baseUrl: string }) {
   );
 }
 
+// ── Phantom Position Alerts ───────────────────────────────────────────────
+
+interface PhantomAlert {
+  id: number;
+  timestamp: string;
+  symbol: string;
+  db_qty: number;
+  binance_qty: number;
+  resolved: number;
+}
+
+function PhantomAlerts({ baseUrl }: { baseUrl: string }) {
+  const [phantoms, setPhantoms] = useState<PhantomAlert[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    fetch(`${baseUrl}/api/diagnostics/phantoms`)
+      .then(r => r.json())
+      .then(d => { setPhantoms(d.phantoms || []); setError(d.error || null); })
+      .catch(e => setError(String(e)));
+  }, [baseUrl]);
+
+  useEffect(() => {
+    load();
+    const iv = setInterval(load, 30_000);
+    return () => clearInterval(iv);
+  }, [load]);
+
+  const resolve = async (id: number) => {
+    await fetch(`${baseUrl}/api/diagnostics/phantoms/${id}/resolve`, { method: 'POST' }).catch(() => {});
+    setPhantoms(prev => prev.filter(p => p.id !== id));
+    toast.success('Phantom alert resolved');
+  };
+
+  return (
+    <div className="space-y-2">
+      <p className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Phantom Position Alerts</p>
+      {error ? (
+        <p className="text-[9px] text-loss">{error}</p>
+      ) : phantoms.length === 0 ? (
+        <div className="flex items-center gap-2 text-[9px] text-gain bg-gain/10 border border-gain/30 rounded px-2 py-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-gain shrink-0" />
+          No phantom positions detected
+        </div>
+      ) : (
+        <div className="space-y-1">
+          <p className="text-[8px] text-muted-foreground">{phantoms.length} unresolved alert(s)</p>
+          {phantoms.map(p => (
+            <div key={p.id} className="flex items-center justify-between border border-loss/30 bg-loss/10 rounded px-2 py-1">
+              <div>
+                <p className="text-[8px] font-semibold font-mono text-loss">{p.symbol}</p>
+                <p className="text-[7px] text-muted-foreground">
+                  DB: {p.db_qty?.toFixed(6)} · Binance: {p.binance_qty?.toFixed(6)} · {new Date(p.timestamp).toLocaleString()}
+                </p>
+              </div>
+              <button onClick={() => resolve(p.id)}
+                className="shrink-0 ml-2 text-[8px] px-1.5 py-0.5 border border-accent/40 text-accent rounded hover:bg-accent/10">
+                Resolve
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main export ───────────────────────────────────────────────────────────
 
 export function DiagnosticsTab({ baseUrl = '' }: { baseUrl?: string }) {
@@ -887,6 +954,9 @@ export function DiagnosticsTab({ baseUrl = '' }: { baseUrl?: string }) {
       </div>
       <div className="border-t border-border/50 pt-3">
         <OrphanCheck baseUrl={baseUrl} />
+      </div>
+      <div className="border-t border-border/50 pt-3">
+        <PhantomAlerts baseUrl={baseUrl} />
       </div>
     </div>
   );

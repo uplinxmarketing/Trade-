@@ -211,6 +211,8 @@ async def lifespan(app: FastAPI):
         steps.append("held_price_refresher OK")
         trade_engine.start_capital_recycler()
         steps.append("capital_recycler OK")
+        trade_engine.start_phantom_checker()
+        steps.append("phantom_checker OK")
 
         # 4. Apply startup defaults and auto-resume logic.
         #    stop_loss and smart_hold are ALWAYS forced OFF on every deploy —
@@ -2585,6 +2587,34 @@ def get_fill_quality(hours: int = 24):
             "sell_slippage": percentiles(sell_slips),
             "worst_fills": worst,
         }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/diagnostics/phantoms")
+def get_phantoms():
+    import sqlite3 as _sq
+    try:
+        conn = _sq.connect(database.DB_PATH)
+        conn.row_factory = _sq.Row
+        rows = conn.execute(
+            "SELECT id, timestamp, symbol, db_qty, binance_qty, resolved FROM phantom_alerts WHERE resolved=0 ORDER BY id DESC LIMIT 50"
+        ).fetchall()
+        conn.close()
+        return {"phantoms": [dict(r) for r in rows], "count": len(rows)}
+    except Exception as e:
+        return {"error": str(e), "phantoms": [], "count": 0}
+
+
+@app.post("/api/diagnostics/phantoms/{alert_id}/resolve")
+def resolve_phantom(alert_id: int):
+    import sqlite3 as _sq
+    try:
+        conn = _sq.connect(database.DB_PATH)
+        conn.execute("UPDATE phantom_alerts SET resolved=1 WHERE id=?", (alert_id,))
+        conn.commit()
+        conn.close()
+        return {"ok": True}
     except Exception as e:
         return {"error": str(e)}
 
