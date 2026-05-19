@@ -627,6 +627,121 @@ function OrphanCheck({ baseUrl }: { baseUrl: string }) {
   );
 }
 
+// ── Fill Quality ──────────────────────────────────────────────────────────
+
+interface FillQualityData {
+  window_hours: number;
+  trade_count: number;
+  buy_slippage: { p50: number|null; p90: number|null; p99: number|null; avg: number|null };
+  sell_slippage: { p50: number|null; p90: number|null; p99: number|null; avg: number|null };
+  worst_fills: Array<{ coin: string; buy_slippage_pct: number|null; sell_slippage_pct: number|null; timestamp_sell: string }>;
+  error?: string;
+}
+
+function FillQuality({ baseUrl }: { baseUrl: string }) {
+  const [hours, setHours] = useState(24);
+  const [data, setData] = useState<FillQualityData | null>(null);
+
+  useEffect(() => {
+    fetch(`${baseUrl}/api/diagnostics/fill_quality?hours=${hours}`)
+      .then(r => r.json())
+      .then(setData)
+      .catch(() => {});
+  }, [baseUrl, hours]);
+
+  const slip_color = (v: number | null) => {
+    if (v == null) return 'text-muted-foreground';
+    if (Math.abs(v) < 0.05) return 'text-gain';
+    if (Math.abs(v) < 0.2) return 'text-yellow-400';
+    return 'text-loss';
+  };
+
+  const SlipTile = ({ label, val }: { label: string; val: number | null }) => (
+    <div className="bg-muted/20 rounded px-2 py-1 text-center">
+      <p className="text-[8px] text-muted-foreground">{label}</p>
+      <p className={`text-[11px] font-bold ${slip_color(val)}`}>
+        {val == null ? '—' : `${val > 0 ? '+' : ''}${val.toFixed(3)}%`}
+      </p>
+    </div>
+  );
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <p className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Fill Quality</p>
+        <select value={hours} onChange={e => setHours(parseInt(e.target.value))}
+          className="text-[8px] bg-background border border-border rounded px-1 py-0.5 text-foreground">
+          <option value={4}>4h</option>
+          <option value={24}>24h</option>
+          <option value={168}>7d</option>
+        </select>
+      </div>
+
+      {data?.error ? (
+        <p className="text-[9px] text-loss">{data.error}</p>
+      ) : !data ? (
+        <p className="text-[9px] text-muted-foreground">Loading…</p>
+      ) : data.trade_count === 0 ? (
+        <p className="text-[9px] text-muted-foreground italic">No trades in window</p>
+      ) : (
+        <div className="space-y-3">
+          <p className="text-[8px] text-muted-foreground">{data.trade_count} trades</p>
+          <div>
+            <p className="text-[8px] font-semibold text-muted-foreground mb-1">Buy Slippage</p>
+            <div className="grid grid-cols-4 gap-1">
+              <SlipTile label="avg" val={data.buy_slippage.avg} />
+              <SlipTile label="p50" val={data.buy_slippage.p50} />
+              <SlipTile label="p90" val={data.buy_slippage.p90} />
+              <SlipTile label="p99" val={data.buy_slippage.p99} />
+            </div>
+          </div>
+          <div>
+            <p className="text-[8px] font-semibold text-muted-foreground mb-1">Sell Slippage</p>
+            <div className="grid grid-cols-4 gap-1">
+              <SlipTile label="avg" val={data.sell_slippage.avg} />
+              <SlipTile label="p50" val={data.sell_slippage.p50} />
+              <SlipTile label="p90" val={data.sell_slippage.p90} />
+              <SlipTile label="p99" val={data.sell_slippage.p99} />
+            </div>
+          </div>
+          {data.worst_fills.length > 0 && (
+            <details>
+              <summary className="cursor-pointer text-[8px] text-muted-foreground hover:text-foreground">
+                Worst fills ({data.worst_fills.length})
+              </summary>
+              <div className="mt-1 overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-border/50">
+                      {['Coin', 'Buy slip', 'Sell slip', 'When'].map(h => (
+                        <th key={h} className="text-[8px] text-muted-foreground font-semibold text-left pb-0.5 pr-2">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.worst_fills.map((r, i) => (
+                      <tr key={i} className="border-b border-border/20 last:border-0">
+                        <td className="text-[8px] font-mono py-0.5 pr-2">{r.coin?.replace('USDT', '')}</td>
+                        <td className={`text-[8px] pr-2 ${slip_color(r.buy_slippage_pct)}`}>
+                          {r.buy_slippage_pct == null ? '—' : `${r.buy_slippage_pct > 0 ? '+' : ''}${r.buy_slippage_pct?.toFixed(3)}%`}
+                        </td>
+                        <td className={`text-[8px] pr-2 ${slip_color(r.sell_slippage_pct)}`}>
+                          {r.sell_slippage_pct == null ? '—' : `${r.sell_slippage_pct > 0 ? '+' : ''}${r.sell_slippage_pct?.toFixed(3)}%`}
+                        </td>
+                        <td className="text-[7px] text-muted-foreground">{r.timestamp_sell ? new Date(r.timestamp_sell).toLocaleString() : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Buy Decision Telemetry ────────────────────────────────────────────────
 
 interface BuyRejectionData {
@@ -763,6 +878,9 @@ export function DiagnosticsTab({ baseUrl = '' }: { baseUrl?: string }) {
       </div>
       <div className="border-t border-border/50 pt-3">
         <SellTimingHistogram baseUrl={baseUrl} />
+      </div>
+      <div className="border-t border-border/50 pt-3">
+        <FillQuality baseUrl={baseUrl} />
       </div>
       <div className="border-t border-border/50 pt-3">
         <StrategyAuditLog baseUrl={baseUrl} />

@@ -2546,6 +2546,49 @@ def api_orphan_check(min_value_usdt: float = 0.10):
             "min_value_usdt_filter": min_value_usdt, "issues": issues}
 
 
+@app.get("/api/diagnostics/fill_quality")
+def get_fill_quality(hours: int = 24):
+    import sqlite3 as _sq
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    try:
+        conn = _sq.connect(database.DB_PATH)
+        conn.row_factory = _sq.Row
+        rows = conn.execute(
+            "SELECT coin, buy_slippage_pct, sell_slippage_pct, intended_buy_price, entry_price, intended_sell_price, exit_price, quantity, timestamp_sell FROM trades WHERE timestamp_sell >= ? AND exit_price IS NOT NULL",
+            (cutoff,)
+        ).fetchall()
+        conn.close()
+        buy_slips  = [r["buy_slippage_pct"]  for r in rows if r["buy_slippage_pct"]  is not None]
+        sell_slips = [r["sell_slippage_pct"] for r in rows if r["sell_slippage_pct"] is not None]
+
+        def percentiles(vals):
+            if not vals:
+                return {"p50": None, "p90": None, "p99": None, "avg": None}
+            s = sorted(vals)
+            n = len(s)
+            return {
+                "p50": round(s[int(n * 0.5)], 4),
+                "p90": round(s[int(n * 0.9)], 4),
+                "p99": round(s[min(int(n * 0.99), n - 1)], 4),
+                "avg": round(sum(s) / n, 4),
+            }
+
+        worst = sorted(
+            [dict(r) for r in rows if r["sell_slippage_pct"] is not None],
+            key=lambda x: abs(x["sell_slippage_pct"] or 0), reverse=True
+        )[:10]
+        return {
+            "window_hours": hours,
+            "trade_count": len(rows),
+            "buy_slippage": percentiles(buy_slips),
+            "sell_slippage": percentiles(sell_slips),
+            "worst_fills": worst,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/diagnostics/thread_health")
 def get_thread_health():
     try:

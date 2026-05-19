@@ -1885,6 +1885,10 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         duration = 0
         buy_dt   = datetime.now(_tz.utc)
 
+    _intended_buy_price = pos.get("intended_buy_price")
+    _pos_buy_slippage   = pos.get("buy_slippage_pct")
+    _intended_sell_price = price
+    _sell_slippage_pct = ((fill_price - price) / price * 100) if price > 0 else None
     trade_record = {
         "coin":               sym,
         "mode":               mode,
@@ -1907,6 +1911,10 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         "timestamp_sell":     sell_ts,
         "sell_reason":        reason,
         "signal_snapshot":    pos.get("signal_snapshot"),
+        "intended_buy_price":  _intended_buy_price,
+        "intended_sell_price": _intended_sell_price,
+        "buy_slippage_pct":    _pos_buy_slippage,
+        "sell_slippage_pct":   _sell_slippage_pct,
     }
     # ── Sell timing diagnostic ────────────────────────────────────────────────
     try:
@@ -2514,6 +2522,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _eff_tp_mult = _bep_mult_buy
         exit_target = round(fill_price * _eff_tp_mult, 8)
         _pos_peaks.pop(sym, None)
+        _buy_slippage_pct = ((fill_price - price) / price * 100) if price > 0 else None
         pos_record = {
             "symbol":             sym,
             "entry_price":        fill_price,
@@ -2529,6 +2538,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             "entry_ma_position":  entry_ma,
             "entry_bb_position":  entry_bb,
             "entry_volume_trend": entry_vol,
+            "intended_buy_price": price,
+            "buy_slippage_pct":   _buy_slippage_pct,
             "buy_signals_snapshot": {
                 "score":         score,
                 "trend":         sigs.get("trend"),
