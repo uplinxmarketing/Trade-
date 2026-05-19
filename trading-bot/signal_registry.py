@@ -137,12 +137,14 @@ def _signal_ema_trend(symbol: str, data: dict, strategy: dict) -> Tuple[bool, An
 def _signal_rsi(symbol: str, data: dict, strategy: dict) -> Tuple[bool, Any]:
     """M1: RSI below configured threshold."""
     rsi_value = data.get("rsi_value")
-    # Read from signal_thresholds nested dict (matches UI display and M2/other Phase 2/3
-    # signals). Fallback to top-level for backward compat with older strategy files.
-    threshold = float(
-        strategy.get("signal_thresholds", {}).get("rsi_buy_threshold")
-        or strategy.get("rsi_buy_threshold", 40.0)
-    )
+    # Read from signal_thresholds (matches UI display and M2 pattern).
+    # Explicit None check avoids the "0 is falsy" trap where a threshold of 0
+    # would fall through to the top-level key via `or`.
+    nested = strategy.get("signal_thresholds", {}).get("rsi_buy_threshold")
+    if nested is None:
+        threshold = float(strategy.get("rsi_buy_threshold", 40.0))
+    else:
+        threshold = float(nested)
     if rsi_value is None:
         return bool(data.get("rsi", False)), None
     return rsi_value < threshold, rsi_value
