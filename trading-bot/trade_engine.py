@@ -1749,6 +1749,11 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         fill_price = float(fills[0].get("price", price)) if fills else price
         raw_quote  = float(result.get("cummulativeQuoteQty") or 0)
         budget     = pos["budget_usdt"]
+        # Use ACTUAL deployed capital (qty * entry_price) as cost basis, not the
+        # requested budget. Binance buys often fill slightly under budget (lot-step
+        # rounding) and the unspent change stays in USDT — subtracting full budget
+        # from proceeds creates a phantom loss equal to the unspent amount.
+        actual_cost = float(pos["quantity"]) * float(pos["entry_price"])
 
         if mode == "live":
             sell_fee, fee_asset = _fills_fee_usdt(fills, raw_quote * _fee_rate)
@@ -1756,13 +1761,13 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
                 usdt_returned = raw_quote
             else:
                 usdt_returned = raw_quote - sell_fee
-            buy_fee = float(pos.get("buy_fee_usdt") or budget * _fee_rate)
+            buy_fee = float(pos.get("buy_fee_usdt") or actual_cost * _fee_rate)
         else:
             sell_fee      = sum(float(f.get("commission") or 0) for f in fills)
             usdt_returned = raw_quote
-            buy_fee       = budget * _fee_rate
+            buy_fee       = actual_cost * _fee_rate
 
-        net_profit = usdt_returned - budget - buy_fee
+        net_profit = usdt_returned - actual_cost - buy_fee
     except Exception as parse_err:
         # Sell DID execute on Binance — fall back to estimates so trade is
         # still recorded and position is properly cleaned up.
@@ -1771,11 +1776,11 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         )
         fill_price    = price
         raw_quote     = price * pos.get("quantity", 0)
-        budget        = pos.get("budget_usdt", 0)
+        actual_cost   = float(pos.get("quantity", 0)) * float(pos.get("entry_price", 0))
         sell_fee      = raw_quote * _fee_rate
-        buy_fee       = float(pos.get("buy_fee_usdt") or budget * _fee_rate)
+        buy_fee       = float(pos.get("buy_fee_usdt") or actual_cost * _fee_rate)
         usdt_returned = raw_quote - sell_fee
-        net_profit    = usdt_returned - budget - buy_fee
+        net_profit    = usdt_returned - actual_cost - buy_fee
 
     # Post-fill integrity check: if a "take-profit" sell actually lost money
     # (market-order slippage filled below breakeven), relabel it so the trade
