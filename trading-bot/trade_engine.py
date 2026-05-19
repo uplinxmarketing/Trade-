@@ -1569,6 +1569,42 @@ def _execute_sell(pos: dict, price: float, reason: str):
         # Force-sell / manual: if we hit an exception, the user explicitly wanted the
         # position gone. Remove from records so retries stop rather than leaving a ghost.
         if reason in ("force-sell", "manual", "user-initiated"):
+            # Log a best-effort trade record before deleting so audit trail is preserved.
+            try:
+                _fs_qty    = float(pos.get("quantity", 0))
+                _fs_entry  = float(pos.get("entry_price", 0))
+                _fs_cost   = _fs_qty * _fs_entry
+                _fs_quote  = price * _fs_qty
+                _fs_sfee   = _fs_quote * _fee_rate
+                _fs_bfee   = float(pos.get("buy_fee_usdt") or _fs_cost * _fee_rate)
+                _fs_profit = _fs_quote - _fs_sfee - _fs_cost - _fs_bfee
+                database.log_trade({
+                    "coin":             sym,
+                    "mode":             mode,
+                    "entry_price":      _fs_entry,
+                    "exit_price":       price,
+                    "quantity":         _fs_qty,
+                    "budget_usdt":      pos.get("budget_usdt"),
+                    "buy_fee":          _fs_bfee,
+                    "sell_fee":         _fs_sfee,
+                    "net_profit":       _fs_profit,
+                    "profitable":       1 if _fs_profit > 0 else 0,
+                    "entry_rsi":        pos.get("entry_rsi"),
+                    "timestamp_buy":    pos.get("timestamp"),
+                    "timestamp_sell":   now,
+                    "sell_reason":      f"force-sell-failed: {str(_exc_sell)[:200]}",
+                    "signal_snapshot":  pos.get("signal_snapshot"),
+                })
+                database.log_activity(
+                    f"[FORCE-SELL-FAIL] {sym}: trade record logged with estimated P&L "
+                    f"(est_profit={_fs_profit:.4f})",
+                    "warn"
+                )
+            except Exception as _log_err:
+                database.log_activity(
+                    f"[FORCE-SELL-FAIL] {sym}: also failed to log trade record: {_log_err}",
+                    "error"
+                )
             with _positions_lock:
                 _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
             if pos.get("id"):
