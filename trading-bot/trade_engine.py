@@ -1487,7 +1487,7 @@ def _execute_sell(pos: dict, price: float, reason: str):
     if _strategy_ls.get("use_lot_step_rounding", True):
         try:
             from exchange_info import compute_sell_quantity
-            _ls_qty, _ls_leftover, _ls_reason = compute_sell_quantity(sym, qty)
+            _ls_qty, _ls_leftover, _ls_reason = compute_sell_quantity(sym, qty, current_price=price)
             if _ls_qty <= 0:
                 database.log_activity(
                     f"[SELL_SKIPPED] {sym} ({reason}): lot_step — {_ls_reason} (raw_qty={qty})",

@@ -78,23 +78,36 @@ def round_quantity_to_step(quantity: float, step_size: float) -> float:
     return float((multiples * s).quantize(s))
 
 
-def compute_sell_quantity(symbol: str, requested_qty: float):
-    """Returns (sellable_qty, leftover_qty, reason_code)."""
+def compute_sell_quantity(symbol: str, requested_qty: float, current_price: float = None):
+    """Returns (sellable_qty, leftover_qty, reason_code).
+
+    sellable_qty=0 means the sell should be skipped entirely (below min_qty or
+    below min_notional). current_price is optional; when provided, the
+    min_notional check is enforced so Binance -1013 errors are caught early.
+    """
     filters = get_symbol_filters(symbol)
     if not filters:
         log.warning("No exchangeInfo filters for %s, using raw quantity %s", symbol, requested_qty)
         return requested_qty, 0.0, "no_filters"
 
-    step = filters.get("step_size", 0)
-    min_qty = filters.get("min_qty", 0)
+    step        = filters.get("step_size", 0)
+    min_qty     = filters.get("min_qty", 0)
+    min_notional = filters.get("min_notional", 0)
 
     if step <= 0:
         return requested_qty, 0.0, "no_step"
 
-    rounded = round_quantity_to_step(requested_qty, step)
+    rounded  = round_quantity_to_step(requested_qty, step)
     leftover = requested_qty - rounded
 
     if rounded < min_qty:
         return 0.0, requested_qty, f"below_min_qty (rounded {rounded} < min {min_qty})"
+
+    if current_price is not None and current_price > 0 and min_notional > 0:
+        notional = rounded * current_price
+        if notional < min_notional:
+            return 0.0, requested_qty, (
+                f"below_min_notional (${notional:.4f} < ${min_notional:.2f})"
+            )
 
     return rounded, leftover, "ok"
