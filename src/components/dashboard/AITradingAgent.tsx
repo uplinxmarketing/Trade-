@@ -441,6 +441,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [serverWins, setServerWins]                   = useState<number | null>(null);
   const [serverTotalTrades, setServerTotalTrades]     = useState<number | null>(null);
   const [showLog, setShowLog]     = useState(true);
+  const [actLogFilter, setActLogFilter] = useState<'all' | 'orders' | 'sells' | 'buys' | 'errors'>('all');
   // All API calls are relative (same-origin) — bot runs on wolfbot.tech.
   const railwayUrl = '';
   const [liveApiKey, setLiveApiKey]         = useState('');
@@ -1693,11 +1694,30 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       {/* Activity log */}
       {showLog && actLog.length > 0 && (
         <div className="border-t border-border px-4 py-3">
-          <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Activity Log</p>
+          <div className="flex items-center justify-between mb-2">
+            <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Activity Log</p>
+            <div className="flex gap-1">
+              {(['all', 'orders', 'sells', 'buys', 'errors'] as const).map(f => (
+                <button key={f} onClick={() => setActLogFilter(f)}
+                  className={`text-[8px] px-1.5 py-0.5 border rounded capitalize ${actLogFilter === f ? 'border-accent text-accent' : 'border-border text-muted-foreground hover:border-accent/50'}`}>
+                  {f}
+                </button>
+              ))}
+            </div>
+          </div>
           <div className="space-y-0.5 max-h-32 overflow-y-auto scrollbar-thin">
-            {actLog.map((line, i) => (
-              <p key={i} className="text-[10px] font-mono text-muted-foreground leading-relaxed">{line}</p>
-            ))}
+            {actLog
+              .filter(line => {
+                if (actLogFilter === 'all') return true;
+                if (actLogFilter === 'orders') return line.includes('[ORDER_SEND]') || line.includes('[ORDER_REPLY]');
+                if (actLogFilter === 'sells') return line.toLowerCase().includes('sell');
+                if (actLogFilter === 'buys') return line.toLowerCase().includes('buy');
+                if (actLogFilter === 'errors') return line.toLowerCase().includes('error') || line.toLowerCase().includes('failed');
+                return true;
+              })
+              .map((line, i) => (
+                <p key={i} className="text-[10px] font-mono text-muted-foreground leading-relaxed">{line}</p>
+              ))}
           </div>
         </div>
       )}

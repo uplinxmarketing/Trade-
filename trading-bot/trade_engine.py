@@ -39,6 +39,37 @@ except Exception:
 
 log = logging.getLogger(__name__)
 
+
+def _log_order_intent(action: str, symbol: str, qty: float, intended_price: float):
+    try:
+        database.log_activity(
+            f"[ORDER_SEND] {action} {symbol} qty={qty:.6f} "
+            f"intended_price={intended_price:.6f} "
+            f"intended_notional=${qty * intended_price:.4f}",
+            "info"
+        )
+    except Exception:
+        pass
+
+
+def _log_order_result(action: str, symbol: str, intended_qty: float, intended_price: float, result: dict):
+    try:
+        fills = result.get("fills", [])
+        filled_qty = float(result.get("executedQty") or sum(float(f.get("qty", 0)) for f in fills))
+        actual_quote = float(result.get("cummulativeQuoteQty") or 0)
+        actual_avg = actual_quote / filled_qty if filled_qty > 0 else 0
+        slippage = ((actual_avg - intended_price) / intended_price * 100) if intended_price > 0 else 0
+        database.log_activity(
+            f"[ORDER_REPLY] {action} {symbol} status={result.get('status')} "
+            f"filled={filled_qty:.6f} (intended {intended_qty:.6f}) "
+            f"avg_price={actual_avg:.6f} (intended {intended_price:.6f}) "
+            f"slippage={slippage:+.3f}% quote=${actual_quote:.4f}",
+            "info"
+        )
+    except Exception:
+        pass
+
+
 # Phase 1: Signal registry — shadow mode only (use_new_signal_engine=False by default).
 # Falls back gracefully if the file is absent so a partial deploy can't break the bot.
 try:
@@ -1698,10 +1729,12 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     try:
         # Paper mode: pass the trigger price directly so concurrent WebSocket/REST
         # updates cannot cause the sell to execute at the wrong price.
+        _log_order_intent("SELL", sym, qty, price)
         if _is_paper:
             result = client.order_market_sell(symbol=sym, quantity=qty, price=price)
         else:
             result = client.order_market_sell(symbol=sym, quantity=qty)
+        _log_order_result("SELL", sym, qty, price, result)
         pos["_sell_binance_done_ts"] = time.time()
     except Exception as e:
         pos["_sell_binance_done_ts"] = time.time()
@@ -2429,7 +2462,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _buying_ts[sym] = _now_b
 
         try:
+            _log_order_intent("BUY", sym, budget / max(price, 1e-12), price)
             result = client.order_market_buy(symbol=sym, quoteOrderQty=budget)
+            _log_order_result("BUY", sym, budget / max(price, 1e-12), price, result)
         except Exception as e:
             with _buying_lock:
                 _buying.discard(sym)
