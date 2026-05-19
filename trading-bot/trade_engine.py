@@ -1161,6 +1161,10 @@ def _record_rejection(symbol: str, score, reason: str, detail: str = ""):
                 ex_list.pop(0)
     except Exception:
         pass
+    try:
+        database.record_buy_rejection(symbol, reason, str(detail)[:500] if detail else None, int(score or 0), None)
+    except Exception:
+        pass
 
 def get_rejection_stats() -> dict:
     with _rejection_lock:

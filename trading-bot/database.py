@@ -206,6 +206,27 @@ def init_db():
                 timestamp_open   TEXT,
                 timestamp_close  TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS buy_rejections (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp  TEXT NOT NULL,
+                coin       TEXT NOT NULL,
+                reason     TEXT NOT NULL,
+                detail     TEXT,
+                score      INTEGER,
+                rsi_value  REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_buy_rejections_ts     ON buy_rejections(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_buy_rejections_reason ON buy_rejections(reason);
+
+            CREATE TABLE IF NOT EXISTS phantom_alerts (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT NOT NULL,
+                symbol      TEXT NOT NULL,
+                db_qty      REAL,
+                binance_qty REAL,
+                resolved    INTEGER DEFAULT 0
+            );
         """)
 
         # ── Schema migrations for existing databases ─────────────────────────
@@ -346,6 +367,19 @@ def get_recent_trades(limit: int = 20) -> List[dict]:
         """, (limit,)).fetchall()
         conn.close()
     return [dict(r) for r in rows]
+
+
+def record_buy_rejection(coin: str, reason: str, detail: str = None, score: int = None, rsi_value: float = None):
+    ts = datetime.now(timezone.utc).isoformat()
+    with _lock:
+        conn = _conn()
+        conn.execute(
+            "INSERT INTO buy_rejections (timestamp, coin, reason, detail, score, rsi_value) VALUES (?,?,?,?,?,?)",
+            (ts, coin, reason, detail, score, rsi_value)
+        )
+        conn.execute("DELETE FROM buy_rejections WHERE id NOT IN (SELECT id FROM buy_rejections ORDER BY id DESC LIMIT 50000)")
+        conn.commit()
+        conn.close()
 
 
 def get_trades_today_count() -> int:

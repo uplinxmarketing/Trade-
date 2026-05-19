@@ -627,6 +627,119 @@ function OrphanCheck({ baseUrl }: { baseUrl: string }) {
   );
 }
 
+// ── Buy Decision Telemetry ────────────────────────────────────────────────
+
+interface BuyRejectionData {
+  window_hours: number;
+  total_rejections: number;
+  by_reason: Array<{ reason: string; count: number; pct: number }>;
+  by_coin: Array<{ coin: string; rejections: number }>;
+  recent: Array<{ timestamp: string; coin: string; reason: string; detail: string | null; score: number | null; rsi_value: number | null }>;
+  error?: string;
+}
+
+function BuyDecisionTelemetry({ baseUrl }: { baseUrl: string }) {
+  const [hours, setHours] = useState(1);
+  const [data, setData] = useState<BuyRejectionData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [showRecent, setShowRecent] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    fetch(`${baseUrl}/api/diagnostics/buy_rejections?hours=${hours}`)
+      .then(r => r.json())
+      .then(d => { setData(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [baseUrl, hours]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const windowLabel = (h: number) => h < 1 ? `${h * 60 | 0}min` : `${h}h`;
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <p className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Buy Decision Telemetry</p>
+        <div className="flex gap-1">
+          {[0.25, 1, 4, 24].map(h => (
+            <button key={h} onClick={() => setHours(h)}
+              className={`text-[8px] px-1.5 py-0.5 border rounded ${hours === h ? 'border-accent text-accent' : 'border-border text-muted-foreground hover:border-accent/50'}`}>
+              {windowLabel(h)}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {loading ? (
+        <p className="text-[9px] text-muted-foreground">Loading…</p>
+      ) : data?.error ? (
+        <p className="text-[9px] text-loss">{data.error}</p>
+      ) : !data ? null : (
+        <div className="space-y-3">
+          <p className="text-[8px] text-muted-foreground">{data.total_rejections} rejections in last {hours}h</p>
+
+          {data.by_reason.length > 0 && (
+            <div>
+              <p className="text-[8px] font-semibold text-muted-foreground mb-1">By Reason</p>
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-border/50">
+                      {['Reason', 'Count', '%'].map(h => (
+                        <th key={h} className="text-[8px] text-muted-foreground font-semibold text-left pb-0.5 pr-2">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.by_reason.map((r, i) => (
+                      <tr key={i} className="border-b border-border/20 last:border-0">
+                        <td className="text-[8px] font-mono py-0.5 pr-2 truncate max-w-[10rem]">{r.reason}</td>
+                        <td className="text-[8px] text-right pr-2">{r.count}</td>
+                        <td className="text-[8px] text-right text-muted-foreground">{r.pct}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {data.by_coin.length > 0 && (
+            <div>
+              <p className="text-[8px] font-semibold text-muted-foreground mb-1">Most Rejected Coins</p>
+              <div className="flex flex-wrap gap-1">
+                {data.by_coin.slice(0, 10).map((c, i) => (
+                  <span key={i} className="text-[8px] font-mono bg-muted/20 rounded px-1.5 py-0.5">
+                    {c.coin.replace('USDT', '')} <span className="text-muted-foreground">{c.rejections}</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {data.recent.length > 0 && (
+            <details open={showRecent} onToggle={e => setShowRecent((e.target as HTMLDetailsElement).open)}>
+              <summary className="cursor-pointer text-[8px] text-muted-foreground hover:text-foreground">
+                Recent Rejections ({data.recent.length})
+              </summary>
+              <div className="mt-1 space-y-0.5 max-h-40 overflow-y-auto">
+                {data.recent.slice(0, 20).map((r, i) => (
+                  <div key={i} className="flex gap-2 text-[7px] border-b border-border/10 py-0.5">
+                    <span className="text-muted-foreground shrink-0 w-16 truncate">{new Date(r.timestamp).toLocaleTimeString()}</span>
+                    <span className="font-mono w-16 truncate shrink-0">{r.coin.replace('USDT', '')}</span>
+                    <span className="text-yellow-400 truncate flex-1">{r.reason}</span>
+                    {r.score != null && <span className="text-muted-foreground shrink-0">s:{r.score}</span>}
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main export ───────────────────────────────────────────────────────────
 
 export function DiagnosticsTab({ baseUrl = '' }: { baseUrl?: string }) {
@@ -641,6 +754,9 @@ export function DiagnosticsTab({ baseUrl = '' }: { baseUrl?: string }) {
       </div>
       <div className="border-t border-border/50 pt-3">
         <SignalWinRates baseUrl={baseUrl} />
+      </div>
+      <div className="border-t border-border/50 pt-3">
+        <BuyDecisionTelemetry baseUrl={baseUrl} />
       </div>
       <div className="border-t border-border/50 pt-3">
         <CoinTraceLookup baseUrl={baseUrl} />

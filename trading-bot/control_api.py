@@ -2555,6 +2555,41 @@ def get_thread_health():
         return {"error": str(e)}
 
 
+@app.get("/api/diagnostics/buy_rejections")
+def get_buy_rejections(hours: int = 1):
+    from datetime import timedelta
+    import sqlite3 as _sq
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    try:
+        conn = _sq.connect(database.DB_PATH)
+        conn.row_factory = _sq.Row
+        total = conn.execute("SELECT COUNT(*) as c FROM buy_rejections WHERE timestamp >= ?", (cutoff,)).fetchone()["c"]
+        by_reason_rows = conn.execute(
+            "SELECT reason, COUNT(*) as cnt FROM buy_rejections WHERE timestamp >= ? GROUP BY reason ORDER BY cnt DESC LIMIT 20",
+            (cutoff,)
+        ).fetchall()
+        by_coin_rows = conn.execute(
+            "SELECT coin, COUNT(*) as rejections FROM buy_rejections WHERE timestamp >= ? GROUP BY coin ORDER BY rejections DESC LIMIT 20",
+            (cutoff,)
+        ).fetchall()
+        recent = conn.execute(
+            "SELECT timestamp, coin, reason, detail, score, rsi_value FROM buy_rejections WHERE timestamp >= ? ORDER BY id DESC LIMIT 50",
+            (cutoff,)
+        ).fetchall()
+        conn.close()
+        by_reason = [{"reason": r["reason"], "count": r["cnt"], "pct": round(r["cnt"]/total*100, 1) if total else 0} for r in by_reason_rows]
+        by_coin = [{"coin": r["coin"], "rejections": r["rejections"]} for r in by_coin_rows]
+        return {
+            "window_hours": hours,
+            "total_rejections": total,
+            "by_reason": by_reason,
+            "by_coin": by_coin,
+            "recent": [dict(r) for r in recent],
+        }
+    except Exception as e:
+        return {"error": str(e), "total_rejections": 0, "by_reason": [], "by_coin": [], "recent": []}
+
+
 @app.get("/api/stats/daily")
 def api_stats_daily(days: int = 7):
     """Daily trade summary — buys, sells, PnL, win rate per day."""
