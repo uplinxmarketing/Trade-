@@ -47,7 +47,7 @@ def _read_frontend_version() -> dict:
             pass
     return {"version": "unknown", "buildTime": "", "commit": ""}
 from fastapi import FastAPI, Response, Body, Query, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
