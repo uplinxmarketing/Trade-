@@ -335,21 +335,87 @@ register_signal(SignalDef(
 ))
 
 
+_pullback_cache: Dict[str, dict] = {}
+_PULLBACK_CACHE_TTL = 10.0
+
+
+def _signal_micro_pullback(symbol: str, data: dict, strategy: dict) -> Tuple[bool, Any]:
+    """M4: Price is at least dip_pct% below the highest candle high over the last
+    lookback_candles 1m candles — a micro-pullback from a recent local top.
+
+    Read dip_pct (default 0.3) and lookback_candles (default 5) from
+    strategy['signal_thresholds']. Never blocks if candle data is unavailable.
+    """
+    now = time.time()
+    cached = _pullback_cache.get(symbol)
+    if cached and (now - cached["ts"]) < _PULLBACK_CACHE_TTL:
+        return cached["result"]
+
+    thresholds = strategy.get("signal_thresholds", {})
+    dip_pct  = float(thresholds.get("dip_pct",          0.3))
+    lookback = int(thresholds.get("lookback_candles",   5))
+
+    cur = float(data.get("current_price") or data.get("price") or 0)
+    if cur <= 0:
+        _pullback_cache[symbol] = {"ts": now, "result": (False, None)}
+        return False, None
+
+    klines = list(data.get("klines_1m", []))
+
+    # Fall back to DB if the in-memory store is too thin
+    if len(klines) < 2:
+        try:
+            import database as _db
+            import config as _cfg
+            db_candles = _db.get_candles(symbol, _cfg.CANDLE_TIMEFRAME, limit=lookback)
+            if db_candles:
+                klines = db_candles
+        except Exception:
+            pass
+
+    if not klines:
+        _pullback_cache[symbol] = {"ts": now, "result": (False, None)}
+        return False, None
+
+    recent = klines[-lookback:] if len(klines) >= lookback else klines
+    highs  = [float(c.get("high", c.get("close", 0))) for c in recent if c.get("high") or c.get("close")]
+    local_high = max(highs) if highs else 0.0
+
+    if local_high <= 0 or local_high <= cur:
+        # Price is at or above the local high — no pullback yet
+        result = (False, round((cur - local_high) / local_high * 100.0, 4) if local_high > 0 else None)
+        _pullback_cache[symbol] = {"ts": now, "result": result}
+        return result
+
+    dip_from_high = (local_high - cur) / local_high * 100.0
+    result = (dip_from_high >= dip_pct, round(dip_from_high, 4))
+    _pullback_cache[symbol] = {"ts": now, "result": result}
+    return result
+
+
+register_signal(SignalDef(
+    "M4_micro_pullback",
+    "momentum",
+    "Price dipped ≥ dip_pct% below recent local high (micro-pullback entry)",
+    _signal_micro_pullback,
+))
+
+
 # ── Default signal_engine config (used when block absent in strategy.json) ───
 
 DEFAULT_SIGNAL_ENGINE: Dict[str, Any] = {
-    "enabled": False,
-    "mandatory_signals": ["T1_ema_short_long", "M1_rsi_below_threshold"],
+    "enabled": True,
+    "mandatory_signals": ["M4_micro_pullback"],
     "scored_signals": [
+        "T1_ema_short_long",
         "M3_macd_rising",
         "V1_volume_above_average",
         "V2_obv_rising",
         "X1_atr_sufficient",
-        "P1_near_24h_low",
         "R1_reversal_confirmed",
     ],
-    "min_scored": 3,
-    "veto_signals": ["E1_spread_too_wide", "TM1_bad_hour"],
+    "min_scored": 2,
+    "veto_signals": ["E1_spread_too_wide"],
 }
 
 DEFAULT_SIGNAL_THRESHOLDS: Dict[str, Any] = {
@@ -358,6 +424,8 @@ DEFAULT_SIGNAL_THRESHOLDS: Dict[str, Any] = {
     "spread_max_pct": 0.10,
     "allowed_trading_hours_utc": "13,14,15,16,17,18,19,20,21,22",
     "stoch_rsi_threshold": 25.0,
+    "dip_pct": 0.3,
+    "lookback_candles": 5,
 }
 
 
