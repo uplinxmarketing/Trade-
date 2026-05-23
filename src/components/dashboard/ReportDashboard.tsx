@@ -37,6 +37,11 @@ interface SqliteTrade {
   duration_seconds: number;
   timestamp_buy: string;
   timestamp_sell: string | null;
+  sell_reason: string | null;
+  intended_sell_price: number | null;
+  sell_slippage_pct: number | null;
+  intended_buy_price: number | null;
+  buy_slippage_pct: number | null;
 }
 
 interface RangeStats {
@@ -59,9 +64,13 @@ interface DisplayTrade {
   entryPrice: number;
   exitPrice: number;
   qty: number;
-  budget: number;
+  actualCost: number;
+  grossProceeds: number;
   buyFee: number;
   sellFee: number;
+  intendedSellPrice: number | null;
+  sellSlippagePct: number | null;
+  sellReason: string | null;
   netPnl: number;
   duration: string;
   closedAt: string;
@@ -237,20 +246,29 @@ const ReportDashboard = () => {
 
   const displayTrades: DisplayTrade[] = activeTrades
     .filter(t => t.exit_price != null && t.net_profit != null)
-    .map(t => ({
-      id:         `rw-${t.id}`,
-      pair:       String(t.coin).replace('USDT', '/USDT'),
-      direction:  'LONG' as const,
-      entryPrice: Number(t.entry_price),
-      exitPrice:  Number(t.exit_price),
-      qty:        Number(t.quantity),
-      budget:     Number(t.budget_usdt ?? 0),
-      buyFee:     Number(t.buy_fee ?? 0),
-      sellFee:    Number(t.sell_fee ?? 0),
-      netPnl:     Number(t.net_profit ?? 0),
-      duration:   fmtDur(Number(t.duration_seconds ?? 0)),
-      closedAt:   t.timestamp_sell ?? t.timestamp_buy ?? '',
-    }))
+    .map(t => {
+      const qty    = Number(t.quantity);
+      const entry  = Number(t.entry_price);
+      const exit   = Number(t.exit_price);
+      return {
+        id:                `rw-${t.id}`,
+        pair:              String(t.coin).replace('USDT', '/USDT'),
+        direction:         'LONG' as const,
+        entryPrice:        entry,
+        exitPrice:         exit,
+        qty,
+        actualCost:        qty * entry,
+        grossProceeds:     qty * exit,
+        buyFee:            Number(t.buy_fee ?? 0),
+        sellFee:           Number(t.sell_fee ?? 0),
+        intendedSellPrice: t.intended_sell_price != null ? Number(t.intended_sell_price) : null,
+        sellSlippagePct:   t.sell_slippage_pct   != null ? Number(t.sell_slippage_pct)   : null,
+        sellReason:        t.sell_reason ?? null,
+        netPnl:            Number(t.net_profit ?? 0),
+        duration:          fmtDur(Number(t.duration_seconds ?? 0)),
+        closedAt:          t.timestamp_sell ?? t.timestamp_buy ?? '',
+      };
+    })
     .sort((a, b) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime());
 
   // ── Metric values ───────────────────────────────────────────────────────────
@@ -580,12 +598,16 @@ const ReportDashboard = () => {
                 <tr className="border-b border-border text-muted-foreground uppercase tracking-widest">
                   <th className="text-left px-3 py-2 font-medium">Timestamp</th>
                   <th className="text-left px-3 py-2 font-medium">Pair</th>
-                  <th className="text-right px-2 py-2 font-medium">Entry</th>
-                  <th className="text-right px-2 py-2 font-medium">Exit</th>
+                  <th className="text-right px-2 py-2 font-medium">Reason</th>
+                  <th className="text-right px-2 py-2 font-medium">Entry px</th>
                   <th className="text-right px-2 py-2 font-medium">Qty</th>
-                  <th className="text-right px-2 py-2 font-medium">Budget</th>
+                  <th className="text-right px-2 py-2 font-medium">Actual cost</th>
+                  <th className="text-right px-2 py-2 font-medium">Gross proceeds</th>
                   <th className="text-right px-2 py-2 font-medium">Buy fee</th>
                   <th className="text-right px-2 py-2 font-medium">Sell fee</th>
+                  <th className="text-right px-2 py-2 font-medium">Intended exit</th>
+                  <th className="text-right px-2 py-2 font-medium">Actual exit</th>
+                  <th className="text-right px-2 py-2 font-medium">Slip %</th>
                   <th className="text-right px-2 py-2 font-medium">Net P&L</th>
                   <th className="text-right px-3 py-2 font-medium">Hold</th>
                 </tr>
@@ -595,12 +617,20 @@ const ReportDashboard = () => {
                   <tr key={p.id} className="border-b border-border/50 hover:bg-muted/10 transition-colors">
                     <td className="px-3 py-2 text-muted-foreground whitespace-nowrap">{fmtDate(p.closedAt)}</td>
                     <td className="px-3 py-2 font-semibold text-foreground whitespace-nowrap">{p.pair}</td>
+                    <td className="px-2 py-2 text-right text-muted-foreground whitespace-nowrap">{p.sellReason ?? '—'}</td>
                     <td className="px-2 py-2 text-right font-mono tabular-nums">${fmt(p.entryPrice, 4)}</td>
-                    <td className="px-2 py-2 text-right font-mono tabular-nums">${fmt(p.exitPrice, 4)}</td>
                     <td className="px-2 py-2 text-right font-mono tabular-nums">{p.qty.toFixed(5)}</td>
-                    <td className="px-2 py-2 text-right font-mono tabular-nums">${fmt(p.budget)}</td>
+                    <td className="px-2 py-2 text-right font-mono tabular-nums">${fmt(p.actualCost, 4)}</td>
+                    <td className="px-2 py-2 text-right font-mono tabular-nums">${fmt(p.grossProceeds, 4)}</td>
                     <td className="px-2 py-2 text-right font-mono tabular-nums text-warn">${fmt(p.buyFee, 4)}</td>
                     <td className="px-2 py-2 text-right font-mono tabular-nums text-warn">${fmt(p.sellFee, 4)}</td>
+                    <td className="px-2 py-2 text-right font-mono tabular-nums text-muted-foreground">
+                      {p.intendedSellPrice != null ? `$${fmt(p.intendedSellPrice, 4)}` : '—'}
+                    </td>
+                    <td className="px-2 py-2 text-right font-mono tabular-nums">${fmt(p.exitPrice, 4)}</td>
+                    <td className={`px-2 py-2 text-right font-mono tabular-nums ${p.sellSlippagePct != null && Math.abs(p.sellSlippagePct) > 0.05 ? 'text-loss' : 'text-muted-foreground'}`}>
+                      {p.sellSlippagePct != null ? `${p.sellSlippagePct >= 0 ? '+' : ''}${fmt(p.sellSlippagePct, 3)}%` : '—'}
+                    </td>
                     <td className={`px-2 py-2 text-right font-mono tabular-nums font-bold ${p.netPnl >= 0 ? 'text-gain' : 'text-loss'}`}>
                       {p.netPnl >= 0 ? '+' : ''}{fmt(p.netPnl, 4)}
                     </td>

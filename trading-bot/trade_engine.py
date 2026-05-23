@@ -1860,16 +1860,35 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         usdt_returned = raw_quote - sell_fee
         net_profit    = usdt_returned - actual_cost - buy_fee
 
-    # Post-fill integrity check: if a "take-profit" sell actually lost money
-    # (market-order slippage filled below breakeven), relabel it so the trade
-    # history is honest, and apply a 30-min cooldown to avoid re-buying immediately.
+    # Post-fill integrity check: if a take-profit sell ended up net-negative,
+    # classify the cause honestly rather than always blaming slippage.
+    #
+    # Genuine slippage: fill price materially worse than the trigger price.
+    # Fee/rounding loss: fill matched the trigger but fees ate the margin —
+    #   not a market execution problem, just a thin-margin edge case.
+    #   These should NOT trigger the re-buy cooldown.
     if net_profit < 0 and reason == "take-profit":
-        reason = "slippage-loss"
-        _loss_cooldown[sym] = time.time() + _LOSS_COOLDOWN_SEC
-        database.log_activity(
-            f"SLIPPAGE-LOSS {sym}: fill at ${fill_price:.6f} returned ${net_profit:.4f} USDT "
-            f"— relabeled 'slippage-loss', cooldown {_LOSS_COOLDOWN_SEC // 60}min", "warn"
-        )
+        _trig_px  = price                     # the trigger price we checked against
+        _fill_px  = fill_price                # what Binance actually filled at
+        _slip_pct = ((_trig_px - _fill_px) / _trig_px * 100) if _trig_px > 0 else 0
+        # Slippage threshold: 0.05% — smaller moves are fee/rounding artefacts
+        _SLIP_THRESHOLD_PCT = 0.05
+        if _slip_pct > _SLIP_THRESHOLD_PCT:
+            reason = "slippage-loss"
+            _loss_cooldown[sym] = time.time() + _LOSS_COOLDOWN_SEC
+            database.log_activity(
+                f"SLIPPAGE-LOSS {sym}: trigger=${_trig_px:.6f} fill=${_fill_px:.6f} "
+                f"slip={_slip_pct:.3f}% net={net_profit:.4f} USDT "
+                f"— relabeled 'slippage-loss', cooldown {_LOSS_COOLDOWN_SEC // 60}min", "warn"
+            )
+        else:
+            reason = "below-breakeven"
+            # No cooldown — this was a fee/rounding edge, not a bad fill.
+            database.log_activity(
+                f"BELOW-BREAKEVEN {sym}: trigger=${_trig_px:.6f} fill=${_fill_px:.6f} "
+                f"slip={_slip_pct:.3f}% net={net_profit:.4f} USDT "
+                f"— relabeled 'below-breakeven' (no cooldown)", "warn"
+            )
 
     buy_ts  = pos.get("timestamp", now)
     sell_ts = now
