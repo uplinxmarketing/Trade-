@@ -1505,8 +1505,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                     const profitable = pos.profitable ?? false;
                     // ready_to_sell = price above BOTH real BEP and exit_target (bot will sell)
                     const readyToSell = pos.ready_to_sell ?? (profitable && cur >= exitTarget);
-                    const progressPct = entry > 0 && exitTarget > entry
-                      ? Math.max(0, Math.min(100, (cur - entry) / (exitTarget - entry) * 100))
+                    // Three-zone bar: Entry(0%) → BEP(bepPct%) → Target(100%)
+                    const barRange = exitTarget > entry ? exitTarget - entry : entry * 0.003;
+                    const bepPct     = entry > 0 && exitTarget > entry && bep > entry
+                      ? Math.min(98, Math.max(2, (bep - entry) / barRange * 100))
+                      : 20;
+                    const progressPct = entry > 0
+                      ? Math.max(0, Math.min(100, (cur - entry) / barRange * 100))
                       : 0;
                     return (
                       <motion.div
@@ -1525,7 +1530,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                               <p className="text-xs font-bold">{pos.symbol.replace('USDT','')}</p>
                               <p className="text-[9px] text-muted-foreground">
                                 {pos.quantity.toFixed(6)} @ <span className="font-mono">${entry > 0 ? entry.toFixed(6) : '—'}</span>
-                                {pos.hold_human && <span className="ml-1 text-muted-foreground/60">· {pos.hold_human}</span>}
                               </p>
                             </div>
                           </div>
@@ -1551,54 +1555,56 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                               : <Banknote className="w-3 h-3" />}
                           </button>
                         </div>
-                        {/* Progress bar: 0% = entry, 100% = exit target */}
-                        <div className="w-full h-1.5 bg-muted/40 rounded-full overflow-hidden">
+                        {/* Three-zone progress bar: Entry → BEP → Target */}
+                        <div className="relative w-full h-2 rounded-full" style={{
+                          background: `linear-gradient(to right, rgba(239,68,68,0.22) 0%, rgba(239,68,68,0.22) ${bepPct}%, rgba(245,158,11,0.18) ${bepPct}%, rgba(245,158,11,0.18) 100%)`
+                        }}>
+                          {/* Fill: current price position */}
                           <div
-                            className={`h-full rounded-full transition-all duration-700 ${
-                              readyToSell ? 'bg-gain' : profitable ? 'bg-amber-400' : progressPct > 50 ? 'bg-accent/70' : 'bg-accent/40'
+                            className={`absolute top-0 left-0 h-full rounded-full transition-all duration-700 ${
+                              readyToSell ? 'bg-gain/80' : profitable ? 'bg-amber-400/80' : 'bg-loss/70'
                             }`}
-                            style={{ width: `${progressPct.toFixed(1)}%` }}
+                            style={{ width: `${Math.min(progressPct, 100).toFixed(1)}%` }}
+                          />
+                          {/* BEP notch — white tick at breakeven */}
+                          <div
+                            className="absolute top-1/2 -translate-y-1/2 w-px h-3.5 bg-white/60 rounded-full"
+                            style={{ left: `${bepPct}%` }}
+                            title={`Breakeven (fees included): $${bep > 0 ? bep.toFixed(6) : '—'}`}
                           />
                         </div>
-                        {/* Exit target row */}
-                        <div className="flex items-center justify-between">
-                          <span className="text-[8px] text-muted-foreground">
-                            Buy <span className="font-mono">${entry > 0 ? entry.toFixed(6) : '—'}</span>
-                            {' → '}Sell ≥ <span className="font-mono text-accent">${exitTarget > 0 ? exitTarget.toFixed(6) : '—'}</span>
+                        {/* Price labels: Entry | BEP | Target */}
+                        <div className="grid grid-cols-3 text-[8px] font-mono mt-0.5">
+                          <span className="text-muted-foreground/70 text-left leading-tight">
+                            Entry<br/><span className="text-foreground/60">${entry > 0 ? entry.toFixed(5) : '—'}</span>
                           </span>
-                          <span
-                            className={`text-[8px] font-mono ${readyToSell ? 'text-gain font-semibold' : profitable ? 'text-amber-400' : 'text-muted-foreground'}`}
-                            title={
-                              readyToSell
-                                ? 'Above user profit threshold — next price tick will trigger sell'
-                                : profitable
-                                ? `Above breakeven but below exit target. Waiting for +${((exitTarget - cur) / cur * 100).toFixed(3)}% more.`
-                                : `Below breakeven — needs +${pos.real_bep_gap_pct !== undefined && pos.real_bep_gap_pct > 0 ? pos.real_bep_gap_pct.toFixed(2) : ((exitTarget - cur) / cur * 100).toFixed(2)}% to cover fees and lot rounding`
-                            }
-                          >
+                          <span className="text-amber-400/80 text-center leading-tight">
+                            BEP<br/><span>${bep > 0 ? bep.toFixed(5) : '—'}</span>
+                          </span>
+                          <span className={`text-right leading-tight ${readyToSell ? 'text-gain' : 'text-accent/80'}`}>
+                            Target<br/><span>${exitTarget > 0 ? exitTarget.toFixed(5) : '—'}</span>
+                          </span>
+                        </div>
+                        {/* Status line */}
+                        <div className="flex items-center justify-between">
+                          <span className="text-[8px] text-muted-foreground/50">
+                            {pos.hold_human ? `held ${pos.hold_human}` : ''}
+                          </span>
+                          <span className={`text-[8px] font-mono font-medium ${readyToSell ? 'text-gain' : profitable ? 'text-amber-400' : 'text-loss'}`}>
                             {readyToSell
                               ? '✓ READY TO SELL'
                               : profitable
-                              ? `PROFITABLE — needs +${((exitTarget - cur) / cur * 100).toFixed(3)}%`
+                              ? `+${((exitTarget - cur) / exitTarget * 100).toFixed(3)}% to target`
                               : cur > 0
-                                ? `${progressPct.toFixed(1)}% — needs +${((exitTarget - cur) / cur * 100).toFixed(3)}%`
+                                ? `${pct.toFixed(3)}% vs BEP`
                                 : 'loading…'}
                           </span>
                         </div>
-                        {/* Real breakeven — shown only when it differs meaningfully from trigger price */}
-                        {pos.breakeven_price_real && pos.breakeven_price_real > exitTarget * 1.001 && (
-                          <div className="text-[8px] text-amber-500/80 font-mono" title="Real breakeven after Binance fees + lot-size rounding. Bot won't sell below this even if trigger fires.">
-                            Real target: ${pos.breakeven_price_real.toFixed(6)}
-                            {pos.real_bep_gap_pct !== undefined && pos.real_bep_gap_pct > 0 && (
-                              <span className="ml-1">(+{pos.real_bep_gap_pct.toFixed(2)}% needed)</span>
-                            )}
-                          </div>
-                        )}
                         {/* Trapped warning — lot-step rounding requires >2% move to break even */}
                         {pos.is_trapped && pos.real_bep_gap_pct !== undefined && (
-                          <div className="text-xs text-yellow-500 mt-1 flex items-center gap-1">
+                          <div className="text-[8px] text-yellow-500 mt-0.5 flex items-center gap-1">
                             <span>⚠</span>
-                            <span>Trapped: needs +{pos.real_bep_gap_pct.toFixed(2)}% to break even{pos.breakeven_price_real ? ` (real target $${pos.breakeven_price_real.toFixed(6)})` : ''}</span>
+                            <span>Lot-size trap: needs +{pos.real_bep_gap_pct.toFixed(2)}% to break even</span>
                           </div>
                         )}
                       </motion.div>
