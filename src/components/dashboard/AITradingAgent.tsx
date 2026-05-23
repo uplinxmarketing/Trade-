@@ -192,6 +192,7 @@ interface OpenPosition {
   is_trapped?: boolean;
   dist_to_exit_pct?: number;
   dist_to_bep_pct?: number;
+  net_profit_now?: number;
 }
 
 interface TradeRow {
@@ -771,6 +772,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       breakeven_price_real: p.breakeven_price_real !== undefined ? Number(p.breakeven_price_real) : undefined,
       real_bep_gap_pct: p.real_bep_gap_pct !== undefined ? Number(p.real_bep_gap_pct) : undefined,
       is_trapped: p.is_trapped === true,
+      net_profit_now: p.net_profit_now !== undefined ? Number(p.net_profit_now) : undefined,
     }));
     setPositions(rawPos);
     positionsRef.current = rawPos;
@@ -1488,8 +1490,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       ?? (isServerMode && pos.current_price && pos.current_price > 0 ? pos.current_price : undefined)
                       ?? prices[pos.symbol]
                       ?? entry;
-                    const pnl = entry > 0 ? (cur - entry) * pos.quantity : 0;
-                    const pct = entry > 0 ? ((cur - entry) / entry) * 100 : 0;
+                    // Real breakeven: server-computed (fees + lot rounding), fallback to ~0.17% above entry
+                    const bep = pos.breakeven_price_real ?? (entry > 0 ? entry * 1.0017 : 0);
+                    // Fee-inclusive net profit if sold now (server provides this; local fallback)
+                    const netPnlNow = pos.net_profit_now
+                      ?? (bep > 0 && entry > 0 ? (cur - entry) * pos.quantity - (cur * pos.quantity * 0.001) : 0);
+                    // % relative to breakeven — green means actual profit after all fees
+                    const pct = bep > 0 ? ((cur - bep) / bep) * 100 : 0;
                     // exit_target comes from server; fallback to entry × breakeven (0.15% above)
                     const exitTarget = pos.exit_target && pos.exit_target > 0
                       ? pos.exit_target
@@ -1513,7 +1520,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       >
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-2">
-                            <div className={`w-1.5 h-1.5 rounded-full ${readyToSell ? 'bg-gain' : profitable ? 'bg-amber-400' : pct < 0 ? 'bg-loss' : 'bg-amber-400/50'}`} />
+                            <div className={`w-1.5 h-1.5 rounded-full ${readyToSell ? 'bg-gain' : profitable ? 'bg-amber-400' : netPnlNow < 0 ? 'bg-loss' : 'bg-amber-400/50'}`} />
                             <div>
                               <p className="text-xs font-bold">{pos.symbol.replace('USDT','')}</p>
                               <p className="text-[9px] text-muted-foreground">
@@ -1529,8 +1536,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                                 className={`font-semibold rounded px-0.5 ${pct >= 0 ? 'animate-flash-green' : 'animate-flash-red'}`}
                               >${cur > 0 ? cur.toFixed(6) : '…'}</span>
                             </p>
-                            <p className={`text-[9px] font-mono ${pnl >= 0 ? 'text-gain' : 'text-loss'}`}>
-                              {formatPnL(pnl, 4)} USDT ({pct >= 0 ? '+' : pct < 0 ? '−' : ''}{Math.abs(pct).toFixed(3)}%)
+                            <p className={`text-[9px] font-mono ${netPnlNow >= 0 ? 'text-gain' : 'text-loss'}`}
+                               title={`Net profit after buy+sell fees if force-sold now. Breakeven: $${bep > 0 ? bep.toFixed(6) : '—'}`}>
+                              {formatPnL(netPnlNow, 4)} USDT ({pct >= 0 ? '+' : '−'}{Math.abs(pct).toFixed(3)}% vs BEP)
                             </p>
                           </div>
                           <button

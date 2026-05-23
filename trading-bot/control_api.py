@@ -466,6 +466,10 @@ def _get_positions():
                 _bep_pos = target
             pnl    = (price - entry) * qty if price and entry else 0
             dist   = ((price - target) / target * 100) if target and price else 0
+            # Fee-inclusive net profit if sold right now (conservative: uses standard 0.1% fee)
+            _buy_fee_pos  = float(p.get("buy_fee_usdt") or 0)
+            _sell_fee_est = (price * qty * 0.001) if price and qty else 0
+            _net_pnl_now  = round(pnl - _buy_fee_pos - _sell_fee_est, 4) if price and entry else 0
             row = _enrich_position({
                 **p,
                 "avg_entry_price": entry,
@@ -473,6 +477,7 @@ def _get_positions():
                 "exit_target":     round(target, 8),
                 "breakeven_price": round(_bep_pos, 6),
                 "unrealized_pnl":  round(pnl, 4),
+                "net_profit_now":  _net_pnl_now,
                 "dist_to_exit_pct": round(dist, 4),
                 "dist_to_bep_pct":  round(((price - _bep_pos) / _bep_pos * 100) if _bep_pos and price else 0, 4),
                 "profitable":      price >= _bep_pos if price and _bep_pos else False,
@@ -494,6 +499,10 @@ def _get_positions():
                         row["real_bep_distance_usdt"]  = round((_real_bep - price) * float(p.get("quantity", 0)), 4)
                         row["is_trapped"]              = bool(_gap_pct > 2.0)
                         row["dist_to_bep_pct"]        = round((price - _real_bep) / _real_bep * 100, 4)
+                        # Recompute net_profit_now using real BEP-derived fee-inclusive P&L
+                        row["net_profit_now"] = round(
+                            (price - entry) * qty - _buy_fee_pos - _sell_fee_est, 4
+                        )
             except Exception:
                 pass
             out.append(row)
