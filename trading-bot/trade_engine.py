@@ -3679,16 +3679,16 @@ async def _refresh_signal_cache():
         except Exception:
             low_24h = None
 
-        # klines_1m — last 5 candles with OHLCV for R1 reversal check
+        # klines_1m — last 15 candles with OHLCV (R1 reversal + M4 micro-pullback)
         try:
-            if raw and len(raw) >= 5:
+            if raw and len(raw) >= 2:
                 klines_1m = [
                     {"open": float(k[1]), "high": float(k[2]),
                      "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])}
-                    for k in raw[-5:]
+                    for k in raw[-15:]
                 ]
-            elif candles and len(candles) >= 5:
-                klines_1m = candles[-5:]
+            elif candles and len(candles) >= 2:
+                klines_1m = candles[-15:]
             else:
                 klines_1m = prev.get("klines_1m", [])
         except Exception:
