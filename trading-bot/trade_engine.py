@@ -703,8 +703,8 @@ def _refresh_risk_params():
     global _user_tp_mult, _take_profit_mult, _stop_loss_mult, _take_profit_enabled, _smart_hold_enabled, _trailing_stop_pct, _BUFFER_OVERRIDES
     strategy = _load_strategy()
     tp_pct = float(strategy.get("take_profit_pct", 0.1))   # e.g. 0.5 → 0.5%
-    sl_pct = float(strategy.get("stop_loss_pct",   2.0))   # e.g. 2.0 → 2.0%
-    sl_on  = bool(strategy.get("stop_loss_enabled", True))
+    sl_pct = float(strategy.get("stop_loss_pct",   0.4))   # default 0.4% from BEP
+    sl_on  = bool(strategy.get("stop_loss_enabled", True))  # always on by default
     _take_profit_enabled = bool(strategy.get("take_profit_enabled", True))
     _smart_hold_enabled  = bool(strategy.get("smart_hold_enabled",  False))
     _trailing_stop_pct   = float(strategy.get("trailing_stop_pct",  0.5))
@@ -2708,7 +2708,9 @@ def realtime_monitor(prices: Dict[str, float]):
         if real_target <= 0:
             _bep_m = pos.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
             real_target = entry * _bep_m  # fallback for incomplete positions
-        stop = entry * _stop_loss_mult
+        # Stop measured from real BEP (fee-inclusive), not raw entry.
+        # e.g. SL 0.4% → stops out at bep × 0.996, capping loss at a known fraction of cost.
+        stop = real_target * _stop_loss_mult
         if _take_profit_enabled:
             target = max(real_target, entry * _user_tp_mult)
         else:
@@ -3402,7 +3404,7 @@ def _sell_monitor_loop():
                 if real_target3 <= 0:
                     _bep_m3 = pos.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
                     real_target3 = entry * _bep_m3
-                stop = entry * _stop_loss_mult
+                stop = real_target3 * _stop_loss_mult  # from BEP, not raw entry
                 if _take_profit_enabled:
                     target = max(real_target3, entry * _user_tp_mult)
                 else:
