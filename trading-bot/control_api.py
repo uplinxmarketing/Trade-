@@ -614,6 +614,25 @@ _acct_cache_ts: float = 0.0
 _ACCT_CACHE_TTL = 20.0
 _acct_cache_lock = threading.Lock()
 
+def _fetch_account_direct() -> dict:
+    """Fetch /api/v3/account via urllib+HMAC, bypassing python-binance/requests
+    which can be geo-blocked by Binance on datacenter IPs."""
+    import urllib.request as _ur
+    import urllib.parse  as _up
+    import hmac, hashlib, time as _t
+    api_key    = os.getenv("BINANCE_API_KEY",    "").strip()
+    api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        return {}
+    ts  = int(_t.time() * 1000)
+    qs  = f"timestamp={ts}"
+    sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    url = f"https://api.binance.com/api/v3/account?{qs}&signature={sig}"
+    req = _ur.Request(url, headers={"X-MBX-APIKEY": api_key, "User-Agent": "WolfBot/1.0"})
+    with _ur.urlopen(req, timeout=8) as r:
+        return json.loads(r.read())
+
+
 def _get_cached_account() -> dict:
     """Return cached Binance account dict, refreshing at most every 5 s."""
     global _acct_cache, _acct_cache_ts
@@ -621,6 +640,19 @@ def _get_cached_account() -> dict:
     with _acct_cache_lock:
         if now - _acct_cache_ts < _ACCT_CACHE_TTL and _acct_cache:
             return _acct_cache
+    # Try direct urllib first (bypasses geo-block that affects python-binance/requests)
+    try:
+        from connection import get_mode
+        if get_mode() == "live":
+            acc = _fetch_account_direct()
+            if acc.get("balances"):
+                with _acct_cache_lock:
+                    _acct_cache = acc
+                    _acct_cache_ts = now
+                return acc
+    except Exception:
+        pass
+    # Fallback: python-binance client (paper mode or direct fetch failed)
     try:
         from connection import client
         acc = client.get_account()
@@ -1613,8 +1645,16 @@ def _update_env_file(updates: dict):
             lines.append(f"{key}={value}\n")
     with open(env_path, "w") as f:
         f.writelines(lines)
-    # Update os.environ so os.execv() child process inherits the new values.
-    # Without this, load_dotenv(override=True) still reads the old inherited env.
+    # Mirror critical settings into the SQLite database so they survive git
+    # operations (which don't touch the DB) even if the .env is lost.
+    _persistent_keys = {"MODE", "BINANCE_API_KEY", "BINANCE_API_SECRET"}
+    for key, value in updates.items():
+        if key in _persistent_keys:
+            try:
+                database.save_setting(f"env_{key}", str(value))
+            except Exception:
+                pass
+    # Update os.environ so the restarted process inherits fresh values.
     for key, value in updates.items():
         os.environ[key] = str(value)
 
@@ -1657,9 +1697,9 @@ def api_set_mode(req: ModeRequest):
 
     def _restart():
         time.sleep(0.8)
-        # Exit cleanly — systemd Restart=always brings the process back up with
-        # the fresh .env written above. os.execv() can fail inside systemd namespaces.
-        os._exit(0)
+        # Exit with code 1 — triggers systemd Restart=on-failure AND Restart=always.
+        # Exit code 0 is silently ignored by Restart=on-failure configurations.
+        os._exit(1)
 
     threading.Thread(target=_restart, daemon=True).start()
     return {"ok": True, "mode": req.mode, "restarting": True}
