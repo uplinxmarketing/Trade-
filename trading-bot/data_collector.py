@@ -227,14 +227,14 @@ def _build_ws_url(coins: list) -> str:
         f"{coin.lower()}@miniTicker"
         for coin in coins
     )
-    return f"wss://stream.binance.com:9443/stream?streams={streams}"
+    return f"wss://data-stream.binance.vision/stream?streams={streams}"
 
 
 async def _verify_symbols(coins: list) -> list:
     """Return only coins that Binance confirms exist as USDT pairs."""
     try:
         def _fetch():
-            url = "https://api.binance.com/api/v3/exchangeInfo?permissions=SPOT"
+            url = "https://data-api.binance.vision/api/v3/exchangeInfo?permissions=SPOT"
             with urllib.request.urlopen(url, timeout=15) as r:
                 return json.loads(r.read())
         data = await asyncio.to_thread(_fetch)

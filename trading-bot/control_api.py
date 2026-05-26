@@ -1964,7 +1964,7 @@ async def api_proxy_ticker_24hr(symbols: str = None):
     for i in range(0, len(symbol_list), CHUNK_SIZE):
         chunk = symbol_list[i:i + CHUNK_SIZE]
         try:
-            url = f"https://api.binance.com/api/v3/ticker/24hr?symbols={json.dumps(chunk)}"
+            url = f"https://data-api.binance.vision/api/v3/ticker/24hr?symbols={json.dumps(chunk)}"
             req = _ur.Request(url, headers={"User-Agent": "WolfBot/1.0"})
             with _ur.urlopen(req, timeout=5.0) as r:
                 all_results.extend(json.loads(r.read()))
@@ -2210,7 +2210,7 @@ async def api_proxy_binance(path: str, request: Request):
     import urllib.request as _ur
     import urllib.error as _ue
     qs = str(request.query_params)
-    url = f"https://api.binance.com/api/v3/{path}"
+    url = f"https://data-api.binance.vision/api/v3/{path}"
     if qs:
         url += "?" + qs
     req = _ur.Request(url, headers={"User-Agent": "WolfBot/1.0"})

@@ -1221,7 +1221,7 @@ _market_regime_cache: dict = {"ts": 0.0, "regime": "unknown", "details": {}}
 _MARKET_REGIME_TTL_SEC = 120.0
 
 def _fetch_btc_1h_klines() -> Optional[List[dict]]:
-    url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=24"
+    url = "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=24"
     ok, data, _, _ = _binance_request(url, timeout=4.0, source="btc_klines")
     if not ok or not isinstance(data, list):
         return None
@@ -1311,7 +1311,7 @@ _reversal_cache: dict = {}
 _REVERSAL_TTL_SEC = 30.0
 
 def _fetch_1m_klines_rc(symbol: str, limit: int = 5) -> Optional[List[dict]]:
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
+    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
     ok, data, _, _ = _binance_request(url, timeout=3.0, source="reversal_klines")
     if not ok or not isinstance(data, list):
         return None
@@ -2429,7 +2429,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         try:
             import urllib.parse as _up_kb
             _fresh_url = (
-                f"https://api.binance.com/api/v3/klines?"
+                f"https://data-api.binance.vision/api/v3/klines?"
                 + _up_kb.urlencode({"symbol": sym, "interval": "1m", "limit": 30})
             )
             _ok_kb, _raw, _, _ = _binance_request(_fresh_url, timeout=2.0, source="klines_pre_buy")
@@ -2822,7 +2822,7 @@ def _fetch_batch_prices(symbols: list) -> Dict[str, float]:
     symbols = list(symbols)
     if len(symbols) == 1:
         # Single-symbol endpoint: weight=1 vs batch weight=2
-        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbols[0]}"
+        url = f"https://data-api.binance.vision/api/v3/ticker/price?symbol={symbols[0]}"
         ok, data, _, _ = _binance_request(url, timeout=3.0, source="batch_prices")
         if not ok or not isinstance(data, dict):
             return {}
@@ -2833,7 +2833,7 @@ def _fetch_batch_prices(symbols: list) -> Dict[str, float]:
             return {}
     _syms_json = json.dumps(symbols, separators=(',', ':'))
     _encoded   = _up2.quote(_syms_json, safe='')
-    url = f"https://api.binance.com/api/v3/ticker/price?symbols={_encoded}"
+    url = f"https://data-api.binance.vision/api/v3/ticker/price?symbols={_encoded}"
     ok, data, _, _ = _binance_request(url, timeout=3.0, source="batch_prices")
     if not ok or not isinstance(data, list):
         return {}
@@ -3531,13 +3531,12 @@ async def signal_scanner(prices: dict):
 
 
 _KLINE_BASES = [
-    # Direct Binance API first — most accurate, real-time prices (no CDN delay)
+    # CDN first — not geo-blocked, works when api.binance.com returns 451
+    "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com",
-    # CDN fallback — may serve slightly stale data but works when API is geo-blocked
-    "https://data-api.binance.vision",
     "https://api4.binance.com",
 ]
 
