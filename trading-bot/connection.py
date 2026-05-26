@@ -37,21 +37,23 @@ def _build_client():
         else:
             try:
                 from binance.client import Client as BinanceClient
-                c = BinanceClient(api_key, api_secret,
-                                  requests_params={"timeout": 10})
-                # Use authenticated endpoint — public /ping is geo-blocked on some VPS regions.
-                # get_account() verifies both connectivity AND that the API key is valid.
-                c.get_account()
+                # The BinanceClient constructor calls self.ping() which is
+                # geo-blocked on datacenter IPs (APIError code=0). Monkeypatch
+                # ping to a no-op for construction, then restore it so real
+                # trading calls are unaffected.
+                _real_ping = BinanceClient.ping
+                BinanceClient.ping = lambda self: {}
+                try:
+                    c = BinanceClient(api_key, api_secret,
+                                      requests_params={"timeout": 10})
+                finally:
+                    BinanceClient.ping = _real_ping
                 c.update_price = lambda symbol, price: None
-                print("[Connection] Live Binance connection established ✓")
+                print("[Connection] Live Binance client initialised ✓")
                 return c
             except Exception as exc:
-                _live_error = f"Binance API connection failed: {exc}"
+                _live_error = f"Binance client init failed: {exc}"
                 _using_paper_fallback = True
-                # Do NOT change _CONFIGURED_MODE — .env still says MODE=live.
-                # get_mode() keeps returning "live" so position tags, mode guards,
-                # and the frontend all stay in live mode. live_error banner explains
-                # the connection issue. Next restart will retry the live connection.
                 print(f"[Connection] {_live_error} — using paper client for this session")
 
     elif _CONFIGURED_MODE == "testnet":
@@ -97,13 +99,17 @@ def _live_reconnect_loop():
             continue
         try:
             from binance.client import Client as BinanceClient
-            c = BinanceClient(api_key, api_secret, requests_params={"timeout": 10})
-            c.get_account()
+            _real_ping = BinanceClient.ping
+            BinanceClient.ping = lambda self: {}
+            try:
+                c = BinanceClient(api_key, api_secret, requests_params={"timeout": 10})
+            finally:
+                BinanceClient.ping = _real_ping
             c.update_price = lambda symbol, price: None
             client = c
             _live_error = ""
             _using_paper_fallback = False
-            print("[Connection] Auto-reconnect: live Binance connection restored ✓")
+            print("[Connection] Auto-reconnect: live Binance client restored ✓")
         except Exception as exc:
             print(f"[Connection] Auto-reconnect failed: {exc}")
 
