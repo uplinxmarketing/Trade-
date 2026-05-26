@@ -58,7 +58,9 @@ const OrderBookPanel = ({ activeCoin, prices }: Props) => {
       depthAbort.current = new AbortController();
       fetch(`/api/proxy/binance/depth?symbol=${activeCoin}&limit=15`, { signal: depthAbort.current.signal })
         .then(r => r.json())
-        .then((d: DepthData) => setDepth(d))
+        .then((d: any) => {
+          if (Array.isArray(d?.asks) && Array.isArray(d?.bids)) setDepth(d as DepthData);
+        })
         .catch(() => {});
     };
 
