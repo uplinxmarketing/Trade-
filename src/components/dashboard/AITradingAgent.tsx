@@ -444,7 +444,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [showLog, setShowLog]     = useState(true);
   const [actLogFilter, setActLogFilter] = useState<'all' | 'orders' | 'sells' | 'buys' | 'errors'>('all');
   // All API calls are relative (same-origin) — bot runs on wolfbot.tech.
-  const railwayUrl = '';
+  const botUrl = '';  // same-origin VPS API — all calls use relative /api/* paths
   const [liveApiKey, setLiveApiKey]         = useState('');
   const [liveApiSecret, setLiveApiSecret]   = useState('');
   const [showLiveSecret, setShowLiveSecret] = useState(false);
@@ -479,15 +479,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const timerRef       = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scanTimerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
   const positionsRef   = useRef<OpenPosition[]>([]);
-  const [railwaySignals, setRailwaySignals] = useState<any[]>([]);
+  const [botSignals, setRailwaySignals] = useState<any[]>([]);
   const [usingPaperFallback, setUsingPaperFallback] = useState(false);
   const [liveErrorMsg, setLiveErrorMsg] = useState<string | null>(null);
 
   // Independent polling for positions and signals tables
   const { data: positionsData, loading: positionsLoading, lastUpdate: positionsUpdated } =
-    useDataFetcher(`${railwayUrl}/api/positions`, 2000, { positions: [] as any[] }, isServerMode);
+    useDataFetcher(`${botUrl}/api/positions`, 2000, { positions: [] as any[] }, isServerMode);
   const { data: signalsData, loading: signalsLoading, lastUpdate: signalsUpdated } =
-    useDataFetcher(`${railwayUrl}/api/signals-summary?limit=30`, 5000, { signals: [] as any[], total_tracked: 0 }, isServerMode);
+    useDataFetcher(`${botUrl}/api/signals-summary?limit=30`, 5000, { signals: [] as any[], total_tracked: 0 }, isServerMode);
 
   const addLog = useCallback((msg: string) => {
     setActLog(prev => [msg, ...prev].slice(0, MAX_LOG_LINES));
@@ -496,7 +496,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // ── Sync settings from server on mount ────────────────────────────────────
   useEffect(() => {
     // (so users with already-correct settings don't see a false warning).
-    fetch(`${railwayUrl}/api/settings`, { cache: 'no-store' })
+    fetch(`${botUrl}/api/settings`, { cache: 'no-store' })
       .then(r => r.ok ? r.json() : null)
       .then(d => {
         if (!d) return;
@@ -511,7 +511,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         if (d.min_signals         !== undefined) setMinSignals(Number(d.min_signals));
       })
       .catch(() => {});
-    fetch(`${railwayUrl}/api/config`, { cache: 'no-store' })
+    fetch(`${botUrl}/api/config`, { cache: 'no-store' })
       .then(r => r.ok ? r.json() : null)
       .then(d => {
         if (!d) return;
@@ -520,12 +520,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         if (d.allocation   !== undefined) setSetupAllocation(Number(d.allocation));
       })
       .catch(() => {});
-  }, [railwayUrl]);
+  }, [botUrl]);
 
   // ── Data loader (Supabase — local mode only) ──────────────────────────────
   const loadData = useCallback(async () => {
-    // Server mode: all data comes from pollRailway (VPS SQLite), not Supabase.
-    // Letting loadData run would race with pollRailway and overwrite server data with empty Supabase rows.
+    // Server mode: all data comes from pollBot (VPS SQLite), not Supabase.
+    // Letting loadData run would race with pollBot and overwrite server data with empty Supabase rows.
     if (isServerMode) return;
     try {
       const { data: cfg } = await supabase.from('bot_config')
@@ -656,25 +656,25 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   useEffect(() => {
     if (!isServerMode || selectedCoins.length === 0) return;
     const handle = setTimeout(() => {
-      fetch(`${railwayUrl}/api/coins`, {
+      fetch(`${botUrl}/api/coins`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ coins: selectedCoins }),
       }).catch(() => {});
     }, 800);
     return () => clearTimeout(handle);
-  }, [selectedCoins, railwayUrl]); // eslint-disable-line
+  }, [selectedCoins, botUrl]); // eslint-disable-line
 
   // ── VPS bot poller ─────────────────────────────────────────────────────────────────
   // Polls /api/all (same-origin → wolfbot.tech) every 5 s normally, every 1 s
   // when positions are open. Mirrors bot state into React state for live UI.
   const serverPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const fastPollRef   = useRef<ReturnType<typeof setInterval> | null>(null);
-  // In-flight guard: both poll intervals call pollRailway. Without this, a slow
+  // In-flight guard: both poll intervals call pollBot. Without this, a slow
   // 5-s response can land after a fast 1-s response and clobber newer data.
   const pollInFlightRef = useRef<boolean>(false);
 
-  const pollRailway = useCallback(async () => {
+  const pollBot = useCallback(async () => {
     if (pollInFlightRef.current) return;
     pollInFlightRef.current = true;
     try {
@@ -684,7 +684,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 5_000);
       try {
-        const res = await fetch(`${railwayUrl}/api/all`, { signal: ctrl.signal, cache: 'no-store' });
+        const res = await fetch(`${botUrl}/api/all`, { signal: ctrl.signal, cache: 'no-store' });
         clearTimeout(timer);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return await res.json();
@@ -782,10 +782,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     }
 
     // Trades
-    const railwayTrades: TradeRow[] = [];
+    const botTrades: TradeRow[] = [];
     for (const t of (data.trades ?? [])) {
       if (!t.symbol || !t.side) continue;
-      railwayTrades.push({
+      botTrades.push({
         id: t.id ?? `${t.symbol}-${t.created_at}`,
         created_at: t.created_at ?? new Date().toISOString(),
         symbol: t.symbol, side: t.side,
@@ -797,19 +797,19 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     }
     // Merge Supabase history only when bot returned NO trades — this
     // happens after a fresh redeploy without a persistent volume.
-    const railwayTrades2 = [...railwayTrades];
-    if (railwayTrades.length === 0) {
+    const botTrades2 = [...botTrades];
+    if (botTrades.length === 0) {
       try {
         const { data: sbTrades } = await supabase.from('trades')
           .select('*').eq('user_session', SESSION)
           .order('created_at', { ascending: false }).limit(50);
         if (Array.isArray(sbTrades) && sbTrades.length > 0) {
-          railwayTrades2.push(...(sbTrades as TradeRow[]));
+          botTrades2.push(...(sbTrades as TradeRow[]));
         }
       } catch { /* Supabase unavailable — bot-only data shown */ }
     }
 
-    const sorted = railwayTrades2.sort((a, b) =>
+    const sorted = botTrades2.sort((a, b) =>
       new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
     );
     setTrades(sorted);
@@ -825,7 +825,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
     // Fetch debug info only if there is a live error shown
     if (s.live_error) {
-      const dbg = await fetch(`${railwayUrl}/api/debug`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null);
+      const dbg = await fetch(`${botUrl}/api/debug`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null);
       if (dbg?.env?.MODE) {
         addLog(`[debug] MODE=${dbg.env.MODE} live_error=${s.live_error ?? 'none'}`);
       }
@@ -833,42 +833,42 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     } finally {
       pollInFlightRef.current = false;
     }
-  }, [railwayUrl, addLog]);
+  }, [botUrl, addLog]);
 
   // Start / stop server poll
   useEffect(() => {
     if (!isServerMode) return;
-    pollRailway();
-    serverPollRef.current = setInterval(pollRailway, 3_000);
+    pollBot();
+    serverPollRef.current = setInterval(pollBot, 3_000);
     return () => { if (serverPollRef.current) clearInterval(serverPollRef.current); };
-  }, [isServerMode, pollRailway]); // eslint-disable-line
+  }, [isServerMode, pollBot]); // eslint-disable-line
 
   // Fetch signal registry once on mount (server mode only)
   useEffect(() => {
     if (!isServerMode) return;
-    fetch(`${railwayUrl}/api/signal-registry`)
+    fetch(`${botUrl}/api/signal-registry`)
       .then(r => r.json())
       .then(d => { if (d.signals) setSignalRegistry(d.signals); })
       .catch(() => {});
-  }, [isServerMode, railwayUrl]); // eslint-disable-line
+  }, [isServerMode, botUrl]); // eslint-disable-line
 
   // Uses `current_price` from the server API response (not WebSocket prices)
   useEffect(() => {
     if (!isServerMode) return;
     if (fastPollRef.current) clearInterval(fastPollRef.current);
     if (positions.length > 0) {
-      fastPollRef.current = setInterval(pollRailway, 500);
+      fastPollRef.current = setInterval(pollBot, 500);
     } else {
       fastPollRef.current = null;
     }
     return () => { if (fastPollRef.current) clearInterval(fastPollRef.current); };
-  }, [isServerMode, positions, pollRailway]); // eslint-disable-line
+  }, [isServerMode, positions, pollBot]); // eslint-disable-line
 
   // ── Start / Stop ──────────────────────────────────────────────────────────
   const handleStartStop = useCallback(async () => {
     if (isRunning) {
       if (isServerMode) {
-        const res = await fetch(`${railwayUrl}/api/agent/stop`, { method: 'POST' });
+        const res = await fetch(`${botUrl}/api/agent/stop`, { method: 'POST' });
         if (res.ok) {
           setIsRunning(false); isRunningRef.current = false;
           setSetupComplete(false); setSettingsSynced(false);
@@ -879,14 +879,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       }
       setIsRunning(false); isRunningRef.current = false;
     }
-  }, [isRunning, isServerMode, railwayUrl, addLog]);
+  }, [isRunning, isServerMode, botUrl, addLog]);
 
   // ── Switch bot to live mode with API keys ───────────────────────────────────
   const handleGoLive = useCallback(async () => {
     if (!liveApiKey || !liveApiSecret) { toast.error('Enter API key and secret'); return; }
     setLiveSetupLoading(true);
     try {
-      const res = await fetch(`${railwayUrl}/api/mode`, {
+      const res = await fetch(`${botUrl}/api/mode`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: 'live', api_key: liveApiKey, api_secret: liveApiSecret }),
@@ -903,12 +903,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         let attempts = 0;
         const poll = setInterval(async () => {
           attempts++;
-          const ping = await fetch(`${railwayUrl}/api/ping`, { cache: 'no-store' });
+          const ping = await fetch(`${botUrl}/api/ping`, { cache: 'no-store' });
           if (ping.ok) {
             const pd = await ping.json();
             if (pd.mode === 'live') {
               clearInterval(poll);
-              await pollRailway();
+              await pollBot();
             }
           }
           if (attempts > 10) clearInterval(poll);
@@ -919,7 +919,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     } finally {
       setLiveSetupLoading(false);
     }
-  }, [liveApiKey, liveApiSecret, railwayUrl, addLog, pollRailway]);
+  }, [liveApiKey, liveApiSecret, botUrl, addLog, pollBot]);
 
   // ── Sync setup wizard settings to server ─────────────────────────────────
   const syncSettingsToServer = useCallback(async (): Promise<boolean> => {
@@ -944,8 +944,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         min_signals:         setupMinSignals,
       };
       await Promise.all([
-        fetch(`${railwayUrl}/api/config`,   { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(budgetPayload) }),
-        fetch(`${railwayUrl}/api/settings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settingsPayload) }),
+        fetch(`${botUrl}/api/config`,   { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(budgetPayload) }),
+        fetch(`${botUrl}/api/settings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settingsPayload) }),
       ]);
       return true;
     } catch {
@@ -956,7 +956,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     setupSlEnabled, setupStopLoss, setupTpEnabled, setupTakeProfit,
     setupSmartHold, setupTrailingStop, setupReinvest,
     setupMaxPositions, setupMinSignals,
-    railwayUrl]);
+    botUrl]);
 
   // ── Start bot ─────────────────────────────────────────────────────────────
   const handleStartBot = useCallback(async () => {
@@ -980,7 +980,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           }
         }
         const endpoint = '/api/agent/start';
-        res = await fetch(`${railwayUrl}${endpoint}`, { method: 'POST' });
+        res = await fetch(`${botUrl}${endpoint}`, { method: 'POST' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (data.error) throw new Error(data.error);
@@ -989,13 +989,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         toast.success('Bot started');
         // Re-sync coins after start (bot resets watchlist on start)
         if (selectedCoins.length > 0) {
-          fetch(`${railwayUrl}/api/coins`, {
+          fetch(`${botUrl}/api/coins`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ coins: selectedCoins }),
           }).catch(() => {});
         }
-        pollRailway().catch(() => {});  // fire-and-forget; don't block UI
+        pollBot().catch(() => {});  // fire-and-forget; don't block UI
         return;
       }
       // Local mode
@@ -1009,7 +1009,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     } finally {
       setLoading(false);
     }
-  }, [loading, isServerMode, selectedCoins, railwayUrl, settingsSynced, syncSettingsToServer, addLog, pollRailway, runCycle]);
+  }, [loading, isServerMode, selectedCoins, botUrl, settingsSynced, syncSettingsToServer, addLog, pollBot, runCycle]);
 
   // ── Force buy ─────────────────────────────────────────────────────────────
   const handleForceBuy = useCallback(async (sym: string) => {
@@ -1018,7 +1018,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     try {
       // Server mode: delegate to VPS bot's force-buy endpoint
       if (positions.find(p => p.symbol === sym)) { toast.error(`Already holding ${sym}`); return; }
-        const res  = await fetch(`${railwayUrl}/api/force-buy/${sym}`, {
+        const res  = await fetch(`${botUrl}/api/force-buy/${sym}`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ budget: setupBudgetValue }),
         });
@@ -1027,14 +1027,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         if (data.error) throw new Error(data.error);
         addLog(`FORCE BUY ${sym} @ ${Number(data.price).toFixed(4)} USDT · ${Number(data.budget).toFixed(2)} USDT`);
         toast.success(`Force-bought ${sym}`);
-        await pollRailway();
+        await pollBot();
     } catch (e: any) {
       toast.error(`Force buy failed: ${e.message}`);
       addLog(`[force-buy] ${sym}: ${e.message}`);
     } finally {
       setForcingBuy(null);
     }
-  }, [isServerMode, positions, railwayUrl, setupBudgetValue, addLog, pollRailway]);
+  }, [isServerMode, positions, botUrl, setupBudgetValue, addLog, pollBot]);
 
   // ── Force sell ────────────────────────────────────────────────────────────
   const handleForceSell = useCallback(async (pos: OpenPosition) => {
@@ -1046,12 +1046,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           : (prices[pos.symbol] ?? 0);
 
         // Optimistic UI: remove position immediately so the panel feels instant.
-        // If the backend fails, the next pollRailway restores it automatically.
+        // If the backend fails, the next pollBot restores it automatically.
         const positionBackup = positions.find(p => p.symbol === pos.symbol);
         setPositions(prev => prev.filter(p => p.symbol !== pos.symbol));
 
         try {
-          const res = await fetch(`${railwayUrl}/api/force-sell/${pos.symbol}`, {
+          const res = await fetch(`${botUrl}/api/force-sell/${pos.symbol}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ price: cur }),
@@ -1061,7 +1061,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           if (data.error) throw new Error(data.error);
           addLog(`FORCE SELL ${pos.symbol} @ ${Number(data.price).toFixed(4)} USDT`);
           toast.success(`Sold ${pos.symbol}`);
-          setTimeout(() => pollRailway(), 200);
+          setTimeout(() => pollBot(), 200);
         } catch (sellErr) {
           // Sell failed — restore position so user can retry
           if (positionBackup) setPositions(prev => [...prev, positionBackup]);
@@ -1091,19 +1091,19 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     } finally {
       setForcingSell(null);
     }
-  }, [isServerMode, railwayUrl, prices, positions, addLog, loadData, pollRailway]);
+  }, [isServerMode, botUrl, prices, positions, addLog, loadData, pollBot]);
 
   // ── Reset wallet ──────────────────────────────────────────────────────────
   const handleReset = useCallback(async () => {
     try {
       if (isServerMode) {
-        const res  = await fetch(`${railwayUrl}/api/reset`, { method: 'POST' });
+        const res  = await fetch(`${botUrl}/api/reset`, { method: 'POST' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (data.error) throw new Error(data.error);
         addLog('=== Bot wallet reset ===');
         toast.success(`Bot reset · ${data.balance_usdt?.toLocaleString()} USDT restored`);
-        await pollRailway();
+        await pollBot();
         return;
       }
       // Local mode
@@ -1120,14 +1120,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     } catch (e: any) {
       toast.error(`Reset failed: ${e.message}`);
     }
-  }, [isServerMode, railwayUrl, addLog, pollRailway, loadData]);
+  }, [isServerMode, botUrl, addLog, pollBot, loadData]);
 
   // ── Save bot settings to server ──────────────────────────────────────────────
   const saveSettings = useCallback(async () => {
     setSavingSettings(true);
     try {
       await Promise.all([
-        fetch(`${railwayUrl}/api/settings`, {
+        fetch(`${botUrl}/api/settings`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1142,7 +1142,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             min_signals:         settingsDraft.minSignals,
           }),
         }),
-        fetch(`${railwayUrl}/api/config`, {
+        fetch(`${botUrl}/api/config`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1169,7 +1169,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     } finally {
       setSavingSettings(false);
     }
-  }, [settingsDraft, setupBudgetMode, setupBudgetValue, setupAllocation, railwayUrl]);
+  }, [settingsDraft, setupBudgetMode, setupBudgetValue, setupAllocation, botUrl]);
 
   // ── Computed stats ────────────────────────────────────────────────────────
   const totalValue = positions.reduce((sum, p) => {
@@ -1302,7 +1302,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => isServerMode ? pollRailway() : runCycle()}
+              onClick={() => isServerMode ? pollBot() : runCycle()}
               disabled={scanning}
               className="p-1.5 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground transition-colors disabled:opacity-40"
               title="Refresh">
@@ -1330,14 +1330,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                   onClick={async () => {
                     setLiveSetupLoading(true);
                     try {
-                      await fetch(`${railwayUrl}/api/mode`, {
+                      await fetch(`${botUrl}/api/mode`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ mode: 'paper' }),
                       });
                       setShowModeToggle(false);
                       toast.success('Switching to paper mode…');
-                      setTimeout(() => pollRailway(), 3000);
+                      setTimeout(() => pollBot(), 3000);
                     } catch (e: any) {
                       toast.error('Failed', { description: e.message });
                     } finally {
@@ -1378,7 +1378,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                     if (!liveApiKey || !liveApiSecret) { toast.error('Enter API key and secret'); return; }
                     setLiveSetupLoading(true);
                     try {
-                      const res = await fetch(`${railwayUrl}/api/mode`, {
+                      const res = await fetch(`${botUrl}/api/mode`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ mode: 'live', api_key: liveApiKey, api_secret: liveApiSecret }),
@@ -1388,24 +1388,21 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       toast.success('Switching to live mode — bot restarting…');
                       setLiveApiKey('');
                       setLiveApiSecret('');
-                      // Poll until bot comes back
+                      // Poll until bot responds (any successful ping = restart done)
                       let attempts = 0;
                       const poll = setInterval(async () => {
                         attempts++;
                         try {
-                          const ping = await fetch(`${railwayUrl}/api/ping`, { cache: 'no-store' });
+                          const ping = await fetch(`${botUrl}/api/ping`, { cache: 'no-store' });
                           if (ping.ok) {
-                            const pd = await ping.json();
-                            if (pd.mode === 'live') {
-                              clearInterval(poll);
-                              await pollRailway();
-                              toast.success('Live mode active');
-                            }
+                            clearInterval(poll);
+                            await pollBot();
+                            toast.success('Bot restarted — check mode indicator');
                           }
                         } catch { /* bot still restarting */ }
                         if (attempts > 30) {
                           clearInterval(poll);
-                          toast.error('Bot restart taking longer than expected — it may still be starting');
+                          toast.info('Bot may still be starting — refresh the page in a moment');
                         }
                       }, 2000);
                     } catch (e: any) {
@@ -1516,7 +1513,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                         setEditingInstr(false);
                         // Sync notes to VPS bot so Claude can use them in strategy decisions
                         if (isServerMode) {
-                          await fetch(`${railwayUrl}/api/settings`, {
+                          await fetch(`${botUrl}/api/settings`, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ strategy_notes: instrDraft }),
@@ -1848,7 +1845,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           </button>
           {showSignalEngine && (
             <div className="px-4 pb-4">
-              <SignalEnginePanel baseUrl={railwayUrl} />
+              <SignalEnginePanel baseUrl={botUrl} />
             </div>
           )}
         </div>
@@ -1870,7 +1867,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           </button>
           {showDiagnostics && (
             <div className="px-4 pb-4">
-              <DiagnosticsTab baseUrl={railwayUrl} />
+              <DiagnosticsTab baseUrl={botUrl} />
             </div>
           )}
         </div>

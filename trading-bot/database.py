@@ -8,24 +8,29 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
 
 # DATA_DIR stores the SQLite database and strategy.json.
-# Default: sibling "data/" directory next to the trading-bot folder, which is
-# outside the git checkout so git operations never touch it.
-# Override with DATA_DIR env var for Railway / Docker volume mounts.
+# Tries in order: DATA_DIR env var → /opt/tradebot/data (VPS, outside git
+# checkout) → /data (Railway) → script directory (last resort).
 def _resolve_data_dir() -> str:
     _script_dir = os.path.dirname(os.path.abspath(__file__))
-    _default    = os.path.join(_script_dir, "..", "data")  # /opt/tradebot/data
-    candidate   = os.getenv("DATA_DIR", _default)
-    try:
-        os.makedirs(candidate, exist_ok=True)
-        probe = os.path.join(candidate, ".write_probe")
-        with open(probe, "w") as _f:
-            _f.write("ok")
-        os.remove(probe)
-        return candidate
-    except OSError:
-        fallback = os.path.dirname(os.path.abspath(__file__))
-        print(f"[DB] {candidate} not writable — falling back to {fallback}")
-        return fallback
+    _candidates = [
+        os.getenv("DATA_DIR"),
+        os.path.join(_script_dir, "..", "data"),  # /opt/tradebot/data
+        "/data",
+        _script_dir,
+    ]
+    for candidate in _candidates:
+        if not candidate:
+            continue
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            probe = os.path.join(candidate, ".write_probe")
+            with open(probe, "w") as _f:
+                _f.write("ok")
+            os.remove(probe)
+            return candidate
+        except OSError:
+            continue
+    return _script_dir
 
 _DATA_DIR = _resolve_data_dir()
 DB_PATH = os.path.join(_DATA_DIR, "bot.db")

@@ -2895,7 +2895,13 @@ def api_save_settings(req: SettingsRequest):
 
 @app.get("/api/ping")
 def api_ping():
-    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
+    from connection import get_mode, is_using_paper_fallback
+    return {
+        "ok":   True,
+        "ts":   datetime.now(timezone.utc).isoformat(),
+        "mode": get_mode(),
+        "using_paper_fallback": is_using_paper_fallback(),
+    }
 
 
 @app.get("/api/buy-rejections")
