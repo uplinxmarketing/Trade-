@@ -37,15 +37,19 @@ def _build_client():
         else:
             try:
                 from binance.client import Client as BinanceClient
-                c = BinanceClient(api_key, api_secret,
-                                  requests_params={"timeout": 10})
-                # Skip ping/account test — Binance geo-blocks public AND account
-                # endpoints for datacenter IPs (APIError code=0, "restricted location").
-                # Actual order/balance calls go through fine; the restriction only
-                # affects the test endpoints. We trust the keys are valid and let
-                # the bot surface errors on real trading calls if they occur.
+                # The BinanceClient constructor calls self.ping() which is
+                # geo-blocked on datacenter IPs (APIError code=0). Monkeypatch
+                # ping to a no-op for construction, then restore it so real
+                # trading calls are unaffected.
+                _real_ping = BinanceClient.ping
+                BinanceClient.ping = lambda self: {}
+                try:
+                    c = BinanceClient(api_key, api_secret,
+                                      requests_params={"timeout": 10})
+                finally:
+                    BinanceClient.ping = _real_ping
                 c.update_price = lambda symbol, price: None
-                print("[Connection] Live Binance client initialised ✓ (connection test skipped)")
+                print("[Connection] Live Binance client initialised ✓")
                 return c
             except Exception as exc:
                 _live_error = f"Binance client init failed: {exc}"
@@ -95,7 +99,12 @@ def _live_reconnect_loop():
             continue
         try:
             from binance.client import Client as BinanceClient
-            c = BinanceClient(api_key, api_secret, requests_params={"timeout": 10})
+            _real_ping = BinanceClient.ping
+            BinanceClient.ping = lambda self: {}
+            try:
+                c = BinanceClient(api_key, api_secret, requests_params={"timeout": 10})
+            finally:
+                BinanceClient.ping = _real_ping
             c.update_price = lambda symbol, price: None
             client = c
             _live_error = ""
