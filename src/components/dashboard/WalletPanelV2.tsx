@@ -222,6 +222,9 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
       const res = await fetch(`${url}/api/wallet`, { cache: 'no-store' });
       if (!res.ok) { toast.error('Failed to load live wallet'); return; }
       const data = await res.json();
+      if (data.account_fetch_ok === false) {
+        toast.error('Binance account fetch failed — check API keys and server logs');
+      }
       const nonZero = (data.balances || []).filter((b: any) =>
         parseFloat(String(b.free)) + parseFloat(String(b.locked)) > 0.0001
       );
