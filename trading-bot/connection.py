@@ -39,7 +39,9 @@ def _build_client():
                 from binance.client import Client as BinanceClient
                 c = BinanceClient(api_key, api_secret,
                                   requests_params={"timeout": 10})
-                c.ping()
+                # Use authenticated endpoint — public /ping is geo-blocked on some VPS regions.
+                # get_account() verifies both connectivity AND that the API key is valid.
+                c.get_account()
                 c.update_price = lambda symbol, price: None
                 print("[Connection] Live Binance connection established ✓")
                 return c
@@ -96,7 +98,7 @@ def _live_reconnect_loop():
         try:
             from binance.client import Client as BinanceClient
             c = BinanceClient(api_key, api_secret, requests_params={"timeout": 10})
-            c.ping()
+            c.get_account()
             c.update_price = lambda symbol, price: None
             client = c
             _live_error = ""

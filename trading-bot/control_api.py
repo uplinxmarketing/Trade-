@@ -1657,7 +1657,9 @@ def api_set_mode(req: ModeRequest):
 
     def _restart():
         time.sleep(0.8)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        # Exit cleanly — systemd Restart=always brings the process back up with
+        # the fresh .env written above. os.execv() can fail inside systemd namespaces.
+        os._exit(0)
 
     threading.Thread(target=_restart, daemon=True).start()
     return {"ok": True, "mode": req.mode, "restarting": True}

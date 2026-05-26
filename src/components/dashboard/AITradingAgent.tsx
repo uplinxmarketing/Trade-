@@ -449,6 +449,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [liveApiSecret, setLiveApiSecret]   = useState('');
   const [showLiveSecret, setShowLiveSecret] = useState(false);
   const [liveSetupLoading, setLiveSetupLoading] = useState(false);
+  const [showModeToggle, setShowModeToggle] = useState(false);
 
   // ── Setup wizard / Agent Trading Settings ─────────────────────────────────────────
   // Wizard always appears before every bot start — no localStorage persistence.
@@ -1273,34 +1274,155 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         ))}
       </div>
 
-      {/* Mode badge + quick actions */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border">
-        <div className="flex items-center gap-2">
-          <span className={`text-[9px] font-bold px-2 py-0.5 rounded-full ${
-            binanceConnected ? 'bg-gain/20 text-gain' : 'bg-muted/40 text-muted-foreground'
-          }`}>
-            {binanceConnected ? 'LIVE' : 'PAPER'}
-          </span>
-          {!binanceConnected && (
-            <button onClick={onConnectBinance}
-              className="text-[10px] text-accent hover:underline">Connect Binance</button>
-          )}
+      {/* Mode toggle row */}
+      <div className="border-b border-border">
+        <div className="flex items-center justify-between px-4 py-2">
+          <div className="flex items-center gap-2">
+            {/* Clickable mode toggle pill */}
+            <button
+              onClick={() => setShowModeToggle(v => !v)}
+              className={`flex items-center gap-1.5 text-[10px] font-bold px-2.5 py-1 rounded-full border transition-all ${
+                mode === 'live' && !usingPaperFallback
+                  ? 'bg-gain/20 text-gain border-gain/30 hover:bg-gain/30'
+                  : usingPaperFallback
+                  ? 'bg-amber-500/20 text-amber-400 border-amber-500/30 hover:bg-amber-500/30'
+                  : 'bg-muted/40 text-muted-foreground border-border hover:bg-muted/60'
+              }`}
+            >
+              <span className={`w-1.5 h-1.5 rounded-full ${
+                mode === 'live' && !usingPaperFallback ? 'bg-gain animate-pulse' :
+                usingPaperFallback ? 'bg-amber-400' : 'bg-muted-foreground'
+              }`} />
+              {mode === 'live' ? (usingPaperFallback ? 'LIVE · PAPER FALLBACK' : 'LIVE') : 'PAPER'}
+              <ChevronDown className={`w-2.5 h-2.5 transition-transform ${showModeToggle ? 'rotate-180' : ''}`} />
+            </button>
+            {liveErrorMsg && !showModeToggle && (
+              <span className="text-[9px] text-amber-400 truncate max-w-[140px]">{liveErrorMsg}</span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => isServerMode ? pollRailway() : runCycle()}
+              disabled={scanning}
+              className="p-1.5 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground transition-colors disabled:opacity-40"
+              title="Refresh">
+              <RefreshCw className={`w-3.5 h-3.5 ${scanning ? 'animate-spin' : ''}`} />
+            </button>
+            <button
+              onClick={() => setShowLog(!showLog)}
+              className="p-1.5 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground transition-colors"
+              title={showLog ? 'Hide log' : 'Show log'}>
+              {showLog ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+            </button>
+          </div>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => isServerMode ? pollRailway() : runCycle()}
-            disabled={scanning}
-            className="p-1.5 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground transition-colors disabled:opacity-40"
-            title="Refresh">
-            <RefreshCw className={`w-3.5 h-3.5 ${scanning ? 'animate-spin' : ''}`} />
-          </button>
-          <button
-            onClick={() => setShowLog(!showLog)}
-            className="p-1.5 rounded hover:bg-muted/40 text-muted-foreground hover:text-foreground transition-colors"
-            title={showLog ? 'Hide log' : 'Show log'}>
-            {showLog ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-          </button>
-        </div>
+
+        {/* Expandable mode switcher */}
+        {showModeToggle && (
+          <div className="px-4 pb-3 pt-1 border-t border-border/50 space-y-2">
+            {mode === 'live' ? (
+              /* Currently LIVE — offer switch to paper */
+              <div className="space-y-2">
+                <p className="text-[10px] text-muted-foreground">
+                  Switch to paper mode to trade with simulated funds. Any open live positions will remain on Binance.
+                </p>
+                <Button
+                  onClick={async () => {
+                    setLiveSetupLoading(true);
+                    try {
+                      await fetch(`${railwayUrl}/api/mode`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ mode: 'paper' }),
+                      });
+                      setShowModeToggle(false);
+                      toast.success('Switching to paper mode…');
+                      setTimeout(() => pollRailway(), 3000);
+                    } catch (e: any) {
+                      toast.error('Failed', { description: e.message });
+                    } finally {
+                      setLiveSetupLoading(false);
+                    }
+                  }}
+                  disabled={liveSetupLoading}
+                  size="sm"
+                  variant="outline"
+                  className="w-full border-amber-500/40 text-amber-400 hover:bg-amber-500/10">
+                  {liveSetupLoading ? 'Switching…' : 'Switch to Paper Mode'}
+                </Button>
+              </div>
+            ) : (
+              /* Currently PAPER — offer switch to live */
+              <div className="space-y-2">
+                <p className="text-[10px] text-muted-foreground">Enter your Binance API keys to trade with real funds.</p>
+                <input
+                  value={liveApiKey}
+                  onChange={e => setLiveApiKey(e.target.value)}
+                  placeholder="Binance API Key"
+                  className="w-full text-xs bg-background border border-border rounded px-2 py-1.5 font-mono outline-none focus:border-accent" />
+                <div className="relative">
+                  <input
+                    value={liveApiSecret}
+                    onChange={e => setLiveApiSecret(e.target.value)}
+                    type={showLiveSecret ? 'text' : 'password'}
+                    placeholder="Binance API Secret"
+                    className="w-full text-xs bg-background border border-border rounded px-2 py-1.5 font-mono outline-none focus:border-accent pr-8" />
+                  <button
+                    onClick={() => setShowLiveSecret(!showLiveSecret)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                    {showLiveSecret ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+                  </button>
+                </div>
+                <Button
+                  onClick={async () => {
+                    if (!liveApiKey || !liveApiSecret) { toast.error('Enter API key and secret'); return; }
+                    setLiveSetupLoading(true);
+                    try {
+                      const res = await fetch(`${railwayUrl}/api/mode`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ mode: 'live', api_key: liveApiKey, api_secret: liveApiSecret }),
+                      });
+                      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                      setShowModeToggle(false);
+                      toast.success('Switching to live mode — bot restarting…');
+                      setLiveApiKey('');
+                      setLiveApiSecret('');
+                      // Poll until bot comes back
+                      let attempts = 0;
+                      const poll = setInterval(async () => {
+                        attempts++;
+                        try {
+                          const ping = await fetch(`${railwayUrl}/api/ping`, { cache: 'no-store' });
+                          if (ping.ok) {
+                            const pd = await ping.json();
+                            if (pd.mode === 'live') {
+                              clearInterval(poll);
+                              await pollRailway();
+                              toast.success('Live mode active');
+                            }
+                          }
+                        } catch { /* bot still restarting */ }
+                        if (attempts > 15) {
+                          clearInterval(poll);
+                          toast.error('Bot restart timed out — check server logs');
+                        }
+                      }, 2000);
+                    } catch (e: any) {
+                      toast.error('Failed to switch mode', { description: e.message });
+                    } finally {
+                      setLiveSetupLoading(false);
+                    }
+                  }}
+                  disabled={liveSetupLoading}
+                  size="sm"
+                  className="w-full bg-gain hover:bg-gain/90 text-white font-semibold">
+                  {liveSetupLoading ? 'Connecting…' : 'Switch to Live Mode'}
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Setup wizard / start button */}
@@ -1416,33 +1538,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 )}
               </div>
 
-              {/* ── Live API setup ── */}
-              {!binanceConnected && (
-                <div className="bg-muted/20 border border-border rounded-md px-3 py-2.5 space-y-2">
-                  <div className="flex items-center gap-2">
-                    <Shield className="w-3.5 h-3.5 text-accent" />
-                    <span className="text-xs font-semibold text-accent">Live Trading Setup</span>
-                  </div>
-                  <div className="space-y-1.5">
-                    <input value={liveApiKey} onChange={e => setLiveApiKey(e.target.value)}
-                      placeholder="Binance API Key"
-                      className="w-full text-xs bg-background border border-border rounded px-2 py-1.5 font-mono outline-none focus:border-accent" />
-                    <div className="relative">
-                      <input value={liveApiSecret} onChange={e => setLiveApiSecret(e.target.value)}
-                        type={showLiveSecret ? 'text' : 'password'}
-                        placeholder="Binance API Secret"
-                        className="w-full text-xs bg-background border border-border rounded px-2 py-1.5 font-mono outline-none focus:border-accent pr-8" />
-                      <button onClick={() => setShowLiveSecret(!showLiveSecret)}
-                        className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
-                        {showLiveSecret ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
-                      </button>
-                    </div>
-                    <Button onClick={handleGoLive} disabled={liveSetupLoading} size="sm" className="w-full bg-gain hover:bg-gain/90 text-white">
-                      {liveSetupLoading ? 'Connecting…' : 'Switch to Live Mode'}
-                    </Button>
-                  </div>
-                </div>
-              )}
+              {/* Mode switching is done via the toggle pill at the top of the card */}
             </div>
           )}
         </div>
