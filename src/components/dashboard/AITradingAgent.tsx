@@ -1403,9 +1403,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                             }
                           }
                         } catch { /* bot still restarting */ }
-                        if (attempts > 15) {
+                        if (attempts > 30) {
                           clearInterval(poll);
-                          toast.error('Bot restart timed out — check server logs');
+                          toast.error('Bot restart taking longer than expected — it may still be starting');
                         }
                       }, 2000);
                     } catch (e: any) {

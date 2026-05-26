@@ -10,10 +10,24 @@ from dotenv import load_dotenv
 # Use absolute path so the correct .env is found regardless of systemd WorkingDirectory.
 _ENV_PATH = pathlib.Path(__file__).parent / ".env"
 
-# override=True ensures .env values always win over inherited process environment.
-# Without this, os.execv() passes the OLD MODE to the restarted process and
-# load_dotenv() silently skips the updated value — bot stays in paper mode forever.
-load_dotenv(_ENV_PATH, override=True)
+# Load .env as base layer (override=False so systemd EnvironmentFile wins if set).
+load_dotenv(_ENV_PATH, override=False)
+
+# Override with values stored in the SQLite database — these are written every time
+# the user sets a mode or API keys via the frontend, so they survive git operations,
+# reboots, and .env loss. DB is the authoritative persistent store; .env is the fallback.
+try:
+    import database as _db_conn
+    for _k, _env_k in (
+        ("env_MODE",               "MODE"),
+        ("env_BINANCE_API_KEY",    "BINANCE_API_KEY"),
+        ("env_BINANCE_API_SECRET", "BINANCE_API_SECRET"),
+    ):
+        _v = _db_conn.get_setting(_k)
+        if _v:
+            os.environ[_env_k] = _v
+except Exception:
+    pass  # DB not ready yet — fall back to .env / systemd environment
 
 # _CONFIGURED_MODE is the authoritative mode from .env — it NEVER changes at runtime.
 # A Binance connection failure must not alter this: get_mode() always returns what

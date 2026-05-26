@@ -7,11 +7,14 @@ import json
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
 
-# DATA_DIR is the Railway persistent volume mount path.
-# We test write access and fall back to the script directory if /data isn't
-# available yet (e.g. before the Railway volume is attached).
+# DATA_DIR stores the SQLite database and strategy.json.
+# Default: sibling "data/" directory next to the trading-bot folder, which is
+# outside the git checkout so git operations never touch it.
+# Override with DATA_DIR env var for Railway / Docker volume mounts.
 def _resolve_data_dir() -> str:
-    candidate = os.getenv("DATA_DIR", "/data")
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _default    = os.path.join(_script_dir, "..", "data")  # /opt/tradebot/data
+    candidate   = os.getenv("DATA_DIR", _default)
     try:
         os.makedirs(candidate, exist_ok=True)
         probe = os.path.join(candidate, ".write_probe")
