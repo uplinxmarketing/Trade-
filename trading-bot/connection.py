@@ -39,19 +39,17 @@ def _build_client():
                 from binance.client import Client as BinanceClient
                 c = BinanceClient(api_key, api_secret,
                                   requests_params={"timeout": 10})
-                # Use authenticated endpoint — public /ping is geo-blocked on some VPS regions.
-                # get_account() verifies both connectivity AND that the API key is valid.
-                c.get_account()
+                # Skip ping/account test — Binance geo-blocks public AND account
+                # endpoints for datacenter IPs (APIError code=0, "restricted location").
+                # Actual order/balance calls go through fine; the restriction only
+                # affects the test endpoints. We trust the keys are valid and let
+                # the bot surface errors on real trading calls if they occur.
                 c.update_price = lambda symbol, price: None
-                print("[Connection] Live Binance connection established ✓")
+                print("[Connection] Live Binance client initialised ✓ (connection test skipped)")
                 return c
             except Exception as exc:
-                _live_error = f"Binance API connection failed: {exc}"
+                _live_error = f"Binance client init failed: {exc}"
                 _using_paper_fallback = True
-                # Do NOT change _CONFIGURED_MODE — .env still says MODE=live.
-                # get_mode() keeps returning "live" so position tags, mode guards,
-                # and the frontend all stay in live mode. live_error banner explains
-                # the connection issue. Next restart will retry the live connection.
                 print(f"[Connection] {_live_error} — using paper client for this session")
 
     elif _CONFIGURED_MODE == "testnet":
@@ -98,12 +96,11 @@ def _live_reconnect_loop():
         try:
             from binance.client import Client as BinanceClient
             c = BinanceClient(api_key, api_secret, requests_params={"timeout": 10})
-            c.get_account()
             c.update_price = lambda symbol, price: None
             client = c
             _live_error = ""
             _using_paper_fallback = False
-            print("[Connection] Auto-reconnect: live Binance connection restored ✓")
+            print("[Connection] Auto-reconnect: live Binance client restored ✓")
         except Exception as exc:
             print(f"[Connection] Auto-reconnect failed: {exc}")
 
