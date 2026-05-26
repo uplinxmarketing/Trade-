@@ -616,9 +616,9 @@ _acct_cache_lock = threading.Lock()
 
 def _fetch_account_direct() -> dict:
     """Fetch /api/v3/account via urllib+HMAC, bypassing python-binance/requests
-    which can be geo-blocked by Binance on datacenter IPs."""
+    which is geo-blocked on datacenter IPs. Returns {} on any failure."""
     import urllib.request as _ur
-    import urllib.parse  as _up
+    import urllib.error   as _ue
     import hmac, hashlib, time as _t
     api_key    = os.getenv("BINANCE_API_KEY",    "").strip()
     api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
@@ -629,51 +629,69 @@ def _fetch_account_direct() -> dict:
     sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
     url = f"https://api.binance.com/api/v3/account?{qs}&signature={sig}"
     req = _ur.Request(url, headers={"X-MBX-APIKEY": api_key, "User-Agent": "WolfBot/1.0"})
-    with _ur.urlopen(req, timeout=8) as r:
-        return json.loads(r.read())
+    try:
+        with _ur.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read())
+        # Binance returns API errors as valid JSON with negative code
+        if isinstance(data, dict) and data.get("code", 0) < 0:
+            print(f"[Account] Binance API error {data['code']}: {data.get('msg', '')}")
+            return {}
+        return data
+    except _ue.HTTPError as e:
+        print(f"[Account] Direct fetch HTTP {e.code}: {e.reason}")
+        return {}
+    except Exception as e:
+        print(f"[Account] Direct fetch failed: {type(e).__name__}: {e}")
+        return {}
 
 
 def _get_cached_account() -> dict:
-    """Return cached Binance account dict, refreshing at most every 5 s."""
+    """Return cached Binance account dict, refreshing at most every ACCT_CACHE_TTL s."""
     global _acct_cache, _acct_cache_ts
+    from connection import get_mode, client as _client
     now = time.time()
     with _acct_cache_lock:
         if now - _acct_cache_ts < _ACCT_CACHE_TTL and _acct_cache:
             return _acct_cache
-    # Try direct urllib first (bypasses geo-block that affects python-binance/requests)
-    try:
-        from connection import get_mode
-        if get_mode() == "live":
-            acc = _fetch_account_direct()
-            if acc.get("balances"):
-                with _acct_cache_lock:
-                    _acct_cache = acc
-                    _acct_cache_ts = now
-                return acc
-    except Exception:
-        pass
-    # Fallback: python-binance client (paper mode or direct fetch failed)
-    try:
-        from connection import client
-        acc = client.get_account()
+
+    if get_mode() == "live":
+        # Live mode: always use direct urllib+HMAC — python-binance/requests is geo-blocked
+        acc = _fetch_account_direct()
+        if acc.get("balances"):
+            with _acct_cache_lock:
+                _acct_cache = acc
+                _acct_cache_ts = now
+            return acc
+        # Direct fetch failed — return stale cache rather than paper data
         with _acct_cache_lock:
-            _acct_cache = acc
-            _acct_cache_ts = now
-        return acc
-    except Exception:
-        with _acct_cache_lock:
-            return _acct_cache  # return stale on error
+            return _acct_cache
+    else:
+        # Paper / testnet mode: use the paper client
+        try:
+            acc = _client.get_account()
+            with _acct_cache_lock:
+                _acct_cache = acc
+                _acct_cache_ts = now
+            return acc
+        except Exception:
+            with _acct_cache_lock:
+                return _acct_cache
 
 
 def _get_usdt_balance() -> float:
     """Returns free USDT only — used for trade budget calculations."""
+    from connection import get_mode, client as _client
     try:
-        from connection import get_mode
-        if get_mode() != "live":
-            from connection import client
-            if hasattr(client, "_balances"):
-                with client._lock:
-                    return float(client._balances.get("USDT", 0.0))
+        if get_mode() == "live":
+            acc = _get_cached_account()
+            for b in acc.get("balances", []):
+                if b["asset"] == "USDT":
+                    return float(b["free"])
+            return 0.0  # live account fetch failed — don't fake $10k
+        # Paper mode: read directly from PaperClient balance dict
+        if hasattr(_client, "_balances"):
+            with _client._lock:
+                return float(_client._balances.get("USDT", 0.0))
         acc = _get_cached_account()
         for b in acc.get("balances", []):
             if b["asset"] == "USDT":
@@ -685,14 +703,17 @@ def _get_usdt_balance() -> float:
 
 def _get_usdt_display_balance() -> float:
     """Returns free+locked USDT — matches what Binance UI shows."""
+    from connection import get_mode, client as _client
     try:
-        from connection import get_mode
-        if get_mode() != "live":
-            from connection import client
-            if hasattr(client, "_balances"):
-                with client._lock:
-                    return float(client._balances.get("USDT", 0.0))
-            return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+        if get_mode() == "live":
+            acc = _get_cached_account()
+            for b in acc.get("balances", []):
+                if b["asset"] == "USDT":
+                    return float(b["free"]) + float(b["locked"])
+            return 0.0
+        if hasattr(_client, "_balances"):
+            with _client._lock:
+                return float(_client._balances.get("USDT", 0.0))
         acc = _get_cached_account()
         for b in acc.get("balances", []):
             if b["asset"] == "USDT":
@@ -1096,11 +1117,12 @@ setInterval(refresh, 5000);  // auto-refresh every 5s
 @app.get("/api/wallet")
 def api_wallet():
     try:
-        from connection import client
         from trade_engine import get_open_positions, _rest_px
         from data_collector import prices as live_prices
 
         acc = _get_cached_account()
+        _fetch_ok = bool(acc.get("balances"))
+
         balances = [
             {
                 "asset":  b["asset"],
@@ -1142,6 +1164,7 @@ def api_wallet():
             "mode":                  _mode,
             "using_paper_fallback":  _paper_fallback,
             "is_paper_data":         _paper_fallback or _mode == "paper",
+            "account_fetch_ok":      _fetch_ok,
         }
     except Exception as e:
         return {"balances": [], "total_usdt": 0.0, "total_value": 0.0,
