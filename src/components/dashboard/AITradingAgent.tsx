@@ -445,9 +445,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [actLogFilter, setActLogFilter] = useState<'all' | 'orders' | 'sells' | 'buys' | 'errors'>('all');
   // All API calls are relative (same-origin) — bot runs on wolfbot.tech.
   const botUrl = '';  // same-origin VPS API — all calls use relative /api/* paths
-  const [liveApiKey, setLiveApiKey]         = useState('');
-  const [liveApiSecret, setLiveApiSecret]   = useState('');
-  const [showLiveSecret, setShowLiveSecret] = useState(false);
   const [liveSetupLoading, setLiveSetupLoading] = useState(false);
   const [showModeToggle, setShowModeToggle] = useState(false);
 
@@ -881,46 +878,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     }
   }, [isRunning, isServerMode, botUrl, addLog]);
 
-  // ── Switch bot to live mode with API keys ───────────────────────────────────
-  const handleGoLive = useCallback(async () => {
-    if (!liveApiKey || !liveApiSecret) { toast.error('Enter API key and secret'); return; }
-    setLiveSetupLoading(true);
-    try {
-      const res = await fetch(`${botUrl}/api/mode`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: 'live', api_key: liveApiKey, api_secret: liveApiSecret }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (data.live_error) {
-        toast.error('Binance connection failed', { description: data.live_error });
-        addLog(`[live] Binance error: ${data.live_error}`);
-      } else {
-        toast.success('Switched to live trading mode');
-        addLog('[live] Live mode enabled');
-        // Poll until mode confirms
-        let attempts = 0;
-        const poll = setInterval(async () => {
-          attempts++;
-          const ping = await fetch(`${botUrl}/api/ping`, { cache: 'no-store' });
-          if (ping.ok) {
-            const pd = await ping.json();
-            if (pd.mode === 'live') {
-              clearInterval(poll);
-              await pollBot();
-            }
-          }
-          if (attempts > 10) clearInterval(poll);
-        }, 1000);
-      }
-    } catch (e: any) {
-      toast.error('Failed to switch mode', { description: e.message });
-    } finally {
-      setLiveSetupLoading(false);
-    }
-  }, [liveApiKey, liveApiSecret, botUrl, addLog, pollBot]);
-
   // ── Sync setup wizard settings to server ─────────────────────────────────
   const syncSettingsToServer = useCallback(async (): Promise<boolean> => {
     try {
@@ -1352,69 +1309,16 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 </Button>
               </div>
             ) : (
-              /* Currently PAPER — offer switch to live */
+              /* Currently PAPER — direct user to the top-right Binance button */
               <div className="space-y-2">
-                <p className="text-[10px] text-muted-foreground">Enter your Binance API keys to trade with real funds.</p>
-                <input
-                  value={liveApiKey}
-                  onChange={e => setLiveApiKey(e.target.value)}
-                  placeholder="Binance API Key"
-                  className="w-full text-xs bg-background border border-border rounded px-2 py-1.5 font-mono outline-none focus:border-accent" />
-                <div className="relative">
-                  <input
-                    value={liveApiSecret}
-                    onChange={e => setLiveApiSecret(e.target.value)}
-                    type={showLiveSecret ? 'text' : 'password'}
-                    placeholder="Binance API Secret"
-                    className="w-full text-xs bg-background border border-border rounded px-2 py-1.5 font-mono outline-none focus:border-accent pr-8" />
-                  <button
-                    onClick={() => setShowLiveSecret(!showLiveSecret)}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
-                    {showLiveSecret ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
-                  </button>
-                </div>
+                <p className="text-[10px] text-muted-foreground">
+                  To trade with real funds, connect your Binance API keys using the <strong>Binance</strong> button in the top-right corner.
+                </p>
                 <Button
-                  onClick={async () => {
-                    if (!liveApiKey || !liveApiSecret) { toast.error('Enter API key and secret'); return; }
-                    setLiveSetupLoading(true);
-                    try {
-                      const res = await fetch(`${botUrl}/api/mode`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ mode: 'live', api_key: liveApiKey, api_secret: liveApiSecret }),
-                      });
-                      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                      setShowModeToggle(false);
-                      toast.success('Switching to live mode — bot restarting…');
-                      setLiveApiKey('');
-                      setLiveApiSecret('');
-                      // Poll until bot responds (any successful ping = restart done)
-                      let attempts = 0;
-                      const poll = setInterval(async () => {
-                        attempts++;
-                        try {
-                          const ping = await fetch(`${botUrl}/api/ping`, { cache: 'no-store' });
-                          if (ping.ok) {
-                            clearInterval(poll);
-                            await pollBot();
-                            toast.success('Bot restarted — check mode indicator');
-                          }
-                        } catch { /* bot still restarting */ }
-                        if (attempts > 30) {
-                          clearInterval(poll);
-                          toast.info('Bot may still be starting — refresh the page in a moment');
-                        }
-                      }, 2000);
-                    } catch (e: any) {
-                      toast.error('Failed to switch mode', { description: e.message });
-                    } finally {
-                      setLiveSetupLoading(false);
-                    }
-                  }}
-                  disabled={liveSetupLoading}
+                  onClick={() => { setShowModeToggle(false); onConnectBinance?.(); }}
                   size="sm"
                   className="w-full bg-gain hover:bg-gain/90 text-white font-semibold">
-                  {liveSetupLoading ? 'Connecting…' : 'Switch to Live Mode'}
+                  Open Binance Settings
                 </Button>
               </div>
             )}
