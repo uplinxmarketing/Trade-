@@ -382,6 +382,13 @@ async def _start_websocket_loop():
                             try:
                                 import trade_engine as _te_mt
                                 _te_mt._last_ws_price_ts[symbol] = time.time()
+                                # For HELD positions, evaluate sell triggers on this
+                                # tick too — low-trade-volume coins may only get
+                                # miniTicker updates, and waiting for another coin's
+                                # @trade event (or the 0.25s fallback loop) delays
+                                # the exit.
+                                if _price_callback and symbol in _te_mt._pos_by_symbol:
+                                    _price_callback(dict(prices))
                             except Exception:
                                 pass
 
