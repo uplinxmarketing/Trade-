@@ -2712,11 +2712,14 @@ def api_orphan_check(min_value_usdt: float = 0.10):
     db_positions = {row[0]: float(row[1]) for row in cur.fetchall()}
     conn.close()
 
-    stables = {"USDT", "BUSD", "USDC", "FDUSD", "TUSD", "DAI", "USDP", "BNB"}
+    stables = {"USDT", "BUSD", "USDC", "FDUSD", "TUSD", "DAI", "USDP", "BNB",
+               "USD", "AEUR", "EUR", "GBP", "TRY", "BRL", "AUD", "UAH", "RUB",
+               "NGN", "ZAR", "PLN", "ARS", "JPY", "MXN", "CZK", "COP"}
     issues = []
 
     for asset, qty in raw_balances.items():
-        if asset in stables or qty <= 0:
+        # LD* = Binance Earn wrappers — not tradeable spot assets
+        if asset in stables or asset.startswith("LD") or qty <= 0:
             continue
         symbol = f"{asset}USDT"
         price = prices.get(symbol, 0)
