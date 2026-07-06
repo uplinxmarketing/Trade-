@@ -1076,7 +1076,13 @@ def load_positions_from_db():
                 free   = float(b["free"])
                 locked = float(b["locked"])
                 total  = free + locked
-                if asset in ("USDT", "BNB", "BUSD", "USDC") or total <= 0:
+                # Skip quote/stable/fiat assets — no <asset>USDT pair exists for
+                # them (e.g. USDUSDT → -1121 Invalid symbol) or they aren't
+                # something the bot should ever auto-sell.
+                if asset in ("USDT", "BNB", "BUSD", "USDC", "USD", "FDUSD", "TUSD",
+                             "DAI", "USDP", "AEUR", "EUR", "GBP", "TRY", "BRL",
+                             "AUD", "UAH", "RUB", "NGN", "ZAR", "PLN", "ARS",
+                             "JPY", "MXN", "CZK", "COP") or total <= 0:
                     continue
                 # Binance Earn wrappers (LDPYTH etc.) are not tradeable spot
                 # assets — never adopt or warn about them.
