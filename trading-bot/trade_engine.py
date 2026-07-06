@@ -602,6 +602,7 @@ _BUYING_TIMEOUT_SEC = 30.0   # auto-release if a buy attempt crashes silently
 _bad_symbols: set = set()
 _sell_last_failed_ts: Dict[str, float] = {}  # last sell failure time per symbol
 _sell_last_failed_reason: Dict[str, str] = {}  # reason that triggered the failed sell
+_ghost_check_fails: Dict[str, int] = {}  # consecutive -2010 check_failed count per symbol
 _SELL_RETRY_COOLDOWN_PROFIT = 0.5   # take-profit: 0.5s breaks retry loop without delaying exit
 _SELL_RETRY_COOLDOWN_LOSS   = 0.0   # stop-loss / force-sell: retry immediately
 
@@ -794,13 +795,21 @@ def _profitable_sell_check(pos: dict, price: float, force_fresh: bool = False) -
     should never result in a net loss.
     """
     symbol = pos.get("symbol", "")
-    if force_fresh and symbol:
+    # Only re-fetch when the triggering price is NOT fresh. A WS tick that just
+    # crossed the target (<2s old) must be honored as-is: re-quoting via REST
+    # adds up to 3s latency and can veto the sell if a sub-second spike already
+    # retraced — exactly the exit the user asked for.
+    _px_age = time.time() - _last_ws_price_ts.get(symbol, 0)
+    if force_fresh and symbol and _px_age >= 2.0:
         try:
-            _fresh = _fetch_batch_prices([symbol])
+            # Own source tag: gate-fetch failures must not escalate the shared
+            # batch_prices backoff and starve the price refreshers.
+            _fresh = _fetch_batch_prices([symbol], source="presell_fresh")
             _fp = _fresh.get(symbol, 0) if _fresh else 0
             if _fp > 0:
                 price = _fp
                 _rest_px[symbol] = _fp
+                _rest_px_sym_ts[symbol] = time.time()
                 _last_ws_price_ts[symbol] = time.time()
                 try:
                     import data_collector as _dc_psc
@@ -820,15 +829,15 @@ def _profitable_sell_check(pos: dict, price: float, force_fresh: bool = False) -
     gross_quote   = price * qty
     est_sell_fee  = gross_quote * _fee_rate
     net_returned  = gross_quote - est_sell_fee
-    # 0.05% slippage cushion — realistic for liquid coins, prevents zero/negative trades
-    slippage_buf  = actual_cost * 0.0005
-    strategy   = _load_strategy()
-    tp_enabled = bool(strategy.get("take_profit_enabled", True))
-    tp_pct     = float(strategy.get("take_profit_pct", 0.1))  # same default as _refresh_risk_params
-    if tp_enabled:
-        min_profit = max(0.003 + slippage_buf, actual_cost * (tp_pct / 100.0))
-    else:
-        min_profit = 0.003 + slippage_buf
+    # GATE == TRIGGER: this check must verify exactly the same threshold the
+    # sell trigger fires at (compute_real_breakeven_price min_profit=0.003).
+    # It previously demanded max(0.003+slippage, cost*tp_pct) NET — i.e. more
+    # profit than the price at the exit target delivers after fees — so every
+    # take-profit sell was vetoed AT the target and only executed 0.05-0.25%
+    # higher (or never, if price retreated). The trigger already guarantees
+    # price >= max(breakeven, entry*tp); the gate only needs to confirm the
+    # sell nets a real profit, not re-add its own margin on top.
+    min_profit = 0.003
     estimated_profit = net_returned - actual_cost
     return estimated_profit >= min_profit
 
@@ -1857,16 +1866,18 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
                 _fresh_now = _rest_px.get(sym, 0) or price
                 database.log_activity(
                     f"SELL ABORTED {sym} ({reason}): freshest REST price ${_fresh_now:.6f} "
-                    f"would not net profit (incl. slippage buffer). "
+                    f"would not net the 0.003 USDT minimum profit. "
                     f"Position held — will retry on next favourable tick (log throttled 60s).",
                     "warn"
                 )
             _sell_last_failed_ts[sym] = time.time()
             _sell_last_failed_reason[sym] = reason
             return  # exit before placing order
-        # _profitable_sell_check with force_fresh=True updated _rest_px[sym] — use it
-        # as the paper-mode execution price so the fill reflects current market
-        price = _rest_px.get(sym, 0) or price
+        # If the gate fetched a fresh REST quote, use it as the paper-mode
+        # execution price. Only when actually fresh — an old _rest_px entry
+        # must not override the WS trigger price.
+        if (time.time() - _rest_px_sym_ts.get(sym, 0)) < 5.0:
+            price = _rest_px.get(sym, 0) or price
 
     pos["_sell_gate_done_ts"] = time.time()
     pos["_sell_binance_start_ts"] = time.time()
@@ -1881,6 +1892,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             result = _market_sell(sym, qty)
         _log_order_result("SELL", sym, qty, price, result)
         pos["_sell_binance_done_ts"] = time.time()
+        _ghost_check_fails.pop(sym, None)  # reset -2010 backoff on success
     except Exception as e:
         pos["_sell_binance_done_ts"] = time.time()
         err_str = str(e)
@@ -1913,11 +1925,19 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             else:
                 # Real position — quantity mismatch or lot-size issue
                 if ghost_reason == "check_failed":
+                    # Exponential backoff: while the signed account endpoint is
+                    # down, each 0.5s retry burns a live order attempt on the
+                    # same -2010. Back off 1s→2s→4s… capped at 30s, and escalate
+                    # a diag error after 5 consecutive failures.
+                    n = _ghost_check_fails.get(sym, 0) + 1
+                    _ghost_check_fails[sym] = n
+                    _sell_last_failed_ts[sym] = time.time() + min(30.0, (2 ** min(n, 5)) * 0.5)
                     database.log_activity(
-                        f"[GHOST CHECK FAILED] {sym}: -2010 but balance check inconclusive — retrying next cycle", "warn"
+                        f"[GHOST CHECK FAILED] {sym}: -2010 but balance check inconclusive — "
+                        f"retry #{n}, backing off {min(30.0, (2 ** min(n, 5)) * 0.5):.0f}s", "warn"
                     )
-                    log_diag_issue("sell_monitor", "warn",
-                                   f"{sym}: -2010 balance check failed, will retry", detail=err_str[:400])
+                    log_diag_issue("sell_monitor", "error" if n >= 5 else "warn",
+                                   f"{sym}: -2010 balance check failed ×{n}, will retry", detail=err_str[:400])
                 else:
                     actual_qty = _get_actual_balance(sym)
                     database.log_activity(
@@ -2921,6 +2941,9 @@ def realtime_monitor(prices: Dict[str, float]):
         pos = pos_index.get(sym)
         if pos is None or price <= 0:
             continue
+        # Stamp freshness for held symbols — lets the pre-sell gate trust this
+        # WS tick instead of re-quoting via REST (3s latency + veto risk).
+        _last_ws_price_ts[sym] = now
         # Rate-limit retries: stop-loss retries immediately, take-profit waits 5s.
         last_fail = _sell_last_failed_ts.get(sym, 0)
         if last_fail:
@@ -2929,10 +2952,11 @@ def realtime_monitor(prices: Dict[str, float]):
                          else _SELL_RETRY_COOLDOWN_PROFIT)
             if (now - last_fail) < _cooldown:
                 continue
-        # Minimum hold: never sell within 10 s of buy — prevents race-condition flips
+        # Minimum hold applies to STOP-LOSS only (prevents race-condition flips
+        # right after the buy). Take-profit must never be delayed — an immediate
+        # post-buy pump that reaches the target sells instantly.
         opened_ts = pos.get("opened_at_ts", 0)
-        if opened_ts > 0 and (now - opened_ts) < _MIN_HOLD_SEC:
-            continue
+        in_min_hold = opened_ts > 0 and (now - opened_ts) < _MIN_HOLD_SEC
         entry  = pos["entry_price"]
         # Real breakeven trigger: (budget + buy_fee + min_profit) / (qty × (1 - sell_fee)).
         # Only fires when a sell would actually net profit — no phantom triggers for
@@ -2966,14 +2990,20 @@ def realtime_monitor(prices: Dict[str, float]):
                 if _smart_hold_enabled and price >= target and target > real_target:
                     _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
                     peak = _pos_peaks[sym]
-                    trail_stop = peak * (1.0 - _trailing_stop_pct / 100.0)
+                    # Trail is hard-floored at the exit target: smart-hold may ride
+                    # the gain higher, but can never give back below the target.
+                    trail_stop = max(peak * (1.0 - _trailing_stop_pct / 100.0), target)
                     sell_reason: Optional[str] = None
                     if price <= trail_stop:
                         sell_reason = "smart-hold-trail"
                     else:
                         with _signal_cache_lock:
-                            score = _signal_cache.get(sym, {}).get("score", 0)
-                        if score < 3:
+                            _sc = _signal_cache.get(sym, {})
+                            score = _sc.get("score", 0)
+                            score_ts = _sc.get("ts", 0)
+                        # A stale score must not hold a profitable position —
+                        # only a FRESH bullish score may defer the sell.
+                        if score < 3 or (now - score_ts) > 120:
                             sell_reason = "take-profit"
                     if sell_reason:
                         with _selling_lock:
@@ -2991,7 +3021,7 @@ def realtime_monitor(prices: Dict[str, float]):
                             pos["_sell_trigger_ts"] = time.time()
                             pos["_sell_reason"] = "take-profit"
                             _sell_executor.submit(_execute_sell, pos, price, "take-profit")
-        elif _stop_loss_mult < 1.0 and price <= stop:
+        elif _stop_loss_mult < 1.0 and price <= stop and not in_min_hold:
             _stop_loss_confirmation[sym] = _stop_loss_confirmation.get(sym, 0) + 1
             if _stop_loss_confirmation[sym] >= _STOP_LOSS_CONFIRMATION_TICKS:
                 _stop_loss_confirmation.pop(sym, None)
@@ -3045,12 +3075,17 @@ _sell_monitor_thread: Optional[threading.Thread] = None
 # REST price fallback cache — populated when WebSocket is geo-blocked on Railway
 _rest_px: Dict[str, float] = {}
 _rest_px_ts: float = 0.0
+# Per-symbol freshness of GENUINE REST quotes (not gap-fills from signal cache
+# or WS carry-forward). Only fresh entries may override live WS prices in the
+# sell monitor — an hours-old REST price must never mask a live WS price.
+_rest_px_sym_ts: Dict[str, float] = {}
+_REST_PX_FRESH_SEC = 10.0
 _stale_px_warn_ts: Dict[str, float] = {}  # throttle "no fresh price" warning per symbol
 _REST_PX_TTL = 5.0   # refetch REST prices every 5 s when WebSocket is down
 _sell_monitor_last_rest_ts: float = 0.0   # rate-limits sell-monitor REST refresh to 2s
 
 
-def _fetch_batch_prices(symbols: list) -> Dict[str, float]:
+def _fetch_batch_prices(symbols: list, source: str = "batch_prices") -> Dict[str, float]:
     """Batch ticker price fetch via _binance_request (source-tagged, circuit-broken).
     Uses single-symbol endpoint (weight=1) when only one symbol requested,
     batch endpoint (weight=2) otherwise."""
@@ -3061,7 +3096,7 @@ def _fetch_batch_prices(symbols: list) -> Dict[str, float]:
     if len(symbols) == 1:
         # Single-symbol endpoint: weight=1 vs batch weight=2
         url = f"https://data-api.binance.vision/api/v3/ticker/price?symbol={symbols[0]}"
-        ok, data, _, _ = _binance_request(url, timeout=3.0, source="batch_prices")
+        ok, data, _, _ = _binance_request(url, timeout=3.0, source=source)
         if not ok or not isinstance(data, dict):
             return {}
         try:
@@ -3072,7 +3107,7 @@ def _fetch_batch_prices(symbols: list) -> Dict[str, float]:
     _syms_json = json.dumps(symbols, separators=(',', ':'))
     _encoded   = _up2.quote(_syms_json, safe='')
     url = f"https://data-api.binance.vision/api/v3/ticker/price?symbols={_encoded}"
-    ok, data, _, _ = _binance_request(url, timeout=3.0, source="batch_prices")
+    ok, data, _, _ = _binance_request(url, timeout=3.0, source=source)
     if not ok or not isinstance(data, list):
         return {}
     result: Dict[str, float] = {}
@@ -3192,6 +3227,8 @@ def _price_refresher_loop():
                 if fetched:
                     _now_rf = time.time()
                     _rest_px.update(fetched)
+                    for _s_rf in fetched:
+                        _rest_px_sym_ts[_s_rf] = _now_rf
                     _rest_px_ts = _now_rf
                     for s, p in fetched.items():
                         # Always inject into _dc.prices and update timestamp so
@@ -3258,7 +3295,7 @@ def _held_position_price_refresher():
     consecutive_errors = 0
 
     try:
-        database.log_activity("Held-position price refresher started (5s interval)", "info")
+        database.log_activity("Held-position price refresher started (2s interval)", "info")
     except Exception:
         pass
 
@@ -3282,6 +3319,7 @@ def _held_position_price_refresher():
                     _dc_hr.prices[s] = px
                     _last_ws_price_ts[s] = now_ts
                     _rest_px[s] = px
+                    _rest_px_sym_ts[s] = now_ts
                 consecutive_errors = 0
 
                 # 60s heartbeat log
@@ -3320,7 +3358,9 @@ def _held_position_price_refresher():
                     f"Held refresher failed ({consecutive_errors} consecutive)",
                     detail=f"{type(_e).__name__}: {_e}",
                 )
-        time.sleep(max(5.0, min(30.0, 5.0 + consecutive_errors * 1.0)))
+        # 2s base cadence — this thread is the sole REST price source for the
+        # sell monitor's trigger evaluation (backs off to 30s under errors).
+        time.sleep(max(2.0, min(30.0, 2.0 + consecutive_errors * 1.0)))
 
 
 def start_held_position_refresher():
@@ -3528,34 +3568,26 @@ def _sell_monitor_loop():
             with _positions_lock:
                 snap = list(_positions)
 
-            # ── REST price refresh BEFORE trigger evaluation (rate-limited to 2s) ─
-            # Fetch current prices for all held positions via a single batch REST
-            # call so trigger decisions use prices ≤3s old regardless of WS activity.
-            # Rate-limited to once every 2s so 0.25s iterations don't flood Binance.
-            global _sell_monitor_last_rest_ts
-            _sm_now_t = time.time()
-            if snap and (_sm_now_t - _sell_monitor_last_rest_ts) >= 2.0:
-                _sm_syms = list({p["symbol"] for p in snap})
-                _sm_fetched = _fetch_batch_prices(_sm_syms)
-                if _sm_fetched:
-                    _sm_ts = time.time()
-                    for _s, _p in _sm_fetched.items():
-                        _dc.prices[_s]        = _p
-                        _rest_px[_s]          = _p
-                        _last_ws_price_ts[_s] = _sm_ts
-                    _sell_monitor_last_rest_ts = _sm_ts
+            # REST price refresh is owned by _held_position_price_refresher
+            # (dedicated 2s thread). It was previously fetched inline here,
+            # blocking this 0.25s trigger loop for up to 3s whenever the REST
+            # endpoint was slow — exactly when fast selling matters most.
 
-            # ── Watchdog: force-clear _selling entries stuck > 20 s ──────────
+            # ── Watchdog: force-clear _selling entries stuck > 45 s ──────────
+            # 45s > worst-case legit sell latency (gate REST 3s + balance clamp
+            # + exchange-info refresh + order, ~25s of stacked timeouts).
+            # Clearing earlier let a second worker submit a DUPLICATE sell
+            # while the first was still placing the order.
             now_wd = time.time()
             with _selling_lock:
-                stuck = [s for s, t in list(_selling_ts.items()) if now_wd - t > 20]
+                stuck = [s for s, t in list(_selling_ts.items()) if now_wd - t > 45]
             for s in stuck:
                 with _selling_lock:
                     _selling.discard(s)
                     _selling_ts.pop(s, None)
                 try:
                     database.log_activity(
-                        f"Sell monitor: force-cleared stuck guard for {s} (>20 s)", "warn"
+                        f"Sell monitor: force-cleared stuck guard for {s} (>45 s)", "warn"
                     )
                 except Exception:
                     pass
@@ -3563,12 +3595,16 @@ def _sell_monitor_loop():
             # Always refresh TP/SL multipliers — settings can change at any time.
             _refresh_risk_params()
 
-            # Build price dict: start with WebSocket, then override with REST.
-            # _rest_px is maintained by _price_refresher_loop — no I/O here.
+            # Build price dict: start with WebSocket, then override with REST —
+            # but ONLY with genuinely fresh REST quotes (<10s). An old REST
+            # price (endpoint down, gap-fill from signal cache) must never
+            # mask a live WS price: that both missed real triggers and fired
+            # phantom ones.
+            _mrg_now = time.time()
             prices = dict(_dc.prices)
             for sym2, p2 in _rest_px.items():
-                if p2 > 0:
-                    prices[sym2] = p2   # REST always overrides stale WS prices
+                if p2 > 0 and (_mrg_now - _rest_px_sym_ts.get(sym2, 0)) < _REST_PX_FRESH_SEC:
+                    prices[sym2] = p2
 
             # Signal-cache is the final fallback — fills gaps when both WS and
             # REST are unavailable for a symbol (e.g. first 30 s after redeploy).
@@ -3652,10 +3688,9 @@ def _sell_monitor_loop():
                                  else _SELL_RETRY_COOLDOWN_PROFIT)
                     if (now_monitor - last_fail) < _cooldown:
                         continue
-                # Minimum hold: never sell within 10 s of buy
+                # Minimum hold applies to STOP-LOSS only — take-profit is never delayed
                 opened_ts3 = pos.get("opened_at_ts", 0)
-                if opened_ts3 > 0 and (now_monitor - opened_ts3) < _MIN_HOLD_SEC:
-                    continue
+                in_min_hold3 = opened_ts3 > 0 and (now_monitor - opened_ts3) < _MIN_HOLD_SEC
                 entry  = pos["entry_price"]
                 real_target3 = compute_real_breakeven_price(pos)
                 if real_target3 <= 0:
@@ -3688,17 +3723,21 @@ def _sell_monitor_loop():
                     if _smart_hold_enabled and price >= target and target > real_target3:
                         _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
                         peak = _pos_peaks[sym]
-                        trail_stop = peak * (1.0 - _trailing_stop_pct / 100.0)
+                        # Trail hard-floored at the exit target (never give back below it)
+                        trail_stop = max(peak * (1.0 - _trailing_stop_pct / 100.0), target)
                         if price <= trail_stop:
                             sell_reason3 = "smart-hold-trail"
                         else:
                             with _signal_cache_lock:
-                                score2 = _signal_cache.get(sym, {}).get("score", 0)
-                            if score2 < 3:
+                                _sc2 = _signal_cache.get(sym, {})
+                                score2 = _sc2.get("score", 0)
+                                score2_ts = _sc2.get("ts", 0)
+                            # Only a FRESH bullish score may defer a profitable sell
+                            if score2 < 3 or (now_monitor - score2_ts) > 120:
                                 sell_reason3 = "take-profit"
                     else:
                         sell_reason3 = "take-profit"
-                elif _stop_loss_mult < 1.0 and price <= stop:
+                elif _stop_loss_mult < 1.0 and price <= stop and not in_min_hold3:
                     _stop_loss_confirmation[sym] = _stop_loss_confirmation.get(sym, 0) + 1
                     if _stop_loss_confirmation[sym] >= _STOP_LOSS_CONFIRMATION_TICKS:
                         _stop_loss_confirmation.pop(sym, None)
