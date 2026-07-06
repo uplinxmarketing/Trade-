@@ -135,12 +135,15 @@ function ThreadHealth({ baseUrl }: { baseUrl: string }) {
 
 function AlertsBanner({ baseUrl }: { baseUrl: string }) {
   const [alerts, setAlerts] = useState<Alert[]>([]);
+  // Distinguish 'loaded, zero alerts' from 'never loaded / endpoint failing' —
+  // an unreachable alerts endpoint must not render the green all-clear banner.
+  const [loadState, setLoadState] = useState<'loading' | 'ok' | 'error'>('loading');
 
   const load = useCallback(() => {
     fetch(`${baseUrl}/api/alerts?only_unacknowledged=true&limit=10`)
-      .then(r => r.json())
-      .then(d => setAlerts(d.alerts || []))
-      .catch(() => {});
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then(d => { setAlerts(d.alerts || []); setLoadState('ok'); })
+      .catch(() => setLoadState('error'));
   }, [baseUrl]);
 
   useEffect(() => {
@@ -156,6 +159,22 @@ function AlertsBanner({ baseUrl }: { baseUrl: string }) {
   };
 
   if (alerts.length === 0) {
+    if (loadState === 'error') {
+      return (
+        <div className="flex items-center gap-2 text-[9px] text-loss bg-loss/10 border border-loss/30 rounded px-2 py-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-loss shrink-0" />
+          Alerts unavailable — bot unreachable
+        </div>
+      );
+    }
+    if (loadState === 'loading') {
+      return (
+        <div className="flex items-center gap-2 text-[9px] text-muted-foreground bg-muted/20 border border-border rounded px-2 py-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground shrink-0" />
+          Loading alerts…
+        </div>
+      );
+    }
     return (
       <div className="flex items-center gap-2 text-[9px] text-gain bg-gain/10 border border-gain/30 rounded px-2 py-1">
         <span className="w-1.5 h-1.5 rounded-full bg-gain shrink-0" />

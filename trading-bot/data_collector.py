@@ -20,6 +20,9 @@ from connection import client
 # Shared live prices dict — imported by trade_engine and strategy_engine
 prices: Dict[str, float] = {}
 
+# Timestamp of the last WebSocket message — watchdog/health checks read this.
+last_ws_message_ts: float = 0.0
+
 # ── WebSocket health counters — zero-cost, written on existing events ─────────
 _ws_health: Dict = {
     "connected":          False,
@@ -249,14 +252,43 @@ async def _verify_symbols(coins: list) -> list:
         return coins
 
 
+def _persist_and_signal(sym: str, closed: list, buf_snapshot: list):
+    """DB read + indicator recompute + save + signal callback for one closed
+    1m candle. Runs on a worker thread (run_in_executor) so the blocking
+    SQLite work never stalls the WebSocket event loop — all watched coins
+    close their candle in the same second, and inline processing froze
+    @trade ticks (and the realtime sell path) for the whole burst."""
+    try:
+        # ── Persist to DB (best-effort, not required)
+        existing = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=50)
+        db_raw = [
+            [row["open_time"], row["open"], row["high"],
+             row["low"], row["close"], row["volume"]]
+            for row in existing
+        ]
+        all_raw = db_raw + [closed]
+        _compute_and_save(sym, all_raw)
+
+        # ── Signal update: prefer DB+new, fall back to WS buffer
+        signal_src = all_raw if len(all_raw) >= _MIN_CANDLES else buf_snapshot
+        if _kline_callback and len(signal_src) >= _MIN_CANDLES:
+            closes  = [float(r[4]) for r in signal_src]
+            volumes = [float(r[5]) for r in signal_src]
+            _kline_callback(sym, closes, volumes)
+    except Exception as e:
+        print(f"[DataCollector] Candle persist/signal error ({sym}): {e}")
+
+
 async def _start_websocket_loop():
     """
     Async WebSocket loop with exponential-backoff reconnect.
     On each trade event: update prices, call trade_engine via callback.
     On closed kline: update candle DB.
     """
+    global last_ws_message_ts
     import websockets
     backoff = 1
+    loop = asyncio.get_running_loop()
 
     # Verify symbols once on startup so invalid coins don't break the connection
     active_coins = await _verify_symbols(config.WATCHED_COINS)
@@ -284,6 +316,7 @@ async def _start_websocket_loop():
                 async for raw in ws:
                     _ws_health["messages_received"] += 1
                     _ws_health["last_message_ts"]    = time.time()
+                    last_ws_message_ts               = _ws_health["last_message_ts"]
                     try:
                         msg  = json.loads(raw)
                         data = msg.get("data", msg)
@@ -332,22 +365,11 @@ async def _start_websocket_loop():
                                 if len(buf) > _WS_CANDLE_MAX:
                                     buf.pop(0)
 
-                                # ── Also persist to DB (best-effort, not required)
-                                existing = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=50)
-                                db_raw = [
-                                    [row["open_time"], row["open"], row["high"],
-                                     row["low"], row["close"], row["volume"]]
-                                    for row in existing
-                                ]
-                                all_raw = db_raw + [closed]
-                                _compute_and_save(sym, all_raw)
-
-                                # ── Signal update: prefer DB+new, fall back to WS buffer
-                                signal_src = all_raw if len(all_raw) >= _MIN_CANDLES else buf
-                                if _kline_callback and len(signal_src) >= _MIN_CANDLES:
-                                    closes  = [float(r[4]) for r in signal_src]
-                                    volumes = [float(r[5]) for r in signal_src]
-                                    _kline_callback(sym, closes, volumes)
+                                # ── Persist + signal on a worker thread so the
+                                # blocking SQLite work never stalls this loop.
+                                loop.run_in_executor(
+                                    None, _persist_and_signal, sym, closed, list(buf)
+                                )
 
                         elif evt == "24hrMiniTicker":
                             symbol = data["s"]
@@ -400,12 +422,51 @@ async def _start_websocket_loop():
             backoff = min(backoff * 2, 30)
 
 
+_ws_thread: Optional[threading.Thread] = None
+
+
+def _ws_thread_runner():
+    """Supervised runner for the websocket feed. Any failure — including a
+    startup import error ('import websockets' missing after a partial update)
+    — is logged loudly and the loop is restarted with backoff, instead of the
+    thread dying silently and freezing all live prices."""
+    import traceback
+    delay = 5
+    while True:
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(_start_websocket_loop())
+            finally:
+                loop.close()
+            print("[DataCollector] FATAL: websocket loop exited unexpectedly "
+                  f"— restarting in {delay}s")
+        except Exception as e:
+            print(f"[DataCollector] FATAL: websocket feed crashed: {type(e).__name__}: {e} "
+                  f"— restarting in {delay}s")
+            traceback.print_exc()
+            try:
+                import trade_engine as _te_ws
+                _te_ws.log_diag_issue(
+                    "websocket", "error",
+                    f"websocket-feed thread crashed: {type(e).__name__}: {e}",
+                    detail=f"restarting in {delay}s",
+                )
+            except Exception:
+                pass
+        _ws_health["connected"] = False
+        time.sleep(delay)
+        delay = min(delay * 2, 300)
+
+
 async def start_websocket():
     """Run WebSocket loop in a dedicated thread — never blocks the uvicorn asyncio event loop."""
-    loop = asyncio.new_event_loop()
-    t = threading.Thread(
-        target=lambda: loop.run_until_complete(_start_websocket_loop()),
+    global _ws_thread
+    if _ws_thread is not None and _ws_thread.is_alive():
+        return
+    _ws_thread = threading.Thread(
+        target=_ws_thread_runner,
         name="websocket-feed",
         daemon=True
     )
-    t.start()
+    _ws_thread.start()

@@ -18,6 +18,12 @@ export function useBinanceWebSocket(symbols: string[]) {
   const connect = useCallback(() => {
     if (symbols.length === 0) return;
 
+    // Clear any pending reconnect so overlapping schedules can't stack sockets.
+    if (reconnectRef.current) {
+      clearTimeout(reconnectRef.current);
+      reconnectRef.current = null;
+    }
+
     const streams = symbols.map(s => `${s.toLowerCase()}@ticker`).join('/');
     const url = `wss://stream.binance.com:9443/ws/${streams}`;
 
@@ -47,6 +53,9 @@ export function useBinanceWebSocket(symbols: string[]) {
 
     ws.onclose = () => {
       setConnected(false);
+      // Only reconnect if this socket is still the active one — an intentionally
+      // replaced/closed socket must not respawn with a stale symbol list.
+      if (wsRef.current !== ws) return;
       reconnectRef.current = setTimeout(connect, 3000);
     };
 
@@ -56,8 +65,19 @@ export function useBinanceWebSocket(symbols: string[]) {
   useEffect(() => {
     connect();
     return () => {
-      wsRef.current?.close();
-      if (reconnectRef.current) clearTimeout(reconnectRef.current);
+      // Intentional close: detach handlers first so onclose can't schedule a
+      // reconnect from the old closure, and clear any pending reconnect timer.
+      if (reconnectRef.current) {
+        clearTimeout(reconnectRef.current);
+        reconnectRef.current = null;
+      }
+      const ws = wsRef.current;
+      if (ws) {
+        wsRef.current = null;
+        ws.onclose = null;
+        ws.onerror = null;
+        ws.close();
+      }
     };
   }, [connect]);
 

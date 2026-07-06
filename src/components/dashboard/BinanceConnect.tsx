@@ -36,7 +36,9 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
     setChecking(true);
     try {
       const res = await fetch(`${API_BASE}/api/status`, { cache: 'no-store' });
-      if (!res.ok) { setBotStatus(null); onConnectionChange(false); return; }
+      // Bot unreachable (non-2xx) — show 'Bot unreachable' in the dialog but do
+      // NOT flip the app to paper; a transient failure must not change the mode.
+      if (!res.ok) { setBotStatus(null); return; }
       const d = await res.json();
       const status: BotStatus = {
         mode:         d.mode ?? 'unknown',
@@ -49,8 +51,9 @@ const BinanceConnect = ({ isOpen, onClose, onConnectionChange }: BinanceConnectP
       // A transient Binance connection failure must not flip the whole UI back to paper.
       onConnectionChange(status.mode === 'live');
     } catch {
+      // Network failure — leave the app-level mode untouched. Only a successful
+      // response reporting mode !== 'live' may downgrade the app to paper.
       setBotStatus(null);
-      onConnectionChange(false);
     } finally {
       setChecking(false);
     }

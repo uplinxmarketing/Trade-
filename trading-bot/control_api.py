@@ -173,6 +173,38 @@ def _log_strategy_changes(new_strategy: dict, source: str) -> None:
 
 # ── Lifespan: start the full trading bot after HTTP server is ready ───────────
 
+# Keep strong references to the core background tasks — asyncio holds only weak
+# refs, and a task that dies from an unhandled exception would otherwise vanish
+# silently (no log, no restart, sell monitoring gone).
+_bg_tasks: list = []
+
+
+def _on_bg_task_done(task):
+    """Done-callback: surface unhandled exceptions from core trading tasks."""
+    try:
+        if task.cancelled():
+            return
+        exc = task.exception()
+    except Exception:
+        return
+    if exc is not None:
+        import traceback
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        msg = f"BACKGROUND TASK DIED: {task.get_name()}: {exc}"
+        print(f"[ControlAPI] {msg}\n{tb}")
+        try:
+            database.log_activity(msg, "error")
+        except Exception:
+            pass
+
+
+def _spawn_bg_task(coro, name: str):
+    t = asyncio.create_task(coro, name=name)
+    t.add_done_callback(_on_bg_task_done)
+    _bg_tasks.append(t)
+    return t
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -241,20 +273,20 @@ async def lifespan(app: FastAPI):
         steps.append("callbacks OK")
 
         # 7. Launch async tasks
-        asyncio.create_task(data_collector.start_websocket())
-        asyncio.create_task(strategy_engine.strategy_loop())
-        asyncio.create_task(trade_engine.signal_scanner(data_collector.prices))
-        asyncio.create_task(trade_engine.position_guardian())
-        asyncio.create_task(_supabase_periodic_sync())
-        asyncio.create_task(_anomaly_checker())
+        _spawn_bg_task(data_collector.start_websocket(), "websocket")
+        _spawn_bg_task(strategy_engine.strategy_loop(), "strategy_loop")
+        _spawn_bg_task(trade_engine.signal_scanner(data_collector.prices), "signal_scanner")
+        _spawn_bg_task(trade_engine.position_guardian(), "position_guardian")
+        _spawn_bg_task(_supabase_periodic_sync(), "supabase_sync")
+        _spawn_bg_task(_anomaly_checker(), "anomaly_checker")
         steps.append("async tasks launched")
 
         # 8. Futures paper-trading agent (completely separate parallel process)
         if config.FUTURES_ENABLED:
             import futures_engine
             futures_engine.init_futures_engine()
-            asyncio.create_task(futures_engine.mark_price_loop())
-            asyncio.create_task(futures_engine.signal_scanner_loop())
+            _spawn_bg_task(futures_engine.mark_price_loop(), "futures_mark_price")
+            _spawn_bg_task(futures_engine.signal_scanner_loop(), "futures_signal_scanner")
             steps.append("futures tasks launched")
 
         msg = "Bot ready — " + " | ".join(steps)
@@ -318,7 +350,7 @@ async def _anomaly_checker():
                     SELECT COUNT(*) AS total,
                            SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) AS wins
                     FROM trades WHERE timestamp_sell > datetime('now', '-4 hours')
-                    AND side IS NULL OR side = 'SELL' OR sell_reason IS NOT NULL
+                    AND exit_price IS NOT NULL
                 """).fetchone()
                 r7d = conn.execute("""
                     SELECT COUNT(*) AS total,
@@ -408,6 +440,21 @@ def _write_strategy_patch(patch: dict):
         _API_ALL_CACHE["data"] = None
     except NameError:
         pass
+
+
+def _flush_db_state():
+    """Best-effort flush of any pending DB state before a process restart.
+
+    database.py commits per-operation on short-lived connections, so there is
+    normally nothing buffered — but if the module ever grows flush/commit/close
+    helpers (or a WAL checkpoint), call them here so restarts never drop state."""
+    for _fn_name in ("flush", "commit", "checkpoint", "close"):
+        _fn = getattr(database, _fn_name, None)
+        if callable(_fn):
+            try:
+                _fn()
+            except Exception:
+                pass
 
 
 def _enrich_position(pos: dict) -> dict:
@@ -611,34 +658,24 @@ def _sell_monitor_alive() -> bool:
 # hammer the REST API on every frontend poll.
 _acct_cache: dict = {}
 _acct_cache_ts: float = 0.0
+_acct_last_success_ts: float = 0.0   # last time a LIVE/paper fetch actually succeeded
+_acct_fail_ts: float = 0.0           # negative-cache: last failed live fetch
 _ACCT_CACHE_TTL = 20.0
+_ACCT_FAIL_TTL = 5.0                 # don't hammer Binance while it's failing
 _acct_cache_lock = threading.Lock()
+_acct_refresh_lock = threading.Lock()  # single-flight guard for the network fetch
 
 def _fetch_account_direct() -> dict:
-    """Fetch /api/v3/account via urllib+HMAC, bypassing python-binance/requests
-    which is geo-blocked on datacenter IPs. Returns {} on any failure."""
-    import urllib.request as _ur
-    import urllib.error   as _ue
-    import hmac, hashlib, time as _t
-    api_key    = os.getenv("BINANCE_API_KEY",    "").strip()
-    api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
-    if not api_key or not api_secret:
+    """Fetch /api/v3/account via binance_direct (urllib+HMAC with recvWindow and
+    server-time sync), bypassing python-binance/requests which is geo-blocked on
+    datacenter IPs. Returns {} on any failure."""
+    if not os.getenv("BINANCE_API_KEY", "").strip() or not os.getenv("BINANCE_API_SECRET", "").strip():
         return {}
-    ts  = int(_t.time() * 1000)
-    qs  = f"timestamp={ts}"
-    sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
-    url = f"https://api.binance.com/api/v3/account?{qs}&signature={sig}"
-    req = _ur.Request(url, headers={"X-MBX-APIKEY": api_key, "User-Agent": "WolfBot/1.0"})
+    import binance_direct
     try:
-        with _ur.urlopen(req, timeout=8) as r:
-            data = json.loads(r.read())
-        # Binance returns API errors as valid JSON with negative code
-        if isinstance(data, dict) and data.get("code", 0) < 0:
-            print(f"[Account] Binance API error {data['code']}: {data.get('msg', '')}")
-            return {}
-        return data
-    except _ue.HTTPError as e:
-        print(f"[Account] Direct fetch HTTP {e.code}: {e.reason}")
+        return binance_direct.get_account()
+    except binance_direct.BinanceDirectError as e:
+        print(f"[Account] Binance API error {e.code}: {e.msg}")
         return {}
     except Exception as e:
         print(f"[Account] Direct fetch failed: {type(e).__name__}: {e}")
@@ -646,8 +683,12 @@ def _fetch_account_direct() -> dict:
 
 
 def _get_cached_account() -> dict:
-    """Return cached Binance account dict, refreshing at most every ACCT_CACHE_TTL s."""
-    global _acct_cache, _acct_cache_ts
+    """Return cached Binance account dict, refreshing at most every ACCT_CACHE_TTL s.
+
+    Single-flight: only one thread performs the (slow) network fetch; concurrent
+    callers get the stale cache. Failed live fetches are negative-cached for
+    _ACCT_FAIL_TTL s so a broken connection doesn't stampede signed requests."""
+    global _acct_cache, _acct_cache_ts, _acct_last_success_ts, _acct_fail_ts
     from connection import get_mode, client as _client
     now = time.time()
     with _acct_cache_lock:
@@ -656,15 +697,31 @@ def _get_cached_account() -> dict:
 
     if get_mode() == "live":
         # Live mode: always use direct urllib+HMAC — python-binance/requests is geo-blocked
-        acc = _fetch_account_direct()
-        if acc.get("balances"):
-            with _acct_cache_lock:
-                _acct_cache = acc
-                _acct_cache_ts = now
-            return acc
-        # Direct fetch failed — return stale cache rather than paper data
         with _acct_cache_lock:
-            return _acct_cache
+            if now - _acct_fail_ts < _ACCT_FAIL_TTL:
+                return _acct_cache  # recent failure — serve stale, don't hammer
+        if not _acct_refresh_lock.acquire(blocking=False):
+            # Another thread is already fetching — serve stale cache immediately
+            with _acct_cache_lock:
+                return _acct_cache
+        try:
+            # Re-check: the previous holder may have just refreshed the cache
+            with _acct_cache_lock:
+                if time.time() - _acct_cache_ts < _ACCT_CACHE_TTL and _acct_cache:
+                    return _acct_cache
+            acc = _fetch_account_direct()
+            if acc.get("balances"):
+                with _acct_cache_lock:
+                    _acct_cache = acc
+                    _acct_cache_ts = time.time()
+                    _acct_last_success_ts = _acct_cache_ts
+                return acc
+            # Direct fetch failed — negative-cache and return stale rather than paper data
+            with _acct_cache_lock:
+                _acct_fail_ts = time.time()
+                return _acct_cache
+        finally:
+            _acct_refresh_lock.release()
     else:
         # Paper / testnet mode: use the paper client
         try:
@@ -672,6 +729,7 @@ def _get_cached_account() -> dict:
             with _acct_cache_lock:
                 _acct_cache = acc
                 _acct_cache_ts = now
+                _acct_last_success_ts = now
             return acc
         except Exception:
             with _acct_cache_lock:
@@ -809,10 +867,14 @@ def set_budget(amount: float):
     if amount < 1:
         return {"error": "Budget must be >= 1 USDT"}
     s = _load_strategy()
-    for coin in s.get("approved_coins", []):
+    coins = s.get("approved_coins", [])
+    for coin in coins:
         coin["budget_usdt"] = amount
-    with open(config.STRATEGY_FILE, "w") as f:
-        json.dump(s, f, indent=2)
+    # Atomic, lock-protected write (tmp+rename) — a raw open(w) here can be
+    # caught mid-truncate by the sell monitor / signal scanner readers.
+    # Also set budget_fixed_usdt: get_budget_for_coin sizes trades from it,
+    # not from the per-coin budget_usdt field.
+    _write_strategy_patch({"approved_coins": coins, "budget_fixed_usdt": amount})
     return {"ok": True, "new_budget": amount}
 
 
@@ -1121,7 +1183,11 @@ def api_wallet():
         from data_collector import prices as live_prices
 
         acc = _get_cached_account()
-        _fetch_ok = bool(acc.get("balances"))
+        # A stale cache still contains balances — only report the fetch as OK
+        # when the last SUCCESSFUL refresh is recent (3x TTL grace window).
+        _stale_age = (time.time() - _acct_last_success_ts) if _acct_last_success_ts > 0 else None
+        _fetch_ok = bool(acc.get("balances")) and _stale_age is not None \
+            and _stale_age < _ACCT_CACHE_TTL * 3
 
         balances = [
             {
@@ -1138,15 +1204,20 @@ def api_wallet():
         usdt_total = sum(b["total"] for b in balances if b["asset"] == "USDT")
 
         # Total portfolio value = free USDT + mark-to-market value of open positions
-        total_value = usdt_free
+        open_pos_value = 0.0
         for pos in get_open_positions():
             sym = pos["symbol"]
             px  = _rest_px.get(sym) or live_prices.get(sym) or pos["entry_price"]
-            total_value += pos["quantity"] * px
+            open_pos_value += pos["quantity"] * px
+        total_value = usdt_free + open_pos_value
 
         # Realized P&L: single source of truth — SQL SUM from trades table
         _mode        = get_mode()
         realized_pnl = database.get_realized_pnl(mode=_mode)
+        try:
+            _total_fees = float(database.get_trade_stats(mode=_mode).get("total_fees", 0.0))
+        except Exception:
+            _total_fees = 0.0
 
         # Session P&L: current total portfolio value minus the mode-appropriate starting balance
         starting_bal  = _get_initial_balance()
@@ -1165,6 +1236,9 @@ def api_wallet():
             "using_paper_fallback":  _paper_fallback,
             "is_paper_data":         _paper_fallback or _mode == "paper",
             "account_fetch_ok":      _fetch_ok,
+            "account_stale_seconds": round(_stale_age, 1) if _stale_age is not None else None,
+            "total_fees":            round(_total_fees, 4),
+            "open_pos_value":        round(open_pos_value, 4),
         }
     except Exception as e:
         return {"balances": [], "total_usdt": 0.0, "total_value": 0.0,
@@ -1222,7 +1296,6 @@ def api_claude_status():
     }
 
 
-@app.get("/api/status")
 def _get_market_health() -> dict:
     """Summarise current signal cache into a market-health verdict."""
     try:
@@ -1252,6 +1325,13 @@ def _get_market_health() -> dict:
         return {}
 
 
+@app.get("/api/market-health")
+def api_market_health():
+    """Market-health verdict — previously (incorrectly) shadowed /api/status."""
+    return _get_market_health()
+
+
+@app.get("/api/status")
 def api_status():
     strategy = _load_strategy()
     # Use aggregated SQL so total/wins/losses/pnl/trades_today all cover the
@@ -1337,26 +1417,28 @@ def api_stats_summary():
     conn = _sqlite3.connect(database.DB_PATH)
     conn.row_factory = _sqlite3.Row
 
+    # Real trades schema: closed rows have exit_price/net_profit/timestamp_sell
+    # (there are no side/pnl/created_at columns).
     today = conn.execute("""
         SELECT
-            COUNT(*) FILTER (WHERE side='SELL' AND pnl IS NOT NULL) AS closed_trades,
-            COUNT(*) FILTER (WHERE side='SELL' AND pnl > 0) AS wins,
-            COUNT(*) FILTER (WHERE side='SELL' AND pnl < 0) AS losses,
-            ROUND(SUM(pnl), 4) AS net_pnl
+            COUNT(*) FILTER (WHERE net_profit IS NOT NULL) AS closed_trades,
+            COUNT(*) FILTER (WHERE net_profit > 0) AS wins,
+            COUNT(*) FILTER (WHERE net_profit <= 0) AS losses,
+            ROUND(COALESCE(SUM(net_profit), 0.0), 4) AS net_pnl
         FROM trades
-        WHERE DATE(created_at) = DATE('now')
+        WHERE exit_price IS NOT NULL AND DATE(timestamp_sell) = DATE('now')
     """).fetchone()
 
     alltime = conn.execute("""
         SELECT
-            COUNT(*) FILTER (WHERE side='SELL' AND pnl IS NOT NULL) AS closed_trades,
-            COUNT(*) FILTER (WHERE side='SELL' AND pnl > 0) AS wins,
-            COUNT(*) FILTER (WHERE side='SELL' AND pnl < 0) AS losses,
-            ROUND(SUM(pnl), 4) AS net_pnl,
-            ROUND(AVG(pnl) FILTER (WHERE side='SELL' AND pnl > 0), 4) AS avg_win,
-            ROUND(AVG(pnl) FILTER (WHERE side='SELL' AND pnl < 0), 4) AS avg_loss
+            COUNT(*) FILTER (WHERE net_profit IS NOT NULL) AS closed_trades,
+            COUNT(*) FILTER (WHERE net_profit > 0) AS wins,
+            COUNT(*) FILTER (WHERE net_profit <= 0) AS losses,
+            ROUND(COALESCE(SUM(net_profit), 0.0), 4) AS net_pnl,
+            ROUND(AVG(net_profit) FILTER (WHERE net_profit > 0), 4) AS avg_win,
+            ROUND(AVG(net_profit) FILTER (WHERE net_profit <= 0), 4) AS avg_loss
         FROM trades
-        WHERE pnl IS NOT NULL
+        WHERE exit_price IS NOT NULL AND net_profit IS NOT NULL
     """).fetchone()
     conn.close()
 
@@ -1458,7 +1540,8 @@ def api_agent_stop():
 
 
 class ForceBuyRequest(BaseModel):
-    price: float = 0.0   # frontend sends its known WebSocket price
+    price:  float = 0.0              # frontend sends its known WebSocket price
+    budget: Optional[float] = None   # user-chosen USDT budget (AITradingAgent sends this)
 
 
 @app.post("/api/force-buy/{symbol}")
@@ -1479,14 +1562,29 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
             return {"ok": False, "error": f"No live price for {sym} — WebSocket not yet connected"}
 
         usdt_balance = _get_usdt_balance()
-        budget = get_budget_for_coin(sym, usdt_balance)
+        # User-supplied budget from the UI takes priority over the strategy sizing
+        req_budget = float(req.budget) if (req and req.budget) else 0.0
+        budget = req_budget if req_budget > 0 else get_budget_for_coin(sym, usdt_balance)
         if budget <= 0:
             return {"ok": False, "error": f"Budget 0 — balance: {usdt_balance:.2f} USDT"}
+        # Binance MARKET min-notional guard (mirrors trade_engine's live $10 check)
+        if budget < 10.0:
+            return {"ok": False, "error": f"Budget {budget:.2f} USDT below the $10 Binance minimum notional"}
+        if budget > usdt_balance:
+            return {"ok": False, "error": f"Budget {budget:.2f} exceeds free balance {usdt_balance:.2f} USDT"}
 
+        # Force-buy intentionally overrides trading_active (manual action), but it
+        # must still respect the max_positions cap.
+        _strategy_fb = _load_strategy()
+        _max_pos_fb = int(_strategy_fb.get("max_positions", 10))
         with _positions_lock:
             already_held = any(p["symbol"] == sym for p in _positions)
+            open_count = len(_positions)
         if already_held:
             return {"ok": False, "error": f"Already holding {sym}"}
+        if open_count >= _max_pos_fb:
+            return {"ok": False,
+                    "error": f"Max positions reached ({open_count}/{_max_pos_fb}) — close a position first"}
 
         # Atomic claim — same guard as _check_buys_from_cache to prevent race with scanner
         with _te._buying_lock:
@@ -1501,9 +1599,15 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
             _te._buying.add(sym)
             _te._buying_ts[sym] = _now_fb
 
-        _client.update_price(sym, price)
         try:
-            result = _client.order_market_buy(symbol=sym, quoteOrderQty=budget)
+            if get_mode() == "live" and not is_using_paper_fallback():
+                # Live mode: python-binance/requests is geo-blocked — route the
+                # order through the direct urllib+HMAC transport.
+                import binance_direct
+                result = binance_direct.order_market_buy(sym, budget)
+            else:
+                _client.update_price(sym, price)
+                result = _client.order_market_buy(symbol=sym, quoteOrderQty=budget)
         except Exception as _buy_e:
             with _te._buying_lock:
                 _te._buying.discard(sym)
@@ -1520,11 +1624,17 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
 
         _bep_m_fb = _get_breakeven_mult(fill_price, sym)
         exit_target = round(fill_price * _bep_m_fb, 8)
+        try:
+            _buy_fee_fb, _ = _te._fills_fee_usdt(result.get("fills", []), budget * _te._fee_rate)
+        except Exception:
+            _buy_fee_fb = budget * 0.001
         pos = {
             "symbol": sym, "entry_price": fill_price, "quantity": qty,
             "budget_usdt": budget, "timestamp": datetime.now(timezone.utc).isoformat(),
             "mode": get_mode(), "exit_target": exit_target,
             "breakeven_mult_at_buy": round(_bep_m_fb, 8),
+            "buy_fee_usdt": round(_buy_fee_fb, 6),   # real BEP/profit-gate accounting
+            "opened_at_ts": time.time(),             # minimum-hold-time guard
         }
         pos["id"] = database.save_position(pos)
         with _positions_lock:
@@ -1720,9 +1830,16 @@ def api_set_mode(req: ModeRequest):
 
     def _restart():
         time.sleep(0.8)
-        # Exit with code 1 — triggers systemd Restart=on-failure AND Restart=always.
-        # Exit code 0 is silently ignored by Restart=on-failure configurations.
-        os._exit(1)
+        _flush_db_state()
+        # Re-exec the current process in place so the bot survives even WITHOUT a
+        # supervisor (bash start.sh / Procfile have no restart loop). Where systemd
+        # or Railway (Restart=always) supervises us, an exec-based restart is
+        # equivalent and they will also handle any crash-exit.
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as _re:
+            print(f"[ModeSwitch] execv failed ({_re}) — falling back to exit(1) for supervisor restart")
+            os._exit(1)
 
     threading.Thread(target=_restart, daemon=True).start()
     return {"ok": True, "mode": req.mode, "restarting": True}
@@ -2012,9 +2129,20 @@ def api_signals_summary(limit: int = 30):
 
 
 @app.get("/api/proxy/binance/ticker/24hr")
-async def api_proxy_ticker_24hr(symbols: str = None):
-    """Chunked proxy for Binance 24hr ticker — avoids 400s from large symbol lists."""
+async def api_proxy_ticker_24hr(symbols: str = None, symbol: str = None):
+    """Chunked proxy for Binance 24hr ticker — avoids 400s from large symbol lists.
+    Also accepts a single `symbol` param (MarketStatsBar/OrderBookPanel use it)."""
     import urllib.request as _ur
+    import urllib.parse as _up
+    if symbol and not symbols:
+        # Single-symbol form: forward as-is; response is a dict, not a list.
+        try:
+            url = f"https://data-api.binance.vision/api/v3/ticker/24hr?symbol={_up.quote(symbol.upper())}"
+            req = _ur.Request(url, headers={"User-Agent": "WolfBot/1.0"})
+            with _ur.urlopen(req, timeout=5.0) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            return JSONResponse(status_code=502, content={"error": f"ticker fetch failed: {e}"})
     if not symbols:
         return JSONResponse(status_code=400, content={"error": "symbols required"})
     try:
@@ -2622,6 +2750,34 @@ def api_orphan_check(min_value_usdt: float = 0.10):
             "min_value_usdt_filter": min_value_usdt, "issues": issues}
 
 
+@app.get("/api/reconcile")
+def api_reconcile():
+    """Reconcile bot positions against Binance balances (TopBar Reconcile button).
+
+    Returns {ghosts: [...], mismatches: [...]} — reuses the orphan-check logic
+    after forcing a fresh account fetch so results reflect current balances."""
+    global _acct_cache_ts, _acct_fail_ts
+    with _acct_cache_lock:
+        _acct_cache_ts = 0.0   # bust the cache — force a fresh account fetch
+        _acct_fail_ts = 0.0
+    _get_cached_account()
+    result = api_orphan_check()
+    if result.get("error"):
+        return {"error": result["error"], "ghosts": [], "mismatches": []}
+    issues     = result.get("issues", [])
+    ghosts     = [i for i in issues if i.get("type") in ("orphan_in_db", "orphan_on_binance")]
+    mismatches = [i for i in issues if i.get("type") == "qty_mismatch"]
+    if ghosts or mismatches:
+        try:
+            database.log_activity(
+                f"Reconcile: {len(ghosts)} ghost(s), {len(mismatches)} qty mismatch(es): "
+                + ", ".join(i.get("symbol", "?") for i in ghosts + mismatches), "warn")
+        except Exception:
+            pass
+    return {"ok": True, "ghosts": ghosts, "mismatches": mismatches,
+            "message": f"{len(ghosts)} ghost(s), {len(mismatches)} mismatch(es)"}
+
+
 @app.get("/api/diagnostics/fill_quality")
 def get_fill_quality(hours: int = 24):
     import sqlite3 as _sq
@@ -2833,14 +2989,17 @@ def api_get_settings():
     s = _load_strategy()
     return {
         "ok":                  True,
-        "stop_loss_enabled":   s.get("stop_loss_enabled",   False),
-        "stop_loss_pct":       s.get("stop_loss_pct",       2.0),
+        # Defaults below MUST mirror the engine's actual fallbacks:
+        # trade_engine._refresh_risk_params (sl_on=True, sl_pct=0.4, tp_pct=0.1,
+        # smart_hold=False, trailing=0.5) and _check_buys_from_cache (max_positions=10).
+        "stop_loss_enabled":   s.get("stop_loss_enabled",   True),
+        "stop_loss_pct":       s.get("stop_loss_pct",       0.4),
         "take_profit_enabled": s.get("take_profit_enabled", True),
         "take_profit_pct":     s.get("take_profit_pct",     0.1),
         "smart_hold_enabled":  s.get("smart_hold_enabled",  False),
         "trailing_stop_pct":   s.get("trailing_stop_pct",   0.5),
         "reinvest_profits":    s.get("reinvest_profits",    False),
-        "max_positions":       s.get("max_positions",       20),
+        "max_positions":       s.get("max_positions",       10),
         "min_signals":         s.get("min_signals",         config.MIN_SIGNALS_TO_BUY),
         "strategy_notes":      s.get("strategy_notes",      ""),
         "budget_mode":         s.get("budget_mode",         config.BUDGET_MODE),
@@ -2860,6 +3019,8 @@ class SettingsRequest(BaseModel):
     reinvest_profits:    Optional[bool]  = None
     max_positions:       Optional[int]   = None
     min_signals:         Optional[int]   = None
+    strategy_notes:      Optional[str]   = None
+    slippage_buffer_pct: Optional[float] = None  # 0.05–0.50%, default 0.10%
 
 
 class _SignalEngineConfig(BaseModel):
@@ -3167,6 +3328,7 @@ def api_debug():
     errors    = [e for e in last_logs if e.get("level") == "error"]
     return {
         "deploy_id":       _DEPLOY_ID,
+        "env":             {"MODE": get_mode()},  # frontend reads dbg.env.MODE
         "python_version":  sys.version,
         "data_dir":        database._DATA_DIR,
         "db_path":         database.DB_PATH,
@@ -3428,6 +3590,11 @@ def api_update():
 
     def _do_update():
         _t.sleep(0.6)  # let HTTP response reach the client first
+        # Pause trading so no new orders start mid-build/mid-restart.
+        try:
+            _write_strategy_patch({"trading_active": False, "pause_reason": "Updating bot"})
+        except Exception:
+            pass
         app_dir = pathlib.Path(__file__).parent.parent
         try:
             subprocess.run(["git", "fetch", "origin", "main"],
@@ -3440,7 +3607,8 @@ def api_update():
         except Exception as exc:
             print(f"[Update] ERROR: {exc}", flush=True)
             return
-        # Restart the current Python process in-place
+        # Flush pending DB state, then restart the current Python process in-place
+        _flush_db_state()
         import os
         os.execv(sys.executable, [sys.executable] + sys.argv)
 

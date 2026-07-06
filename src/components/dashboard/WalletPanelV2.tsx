@@ -299,7 +299,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   // Replaces Supabase-derived P&L when server is the backend.
   const [serverWallet, setServerWallet] = useState<{
     realized_pnl: number; session_pnl: number; starting_balance: number;
-    total_fees: number; open_pos_value: number;
+    total_fees: number | null; open_pos_value: number;
   } | null>(null);
 
   useEffect(() => {
@@ -314,7 +314,9 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
           realized_pnl:     Number(d.realized_pnl     ?? 0),
           session_pnl:      Number(d.session_pnl      ?? 0),
           starting_balance: Number(d.starting_balance ?? 0),
-          total_fees:       Number(d.total_fees        ?? 0),
+          // null (not 0) when the backend omits the key so the local fee
+          // estimate below can take over instead of showing a fake 0.
+          total_fees:       d.total_fees !== undefined && d.total_fees !== null ? Number(d.total_fees) : null,
           open_pos_value:   Number(d.open_pos_value    ?? 0),
         });
       } catch {}
@@ -350,7 +352,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
   const effectiveSessionGain = serverWallet ? serverWallet.realized_pnl : tradesRealizedPnl;
   // Server total_fees covers both buy AND sell fees from the trades table.
   // Fallback: estimate from agentTrades sell side only (misses buy fees).
-  const effectiveFees = serverWallet
+  const effectiveFees = serverWallet && serverWallet.total_fees !== null
     ? serverWallet.total_fees
     : effectiveSells.length > 0
       ? Math.round(effectiveSells.reduce((s, t) => {
@@ -463,7 +465,7 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
                 fetch(`${API_BASE}/api/wallet`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null).catch(() => null),
                 fetch(`${API_BASE}/api/positions`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null).catch(() => null),
               ]);
-              if (walRes) setServerWallet({ realized_pnl: Number(walRes.realized_pnl ?? 0), session_pnl: Number(walRes.session_pnl ?? 0), starting_balance: Number(walRes.starting_balance ?? 0), total_fees: Number(walRes.total_fees ?? 0), open_pos_value: Number(walRes.open_pos_value ?? 0) });
+              if (walRes) setServerWallet({ realized_pnl: Number(walRes.realized_pnl ?? 0), session_pnl: Number(walRes.session_pnl ?? 0), starting_balance: Number(walRes.starting_balance ?? 0), total_fees: walRes.total_fees !== undefined && walRes.total_fees !== null ? Number(walRes.total_fees) : null, open_pos_value: Number(walRes.open_pos_value ?? 0) });
               if (walRes?.total_usdt !== undefined) setUsdtFree(Number(walRes.total_usdt));
               if (posRes?.positions) setPositions(posRes.positions as Position[]);
               setLastUpdated(formatTime(new Date()));

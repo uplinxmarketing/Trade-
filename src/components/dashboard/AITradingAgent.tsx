@@ -136,6 +136,12 @@ const SIGNAL_SHORT_LABELS: Record<string, string> = {
   M2_stoch_rsi_oversold:   'SRSI',
 };
 
+// Safe numeric price from the WebSocket ticker map (entries are objects, not numbers).
+function numPrice(prices: LivePrices, sym: string): number | undefined {
+  const v = Number(prices[sym]?.price);
+  return Number.isFinite(v) && v > 0 ? v : undefined;
+}
+
 const INSTRUCTIONS_KEY  = 'ai_agent_instructions';
 const AGENT_CYCLE_MS    = 30_000;
 const MAX_LOG_LINES     = 200;
@@ -447,6 +453,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const botUrl = '';  // same-origin VPS API — all calls use relative /api/* paths
   const [liveSetupLoading, setLiveSetupLoading] = useState(false);
   const [showModeToggle, setShowModeToggle] = useState(false);
+  // Poll health — drives the "Bot Server" badge (CONNECTED vs UNREACHABLE)
+  const [lastPollOkAt, setLastPollOkAt] = useState(0);
+  const [pollFailCount, setPollFailCount] = useState(0);
 
   // ── Setup wizard / Agent Trading Settings ─────────────────────────────────────────
   // Wizard always appears before every bot start — no localStorage persistence.
@@ -513,8 +522,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       .then(d => {
         if (!d) return;
         if (d.budget_mode  !== undefined) setSetupBudgetMode(d.budget_mode as 'fixed'|'percent'|'capped');
-        if (d.budget_value !== undefined) setSetupBudgetValue(Number(d.budget_value));
-        if (d.allocation   !== undefined) setSetupAllocation(Number(d.allocation));
+        // /api/config returns budget_fixed_usdt / budget_pct_of_free /
+        // budget_total_cap_usdt / bot_allocation_usdt — pick per-mode value.
+        const budgetMode = d.budget_mode ?? 'fixed';
+        const budgetVal  = budgetMode === 'percent' ? d.budget_pct_of_free
+                         : budgetMode === 'capped'  ? d.budget_total_cap_usdt
+                         : d.budget_fixed_usdt;
+        if (budgetVal            !== undefined) setSetupBudgetValue(Number(budgetVal));
+        if (d.bot_allocation_usdt !== undefined) setSetupAllocation(Number(d.bot_allocation_usdt));
       })
       .catch(() => {});
   }, [botUrl]);
@@ -699,6 +714,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       try { data = await attempt(); }
       catch (e: any) {
         if (e.name !== 'AbortError') addLog(`[Bot] poll failed: ${e.message}`);
+        setPollFailCount(c => c + 1);
         return;
       }
     }
@@ -708,6 +724,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       addLog(`[Bot] server error: ${data.error}`);
       return;
     }
+    setLastPollOkAt(Date.now());
+    setPollFailCount(0);
 
     const s = data.status ?? {};
     const running = Boolean(s.running);
@@ -722,6 +740,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     // Propagate mode to parent so binanceConnected stays correct even when the
     // page loaded while the bot was restarting and the mount hook failed.
     onLiveModeDetected?.(s.mode === 'live');
+    // Mirror server mode into local state so the mode pill / switcher reflect truth.
+    setMode(s.mode === 'live' ? 'live' : 'test');
     setAgentStatus(`Bot · ${s.mode?.toUpperCase() ?? 'PAPER'} · ${formatTime(new Date())}`);
     if (s.data_persistent !== undefined) setDataPersistent(Boolean(s.data_persistent));
     setUsingPaperFallback(Boolean(s.using_paper_fallback));
@@ -822,9 +842,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
     // Fetch debug info only if there is a live error shown
     if (s.live_error) {
-      const dbg = await fetch(`${botUrl}/api/debug`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null);
-      if (dbg?.env?.MODE) {
-        addLog(`[debug] MODE=${dbg.env.MODE} live_error=${s.live_error ?? 'none'}`);
+      const dbg = await fetch(`${botUrl}/api/debug`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null).catch(() => null);
+      if (dbg) {
+        addLog(`[debug] MODE=${dbg?.env?.MODE ?? 'unknown'} live_error=${s.live_error ?? 'none'}`);
       }
     }
     } finally {
@@ -900,11 +920,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         max_positions:       setupMaxPositions,
         min_signals:         setupMinSignals,
       };
-      await Promise.all([
+      const [cfgRes, setRes] = await Promise.all([
         fetch(`${botUrl}/api/config`,   { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(budgetPayload) }),
         fetch(`${botUrl}/api/settings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settingsPayload) }),
       ]);
-      return true;
+      return cfgRes.ok && setRes.ok;
     } catch {
       return false;
     }
@@ -977,7 +997,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       if (positions.find(p => p.symbol === sym)) { toast.error(`Already holding ${sym}`); return; }
         const res  = await fetch(`${botUrl}/api/force-buy/${sym}`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ budget: setupBudgetValue }),
+          // price hint lets the server fill even when its WS cache is cold
+          body: JSON.stringify({ budget: setupBudgetValue, price: numPrice(prices, sym) ?? 0 }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
@@ -991,16 +1012,18 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     } finally {
       setForcingBuy(null);
     }
-  }, [isServerMode, positions, botUrl, setupBudgetValue, addLog, pollBot]);
+  }, [isServerMode, positions, botUrl, setupBudgetValue, prices, addLog, pollBot]);
 
   // ── Force sell ────────────────────────────────────────────────────────────
   const handleForceSell = useCallback(async (pos: OpenPosition) => {
     setForcingSell(pos.symbol);
     try {
       if (isServerMode) {
+        // prices[] entries are ticker OBJECTS — coerce to a number or the
+        // backend rejects the request (price: float) with HTTP 422.
         const cur = (pos.current_price && pos.current_price > 0)
           ? pos.current_price
-          : (prices[pos.symbol] ?? 0);
+          : (numPrice(prices, pos.symbol) ?? 0);
 
         // Optimistic UI: remove position immediately so the panel feels instant.
         // If the backend fails, the next pollBot restores it automatically.
@@ -1027,7 +1050,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         return;
       }
       // Local mode
-      const exitPrice = prices[pos.symbol] ?? pos.avg_entry_price;
+      const exitPrice = numPrice(prices, pos.symbol) ?? pos.avg_entry_price;
       const pnl = (exitPrice - pos.avg_entry_price) * pos.quantity * (1 - TAKER_FEE);
       await supabase.from('positions').update({ status: 'closed', updated_at: new Date().toISOString() })
         .eq('user_session', SESSION).eq('symbol', pos.symbol).eq('status', 'open');
@@ -1083,7 +1106,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const saveSettings = useCallback(async () => {
     setSavingSettings(true);
     try {
-      await Promise.all([
+      const [settingsRes, configRes] = await Promise.all([
         fetch(`${botUrl}/api/settings`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1111,6 +1134,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           }),
         }),
       ]);
+      if (!settingsRes.ok) throw new Error(`settings HTTP ${settingsRes.status}`);
+      if (!configRes.ok)   throw new Error(`config HTTP ${configRes.status}`);
       setStopLossEnabled(settingsDraft.stopLossEnabled);
       setStopLossPct(settingsDraft.stopLossPct);
       setTakeProfitEnabled(settingsDraft.takeProfitEnabled);
@@ -1130,12 +1155,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
 
   // ── Computed stats ────────────────────────────────────────────────────────
   const totalValue = positions.reduce((sum, p) => {
-    const cur = (isServerMode && p.current_price) ? p.current_price : (prices[p.symbol] ?? p.avg_entry_price);
+    const cur = (isServerMode && p.current_price) ? p.current_price : (numPrice(prices, p.symbol) ?? p.avg_entry_price);
     return sum + cur * p.quantity;
   }, 0);
 
   const unrealizedPnl = positions.reduce((sum, p) => {
-    const cur = (isServerMode && p.current_price) ? p.current_price : (prices[p.symbol] ?? p.avg_entry_price);
+    const cur = (isServerMode && p.current_price) ? p.current_price : (numPrice(prices, p.symbol) ?? p.avg_entry_price);
     return sum + (cur - p.avg_entry_price) * p.quantity;
   }, 0);
 
@@ -1150,6 +1175,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     : trades.filter(t => t.side === 'SELL').length;
   const winRate = totalClosedTrades > 0 ? (winningTrades / totalClosedTrades) * 100 : 0;
   const roi = initialBalance > 0 ? ((balance + totalValue - initialBalance) / initialBalance) * 100 : 0;
+
+  // Bot reachability derived from actual poll health, not compile-time constants.
+  const botReachable = lastPollOkAt > 0 && pollFailCount < 2;
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -1391,7 +1419,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 <div className="flex items-center gap-2">
                   <Activity className="w-3.5 h-3.5 text-accent" />
                   <span className="text-xs font-semibold text-accent">Bot Server</span>
-                  {isServerMode && <span className="text-[9px] px-1.5 py-0.5 rounded bg-gain/20 text-gain font-bold">CONNECTED</span>}
+                  {isServerMode && (botReachable
+                    ? <span className="text-[9px] px-1.5 py-0.5 rounded bg-gain/20 text-gain font-bold">CONNECTED</span>
+                    : <span className="text-[9px] px-1.5 py-0.5 rounded bg-loss/20 text-loss font-bold">UNREACHABLE</span>)}
                 </div>
                 <p className="text-[10px] text-gain font-sans">
                   Same-origin · API calls go to <code className="bg-muted px-1 rounded text-foreground">/api/*</code>
@@ -1485,7 +1515,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                     // Priority: fresh_prices (injected per-poll outside cache) > local WS > cached server price
                     const cur   = freshPrices[pos.symbol]
                       ?? (isServerMode && pos.current_price && pos.current_price > 0 ? pos.current_price : undefined)
-                      ?? prices[pos.symbol]
+                      ?? numPrice(prices, pos.symbol)
                       ?? entry;
                     // Real breakeven: server-computed (fees + lot rounding), fallback to ~0.17% above entry
                     const bep = pos.breakeven_price_real ?? (entry > 0 ? entry * 1.0017 : 0);
