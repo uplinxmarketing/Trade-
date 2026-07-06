@@ -34,11 +34,12 @@ import pathlib as _pl_v
 
 def _read_frontend_version() -> dict:
     """Read version metadata from dist/version.json.
-    Checks trading-bot/dist/ first, then the repo-root dist/, so the
-    endpoint always reflects whatever the bot is actually serving."""
+    The repo-root dist/ is the ONLY build location (committed on every release).
+    trading-bot/dist/ was a stale committed copy that shadowed it — the update
+    button kept 'installing' while the served version never changed."""
     for candidate in [
-        _pl_v.Path(__file__).parent / "dist" / "version.json",
         _pl_v.Path(__file__).parent.parent / "dist" / "version.json",
+        _pl_v.Path(__file__).parent / "dist" / "version.json",
     ]:
         try:
             if candidate.exists():
@@ -240,6 +241,13 @@ async def lifespan(app: FastAPI):
         # starts serving immediately and endpoints tolerate partial state.
         async def _deferred_init():
             try:
+                # Warm the Binance account cache immediately (live mode) so the
+                # wallet panel's first request is served from cache instead of
+                # waiting on a cold signed fetch.
+                try:
+                    await asyncio.to_thread(_get_cached_account)
+                except Exception:
+                    pass
                 # 3. Restore open positions + coins + balance from SQLite / Supabase
                 await asyncio.to_thread(trade_engine.load_positions_from_db)
                 steps.append("positions OK")
@@ -262,6 +270,12 @@ async def lifespan(app: FastAPI):
                 if "trading_active" not in _s:
                     # Brand-new deploy — don't auto-start, let user press Start
                     _auto_patch["trading_active"] = False
+                elif _s.get("resume_after_restart"):
+                    # /api/update paused trading for the restart — the bot was
+                    # RUNNING before the update, so resume it automatically.
+                    _auto_patch["trading_active"] = True
+                    _auto_patch["resume_after_restart"] = False
+                    print("[ControlAPI] Resuming trading after update (was active before restart)")
                 # else: preserve existing trading_active (resumes running bot after redeploy)
                 if not _s.get("initial_balance_usdt"):
                     _bal = await asyncio.to_thread(_get_usdt_balance)
@@ -2124,13 +2138,23 @@ def api_signals_summary(limit: int = 30):
                         signal_results[sig_id] = {"fired": False, "raw_value": None}
 
                 decision = _sr.evaluate_buy_decision(sym, signal_data, strategy)
+                # Full gate chain — a coin only displays as a BUY candidate when
+                # the bot would ACTUALLY buy it (vetoes, cooldowns, macro gate,
+                # capacity, paused state all included). Signal score alone is
+                # NOT a buy: showing it as one made the bot look broken.
+                import trade_engine as _te_gates
+                gates = _te_gates.evaluate_buy_gates(sym)
+                sig_ok = bool(decision.get("allowed", False))
                 signals_list.append({
                     "symbol": sym,
                     "score": entry.get("score", 0),
                     "price": entry.get("price"),
                     "signal_results": signal_results,
-                    "buy_allowed": bool(decision.get("allowed", False)),
-                    "buy_reason": decision.get("reason", ""),
+                    "buy_allowed": sig_ok and gates["ready"],
+                    "buy_reason": (decision.get("reason", "") if not sig_ok
+                                   else ("; ".join(gates["blockers"]) if gates["blockers"] else "ready")),
+                    "gate_blockers": gates["blockers"],
+                    "signal_engine_allowed": sig_ok,
                     "ts": entry.get("ts", 0),
                 })
             except Exception:
@@ -2699,7 +2723,9 @@ def api_diagnostics_errors_summary():
 
 
 @app.get("/api/diagnostics/orphan-check")
-def api_orphan_check(min_value_usdt: float = 0.10):
+def api_orphan_check(min_value_usdt: float = 10.0):
+    # Default threshold = Binance's ~$10 min notional: holdings below it can't
+    # be market-sold by the bot anyway, so alerting on $0.10 dust is pure noise.
     """Compare Binance balances to bot DB positions. Reports orphans and mismatches."""
     import sqlite3 as _sq
 
@@ -2740,7 +2766,9 @@ def api_orphan_check(min_value_usdt: float = 0.10):
         symbol = f"{asset}USDT"
         price = prices.get(symbol, 0)
         value_usdt = round(qty * price, 4) if price > 0 else None
-        if value_usdt is not None and value_usdt < min_value_usdt:
+        # Unknown price (value None) on the Binance side means an asset with no
+        # USDT pair or one the bot never tracks — it's dust noise, skip it too.
+        if value_usdt is None or value_usdt < min_value_usdt:
             continue
         db_qty = db_positions.get(symbol)
         if db_qty is None:
@@ -3610,8 +3638,13 @@ def api_update():
     def _do_update():
         _t.sleep(0.6)  # let HTTP response reach the client first
         # Pause trading so no new orders start mid-build/mid-restart.
+        # resume_after_restart lets the deferred init restore the bot to its
+        # pre-update running state — updates must not leave the bot stopped.
+        was_active = bool(_load_strategy().get("trading_active", False))
         try:
-            _write_strategy_patch({"trading_active": False, "pause_reason": "Updating bot"})
+            _write_strategy_patch({"trading_active": False,
+                                   "pause_reason": "Updating bot",
+                                   "resume_after_restart": was_active})
         except Exception:
             pass
         app_dir = pathlib.Path(__file__).parent.parent
@@ -3620,12 +3653,26 @@ def api_update():
                            cwd=str(app_dir), check=True, timeout=30)
             subprocess.run(["git", "reset", "--hard", "origin/main"],
                            cwd=str(app_dir), check=True, timeout=30)
+        except Exception as exc:
+            # Pull failed — nothing changed on disk; un-pause and bail.
+            print(f"[Update] ERROR pulling code: {exc}", flush=True)
+            try:
+                _write_strategy_patch({"trading_active": was_active,
+                                       "pause_reason": None,
+                                       "resume_after_restart": False})
+            except Exception:
+                pass
+            return
+        # The frontend build is COMMITTED in dist/ — npm is optional on the VPS.
+        # A build failure must never abort the restart (that left the process
+        # running old code while the repo had already been updated).
+        try:
             subprocess.run(["npm", "run", "build"],
                            cwd=str(app_dir), check=True, timeout=300)
-            print("[Update] Rebuild complete — restarting bot", flush=True)
+            print("[Update] Rebuild complete", flush=True)
         except Exception as exc:
-            print(f"[Update] ERROR: {exc}", flush=True)
-            return
+            print(f"[Update] npm build skipped/failed ({exc}) — using committed dist/", flush=True)
+        print("[Update] Restarting bot", flush=True)
         # Flush pending DB state, then restart the current Python process in-place
         _flush_db_state()
         import os
@@ -3793,11 +3840,12 @@ def start_control_api():
     # Mount React build INSIDE start_control_api so any failure (missing
     # aiofiles, missing dist/) is caught and logged — it never prevents the
     # HTTP server from binding and passing Railway's health check.
-    # Check trading-bot/dist/ first, then repo-root dist/ as fallback.
-    # Repo-root dist/ is what gets committed when building locally.
+    # Repo-root dist/ is the committed build and MUST win — a leftover
+    # trading-bot/dist/ from old deploys shadowed it and froze the UI at an
+    # old version no matter how many updates were installed.
     _dist_candidates = [
-        pathlib.Path(__file__).parent / "dist",
         pathlib.Path(__file__).parent.parent / "dist",
+        pathlib.Path(__file__).parent / "dist",
     ]
     dist = next((d for d in _dist_candidates if d.exists()), None)
     if dist:

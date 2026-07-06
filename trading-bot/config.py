@@ -39,16 +39,51 @@ CLAUDE_MODEL            = "claude-haiku-4-5-20251001"
 CLAUDE_MAX_TOKENS       = 400
 import os as _os
 def _data_dir() -> str:
-    c = _os.getenv("DATA_DIR", "/data")
+    """MUST resolve identically to database._resolve_data_dir() — strategy.json
+    and bot.db live together. Two different resolutions caused strategy.json to
+    'reset from scratch' on deploys whenever the paths disagreed."""
+    def _writable(d: str) -> bool:
+        try:
+            p = _os.path.join(d, ".cfg_probe")
+            open(p, "w").close(); _os.remove(p)
+            return True
+        except OSError:
+            return False
+    env_dir = _os.getenv("DATA_DIR")
+    if env_dir:
+        try:
+            _os.makedirs(env_dir, exist_ok=True)
+        except OSError:
+            pass
+        if _writable(env_dir):
+            return env_dir
+    for c in ("/opt/tradebot/data", "/data"):
+        if _os.path.isdir(c) and _writable(c):
+            return c
+    home = _os.path.join(_os.path.expanduser("~"), ".wolfbot", "data")
     try:
-        _os.makedirs(c, exist_ok=True)
-        p = _os.path.join(c, ".cfg_probe")
-        open(p, "w").close(); _os.remove(p)
-        return c
+        _os.makedirs(home, exist_ok=True)
     except OSError:
-        return _os.path.dirname(_os.path.abspath(__file__))
+        pass
+    if _writable(home):
+        return home
+    return _os.path.dirname(_os.path.abspath(__file__))
 _DATA_DIR     = _data_dir()
 STRATEGY_FILE = _os.path.join(_DATA_DIR, "strategy.json")
+
+# One-time migration: older builds kept strategy.json in /data while the DB
+# lived elsewhere. Copy it to the unified dir so user settings survive.
+if not _os.path.exists(STRATEGY_FILE):
+    for _legacy in ("/data/strategy.json",
+                    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "strategy.json")):
+        try:
+            if _os.path.exists(_legacy) and _os.path.abspath(_legacy) != _os.path.abspath(STRATEGY_FILE):
+                import shutil as _sh
+                _sh.copy2(_legacy, STRATEGY_FILE)
+                print(f"[Config] Migrated strategy.json: {_legacy} → {STRATEGY_FILE}")
+                break
+        except OSError:
+            pass
 
 # ── Two-speed architecture constants ────────────────────────────────────────────
 SCAN_INTERVAL_SEC    = 30      # REST backup cache refresh — WebSocket handles real-time

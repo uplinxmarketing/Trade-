@@ -1362,6 +1362,79 @@ def clear_rejection_stats() -> int:
         return n
 
 
+def evaluate_buy_gates(sym: str) -> dict:
+    """Mirror of the per-symbol gate chain in _check_buys_from_cache, WITHOUT
+    executing anything. Used by /api/signals-summary so the frontend only shows
+    a coin as a buy candidate when the bot would ACTUALLY buy it right now —
+    a coin that passes the signal score but fails a veto (5m downtrend, BB top,
+    cooldown, macro gate, paused bot…) must not display as 'BUY'.
+
+    Returns {"ready": bool, "blockers": [str, ...]} — blockers lists every gate
+    currently failing (empty when ready). Transient gates the buy loop retries
+    on its own (buy stagger, per-scan cap) are intentionally excluded.
+    """
+    blockers: list = []
+    strategy = _load_strategy()
+
+    if not strategy.get("trading_active", True):
+        blockers.append("bot_paused")
+    if get_mode() == "live" and connection.is_using_paper_fallback():
+        blockers.append("live_connection_down")
+
+    max_pos = int(strategy.get("max_positions", 10))
+    with _positions_lock:
+        n_open = len(_positions)
+        already_held = any(p["symbol"] == sym for p in _positions)
+    if n_open >= max_pos:
+        blockers.append(f"max_positions ({n_open}/{max_pos})")
+    if already_held:
+        blockers.append("already_held")
+
+    approved = {c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")}
+    if approved and sym not in approved:
+        blockers.append("not_in_approved_coins")
+
+    if _in_cooldown(sym):
+        blockers.append("cooldown_after_loss")
+    if _loss_cooldown.get(sym, 0) > time.time():
+        blockers.append("slippage_loss_cooldown")
+
+    if bool(strategy.get("macro_gate_enabled", True)):
+        _btc = get_btc_state()
+        if _btc and _btc.get("regime") == "bearish":
+            blockers.append("btc_bearish_macro_gate")
+
+    with _signal_cache_lock:
+        cached = _signal_cache.get(sym)
+    if not cached:
+        blockers.append("no_signal_data")
+        return {"ready": False, "blockers": blockers}
+
+    min_sigs = int(strategy.get("min_signals", config.MIN_SIGNALS_TO_BUY))
+    signal_engine_active = (
+        SIGNAL_REGISTRY_AVAILABLE
+        and bool(strategy.get("signal_engine", {}).get("enabled", False))
+    )
+    if not signal_engine_active:
+        if cached.get("score", 0) < min_sigs:
+            blockers.append(f"score {cached.get('score', 0)}/{min_sigs}")
+        if bool(strategy.get("mandatory_signals_enabled", True)):
+            sigs = cached.get("signals", {})
+            rsi_v = cached.get("rsi_val", 0.0)
+            rsi_threshold = float(strategy.get("rsi_buy_threshold", 40.0))
+            if not sigs.get("trend", False):
+                blockers.append("mandatory_ema_down")
+            if rsi_v <= 0 or rsi_v >= rsi_threshold:
+                blockers.append(f"rsi {rsi_v:.0f} >= {rsi_threshold:.0f}")
+
+    if not cached.get("bb_ok", True):
+        blockers.append("price_at_upper_bollinger")
+    if not cached.get("5m_ok", True):
+        blockers.append("5m_downtrend")
+
+    return {"ready": not blockers, "blockers": blockers}
+
+
 # ── BTC market regime filter ───────────────────────────────────────────────────
 _market_regime_cache: dict = {"ts": 0.0, "regime": "unknown", "details": {}}
 _MARKET_REGIME_TTL_SEC = 120.0
