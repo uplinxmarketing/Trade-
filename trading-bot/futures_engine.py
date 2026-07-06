@@ -64,8 +64,10 @@ _futures_settings: dict = {
 }
 _settings_lock = threading.Lock()
 
-# Spot REST endpoint — identical kline format to fapi, reliably reachable
-SPOT_API_BASE = "https://api.binance.com"
+# Spot REST endpoint — identical kline format to fapi. api.binance.com is
+# geo-blocked (HTTP 451) from this datacenter; data-api.binance.vision serves
+# the same public /api/v3/klines and is used by every other fallback in the repo.
+SPOT_API_BASE = "https://data-api.binance.vision"
 FSTREAM_WS    = "wss://fstream.binance.com/ws/!markPrice@arr@1s"
 
 
@@ -292,8 +294,11 @@ def _calc_budget(settings: dict, balance: float, open_margin: float = 0.0) -> fl
 
     if settings.get("budget_mode") == "percent":
         pct = float(settings.get("budget_pct", 10.0))
-        val = effective * (pct / 100.0)
-        return max(5.0, min(val, effective))
+        # Apply the 5 USDT minimum FIRST, then verify the floored budget still
+        # fits within the remaining allocation/balance. If it doesn't, return
+        # 0.0 so the caller skips the trade instead of exceeding the cap.
+        val = max(5.0, effective * (pct / 100.0))
+        return val if val <= effective else 0.0
 
     # Fixed mode: requested USDT, capped by what's actually available
     requested = float(settings.get("budget_usdt", config.FUTURES_BUDGET_USDT))
@@ -588,6 +593,16 @@ async def _run_scan():
     async with aiohttp.ClientSession() as session:
         for symbol in config.FUTURES_WATCHED_COINS:
             try:
+                # Recompute remaining allocation/budget before EACH symbol —
+                # positions opened earlier in this same scan consume margin,
+                # so a scan-start snapshot would let one scan blow through
+                # the allocation cap.
+                balance     = client.get_balance()
+                open_margin = sum(
+                    p.get("margin_usdt", 0.0) for p in client.get_open_positions()
+                )
+                budget = _calc_budget(settings, balance, open_margin)
+
                 score, direction = await _scan_symbol(
                     session, client, symbol,
                     min_sig, max_pos, leverage, budget,
@@ -667,7 +682,9 @@ async def _scan_symbol(
     direction = "LONG" if score >= min_sig else ("SHORT" if score <= -min_sig else "NONE")
 
     if score >= min_sig:
-        if n_open >= max_pos:
+        if budget <= 0:
+            print(f"[FuturesEngine] {symbol} score={score:+d} LONG signal — no allocation/budget remaining")
+        elif n_open >= max_pos:
             print(f"[FuturesEngine] {symbol} score={score:+d} LONG signal — max_pos {max_pos} reached")
         elif client.has_any_open_position(symbol):
             # Prevent hedging — never open opposite direction on the same coin.
@@ -692,7 +709,9 @@ async def _scan_symbol(
                 )
 
     elif score <= -min_sig:
-        if n_open >= max_pos:
+        if budget <= 0:
+            print(f"[FuturesEngine] {symbol} score={score:+d} SHORT signal — no allocation/budget remaining")
+        elif n_open >= max_pos:
             print(f"[FuturesEngine] {symbol} score={score:+d} SHORT signal — max_pos {max_pos} reached")
         elif client.has_any_open_position(symbol):
             print(f"[FuturesEngine] {symbol} score={score:+d} SHORT — already has position, skipping")

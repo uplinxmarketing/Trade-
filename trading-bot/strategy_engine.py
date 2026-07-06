@@ -6,8 +6,10 @@ Never executes trades — only writes strategy.json.
 """
 
 import asyncio
+import fcntl
 import json
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import config
@@ -22,6 +24,32 @@ def _load_strategy() -> dict:
             return json.load(f)
     except Exception:
         return {}
+
+
+@contextmanager
+def _strategy_file_lock():
+    """Exclusive file lock guarding strategy.json read-modify-write cycles.
+
+    NOTE on lock domains: control_api._write_strategy_patch serializes its own
+    writers on a module-private threading.Lock (_strategy_write_lock), which
+    does NOT protect against this module's writes — a Claude strategy write
+    could land between control_api's read and write (or vice versa) and
+    silently revert a user settings change. This lockfile (fcntl.flock on
+    strategy.json.lock) works across both threads and processes; control_api
+    should adopt this same lockfile so all strategy.json writers share one
+    lock domain.
+    """
+    lock_path = config.STRATEGY_FILE + ".lock"
+    f = open(lock_path, "w")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        f.close()
 
 
 def _atomic_write_strategy(data: dict):
@@ -85,12 +113,16 @@ def write_default_strategy():
     # ── Preserve existing strategy across redeploys ────────────────────────────────────────────────────────────────────────────────────
     if os.path.exists(config.STRATEGY_FILE):
         try:
-            with open(config.STRATEGY_FILE) as f:
-                existing = json.load(f)
+            # Read-modify-write under the shared file lock so a concurrent
+            # settings write can't be lost between our read and our write.
+            with _strategy_file_lock():
+                with open(config.STRATEGY_FILE) as f:
+                    existing = json.load(f)
+                if existing.get("approved_coins"):
+                    # Valid file — keep all user settings, just refresh the timestamp
+                    existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    _atomic_write_strategy(existing)
             if existing.get("approved_coins"):
-                # Valid file — keep all user settings, just refresh the timestamp
-                existing["updated_at"] = datetime.now(timezone.utc).isoformat()
-                _atomic_write_strategy(existing)
                 n = len(existing["approved_coins"])
                 active = existing.get("trading_active", True)
                 print(f"[StrategyEngine] strategy.json preserved — {n} coins, active={active}.")
@@ -130,7 +162,8 @@ def write_default_strategy():
         ],
         "next_review_seconds":  config.DECISION_INTERVAL_SEC,
     }
-    _atomic_write_strategy(strategy)
+    with _strategy_file_lock():
+        _atomic_write_strategy(strategy)
     print(f"[StrategyEngine] strategy.json created — {len(config.WATCHED_COINS)} coins.")
     return strategy
 
@@ -267,52 +300,39 @@ def run_strategy_once():
         if not strategy or "approved_coins" not in strategy:
             raise ValueError("Claude returned invalid strategy")
 
-        # Preserve the user's coin selection — never let Claude overwrite it.
-        # If the existing strategy has approved_coins set by the user (identified
-        # by a "user_selected" flag written when coins are saved via /api/strategy),
-        # restore those coins verbatim so the user's watchlist survives every cycle.
-        try:
-            with open(config.STRATEGY_FILE) as _fcoin:
-                _ecoin = json.load(_fcoin)
-            if _ecoin.get("user_selected_coins") and _ecoin.get("approved_coins"):
-                strategy["approved_coins"] = _ecoin["approved_coins"]
-                strategy["user_selected_coins"] = True
-        except Exception:
-            pass
+        # Merge Claude's output INTO the current file rather than replacing it.
+        # Claude's schema only produces the keys below; every other key in
+        # strategy.json (protection toggles, budget/risk settings, notes —
+        # e.g. bot_allocation_usdt, stop_loss_*, take_profit_*, max_positions,
+        # min_signals, budget_*, macro_gate_enabled, claude_agent_enabled, …)
+        # is user/API-owned and must survive every Claude write verbatim.
+        # NOTE: trading_active is intentionally NOT overlaid from Claude — we
+        # force it below so Claude can never silently stop the bot; an explicit
+        # user stop (trading_active=False via /api/stop) is always honoured.
+        _CLAUDE_OWNED_KEYS = ["approved_coins", "pause_reason", "next_review_seconds"]
 
-        # Preserve ALL user-configured fields — Claude's schema only contains
-        # approved_coins / trading_active / next_review_seconds; anything else
-        # (risk settings, budget, notes) must survive every Claude write.
-        # NOTE: trading_active is intentionally NOT in this list — we always
-        # force it to True below so Claude can never silently stop the bot.
-        # Use /api/stop to pause; that writes False and it is preserved here.
-        _PRESERVED_KEYS = [
-            "initial_balance_usdt",
-            "stop_loss_enabled", "stop_loss_pct",
-            "take_profit_enabled", "take_profit_pct",
-            "smart_hold_enabled", "trailing_stop_pct",
-            "reinvest_profits",
-            "max_positions", "min_signals", "strategy_notes",
-            "budget_mode", "budget_fixed_usdt", "budget_pct_of_free",
-            "budget_total_cap_usdt", "budget_per_coin", "budget_coin_pct",
-        ]
-        try:
-            with open(config.STRATEGY_FILE) as _f:
-                _existing = json.load(_f)
-            for key in _PRESERVED_KEYS:
-                if key in _existing:
-                    strategy[key] = _existing[key]
-            # Honour an explicit user-initiated stop (trading_active=False written
-            # by /api/stop); ignore Claude's own value either way.
-            if _existing.get("trading_active") is False:
-                strategy["trading_active"] = False
-            else:
-                strategy["trading_active"] = True
-        except Exception:
-            strategy["trading_active"] = True
+        # Do the read-merge-write under the strategy file lock so a concurrent
+        # settings write (control_api) can't be clobbered by this write.
+        with _strategy_file_lock():
+            _existing = _load_strategy()
+            merged = dict(_existing)
+            for key in _CLAUDE_OWNED_KEYS:
+                if key in strategy:
+                    merged[key] = strategy[key]
 
-        strategy["updated_at"] = datetime.now(timezone.utc).isoformat()
-        _atomic_write_strategy(strategy)
+            # Preserve the user's coin selection — never let Claude overwrite it.
+            # (Flag written when coins are saved via /api/strategy.)
+            if _existing.get("user_selected_coins") and _existing.get("approved_coins"):
+                merged["approved_coins"] = _existing["approved_coins"]
+                merged["user_selected_coins"] = True
+
+            # Honour an explicit user-initiated stop; ignore Claude's own value.
+            merged["trading_active"] = False if _existing.get("trading_active") is False else True
+
+            merged["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _atomic_write_strategy(merged)
+
+        strategy = merged
 
         active  = strategy.get("trading_active", True)
         n_approved = sum(1 for c in strategy.get("approved_coins", []) if c.get("approved"))

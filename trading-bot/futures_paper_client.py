@@ -8,9 +8,11 @@ Position P&L formula (isolated margin):
   LONG  pnl = (exit - entry) * qty - fees   (qty = margin * leverage / entry)
   SHORT pnl = (entry - exit) * qty - fees
 
-Liquidation (simplified, no maintenance margin buffer):
-  LONG  liq = entry * (1 - 1/leverage)
-  SHORT liq = entry * (1 + 1/leverage)
+Liquidation (simplified isolated-margin model with maintenance margin):
+  LONG  liq = entry * (1 - 1/leverage + MAINT_MARGIN_RATE)
+  SHORT liq = entry * (1 + 1/leverage - MAINT_MARGIN_RATE)
+i.e. liquidation triggers slightly BEFORE the bankruptcy price (100% margin
+loss), matching how real exchanges liquidate once maintenance margin is hit.
 """
 
 import math
@@ -22,6 +24,7 @@ from typing import Dict, List, Optional
 import database
 
 FEE_RATE = 0.0004   # typical Binance USDT-M taker fee
+MAINT_MARGIN_RATE = 0.005   # simplified maintenance margin rate (0.5%)
 
 
 class FuturesPaperClient:
@@ -102,30 +105,37 @@ class FuturesPaperClient:
     ) -> Optional[dict]:
         """Reserve margin and persist a new futures position. Returns position dict or None."""
         with self._lock:
-            if self._usdt < margin_usdt:
+            # Balance must cover margin PLUS the open fee (both are deducted below)
+            fee = margin_usdt * leverage * FEE_RATE
+            if self._usdt < margin_usdt + fee:
                 print(f"[FuturesPaper] Insufficient balance for {symbol}: "
-                      f"need {margin_usdt:.2f}, have {self._usdt:.2f}")
+                      f"need {margin_usdt + fee:.2f} (margin+fee), have {self._usdt:.2f}")
                 return None
 
             qty = math.floor((margin_usdt * leverage / entry_price) * 1e8) / 1e8
             if qty <= 0:
                 return None
 
-            fee = margin_usdt * leverage * FEE_RATE
             self._usdt -= (margin_usdt + fee)
 
             # Store open_fee in position dict so close_position can include it
             # in net_profit reporting (it was already deducted from balance above).
             open_fee = fee
 
+            # Liquidation price (isolated margin, simplified):
+            #   LONG:  liq = entry * (1 - 1/leverage + MAINT_MARGIN_RATE)
+            #   SHORT: liq = entry * (1 + 1/leverage - MAINT_MARGIN_RATE)
+            # The maintenance-margin term pulls liquidation CLOSER to entry than
+            # the bankruptcy price (entry * (1 ∓ 1/leverage)), so a position is
+            # liquidated slightly before losing 100% of its margin — never after.
             if direction == "LONG":
                 take_profit       = entry_price * (1 + tp_pct)
                 stop_loss         = entry_price * (1 - sl_pct) if sl_enabled else None
-                liquidation_price = entry_price * (1 - 1 / leverage) * 0.99
+                liquidation_price = entry_price * (1 - 1 / leverage + MAINT_MARGIN_RATE)
             else:
                 take_profit       = entry_price * (1 - tp_pct)
                 stop_loss         = entry_price * (1 + sl_pct) if sl_enabled else None
-                liquidation_price = entry_price * (1 + 1 / leverage) * 1.01
+                liquidation_price = entry_price * (1 + 1 / leverage - MAINT_MARGIN_RATE)
 
             ts = datetime.now(timezone.utc).isoformat()
             pos = {
@@ -182,13 +192,18 @@ class FuturesPaperClient:
             # net_profit for correct P&L reporting but NOT in margin_returned.
             open_fee  = pos.get("open_fee", pos["margin_usdt"] * pos.get("leverage", 1) * FEE_RATE)
             close_fee = qty * exit_price * FEE_RATE
-            net_pnl   = gross_pnl - open_fee - close_fee
 
             # Balance: return margin + gross profit − close fee only
             # (open_fee was already deducted when opening; don't deduct it again)
             margin_returned = pos["margin_usdt"] + gross_pnl - close_fee
             if margin_returned < 0:
                 margin_returned = 0.0    # liquidated — lose entire margin
+
+            # Recorded net P&L must equal the actual cash delta of this trade:
+            #   cash delta = margin_returned − margin − open_fee
+            # (equivalent to gross_pnl − open_fee − close_fee, but clamped so a
+            # liquidation never records a bigger loss than the wallet took).
+            net_pnl = margin_returned - pos["margin_usdt"] - open_fee
 
             self._usdt += margin_returned
             del self._positions[pos_id]

@@ -56,8 +56,10 @@ export default function MarketStatsBar({ activeCoin, prices }: Props) {
   useEffect(() => {
     if (!activeCoin) return;
     fetch(`/api/proxy/binance/ticker/24hr?symbol=${activeCoin}`)
-      .then(r => r.json())
-      .then(setTicker)
+      .then(r => (r.ok ? r.json() : null))
+      // Skip update on error responses — keep the last good ticker instead of
+      // poisoning state with an error envelope ({error: ...} → NaN stats).
+      .then(d => { if (d && !d.error && d.highPrice !== undefined) setTicker(d); })
       .catch(() => {});
   }, [activeCoin]);
 

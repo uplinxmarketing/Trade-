@@ -8,32 +8,68 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
 
 # DATA_DIR stores the SQLite database and strategy.json.
-# Tries in order: DATA_DIR env var → /opt/tradebot/data (VPS, outside git
-# checkout) → /data (Railway) → script directory (last resort).
+# Resolution order (never inside the git working tree unless nothing else works):
+#   DATA_DIR env var → /opt/tradebot/data (if it already exists) → /data
+#   (Railway volume, if it already exists) → ~/.wolfbot/data (created) →
+#   script directory (last resort, with a loud warning — deploys/clones can
+#   clobber a DB stored inside the checkout).
+def _dir_writable(candidate: str, create: bool = True) -> bool:
+    try:
+        if create:
+            os.makedirs(candidate, exist_ok=True)
+        elif not os.path.isdir(candidate):
+            return False
+        probe = os.path.join(candidate, ".write_probe")
+        with open(probe, "w") as _f:
+            _f.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
 def _resolve_data_dir() -> str:
     _script_dir = os.path.dirname(os.path.abspath(__file__))
-    _candidates = [
-        os.getenv("DATA_DIR"),
-        os.path.join(_script_dir, "..", "data"),  # /opt/tradebot/data
-        "/data",
-        _script_dir,
-    ]
-    for candidate in _candidates:
-        if not candidate:
-            continue
-        try:
-            os.makedirs(candidate, exist_ok=True)
-            probe = os.path.join(candidate, ".write_probe")
-            with open(probe, "w") as _f:
-                _f.write("ok")
-            os.remove(probe)
+
+    env_dir = os.getenv("DATA_DIR")
+    if env_dir and _dir_writable(env_dir, create=True):
+        return env_dir
+
+    # Pre-existing system locations — never created here (need root / a mount)
+    for candidate in ("/opt/tradebot/data", "/data"):
+        if _dir_writable(candidate, create=False):
             return candidate
-        except OSError:
-            continue
+
+    home_dir = os.path.join(os.path.expanduser("~"), ".wolfbot", "data")
+    if _dir_writable(home_dir, create=True):
+        return home_dir
+
+    print("[Database] WARNING: falling back to a data dir INSIDE the git "
+          f"checkout ({_script_dir}) — a redeploy, fresh clone, or 'git clean' "
+          "can destroy the database. Set DATA_DIR to a persistent path.")
     return _script_dir
 
 _DATA_DIR = _resolve_data_dir()
 DB_PATH = os.path.join(_DATA_DIR, "bot.db")
+
+# One-time migration: older builds stored bot.db at <repo>/data/bot.db (inside
+# the git working tree). If that file exists and the new location is empty,
+# COPY it over so history survives — the old file is left in place untouched.
+def _migrate_legacy_db():
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    legacy = os.path.abspath(os.path.join(_script_dir, "..", "data", "bot.db"))
+    if legacy == os.path.abspath(DB_PATH):
+        return
+    if os.path.exists(legacy) and not os.path.exists(DB_PATH):
+        try:
+            import shutil
+            shutil.copy2(legacy, DB_PATH)
+            print(f"[Database] Migrated existing database: copied {legacy} → {DB_PATH} "
+                  "(old file kept as-is)")
+        except OSError as e:
+            print(f"[Database] WARNING: could not migrate legacy DB {legacy} → {DB_PATH}: {e}")
+
+_migrate_legacy_db()
 _lock = threading.Lock()
 
 import time as _time
@@ -281,6 +317,26 @@ def init_db():
             except Exception:
                 pass  # column already exists — SQLite has no IF NOT EXISTS for ALTER
 
+        # ── Trade dedupe index ────────────────────────────────────────────────
+        # import_trades relies on INSERT OR IGNORE, which is a no-op without a
+        # UNIQUE constraint. Clean up existing exact-duplicate rows first
+        # (keep lowest id) so index creation cannot fail on legacy data.
+        try:
+            c.execute("""
+                DELETE FROM trades WHERE id NOT IN (
+                    SELECT MIN(id) FROM trades
+                    GROUP BY coin, mode, entry_price, exit_price, quantity,
+                             timestamp_buy, timestamp_sell
+                )
+            """)
+            c.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_dedupe
+                ON trades(coin, mode, entry_price, exit_price, quantity,
+                          timestamp_buy, timestamp_sell)
+            """)
+        except Exception as e:
+            print(f"[Database] WARNING: trade dedupe index not created: {e}")
+
         conn.commit()
         conn.close()
     print("Database initialised.")
@@ -485,16 +541,19 @@ def load_positions(mode: str = None) -> List[dict]:
 
 
 def migrate_positions_mode(mode: str):
-    """Set mode on all positions that have a wrong/missing mode tag.
+    """Set mode on positions that have a MISSING or unknown mode tag only.
     Called once on startup when the filtered query returns nothing but the
     unfiltered table has rows — happens when positions were saved before the
-    mode-isolation fix (they default to 'paper' regardless of actual mode).
+    mode-isolation fix. Rows already carrying a valid mode ('paper'/'live'/
+    'testnet') are NEVER re-tagged — re-tagging opposite-mode rows would turn
+    paper positions into live ones (real sells) and vice versa.
     """
     with _lock:
         conn = _conn()
         conn.execute(
-            "UPDATE positions SET mode=? WHERE mode IS NULL OR mode != ?",
-            (mode, mode)
+            "UPDATE positions SET mode=? "
+            "WHERE mode IS NULL OR mode NOT IN ('paper','live','testnet')",
+            (mode,)
         )
         conn.commit()
         conn.close()
@@ -533,11 +592,12 @@ def load_paper_state() -> Optional[dict]:
 
 
 def reset_paper_wallet(starting_usdt: float):
-    """Wipe all trades, positions, and activity log. Restore starting USDT balance."""
+    """Wipe PAPER trades, PAPER positions, and the activity log.
+    Live/testnet rows are never touched — this is a paper-wallet reset only."""
     with _lock:
         conn = _conn()
-        conn.execute("DELETE FROM trades")
-        conn.execute("DELETE FROM positions")
+        conn.execute("DELETE FROM trades WHERE mode='paper'")
+        conn.execute("DELETE FROM positions WHERE mode='paper'")
         conn.execute("DELETE FROM activity_log")
         conn.execute("""
             INSERT INTO paper_state (id, balances, updated_at)

@@ -68,8 +68,9 @@ const OrderBookPanel = ({ activeCoin, prices }: Props) => {
       if (statsAbort.current) statsAbort.current.abort();
       statsAbort.current = new AbortController();
       fetch(`/api/proxy/binance/ticker/24hr?symbol=${activeCoin}`, { signal: statsAbort.current.signal })
-        .then(r => r.json())
-        .then((d: Stats24h) => setStats(d))
+        .then(r => (r.ok ? r.json() : null))
+        // Skip update on error responses — never store an {error: ...} envelope
+        .then((d: any) => { if (d && !d.error && d.highPrice !== undefined) setStats(d as Stats24h); })
         .catch(() => {});
     };
 

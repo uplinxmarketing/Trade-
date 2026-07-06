@@ -14,11 +14,21 @@ import sqlite3
 import sys
 import os
 
-DB_PATH = os.getenv("DB_PATH", "/opt/tradebot/data/bot.db")
+# Use the same resolved DB path as the running bot (database._resolve_data_dir)
+# so this script can never open/create a different, empty database.
+# An explicit DB_PATH env var still wins for one-off runs against a copy.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import database
+
+DB_PATH = os.getenv("DB_PATH") or database.DB_PATH
 BACKUP_PATH = DB_PATH + ".backup_before_pnl_fix"
 EPSILON = 0.0005   # rows within this tolerance are considered already correct
 
 dry_run = "--commit" not in sys.argv
+
+if not os.path.exists(DB_PATH):
+    print(f"ERROR: database not found at {DB_PATH} — refusing to create an empty one.")
+    sys.exit(1)
 
 conn = sqlite3.connect(DB_PATH)
 conn.row_factory = sqlite3.Row

@@ -336,6 +336,10 @@ const FuturesAgent = () => {
   });
 
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsLoading, setSettingsLoading] = useState(false);
+  // Keys the user actually changed in the panel — Save only sends these, so
+  // fields the frontend never loaded can't silently overwrite server values.
+  const dirtyRef = useRef<Set<keyof FuturesSettings>>(new Set());
   const [showSignals, setShowSignals]   = useState(false);
   const [showTrades, setShowTrades]     = useState(false);
   const [showReports, setShowReports]   = useState(false);
@@ -344,6 +348,7 @@ const FuturesAgent = () => {
   const [pollError, setPollError]       = useState(false);
   const pollRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inFlightRef = useRef(false);
+  const disposedRef = useRef(false);
   const fundingCountdown = useFundingCountdown();
 
   // ── Poll ──────────────────────────────────────────────────────────────────
@@ -369,13 +374,15 @@ const FuturesAgent = () => {
         setSignals(arr);
       }
       if (d.status) {
+        // Never overwrite fields the user is currently editing (dirty keys).
+        const dirty = dirtyRef.current;
         setSettings(s => ({
           ...s,
-          stop_loss_enabled: d.status.stop_loss_enabled ?? s.stop_loss_enabled,
-          budget_mode:       d.status.budget_mode       ?? s.budget_mode,
-          budget_pct:        d.status.budget_pct        ?? s.budget_pct,
-          allocation_usdt:   d.status.allocation_usdt   ?? s.allocation_usdt,
-          budget_usdt:       d.status.budget_usdt       ?? s.budget_usdt,
+          stop_loss_enabled: dirty.has('stop_loss_enabled') ? s.stop_loss_enabled : (d.status.stop_loss_enabled ?? s.stop_loss_enabled),
+          budget_mode:       dirty.has('budget_mode')       ? s.budget_mode       : (d.status.budget_mode       ?? s.budget_mode),
+          budget_pct:        dirty.has('budget_pct')        ? s.budget_pct        : (d.status.budget_pct        ?? s.budget_pct),
+          allocation_usdt:   dirty.has('allocation_usdt')   ? s.allocation_usdt   : (d.status.allocation_usdt   ?? s.allocation_usdt),
+          budget_usdt:       dirty.has('budget_usdt')       ? s.budget_usdt       : (d.status.budget_usdt       ?? s.budget_usdt),
         }));
       }
       setPollError(false);
@@ -383,13 +390,19 @@ const FuturesAgent = () => {
       setPollError(true);
     } finally {
       inFlightRef.current = false;
-      pollRef.current = setTimeout(poll, POLL_MS);
+      // Do not re-arm after unmount — a fetch in flight during cleanup would
+      // otherwise install a fresh timer that nothing ever clears.
+      if (!disposedRef.current) pollRef.current = setTimeout(poll, POLL_MS);
     }
   }, []);
 
   useEffect(() => {
+    disposedRef.current = false;
     poll();
-    return () => { if (pollRef.current) clearTimeout(pollRef.current); };
+    return () => {
+      disposedRef.current = true;
+      if (pollRef.current) clearTimeout(pollRef.current);
+    };
   }, [poll]);
 
   // ── Actions ───────────────────────────────────────────────────────────────
@@ -476,20 +489,65 @@ const FuturesAgent = () => {
     }
   };
 
+  // Panel edits go through this so Save knows exactly which fields changed.
+  const updateSetting = useCallback((patch: Partial<FuturesSettings>) => {
+    (Object.keys(patch) as (keyof FuturesSettings)[]).forEach(k => dirtyRef.current.add(k));
+    setSettings(s => ({ ...s, ...patch }));
+  }, []);
+
+  // Load persisted settings from the backend before allowing edits/save, so the
+  // panel doesn't show hardcoded defaults that Save would then write back.
+  const openSettings = useCallback(async () => {
+    const next = !showSettings;
+    setShowSettings(next);
+    if (!next) return;
+    dirtyRef.current.clear();
+    setSettingsLoading(true);
+    try {
+      const resp = await apiFetch('/api/futures/settings');
+      if (resp.ok) {
+        const d = await resp.json();
+        const src = (d && typeof d === 'object' && d.settings && typeof d.settings === 'object') ? d.settings : d;
+        if (src && typeof src === 'object' && !src.error) {
+          setSettings(s => ({
+            ...s,
+            leverage:          src.leverage          !== undefined ? Number(src.leverage)          : s.leverage,
+            budget_usdt:       src.budget_usdt       !== undefined ? Number(src.budget_usdt)       : s.budget_usdt,
+            budget_mode:       src.budget_mode       !== undefined ? src.budget_mode               : s.budget_mode,
+            budget_pct:        src.budget_pct        !== undefined ? Number(src.budget_pct)        : s.budget_pct,
+            allocation_usdt:   src.allocation_usdt   !== undefined ? Number(src.allocation_usdt)   : s.allocation_usdt,
+            take_profit_pct:   src.take_profit_pct   !== undefined ? Number(src.take_profit_pct)   : s.take_profit_pct,
+            stop_loss_pct:     src.stop_loss_pct     !== undefined ? Number(src.stop_loss_pct)     : s.stop_loss_pct,
+            stop_loss_enabled: src.stop_loss_enabled !== undefined ? Boolean(src.stop_loss_enabled): s.stop_loss_enabled,
+            min_signals:       src.min_signals       !== undefined ? Number(src.min_signals)       : s.min_signals,
+            max_positions:     src.max_positions     !== undefined ? Number(src.max_positions)     : s.max_positions,
+          }));
+          dirtyRef.current.clear();
+        }
+      }
+      // Endpoint missing (404/405) is tolerated — dirty-only save still
+      // prevents unloaded fields from being overwritten with defaults.
+    } catch { /* bot unreachable — panel keeps current values, save is dirty-only */ }
+    finally { setSettingsLoading(false); }
+  }, [showSettings]);
+
   const handleSaveSettings = async () => {
-    const res = await postAction('/api/futures/settings', {
-      leverage:          settings.leverage,
-      budget_usdt:       settings.budget_usdt,
-      budget_mode:       settings.budget_mode,
-      budget_pct:        settings.budget_pct,
-      allocation_usdt:   settings.allocation_usdt,
-      take_profit_pct:   settings.take_profit_pct,
-      stop_loss_pct:     settings.stop_loss_pct,
-      stop_loss_enabled: settings.stop_loss_enabled,
-      min_signals:       settings.min_signals,
-      max_positions:     settings.max_positions,
-    });
-    if (res) { toast.success('Futures settings saved'); setShowSettings(false); }
+    if (dirtyRef.current.size === 0) {
+      toast.info('No settings changed');
+      setShowSettings(false);
+      return;
+    }
+    // Send ONLY user-changed fields — never stale defaults for unloaded keys.
+    const payload: Partial<Record<keyof FuturesSettings, unknown>> = {};
+    dirtyRef.current.forEach(k => { payload[k] = settings[k]; });
+    const res = await postAction('/api/futures/settings', payload);
+    if (res && res.success !== false) {
+      toast.success('Futures settings saved');
+      dirtyRef.current.clear();
+      setShowSettings(false);
+    } else if (res) {
+      toast.error(res.error ?? 'Failed to save futures settings');
+    }
   };
 
   // ── Derived values ────────────────────────────────────────────────────────
@@ -552,7 +610,7 @@ const FuturesAgent = () => {
             SL {slEnabled ? 'ON' : 'OFF'}
           </button>
           <Button variant="ghost" size="icon" className="h-7 w-7"
-            onClick={() => setShowSettings(v => !v)} title="Settings">
+            onClick={openSettings} title="Settings">
             <Settings className="w-3.5 h-3.5" />
           </Button>
           <Button variant="ghost" size="icon" className="h-7 w-7"
@@ -669,7 +727,7 @@ const FuturesAgent = () => {
               <div className="flex gap-1 mt-1 flex-wrap">
                 {[2, 3, 5, 10, 20].map(lv => (
                   <button key={lv}
-                    onClick={() => setSettings(s => ({ ...s, leverage: lv }))}
+                    onClick={() => updateSetting({ leverage: lv })}
                     className={`px-2 py-0.5 rounded text-[10px] font-medium border transition-colors ${
                       settings.leverage === lv
                         ? 'bg-accent text-accent-foreground border-accent'
@@ -686,7 +744,7 @@ const FuturesAgent = () => {
               <div className="flex gap-1 mt-1">
                 {[1, 2, 3, 4, 5, 6].map(n => (
                   <button key={n}
-                    onClick={() => setSettings(s => ({ ...s, min_signals: n }))}
+                    onClick={() => updateSetting({ min_signals: n })}
                     className={`px-2 py-0.5 rounded text-[10px] font-medium border transition-colors ${
                       settings.min_signals === n
                         ? 'bg-accent text-accent-foreground border-accent'
@@ -702,7 +760,7 @@ const FuturesAgent = () => {
               <label className="text-[10px] text-muted-foreground">Total Allocation (USDT)</label>
               <input type="number" min={0} max={100000} step={50}
                 value={settings.allocation_usdt}
-                onChange={e => setSettings(s => ({ ...s, allocation_usdt: Number(e.target.value) }))}
+                onChange={e => updateSetting({ allocation_usdt: Number(e.target.value) })}
                 className="w-full mt-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono"
                 placeholder="0 = unlimited"
               />
@@ -719,7 +777,7 @@ const FuturesAgent = () => {
               <div className="flex gap-1 mt-1">
                 {(['fixed', 'percent'] as const).map(m => (
                   <button key={m}
-                    onClick={() => setSettings(s => ({ ...s, budget_mode: m }))}
+                    onClick={() => updateSetting({ budget_mode: m })}
                     className={`flex-1 px-2 py-0.5 rounded text-[10px] font-medium border transition-colors ${
                       settings.budget_mode === m
                         ? 'bg-accent text-accent-foreground border-accent'
@@ -731,7 +789,7 @@ const FuturesAgent = () => {
               {settings.budget_mode === 'fixed' ? (
                 <input type="number" min={10} max={10000} step={10}
                   value={settings.budget_usdt}
-                  onChange={e => setSettings(s => ({ ...s, budget_usdt: Number(e.target.value) }))}
+                  onChange={e => updateSetting({ budget_usdt: Number(e.target.value) })}
                   className="w-full mt-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono"
                   placeholder="USDT per trade"
                 />
@@ -739,7 +797,7 @@ const FuturesAgent = () => {
                 <div className="flex items-center gap-1 mt-1">
                   <input type="number" min={1} max={100} step={1}
                     value={settings.budget_pct}
-                    onChange={e => setSettings(s => ({ ...s, budget_pct: Number(e.target.value) }))}
+                    onChange={e => updateSetting({ budget_pct: Number(e.target.value) })}
                     className="flex-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono"
                     placeholder="% of balance"
                   />
@@ -753,7 +811,7 @@ const FuturesAgent = () => {
               <label className="text-[10px] text-muted-foreground">Max Open Positions</label>
               <input type="number" min={1} max={100}
                 value={settings.max_positions}
-                onChange={e => setSettings(s => ({ ...s, max_positions: Number(e.target.value) }))}
+                onChange={e => updateSetting({ max_positions: Number(e.target.value) })}
                 className="w-full mt-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono"
               />
             </div>
@@ -763,7 +821,7 @@ const FuturesAgent = () => {
               <label className="text-[10px] text-muted-foreground">Take Profit %</label>
               <input type="number" min={0.1} max={50} step={0.1}
                 value={(settings.take_profit_pct * 100).toFixed(1)}
-                onChange={e => setSettings(s => ({ ...s, take_profit_pct: Number(e.target.value) / 100 }))}
+                onChange={e => updateSetting({ take_profit_pct: Number(e.target.value) / 100 })}
                 className="w-full mt-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono"
               />
               <div className="text-[9px] text-muted-foreground mt-0.5">
@@ -778,11 +836,11 @@ const FuturesAgent = () => {
                 <input type="number" min={0.1} max={50} step={0.1}
                   value={(settings.stop_loss_pct * 100).toFixed(1)}
                   disabled={!settings.stop_loss_enabled}
-                  onChange={e => setSettings(s => ({ ...s, stop_loss_pct: Number(e.target.value) / 100 }))}
+                  onChange={e => updateSetting({ stop_loss_pct: Number(e.target.value) / 100 })}
                   className="flex-1 bg-muted/30 border border-border rounded px-2 py-1 text-xs font-mono disabled:opacity-40"
                 />
                 <button
-                  onClick={() => setSettings(s => ({ ...s, stop_loss_enabled: !s.stop_loss_enabled }))}
+                  onClick={() => updateSetting({ stop_loss_enabled: !settings.stop_loss_enabled })}
                   className={`px-2 py-1 rounded text-[10px] font-medium border transition-colors flex-shrink-0 ${
                     settings.stop_loss_enabled
                       ? 'bg-gain/10 border-gain/30 text-gain'
@@ -793,8 +851,8 @@ const FuturesAgent = () => {
             </div>
           </div>
 
-          <Button onClick={handleSaveSettings} disabled={loading} className="w-full" size="sm">
-            Save Settings
+          <Button onClick={handleSaveSettings} disabled={loading || settingsLoading} className="w-full" size="sm">
+            {settingsLoading ? 'Loading settings…' : 'Save Settings'}
           </Button>
         </div>
       )}

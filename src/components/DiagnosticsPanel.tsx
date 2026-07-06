@@ -134,6 +134,10 @@ export function DiagnosticsPanel() {
   const [claudeEnabled, setClaudeEnabled] = useState<boolean | null>(null);
   const [claudeKeyOk, setClaudeKeyOk]     = useState(false);
   const [claudeToggling, setClaudeToggling] = useState(false);
+  // Staleness tracking: without this, one successful poll freezes the panel
+  // on green dots forever even after the bot dies.
+  const [lastOkAt, setLastOkAt]     = useState(0);
+  const [failCount, setFailCount]   = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -142,9 +146,9 @@ export function DiagnosticsPanel() {
         const r = await fetch('/api/diagnostics');
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
-        if (!cancelled) { setDiag(data); setError(null); }
+        if (!cancelled) { setDiag(data); setError(null); setLastOkAt(Date.now()); setFailCount(0); }
       } catch (e: unknown) {
-        if (!cancelled) setError((e as Error).message ?? 'fetch failed');
+        if (!cancelled) { setError((e as Error).message ?? 'fetch failed'); setFailCount(c => c + 1); }
       }
     }
     poll();
@@ -175,7 +179,13 @@ export function DiagnosticsPanel() {
     }
   }
 
+  // Stale = the last two polls failed, or no successful poll in ~15 s.
+  // When stale, every status dot must go red — the snapshot is no longer live.
+  const stale = failCount >= 2 || (lastOkAt > 0 && Date.now() - lastOkAt > 15_000);
+  const staleAgeSec = lastOkAt > 0 ? Math.round((Date.now() - lastOkAt) / 1000) : null;
+
   const overallOk =
+    !stale &&
     (diag?.binance.rest_ok ?? false) &&
     (diag?.websocket.connected ?? false) &&
     (diag?.sell_monitor.alive ?? false) &&
@@ -255,10 +265,18 @@ export function DiagnosticsPanel() {
       </div>
 
       <div className="p-3 space-y-3 max-h-[80vh] overflow-y-auto">
+        {/* Stale / disconnected banner */}
+        {stale && (
+          <div className="bg-red-900/40 border border-red-700 text-red-300 rounded px-2 py-1.5 text-[10px]">
+            Diagnostics stale — bot unreachable
+            {staleAgeSec != null && <> (last update {staleAgeSec}s ago)</>}.
+            {error && <div className="truncate text-red-400/70 mt-0.5">↳ {error}</div>}
+          </div>
+        )}
         {/* Binance REST */}
         <section>
           <div className="flex items-center gap-2 mb-1">
-            <StatusDot ok={diag.binance.rest_ok} />
+            <StatusDot ok={!stale && diag.binance.rest_ok} />
             <span className="font-semibold">Binance REST</span>
             <span className="ml-auto text-gray-500 text-[10px]">
               {diag.binance.last_latency_ms}ms · {diag.binance.last_rest_age_sec ?? '—'}s ago
@@ -284,7 +302,7 @@ export function DiagnosticsPanel() {
         {/* WebSocket */}
         <section>
           <div className="flex items-center gap-2 mb-1">
-            <StatusDot ok={diag.websocket.connected} />
+            <StatusDot ok={!stale && diag.websocket.connected} />
             <span className="font-semibold">WebSocket</span>
             <span className="ml-auto text-gray-500 text-[10px]">
               {diag.websocket.last_message_age_sec != null
@@ -302,7 +320,7 @@ export function DiagnosticsPanel() {
         <section>
           <div className="flex items-center gap-2 mb-1">
             <StatusDot
-              ok={(diag.signal_scanner.last_refresh_age_sec ?? 999) < diag.signal_scanner.interval_sec * 2}
+              ok={!stale && (diag.signal_scanner.last_refresh_age_sec ?? 999) < diag.signal_scanner.interval_sec * 2}
             />
             <span className="font-semibold">Signal Scan</span>
             <span className="ml-auto text-gray-500 text-[10px]">
@@ -318,7 +336,7 @@ export function DiagnosticsPanel() {
 
         {/* Sell monitor */}
         <section className="flex items-center gap-2">
-          <StatusDot ok={diag.sell_monitor.alive} />
+          <StatusDot ok={!stale && diag.sell_monitor.alive} />
           <span className="font-semibold">Sell Monitor</span>
           <span className="ml-auto text-[10px] text-gray-500">
             hb {diag.sell_monitor.heartbeat_age_sec ?? '—'}s · {diag.sell_monitor.open_positions} pos
@@ -330,7 +348,7 @@ export function DiagnosticsPanel() {
 
         {/* Price refresher */}
         <section className="flex items-center gap-2">
-          <StatusDot ok={diag.price_refresher.alive} />
+          <StatusDot ok={!stale && diag.price_refresher.alive} />
           <span className="font-semibold">Price Refresher</span>
           <span className="ml-auto text-[10px] text-gray-500">
             {diag.price_refresher.alive ? 'running' : <span className="text-red-400">stopped</span>}

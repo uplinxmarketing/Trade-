@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { API_BASE } from '@/config';
 import TopBar from '@/components/dashboard/TopBar';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
@@ -125,8 +125,20 @@ const Index = () => {
     })();
   }, []);
 
+  // True once the mode has been confirmed by a successful backend response.
+  // Until then the localStorage seed is display-only and must not be
+  // re-persisted (a stale 'live' would otherwise refresh itself forever).
+  const modeVerifiedRef = useRef(false);
+
+  const setVerifiedConnected = useCallback((connected: boolean) => {
+    modeVerifiedRef.current = true;
+    setBinanceConnected(connected);
+  }, []);
+
   // Persist mode to localStorage so any reload/device restores state instantly.
+  // Only after backend verification — never write back the unverified seed.
   useEffect(() => {
+    if (!modeVerifiedRef.current) return;
     try { localStorage.setItem('binance_mode', binanceConnected ? 'live' : 'paper'); }
     catch { /* quota */ }
   }, [binanceConnected]);
@@ -140,10 +152,10 @@ const Index = () => {
         const res = await fetch(`${API_BASE}/api/status`, { cache: 'no-store' });
         if (!res.ok) return;
         const d = await res.json();
-        setBinanceConnected(d.mode === 'live');
+        setVerifiedConnected(d.mode === 'live');
       } catch { /* bot unreachable — keep localStorage value */ }
     })();
-  }, []);
+  }, [setVerifiedConnected]);
 
   const handleModeChange = useCallback((_m: 'test' | 'live') => {
     if (!binanceConnected) {
@@ -164,7 +176,7 @@ const Index = () => {
       <BinanceConnect
         isOpen={showBinanceConnect}
         onClose={() => setShowBinanceConnect(false)}
-        onConnectionChange={setBinanceConnected}
+        onConnectionChange={setVerifiedConnected}
       />
 
       {/* Main 3-column layout: coin list | content | chat */}
@@ -218,7 +230,7 @@ const Index = () => {
               prices={prices}
               binanceConnected={binanceConnected}
               onConnectBinance={() => setShowBinanceConnect(true)}
-              onLiveModeDetected={setBinanceConnected}
+              onLiveModeDetected={setVerifiedConnected}
               onStateChange={(pos, bal, initBal, trades) => {
                 setAgentPositions(pos);
                 setAgentBalance(bal);

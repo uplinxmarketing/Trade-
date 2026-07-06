@@ -20,6 +20,10 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
     const toastId = toast.loading('Reconciling positions with Binance…');
     try {
       const res  = await fetch('/api/reconcile', { cache: 'no-store' });
+      if (!res.ok) {
+        toast.error('Reconcile failed', { id: toastId, description: `Bot returned HTTP ${res.status}` });
+        return;
+      }
       const data = await res.json();
       if (data.error) {
         toast.error('Reconcile failed', { id: toastId, description: data.error });

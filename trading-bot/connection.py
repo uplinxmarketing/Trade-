@@ -10,19 +10,30 @@ from dotenv import load_dotenv
 # Use absolute path so the correct .env is found regardless of systemd WorkingDirectory.
 _ENV_PATH = pathlib.Path(__file__).parent / ".env"
 
-# Load .env as base layer (override=False so systemd EnvironmentFile wins if set).
+# Precedence: real process environment (systemd EnvironmentFile / Railway vars)
+# > SQLite settings (written by the frontend) > .env file.
+# Snapshot which keys the REAL environment defines BEFORE load_dotenv runs, so
+# a DB override can never defeat an operator-set variable (e.g. MODE=paper set
+# in the deployment environment to force the bot out of live mode).
+_DB_ENV_KEYS = (
+    ("env_MODE",               "MODE"),
+    ("env_BINANCE_API_KEY",    "BINANCE_API_KEY"),
+    ("env_BINANCE_API_SECRET", "BINANCE_API_SECRET"),
+)
+_real_env_has = {_env_k: _env_k in os.environ for _, _env_k in _DB_ENV_KEYS}
+
+# Load .env as base layer (override=False so the real environment wins if set).
 load_dotenv(_ENV_PATH, override=False)
 
-# Override with values stored in the SQLite database — these are written every time
-# the user sets a mode or API keys via the frontend, so they survive git operations,
-# reboots, and .env loss. DB is the authoritative persistent store; .env is the fallback.
+# Fill from the SQLite database — written every time the user sets a mode or
+# API keys via the frontend, so they survive git operations, reboots, and .env
+# loss. DB values may override .env values (DB is the frontend-written store;
+# .env is the fallback) but NEVER a variable set in the real process environment.
 try:
     import database as _db_conn
-    for _k, _env_k in (
-        ("env_MODE",               "MODE"),
-        ("env_BINANCE_API_KEY",    "BINANCE_API_KEY"),
-        ("env_BINANCE_API_SECRET", "BINANCE_API_SECRET"),
-    ):
+    for _k, _env_k in _DB_ENV_KEYS:
+        if _real_env_has.get(_env_k):
+            continue  # real environment wins — never override it from the DB
         _v = _db_conn.get_setting(_k)
         if _v:
             os.environ[_env_k] = _v

@@ -30,7 +30,9 @@ import config
 import database
 import indicators
 import learning
-from connection import client, get_mode
+import connection
+from connection import get_mode
+import binance_direct
 
 try:
     import thread_health as _thread_health
@@ -38,6 +40,53 @@ except Exception:
     _thread_health = None
 
 log = logging.getLogger(__name__)
+
+
+# ── Client transport helpers ─────────────────────────────────────────────────
+# Always resolve the client through the connection module at call time so the
+# auto-reconnect loop's rebinding (connection.client = new_client) takes effect
+# here — a `from connection import client` snapshot would hold the stale
+# PaperClient forever after a live reconnect.
+#
+# In LIVE mode all signed calls (account reads, order placement) go through
+# binance_direct (urllib + HMAC): python-binance uses the `requests` library,
+# which is geo-blocked on datacenter IPs (HTTP 451 / APIError code=0).
+# Paper and testnet modes keep using the connection client unchanged.
+
+def _client():
+    """Current client — never cache the returned object across reconnects."""
+    return connection.client
+
+
+def _acct() -> dict:
+    """Account snapshot. Live mode uses the geo-block-safe direct transport."""
+    if get_mode() == "live":
+        return binance_direct.get_account()
+    return connection.client.get_account()
+
+
+def _market_buy(symbol: str, quote_order_qty: float) -> dict:
+    """Market buy via the mode-appropriate transport.
+
+    Live mode: geo-block-safe signed call. If live mode is running on the
+    paper fallback client (Binance connection failed at boot), buys are
+    BLOCKED entirely — never silently 'trade' the paper client while the
+    records would be stamped mode='live'.
+    """
+    if get_mode() == "live":
+        if connection.is_using_paper_fallback():
+            raise RuntimeError(
+                "live mode is in paper fallback (Binance client unavailable) — buy blocked"
+            )
+        return binance_direct.order_market_buy(symbol, quote_order_qty)
+    return connection.client.order_market_buy(symbol=symbol, quoteOrderQty=quote_order_qty)
+
+
+def _market_sell(symbol: str, quantity: float) -> dict:
+    """Live-mode market sell via the geo-block-safe direct transport."""
+    if get_mode() == "live":
+        return binance_direct.order_market_sell(symbol, quantity)
+    return connection.client.order_market_sell(symbol=symbol, quantity=quantity)
 
 
 def _log_order_intent(action: str, symbol: str, qty: float, intended_price: float):
@@ -576,6 +625,7 @@ _last_buy_check: float = 0.0
 _last_no_signal_log: float = 0.0   # throttle "no coins ready" log to once per 60 s
 _last_buy_scan_log: float = 0.0    # throttle "Buy scan: ..." to once per 30 s
 _last_at_capacity_log: float = 0.0 # throttle "at max capacity" log to once per 60 s
+_last_fallback_block_log: float = 0.0  # throttle "paper fallback — buys blocked" to once per 60 s
 
 # Buy stagger — prevents mass simultaneous buys on stale cache signals
 _last_buy_ts: float = 0.0
@@ -598,7 +648,8 @@ def can_execute_buy(coin_cfg: dict, client) -> tuple[bool, str]:
     """
     budget = coin_cfg.get("budget_usdt", config.BUDGET_FIXED_USDT)
     try:
-        account = client.get_account()
+        # Geo-block-safe in live mode; param `client` kept for signature compat.
+        account = _acct()
         balances = {b["asset"]: float(b["free"]) for b in account["balances"]}
         usdt_free = balances.get("USDT", 0.0)
     except Exception as e:
@@ -687,10 +738,14 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
         scale = max(0.5, min(2.0, free_usdt / initial))
         base = base * scale
 
-    # In fixed/per_coin mode return the full configured amount.
-    # _check_balance / can_execute_buy will reject the buy if free USDT is insufficient —
-    # that gives a clean "have X, need Y" message rather than silently trading a partial amount.
+    # In fixed/per_coin mode return the full configured amount (when no allocation
+    # cap is set) — can_execute_buy will reject the buy if free USDT is insufficient,
+    # giving a clean "have X, need Y" message rather than silently trading a partial amount.
+    # When bot_allocation_usdt IS set, enforce it here too: without this clamp the
+    # early return bypassed the cap entirely and the bot could spend the whole wallet.
     if mode in ("fixed", "per_coin"):
+        if allocation > 0:
+            return round(min(base, effective_free), 2)
         return round(base, 2)
     # For capped mode cap to 90% so a tiny buffer remains for fees.
     return round(min(base, effective_free * 0.9), 2)
@@ -769,7 +824,7 @@ def _profitable_sell_check(pos: dict, price: float, force_fresh: bool = False) -
     slippage_buf  = actual_cost * 0.0005
     strategy   = _load_strategy()
     tp_enabled = bool(strategy.get("take_profit_enabled", True))
-    tp_pct     = float(strategy.get("take_profit_pct", 0.25))
+    tp_pct     = float(strategy.get("take_profit_pct", 0.1))  # same default as _refresh_risk_params
     if tp_enabled:
         min_profit = max(0.003 + slippage_buf, actual_cost * (tp_pct / 100.0))
     else:
@@ -829,6 +884,44 @@ def _apply_coin_restore(coins: list):
             print(f"[TradeEngine] Restored {len(coins)} coins from Supabase → strategy.json.")
     except Exception as ce:
         print(f"[TradeEngine] Coin restore to strategy.json failed: {ce}")
+
+
+# Symbols/assets already warned about by the orphan scanner — log once per
+# process, not on every startup loop.
+_orphan_warned: set = set()
+
+
+def _has_unclosed_bot_buy(sym: str) -> bool:
+    """True when the DB records a bot LIVE BUY of `sym` with no later closing sell.
+
+    The trades table only stores completed round-trips (a row is written at sell
+    time), so the buy-time evidence lives in activity_log: every live buy logs
+    "[LIVE] BOUGHT {sym} ..." and every close logs "[LIVE] SOLD {sym} ..." (or a
+    force-close message). Read-only query — never adopt a wallet holding as a
+    sellable position unless the bot itself bought it.
+    """
+    try:
+        import sqlite3 as _sq_ob
+        conn = _sq_ob.connect(database.DB_PATH)
+        try:
+            buy_id = conn.execute(
+                "SELECT MAX(id) FROM activity_log WHERE message LIKE ?",
+                (f"[LIVE] BOUGHT {sym} %",),
+            ).fetchone()[0]
+            if buy_id is None:
+                return False
+            sell_id = conn.execute(
+                "SELECT MAX(id) FROM activity_log WHERE message LIKE ? "
+                "OR message LIKE ? OR message LIKE ?",
+                (f"[LIVE] SOLD {sym} %",
+                 f"{sym}: force-closing position%",
+                 f"{sym}: position removed from records%"),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        return sell_id is None or buy_id > sell_id
+    except Exception:
+        return False  # uncertainty must never fabricate a sellable position
 
 
 def load_positions_from_db():
@@ -922,9 +1015,10 @@ def load_positions_from_db():
         # ── Balance: restore when SQLite paper-state is empty or zero ──────────
         if restored.get("usdt_balance") is not None:
             usdt = restored["usdt_balance"]
-            if hasattr(client, "_balances"):
-                with client._lock:
-                    current = client._balances.get("USDT", 0.0)
+            _pc = _client()
+            if hasattr(_pc, "_balances"):
+                with _pc._lock:
+                    current = _pc._balances.get("USDT", 0.0)
                 # Restore from Supabase when:
                 #   a) local balance is zero / negative
                 #   b) no open positions in SQLite (fresh deploy / no volume)
@@ -934,9 +1028,9 @@ def load_positions_from_db():
                 _at_default    = abs(current - _starting_usdt) < 0.01
                 _supa_differs  = abs(usdt - current) > 1.0
                 if current <= 0 or not rows or (_at_default and _supa_differs):
-                    with client._lock:
-                        client._balances["USDT"] = usdt
-                        snapshot = dict(client._balances)
+                    with _pc._lock:
+                        _pc._balances["USDT"] = usdt
+                        snapshot = dict(_pc._balances)
                     database.save_paper_state(snapshot)
                     print(f"[TradeEngine] Restored USDT balance from Supabase: {usdt:.2f}")
                     database.log_activity(
@@ -972,7 +1066,7 @@ def load_positions_from_db():
     # the sell monitor immediately tracks them and can exit at take-profit/stop-loss.
     if get_mode() == "live":
         try:
-            acc = client.get_account()
+            acc = _acct()  # geo-block-safe direct transport
             tracked_symbols = {p["symbol"] for p in _positions}
             recovered_syms = []
             now_ts = datetime.now(timezone.utc).isoformat()
@@ -984,16 +1078,20 @@ def load_positions_from_db():
                 total  = free + locked
                 if asset in ("USDT", "BNB", "BUSD", "USDC") or total <= 0:
                     continue
+                # Binance Earn wrappers (LDPYTH etc.) are not tradeable spot
+                # assets — never adopt or warn about them.
+                if asset.startswith("LD"):
+                    continue
                 sym = asset + "USDT"
                 if sym in tracked_symbols:
                     continue
 
-                # Fetch current price — try cached REST price first, then live ticker
+                # Fetch current price — try cached REST price first, then the
+                # public data-api ticker (geo-block-safe, no signed call needed)
                 price = _rest_px.get(sym, 0) or 0
                 if price <= 0:
                     try:
-                        ticker = client.get_symbol_ticker(symbol=sym)
-                        price  = float(ticker.get("price", 0) or 0)
+                        price = float(_fetch_batch_prices([sym]).get(sym, 0) or 0)
                     except Exception:
                         pass
 
@@ -1001,6 +1099,31 @@ def load_positions_from_db():
                 # would cause -2010 "insufficient balance" on Binance.
                 sell_qty = free if free > 0 else total
                 value = sell_qty * price if price > 0 else 0
+
+                # Dust below Binance's ~$10 min notional can't be sold anyway —
+                # skip it (log once per process, not every startup/loop).
+                if price > 0 and value < 10.0:
+                    if value >= 1.0 and asset not in _orphan_warned:
+                        _orphan_warned.add(asset)
+                        database.log_activity(
+                            f"Orphan scan: skipping {asset} (~${value:.2f}) — below $10 "
+                            f"min notional, unsellable dust", "info"
+                        )
+                    continue
+
+                # ONLY adopt holdings the bot itself bought (recorded live BUY
+                # with no closing sell). Anything else is the user's personal
+                # holding — fabricating a position here would let the sell
+                # monitor liquidate the user's own coins.
+                if not _has_unclosed_bot_buy(sym):
+                    if asset not in _orphan_warned:
+                        _orphan_warned.add(asset)
+                        database.log_activity(
+                            f"Orphan scan: {asset} (~${value:.2f}) held on Binance but has "
+                            f"no recorded bot buy — leaving untouched (not a bot position)",
+                            "info"
+                        )
+                    continue
 
                 if price > 0 and value > 1.0:
                     # Recreate position using current price as estimated entry.
@@ -1031,7 +1154,8 @@ def load_positions_from_db():
                     )
                     print(f"[TradeEngine] {msg}")
                     database.log_activity(msg, "warn")
-                else:
+                elif asset not in _orphan_warned:
+                    _orphan_warned.add(asset)
                     msg = (
                         f"⚠ ORPHANED COIN: {asset} qty={total:.8f} on Binance "
                         f"but no price available — sell manually via Binance app."
@@ -1053,7 +1177,8 @@ def load_positions_from_db():
     # state is out of sync with the positions table (e.g. a partial crash),
     # sells will fail with "Insufficient balance". Self-heal by crediting the
     # exact quantity that each open position holds.
-    if hasattr(client, "_balances") and _positions:
+    _pc2 = _client()
+    if hasattr(_pc2, "_balances") and _positions:
         changed = False
         for pos in _positions:
             sym  = pos["symbol"]
@@ -1061,14 +1186,14 @@ def load_positions_from_db():
             qty  = float(pos.get("quantity", 0))
             if qty <= 0:
                 continue
-            with client._lock:
-                current = client._balances.get(coin, 0.0)
+            with _pc2._lock:
+                current = _pc2._balances.get(coin, 0.0)
                 if current < qty * 0.99:
-                    client._balances[coin] = qty
+                    _pc2._balances[coin] = qty
                     changed = True
                     print(f"[TradeEngine] Synced paper balance: {coin}={qty:.8f} (was {current:.8f})")
         if changed:
-            database.save_paper_state(dict(client._balances))
+            database.save_paper_state(dict(_pc2._balances))
 
 
 def get_open_positions() -> List[dict]:
@@ -1109,12 +1234,14 @@ def _get_usdt_balance() -> float:
     try:
         if get_mode() != "live":
             # Paper mode: read directly from PaperClient's in-memory balance dict
-            if hasattr(client, "_balances"):
-                with client._lock:
-                    return float(client._balances.get("USDT", 0.0))
+            _pc = _client()
+            if hasattr(_pc, "_balances"):
+                with _pc._lock:
+                    return float(_pc._balances.get("USDT", 0.0))
             return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
-        # Live mode: query Binance spot wallet — use free balance only (tradeable)
-        acc = client.get_account()
+        # Live mode: query Binance spot wallet — use free balance only (tradeable).
+        # Geo-block-safe direct transport (python-binance requests are blocked).
+        acc = _acct()
         for b in acc["balances"]:
             if b["asset"] == "USDT":
                 return float(b["free"])
@@ -1127,7 +1254,7 @@ def _get_actual_balance(symbol: str) -> float:
     """Return free+locked balance for the base asset of symbol, or 0.0 on error."""
     try:
         base = symbol.replace("USDT", "").replace("usdt", "")
-        acc = client.get_account()
+        acc = _acct()
         for b in acc.get("balances", []):
             if b["asset"] == base:
                 return float(b.get("free", 0)) + float(b.get("locked", 0))
@@ -1146,7 +1273,7 @@ def _is_truly_ghost_position(symbol: str, expected_qty: float) -> Tuple[bool, st
     """
     try:
         base = symbol.replace("USDT", "").replace("usdt", "")
-        acc = client.get_account()
+        acc = _acct()
         for b in acc.get("balances", []):
             if b["asset"] == base:
                 total = float(b.get("free", 0)) + float(b.get("locked", 0))
@@ -1353,14 +1480,18 @@ def _floor_qty(qty: float, symbol: str = "", decimals: int = 8) -> float:
         step = _lot_step_cache.get(symbol)
         if step is None:
             try:
-                info = client.get_symbol_info(symbol)
+                info = _client().get_symbol_info(symbol)
                 for f in (info or {}).get("filters", []):
                     if f.get("filterType") == "LOT_SIZE":
                         step = float(f["stepSize"])
                         break
             except Exception:
                 step = 0.0
-            _lot_step_cache[symbol] = step or 0.0
+            # Cache only successful lookups — a transient failure (timeout,
+            # geo-block, paper client) must not disable LOT_SIZE rounding for
+            # this symbol permanently; retry on the next call instead.
+            if step and step > 0:
+                _lot_step_cache[symbol] = step
         if step and step > 0:
             factor = 1.0 / step
             return math.floor(qty * factor) / factor
@@ -1547,7 +1678,7 @@ def _execute_sell(pos: dict, price: float, reason: str):
     if get_mode() == "live":
         try:
             _asset = sym[:-4]  # e.g. "XRP" from "XRPUSDT"
-            _acc = client.get_account()
+            _acc = _acct()  # geo-block-safe direct transport in live mode
             _free = next(
                 (float(b["free"]) for b in _acc.get("balances", []) if b["asset"] == _asset),
                 None
@@ -1673,19 +1804,20 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
 
     # Ensure PaperClient price is current before the sell
     try:
-        client.update_price(sym, price)
+        _client().update_price(sym, price)
     except Exception:
         pass
 
     # Paper mode: self-heal coin balance if it went missing after a restart.
     # open position record is the source of truth for what we own.
-    if mode != "live" and hasattr(client, "_balances"):
+    _pc = _client()
+    if mode != "live" and hasattr(_pc, "_balances"):
         coin = sym[:-4]
-        with client._lock:
-            current_coin_bal = client._balances.get(coin, 0.0)
+        with _pc._lock:
+            current_coin_bal = _pc._balances.get(coin, 0.0)
             if current_coin_bal < qty * 0.99:
-                client._balances[coin] = qty
-                snapshot = dict(client._balances)
+                _pc._balances[coin] = qty
+                snapshot = dict(_pc._balances)
             else:
                 snapshot = None
         if snapshot is not None:
@@ -1700,7 +1832,9 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     pos["_sell_gate_start_ts"] = time.time()
     # FINAL SAFETY GATE — never lose money on a take-profit sell.
     # Stop-loss and force-sell bypass this check (they're meant to fire even at a loss).
-    if reason not in ("stop-loss", "force-sell", "manual", "user-initiated"):
+    # auto-recycle bypasses too: the recycler explicitly frees capital from positions
+    # >3% underwater — the profit gate would veto every one of its sells otherwise.
+    if reason not in ("stop-loss", "force-sell", "manual", "user-initiated", "auto-recycle"):
         # force_fresh=True: _profitable_sell_check fetches a fresh REST price for this
         # symbol RIGHT NOW before evaluating. This prevents a stale price from passing
         # the check while the actual Binance fill comes back at a lower level.
@@ -1731,9 +1865,10 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         # updates cannot cause the sell to execute at the wrong price.
         _log_order_intent("SELL", sym, qty, price)
         if _is_paper:
-            result = client.order_market_sell(symbol=sym, quantity=qty, price=price)
+            result = _client().order_market_sell(symbol=sym, quantity=qty, price=price)
         else:
-            result = client.order_market_sell(symbol=sym, quantity=qty)
+            # Live mode: geo-block-safe direct signed transport
+            result = _market_sell(sym, qty)
         _log_order_result("SELL", sym, qty, price, result)
         pos["_sell_binance_done_ts"] = time.time()
     except Exception as e:
@@ -1824,22 +1959,40 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     # a silent position ghost (sell executed on Binance, position stays in bot).
     try:
         fills      = result.get("fills", [])
-        fill_price = float(fills[0].get("price", price)) if fills else price
         raw_quote  = float(result.get("cummulativeQuoteQty") or 0)
+        _exec_qty  = float(result.get("executedQty") or 0)
+        # Exit price = VWAP across ALL fills (cummulativeQuoteQty / executedQty).
+        # fills[0] is only the best-priced tranche of a multi-fill market order.
+        # (Live only: PaperClient's cummulativeQuoteQty is already net of fee.)
+        if mode == "live" and raw_quote > 0 and _exec_qty > 0:
+            fill_price = raw_quote / _exec_qty
+        elif fills:
+            fill_price = float(fills[0].get("price", price))
+        else:
+            fill_price = price
         budget     = pos["budget_usdt"]
-        # Use ACTUAL deployed capital (qty * entry_price) as cost basis, not the
-        # requested budget. Binance buys often fill slightly under budget (lot-step
-        # rounding) and the unspent change stays in USDT — subtracting full budget
-        # from proceeds creates a phantom loss equal to the unspent amount.
-        actual_cost = float(pos["quantity"]) * float(pos["entry_price"])
+        # Use ACTUAL deployed capital as cost basis, not the requested budget —
+        # and use the SAME quantity for cost basis as for proceeds. Lot-step
+        # rounding / balance clamps can sell less than pos['quantity']; charging
+        # the full recorded quantity against partial proceeds books a phantom loss.
+        _pos_qty   = float(pos.get("quantity") or 0)
+        _sold_qty  = _exec_qty if _exec_qty > 0 else qty
+        _sold_frac = (_sold_qty / _pos_qty) if _pos_qty > 0 else 1.0
+        actual_cost = _sold_qty * float(pos["entry_price"])
 
         if mode == "live":
             sell_fee, fee_asset = _fills_fee_usdt(fills, raw_quote * _fee_rate)
-            if fee_asset in ("USDT", "BUSD", "USDC"):
-                usdt_returned = raw_quote
-            else:
+            # Binance sell-fee semantics: a stablecoin commission IS deducted from
+            # the quote proceeds (received = cummulativeQuoteQty - commission);
+            # a BNB commission comes out of the separate BNB balance, so the
+            # full quote amount is received. ("estimated" fallback is treated as
+            # quote-deducted — the conservative assumption.)
+            if fee_asset in ("USDT", "BUSD", "USDC", "estimated"):
                 usdt_returned = raw_quote - sell_fee
-            buy_fee = float(pos.get("buy_fee_usdt") or actual_cost * _fee_rate)
+            else:
+                usdt_returned = raw_quote
+            buy_fee = float(pos.get("buy_fee_usdt") or _pos_qty * float(pos["entry_price"]) * _fee_rate)
+            buy_fee *= _sold_frac  # charge only the sold portion's share of the buy fee
         else:
             sell_fee      = sum(float(f.get("commission") or 0) for f in fills)
             usdt_returned = raw_quote
@@ -1966,18 +2119,6 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     except Exception:
         pass
 
-    # Remove position from memory and DB immediately — sell is confirmed on Binance.
-    # Supabase sync and learning run after so a slow network never delays cleanup.
-    if pos.get("id"):
-        try:
-            database.delete_position(pos["id"])
-        except Exception:
-            pass
-    with _positions_lock:
-        _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
-    _rebuild_pos_index()
-    _pos_peaks.pop(sym, None)
-
     # ── Sell latency for DB ───────────────────────────────────────────────────
     try:
         _fill_ts = time.time()
@@ -2000,36 +2141,55 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         _trigger_to_filled_ms = None
         _target_crossed_iso   = None
 
+    # Write the closed-trade record BEFORE deleting the position row — a crash
+    # or DB error between the two must never lose the trade record. A leftover
+    # position row is recoverable (the next sell attempt gets -2010 and the
+    # ghost check cleans it up); a missing trade row is lost P&L history.
     try:
         database.log_trade(trade_record,
                            target_crossed_to_trigger_ms=_target_to_trigger_ms,
                            trigger_to_filled_ms=_trigger_to_filled_ms,
                            target_crossed_ts=_target_crossed_iso)
-        try:
-            import supabase_sync
-            # Paper mode: read balance from memory (instant, no network call).
-            # Live mode: skip the get_account() REST call — Supabase sync gets
-            # an estimate from net_profit instead, avoiding a 10s blocking call
-            # on the sell worker thread.
-            if get_mode() != "live" and hasattr(client, "_balances"):
-                with client._lock:
-                    usdt_now = float(client._balances.get("USDT", 0.0))
-            else:
-                usdt_now = _get_usdt_balance()
-            supabase_sync.sync_sell_result_sync(trade_record, sym, usdt_now)
-        except Exception as se:
-            err_msg = f"Supabase sync error after selling {sym}: {se}"
-            print(f"[TradeEngine] {err_msg}")
-            try:
-                database.log_activity(err_msg, "error")
-            except Exception:
-                pass
-        try:
-            learning.learn_from_trade(trade_record)
-        except Exception as le:
-            database.log_activity(f"learn_from_trade error ({sym}): {le}", "warn")
     except Exception as te:
         database.log_activity(f"log_trade error ({sym}): {te}", "warn")
+
+    # Remove position from memory and DB — sell is confirmed on Binance and the
+    # trade record is already written. Supabase sync and learning run after so
+    # a slow network never delays cleanup.
+    if pos.get("id"):
+        try:
+            database.delete_position(pos["id"])
+        except Exception:
+            pass
+    with _positions_lock:
+        _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
+    _rebuild_pos_index()
+    _pos_peaks.pop(sym, None)
+
+    try:
+        import supabase_sync
+        # Paper mode: read balance from memory (instant, no network call).
+        # Live mode: skip the get_account() REST call — Supabase sync gets
+        # an estimate from net_profit instead, avoiding a 10s blocking call
+        # on the sell worker thread.
+        _pc_sync = _client()
+        if get_mode() != "live" and hasattr(_pc_sync, "_balances"):
+            with _pc_sync._lock:
+                usdt_now = float(_pc_sync._balances.get("USDT", 0.0))
+        else:
+            usdt_now = _get_usdt_balance()
+        supabase_sync.sync_sell_result_sync(trade_record, sym, usdt_now)
+    except Exception as se:
+        err_msg = f"Supabase sync error after selling {sym}: {se}"
+        print(f"[TradeEngine] {err_msg}")
+        try:
+            database.log_activity(err_msg, "error")
+        except Exception:
+            pass
+    try:
+        learning.learn_from_trade(trade_record)
+    except Exception as le:
+        database.log_activity(f"learn_from_trade error ({sym}): {le}", "warn")
 
     pnl_sign = "+" if net_profit >= 0 else ""
     mode_tag = "LIVE" if mode == "live" else "PAPER"
@@ -2057,8 +2217,11 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     _buys_this_scan = 0  # reset per-scan counter each invocation
 
     # Fast pre-check: any coin signalling BUY? (no lock needed for scalar read)
+    # Use the runtime min_signals setting — the hardcoded config default would
+    # silently defeat a user threshold set below it (_load_strategy is mtime-cached).
+    _pre_min_sigs = int(_load_strategy().get("min_signals", config.MIN_SIGNALS_TO_BUY))
     with _signal_cache_lock:
-        any_ready = any(v["score"] >= config.MIN_SIGNALS_TO_BUY for v in _signal_cache.values())
+        any_ready = any(v["score"] >= _pre_min_sigs for v in _signal_cache.values())
         cache_size = len(_signal_cache)
 
     if not any_ready:
@@ -2083,7 +2246,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     for s, v in top
                 )
                 database.log_activity(
-                    f"Buy check: {cache_size} coins, none at score≥{config.MIN_SIGNALS_TO_BUY} — top5: {detail}", "info"
+                    f"Buy check: {cache_size} coins, none at score≥{_pre_min_sigs} — top5: {detail}", "info"
                 )
         return
 
@@ -2140,9 +2303,24 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         return
 
     from datetime import timezone as _tz
+    mode = get_mode()
+
+    # HARD BLOCK: live mode running on the paper fallback client must never buy —
+    # the fills would be simulated but recorded as mode='live'. Sells/monitoring
+    # continue via the direct transport; buys resume when reconnect succeeds.
+    if mode == "live" and connection.is_using_paper_fallback():
+        global _last_fallback_block_log
+        _now_fb = time.time()
+        if _now_fb - _last_fallback_block_log >= 60.0:
+            _last_fallback_block_log = _now_fb
+            database.log_activity(
+                "Buy check: live mode is in paper fallback (Binance client unavailable) "
+                "— all buys blocked until the live connection is restored", "warn"
+            )
+        return
+
     usdt_balance = _get_usdt_balance()
     ts_now = datetime.now(_tz.utc).isoformat()
-    mode   = get_mode()
 
     # Build the cache snapshot but only emit the activity log every 30 s — these
     # writes hold the global DB lock and previously fired on every WS-tick scan,
@@ -2402,10 +2580,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             )
             continue
 
-        client.update_price(sym, price)
+        _client().update_price(sym, price)
 
         buy_cfg = {**approved[sym], "symbol": sym, "budget_usdt": budget}
-        allowed, reason = can_execute_buy(buy_cfg, client)
+        allowed, reason = can_execute_buy(buy_cfg, _client())
         if not allowed:
             database.log_activity(f"{sym}: buy skipped — {reason}", "info")
             continue
@@ -2422,6 +2600,46 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"(increase trade size in Settings)", "warn"
             )
             continue
+
+        # ── Atomic claim — BEFORE the slow REST gates below ─────────────────────
+        # The fresh re-check + reversal confirmation take multiple seconds. If the
+        # claim happened after them (as it used to), a concurrent scan could buy
+        # this symbol inside that window, release the claim, and this thread would
+        # then claim unopposed and buy it AGAIN (confirmed duplicate DOT/IMX rows).
+        # Claim first; release on every failure path.
+        with _buying_lock:
+            _now_b = time.time()
+            _stale_b = [s for s, ts in _buying_ts.items() if (_now_b - ts) > _BUYING_TIMEOUT_SEC]
+            for _s in _stale_b:
+                _buying.discard(_s)
+                _buying_ts.pop(_s, None)
+            if sym in _buying:
+                database.log_activity(f"{sym}: buy skipped — concurrent buy already in flight", "info")
+                _record_rejection(sym, score, "in_progress_buy")
+                continue
+            _buying.add(sym)
+            _buying_ts[sym] = _now_b
+            _other_buying = len(_buying) - 1  # in-flight claims on OTHER symbols
+
+        def _release_buy_claim(_s=sym):
+            with _buying_lock:
+                _buying.discard(_s)
+                _buying_ts.pop(_s, None)
+
+        # Re-verify under the claim: another thread may have bought this symbol
+        # or filled the last slot while this scan was mid-loop. Counting other
+        # in-flight claims as reserved slots keeps concurrent scans from
+        # collectively exceeding max_positions.
+        with _positions_lock:
+            _held_now = any(p["symbol"] == sym for p in _positions)
+            _at_capacity_now = (len(_positions) + _other_buying) >= max_pos
+        if _held_now:
+            _release_buy_claim()
+            _record_rejection(sym, score, "already_held")
+            continue
+        if _at_capacity_now:
+            _release_buy_claim()
+            break
 
         # ── Fresh signal re-check before committing ────────────────────────────
         # Cache can be 30-60s stale. A single REST kline fetch verifies signals
@@ -2451,6 +2669,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     f"(cache had {score}/6, age={cache_age}s)", "warn"
                 )
                 _record_rejection(sym, score, "stale_signals", f"fresh={_fresh_score} cache={score} age={cache_age}s")
+                _release_buy_claim()
                 continue
             _live_price = _fresh_closes[-1]
             if price > 0 and abs(_live_price - price) / price > 0.005:
@@ -2458,13 +2677,15 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     f"[SKIP] {sym}: price moved {(_live_price - price)/price*100:.2f}% "
                     f"since cache (${price:.4f} → ${_live_price:.4f}) — skipping", "warn"
                 )
+                _release_buy_claim()
                 continue
             price = _live_price
-            client.update_price(sym, price)
+            _client().update_price(sym, price)
         except Exception as _fresh_e:
             database.log_activity(
                 f"[SKIP] {sym}: fresh re-check failed ({_fresh_e}) — skipping for safety", "warn"
             )
+            _release_buy_claim()
             continue
 
         # ── Reversal confirmation ──────────────────────────────────────────────
@@ -2472,30 +2693,16 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _rev_ok, _rev_reason = is_reversal_confirmed(sym)
             if not _rev_ok:
                 _record_rejection(sym, score, "no_reversal_confirmed", _rev_reason)
+                _release_buy_claim()
                 continue
-
-        # Atomic claim — prevents concurrent buy for the same symbol
-        with _buying_lock:
-            _now_b = time.time()
-            _stale_b = [s for s, ts in _buying_ts.items() if (_now_b - ts) > _BUYING_TIMEOUT_SEC]
-            for _s in _stale_b:
-                _buying.discard(_s)
-                _buying_ts.pop(_s, None)
-            if sym in _buying:
-                database.log_activity(f"{sym}: buy skipped — concurrent buy already in flight", "info")
-                _record_rejection(sym, score, "in_progress_buy")
-                continue
-            _buying.add(sym)
-            _buying_ts[sym] = _now_b
 
         try:
             _log_order_intent("BUY", sym, budget / max(price, 1e-12), price)
-            result = client.order_market_buy(symbol=sym, quoteOrderQty=budget)
+            # Live mode: geo-block-safe direct transport; raises in paper fallback.
+            result = _market_buy(sym, budget)
             _log_order_result("BUY", sym, budget / max(price, 1e-12), price, result)
         except Exception as e:
-            with _buying_lock:
-                _buying.discard(sym)
-                _buying_ts.pop(sym, None)
+            _release_buy_claim()
             err_str = str(e)
             print(f"[RealtimeBuy] BUY failed {sym}: {e}")
             database.log_activity(f"{sym}: BUY failed — {e}", "error")
@@ -2505,12 +2712,29 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             continue
 
         buy_fills  = result.get("fills", [])
-        fill_price = float(buy_fills[0].get("price", price)) if buy_fills else price
-        qty        = float(result.get("executedQty", 0))
+        _exec_qty  = float(result.get("executedQty", 0) or 0)
+        _cum_quote = float(result.get("cummulativeQuoteQty", 0) or 0)
+        # Entry price = VWAP across ALL fills (cummulativeQuoteQty / executedQty).
+        # fills[0] is only the best-priced tranche — using it understates the true
+        # average cost on multi-fill market buys and corrupts breakeven math.
+        if _exec_qty > 0 and _cum_quote > 0:
+            fill_price = _cum_quote / _exec_qty
+        elif buy_fills:
+            fill_price = float(buy_fills[0].get("price", price))
+        else:
+            fill_price = price
+        # Subtract base-asset commission from executedQty: without the BNB fee
+        # discount Binance takes the fee in the bought coin, so the wallet is
+        # credited executedQty − Σcommission. Recording the gross qty causes
+        # -2010 "insufficient balance" on the eventual sell.
+        _base_asset = sym[:-4] if sym.endswith("USDT") else sym
+        _base_commission = sum(
+            float(f.get("commission") or 0) for f in buy_fills
+            if f.get("commissionAsset") == _base_asset
+        )
+        qty = max(0.0, _exec_qty - _base_commission)
         if qty <= 0:
-            with _buying_lock:
-                _buying.discard(sym)
-                _buying_ts.pop(sym, None)
+            _release_buy_claim()
             continue
 
         # Compute actual buy fee in USDT across all fills.
@@ -2708,15 +2932,18 @@ def realtime_monitor(prices: Dict[str, float]):
         if real_target <= 0:
             _bep_m = pos.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
             real_target = entry * _bep_m  # fallback for incomplete positions
-        # Stop measured from real BEP (fee-inclusive), not raw entry.
-        # e.g. SL 0.4% → stops out at bep × 0.996, capping loss at a known fraction of cost.
-        stop = real_target * _stop_loss_mult
+        # Stop measured from ENTRY price — matches the frontend's "% below entry"
+        # label. (Measuring from fee-inclusive BEP fired ~0.26% earlier than the
+        # user's configured distance.)
+        stop = entry * _stop_loss_mult
+        # Take-profit trigger: the user's TP target, floored at real breakeven —
+        # never fire at bare breakeven when the user asked for more.
         if _take_profit_enabled:
             target = max(real_target, entry * _user_tp_mult)
         else:
             target = real_target
 
-        if price >= real_target:
+        if price >= target:
             # Record first-seen crossing time — distinct from _sell_trigger_ts (which is
             # set when we actually call .submit()). The gap between these two timestamps
             # reveals event-loop starvation: if target_crossed_to_trigger_ms >> 0, sells
@@ -2808,6 +3035,7 @@ _sell_monitor_thread: Optional[threading.Thread] = None
 # REST price fallback cache — populated when WebSocket is geo-blocked on Railway
 _rest_px: Dict[str, float] = {}
 _rest_px_ts: float = 0.0
+_stale_px_warn_ts: Dict[str, float] = {}  # throttle "no fresh price" warning per symbol
 _REST_PX_TTL = 5.0   # refetch REST prices every 5 s when WebSocket is down
 _sell_monitor_last_rest_ts: float = 0.0   # rate-limits sell-monitor REST refresh to 2s
 
@@ -3201,7 +3429,7 @@ def _phantom_check_loop():
             if not snap:
                 continue
             try:
-                acc = client.get_account()
+                acc = _acct()  # geo-block-safe direct transport
                 balances = {b["asset"]: float(b.get("free", 0)) + float(b.get("locked", 0))
                             for b in acc.get("balances", [])}
             except Exception as _be:
@@ -3334,6 +3562,10 @@ def _sell_monitor_loop():
 
             # Signal-cache is the final fallback — fills gaps when both WS and
             # REST are unavailable for a symbol (e.g. first 30 s after redeploy).
+            # These prices can be 60 s+ stale, so they are used for DIAGNOSTICS
+            # ONLY: symbols in _stale_px_syms are skipped by the trigger loop
+            # below (better to retry in 250 ms than to stop-loss on a stale price).
+            _stale_px_syms: set = set()
             with _signal_cache_lock:
                 sc_snap = dict(_signal_cache)
             for pos in snap:
@@ -3342,6 +3574,7 @@ def _sell_monitor_loop():
                     sc_p = sc_snap.get(s, {}).get("price", 0)
                     if sc_p and sc_p > 0:
                         prices[s] = sc_p
+                        _stale_px_syms.add(s)
 
             # Diagnostic log every 60 s — shows ACTUAL sell target, not just breakeven
             now_t = time.time()
@@ -3384,6 +3617,20 @@ def _sell_monitor_loop():
 
                 if price <= 0:
                     continue
+                if sym in _stale_px_syms:
+                    # Only a stale signal-cache price is available — never make a
+                    # stop-loss/take-profit decision on it. Warn (throttled) and
+                    # retry next cycle when the refresher has a fresh price.
+                    if now_monitor - _stale_px_warn_ts.get(sym, 0) >= 60.0:
+                        _stale_px_warn_ts[sym] = now_monitor
+                        try:
+                            database.log_activity(
+                                f"Sell monitor: no fresh price for {sym} — skipping sell "
+                                f"checks this cycle (signal-cache price may be stale)", "warn"
+                            )
+                        except Exception:
+                            pass
+                    continue
                 with _selling_lock:
                     if sym in _selling:
                         continue
@@ -3404,7 +3651,8 @@ def _sell_monitor_loop():
                 if real_target3 <= 0:
                     _bep_m3 = pos.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
                     real_target3 = entry * _bep_m3
-                stop = real_target3 * _stop_loss_mult  # from BEP, not raw entry
+                stop = entry * _stop_loss_mult  # % below ENTRY — matches frontend label
+                # TP trigger = user target floored at real breakeven
                 if _take_profit_enabled:
                     target = max(real_target3, entry * _user_tp_mult)
                 else:
@@ -3418,15 +3666,15 @@ def _sell_monitor_loop():
                     _cd_rem  = max(0.0, _loss_cd - _tr_now)
                     database.log_activity(
                         f"[SELL_TRACE] {sym}: entry={entry:.6f} cur={price:.6f} "
-                        f"real_target={real_target3:.6f} "
-                        f"above_target={price >= real_target3} "
+                        f"target={target:.6f} (bep={real_target3:.6f}) "
+                        f"above_target={price >= target} "
                         f"cooldown={_cd_rem:.0f}s",
                         "info"
                     )
 
                 sell_reason3: Optional[str] = None
 
-                if price >= real_target3:
+                if price >= target:
                     if _smart_hold_enabled and price >= target and target > real_target3:
                         _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
                         peak = _pos_peaks[sym]
