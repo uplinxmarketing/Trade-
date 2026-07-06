@@ -240,29 +240,60 @@ async def lifespan(app: FastAPI):
         # (10-30 s on every deploy). Defer it to a background task; the API
         # starts serving immediately and endpoints tolerate partial state.
         async def _deferred_init():
-            try:
-                # Warm the Binance account cache immediately (live mode) so the
-                # wallet panel's first request is served from cache instead of
-                # waiting on a cold signed fetch.
+            # Every step below is isolated in its OWN try/except.  Previously
+            # steps 3-8 shared a single try-block: one exception in an early
+            # step (position restore, balance fetch, …) silently prevented
+            # callback registration AND the websocket/signal_scanner spawns,
+            # so the signal cache stayed empty forever and zero automatic
+            # buys could fire while the HTTP API looked perfectly healthy.
+            # Now a failing step is logged loudly and init continues — the
+            # critical buy pipeline (callbacks + task spawns) is GUARANTEED
+            # to be reached regardless of earlier failures.
+            def _step_failed(step_name: str, exc: Exception):
+                err = (f"STARTUP ERROR at step {step_name}: {exc!r} — "
+                       f"continuing with remaining init steps")
+                print(f"[ControlAPI] {err}")
                 try:
-                    await asyncio.to_thread(_get_cached_account)
+                    database.log_activity(err, "error")
                 except Exception:
                     pass
-                # 3. Restore open positions + coins + balance from SQLite / Supabase
+
+            # Warm the Binance account cache immediately (live mode) so the
+            # wallet panel's first request is served from cache instead of
+            # waiting on a cold signed fetch.
+            try:
+                await asyncio.to_thread(_get_cached_account)
+            except Exception as exc:
+                _step_failed("account_cache_warm", exc)
+
+            # 3. Restore open positions + coins + balance from SQLite / Supabase
+            try:
                 await asyncio.to_thread(trade_engine.load_positions_from_db)
                 steps.append("positions OK")
+            except Exception as exc:
+                _step_failed("positions", exc)
 
-                # 3b. Start REST price refresher for held positions (2s interval —
-                #     critical for low-WS-volume coins that can go minutes stale)
+            # 3b. Start REST price refresher for held positions (2s interval —
+            #     critical for low-WS-volume coins that can go minutes stale)
+            try:
                 trade_engine.start_held_position_refresher()
                 steps.append("held_price_refresher OK")
+            except Exception as exc:
+                _step_failed("held_price_refresher", exc)
+            try:
                 trade_engine.start_capital_recycler()
                 steps.append("capital_recycler OK")
+            except Exception as exc:
+                _step_failed("capital_recycler", exc)
+            try:
                 trade_engine.start_phantom_checker()
                 steps.append("phantom_checker OK")
+            except Exception as exc:
+                _step_failed("phantom_checker", exc)
 
-                # 4. Apply startup defaults and auto-resume logic.
-                #    trading_active is preserved so a running bot resumes after a redeploy.
+            # 4. Apply startup defaults and auto-resume logic.
+            #    trading_active is preserved so a running bot resumes after a redeploy.
+            try:
                 _s = _load_strategy()
                 _auto_patch: dict = {
                     "pause_reason": None,
@@ -282,43 +313,78 @@ async def lifespan(app: FastAPI):
                     _auto_patch["initial_balance_usdt"] = _bal or float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
                 _write_strategy_patch(_auto_patch)
                 steps.append(f"trading_active={'resume' if _s.get('trading_active') else 'off'}")
+            except Exception as exc:
+                _step_failed("auto_resume_patch", exc)
 
-                # 5. History download — daemon thread, never blocks
+            # 5. History download — daemon thread, never blocks
+            try:
                 threading.Thread(target=data_collector.download_history, daemon=True).start()
                 steps.append("history_dl started")
+            except Exception as exc:
+                _step_failed("history_dl", exc)
 
-                # 6. Register price/kline callbacks
+            # 6. Register price/kline callbacks — CRITICAL: without these the
+            #    signal cache never fills and no automatic buy can ever fire.
+            try:
                 data_collector.register_price_callback(trade_engine.realtime_monitor)
                 data_collector.register_kline_callback(trade_engine.update_coin_signals)
                 steps.append("callbacks OK")
+            except Exception as exc:
+                _step_failed("callbacks", exc)
 
-                # 7. Launch async tasks
-                _spawn_bg_task(data_collector.start_websocket(), "websocket")
-                _spawn_bg_task(strategy_engine.strategy_loop(), "strategy_loop")
-                _spawn_bg_task(trade_engine.signal_scanner(data_collector.prices), "signal_scanner")
-                _spawn_bg_task(trade_engine.position_guardian(), "position_guardian")
-                _spawn_bg_task(_supabase_periodic_sync(), "supabase_sync")
-                _spawn_bg_task(_anomaly_checker(), "anomaly_checker")
-                steps.append("async tasks launched")
+            # 7. Launch async tasks — CRITICAL: websocket + signal_scanner feed
+            #    the signal cache. Each spawn is isolated so one failure can
+            #    never stop the remaining tasks from launching.
+            _spawned: list[str] = []
+            for _task_name, _coro_factory in (
+                ("websocket",         lambda: data_collector.start_websocket()),
+                ("strategy_loop",     lambda: strategy_engine.strategy_loop()),
+                ("signal_scanner",    lambda: trade_engine.signal_scanner(data_collector.prices)),
+                ("position_guardian", lambda: trade_engine.position_guardian()),
+                ("supabase_sync",     lambda: _supabase_periodic_sync()),
+                ("anomaly_checker",   lambda: _anomaly_checker()),
+            ):
+                try:
+                    _spawn_bg_task(_coro_factory(), _task_name)
+                    _spawned.append(_task_name)
+                except Exception as exc:
+                    _step_failed(f"spawn_{_task_name}", exc)
+            steps.append(f"async tasks launched ({len(_spawned)}/6: {', '.join(_spawned) or 'none'})")
 
-                # 8. Futures paper-trading agent (completely separate parallel process)
+            # 8. Futures paper-trading agent (completely separate parallel process)
+            try:
                 if config.FUTURES_ENABLED:
                     import futures_engine
                     futures_engine.init_futures_engine()
                     _spawn_bg_task(futures_engine.mark_price_loop(), "futures_mark_price")
                     _spawn_bg_task(futures_engine.signal_scanner_loop(), "futures_signal_scanner")
                     steps.append("futures tasks launched")
-
-                msg = "Bot ready — " + " | ".join(steps)
-                print(f"[ControlAPI] {msg}")
-                database.log_activity(msg, "info")
             except Exception as exc:
-                err = f"STARTUP ERROR at step {steps[-1] if steps else '?'}: {exc}"
-                print(f"[ControlAPI] {err}")
-                try:
-                    database.log_activity(err, "error")
-                except Exception:
-                    pass
+                _step_failed("futures", exc)
+
+            # 9. Log which BUY DECISION PATH is active, computed exactly the
+            #    way trade_engine gates it (strategy.get("signal_engine", {})
+            #    .get("enabled", False)) — so "engine looks on in the UI but
+            #    legacy path is running" is visible straight from the logs.
+            try:
+                _sp = _load_strategy()
+                _engine_on = bool(_sp.get("signal_engine", {}).get("enabled", False))
+                _path_msg = (
+                    "Buy decision path: SIGNAL ENGINE (strategy.json signal_engine.enabled=true)"
+                    if _engine_on else
+                    "Buy decision path: LEGACY 6-signal score (strategy.json signal_engine.enabled absent/false)"
+                )
+                print(f"[ControlAPI] {_path_msg}")
+                database.log_activity(_path_msg, "info")
+            except Exception as exc:
+                _step_failed("decision_path_log", exc)
+
+            msg = "Bot ready — " + " | ".join(steps)
+            print(f"[ControlAPI] {msg}")
+            try:
+                database.log_activity(msg, "info")
+            except Exception:
+                pass
 
         _spawn_bg_task(_deferred_init(), "deferred_init")
         print("[ControlAPI] HTTP up — deferred init running in background")
@@ -1503,6 +1569,14 @@ def api_set_coins(req: CoinsRequest):
         })
     _write_strategy_patch({"approved_coins": new_approved, "user_selected_coins": True})
 
+    # Re-subscribe the WebSocket to the new coin list immediately — without
+    # this, newly added coins stream no data until the 60s self-heal poll.
+    try:
+        import data_collector
+        data_collector.refresh_watchlist()
+    except Exception:
+        pass
+
     # Persist coin list to Supabase so it survives Railway redeploys
     try:
         import supabase_sync
@@ -1584,6 +1658,16 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
                                     _get_breakeven_mult, _rebuild_pos_index)
         from connection import client as _client
         from data_collector import prices as live_prices
+
+        # Live mode on the paper-fallback client: REFUSE. Executing through
+        # the in-memory PaperClient here would record a simulated fill as
+        # mode='live' — a fake trade indistinguishable from a real one.
+        # Paper mode is unaffected.
+        if get_mode() == "live" and is_using_paper_fallback():
+            return {"ok": False,
+                    "error": ("live Binance connection is down — refusing to simulate a live order "
+                              "(paper-fallback client is active; restore API keys/connectivity or "
+                              "switch to paper mode)")}
 
         # Use price hint from frontend; fall back to WebSocket cache if not provided
         hint_price = (req.price if req else 0) or 0
@@ -2239,6 +2323,13 @@ def api_signal_registry():
         return {
             "available":      True,
             "engine_enabled": engine_active,
+            # Explicit decision-path flags (same computation trade_engine uses:
+            # strategy.get("signal_engine", {}).get("enabled", False)). When
+            # "persisted" is False the roles above come from code defaults,
+            # NOT from saved config — the legacy path is what actually runs.
+            "active":         engine_active,
+            "persisted":      bool(engine_cfg),
+            "decision_path":  "signal_engine" if engine_active else "legacy_6_signal",
             "total":          len(signals_info),
             "categories":     sorted({s["category"] for s in signals_info}),
             "min_scored":     int(engine_cfg.get("min_scored", _sr.DEFAULT_SIGNAL_ENGINE["min_scored"])),
@@ -3505,18 +3596,34 @@ async def api_chat(req: ChatRequest):
 
 @app.get("/api/signal-engine/config")
 def api_signal_engine_config_get():
-    """Return current signal engine configuration plus full signal registry."""
+    """Return the ACTUAL persisted signal engine configuration plus registry.
+
+    Never dress up code defaults as saved config: DEFAULT_SIGNAL_ENGINE has
+    enabled=True while trade_engine's gate defaults enabled=False when the
+    strategy.json block is absent — echoing the defaults as "config" made the
+    UI show an engine that was not actually running. "config" is now exactly
+    what strategy.json holds ({} if never saved), "active" is computed the
+    SAME way trade_engine gates buys, and the defaults are returned under a
+    clearly-labelled separate key for UI prefill.
+    """
     try:
         import signal_registry as _sr
         strategy   = _load_strategy()
         engine_cfg = strategy.get("signal_engine", {})
+        # Mirror trade_engine's gate exactly: absent block/key => False =>
+        # the LEGACY 6-signal path is what actually runs.
+        engine_active = bool(strategy.get("signal_engine", {}).get("enabled", False))
         registry   = [
             {"id": sid, "category": sd.category, "description": sd.description}
             for sid, sd in _sr.SIGNAL_REGISTRY.items()
         ]
         return {
             "registry":   registry,
-            "config":     engine_cfg if engine_cfg else _sr.DEFAULT_SIGNAL_ENGINE,
+            "config":     engine_cfg,               # persisted state only — {} if never saved
+            "active":     engine_active,            # what trade_engine actually enforces
+            "persisted":  bool(engine_cfg),         # False => block absent from strategy.json
+            "defaults":   _sr.DEFAULT_SIGNAL_ENGINE,  # code defaults, NOT saved config
+            "decision_path": "signal_engine" if engine_active else "legacy_6_signal",
             "thresholds": strategy.get("signal_thresholds", _sr.DEFAULT_SIGNAL_THRESHOLDS),
         }
     except Exception as e:

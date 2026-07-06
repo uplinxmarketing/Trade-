@@ -627,6 +627,10 @@ _last_no_signal_log: float = 0.0   # throttle "no coins ready" log to once per 6
 _last_buy_scan_log: float = 0.0    # throttle "Buy scan: ..." to once per 30 s
 _last_at_capacity_log: float = 0.0 # throttle "at max capacity" log to once per 60 s
 _last_fallback_block_log: float = 0.0  # throttle "paper fallback — buys blocked" to once per 60 s
+_last_paused_log: float = 0.0          # throttle "bot is paused" warn to once per 60 s
+_last_fresh_nodata_log: float = 0.0    # throttle "fresh re-check has no data" warn to once per 60 s
+_last_reversal_nodata_log: float = 0.0 # throttle "reversal check has no data" warn to once per 60 s
+_warned_5m_warmup: bool = False        # one-shot "5m veto neutral during warmup" startup log
 
 # Buy stagger — prevents mass simultaneous buys on stale cache signals
 _last_buy_ts: float = 0.0
@@ -1319,11 +1323,9 @@ _rejection_lock = threading.Lock()
 _rejection_reset_ts: float = time.time()
 
 def _record_rejection(symbol: str, score, reason: str, detail: str = ""):
-    try:
-        if int(score or 0) < 3:
-            return
-    except Exception:
-        return
+    # NOTE: no score filter here — engine-path rejections carry the ENGINE
+    # score (often 0-2) and systematic gates (pre-gate, min-notional, vetoes)
+    # must be visible in diagnostics regardless of the legacy score.
     try:
         with _rejection_lock:
             _rejection_counts[reason] += 1
@@ -1415,13 +1417,37 @@ def evaluate_buy_gates(sym: str) -> dict:
         SIGNAL_REGISTRY_AVAILABLE
         and bool(strategy.get("signal_engine", {}).get("enabled", False))
     )
-    if not signal_engine_active:
+    if signal_engine_active:
+        # Mirror the fixed pipeline: when the engine is enabled it is the sole
+        # signal authority — no legacy-score blocker. Surface the engine's own
+        # decision so the UI matches what the buy loop would actually do.
+        try:
+            _sig_data = {
+                **cached.get("signals", {}),
+                "rsi_value":       cached.get("rsi_val", 0.0),
+                "current_price":   cached.get("price", 0.0),
+                "low_24h":         cached.get("low_24h"),
+                "klines_1m":       cached.get("klines_1m", []),
+                "stoch_rsi_value": cached.get("stoch_rsi_val"),
+            }
+            _dec = _sr_evaluate_buy_decision(sym, _sig_data, strategy)
+            if not _dec.get("allowed"):
+                blockers.append(f"engine:{_dec.get('reason', 'blocked')}")
+        except Exception:
+            pass
+    else:
         if cached.get("score", 0) < min_sigs:
             blockers.append(f"score {cached.get('score', 0)}/{min_sigs}")
         if bool(strategy.get("mandatory_signals_enabled", True)):
             sigs = cached.get("signals", {})
             rsi_v = cached.get("rsi_val", 0.0)
-            rsi_threshold = float(strategy.get("rsi_buy_threshold", 40.0))
+            # Single source of truth: nested signal_thresholds first, root
+            # key as fallback — matches the buy loop's legacy mandatory gate.
+            rsi_threshold = float(
+                strategy.get("signal_thresholds", {}).get(
+                    "rsi_buy_threshold", strategy.get("rsi_buy_threshold", 40.0)
+                )
+            )
             if not sigs.get("trend", False):
                 blockers.append("mandatory_ema_down")
             if rsi_v <= 0 or rsi_v >= rsi_threshold:
@@ -1529,41 +1555,138 @@ def get_btc_state() -> Optional[dict]:
 _reversal_cache: dict = {}
 _REVERSAL_TTL_SEC = 30.0
 
-def _fetch_1m_klines_rc(symbol: str, limit: int = 5) -> Optional[List[dict]]:
-    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
-    ok, data, _, _ = _binance_request(url, timeout=3.0, source="reversal_klines")
-    if not ok or not isinstance(data, list):
-        return None
+def _fetch_1m_klines_rc(symbol: str, limit: int = 6) -> Optional[List[dict]]:
+    """Fetch 1m klines for reversal confirmation — tries every Binance base
+    (same fallback list as the scanner) instead of a single hardcoded host."""
+    for _base in _KLINE_BASES:
+        url = f"{_base}/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
+        _src = f"reversal_klines_{_base.split('//', 1)[-1].split('.', 1)[0]}"
+        ok, data, _, _ = _binance_request(url, timeout=3.0, source=_src)
+        if not ok or not isinstance(data, list) or len(data) < limit:
+            continue
+        try:
+            return [{"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+                     "close": float(k[4]), "volume": float(k[5])} for k in data]
+        except Exception:
+            continue
+    return None
+
+
+def _reversal_candles(symbol: str) -> Optional[List[dict]]:
+    """Return the last 5 COMPLETED 1m candles for reversal confirmation.
+
+    REST returns the in-progress candle last, so fetch 6 and drop it. When
+    REST fails, fall back to the WebSocket closed-candle buffer (which holds
+    only completed candles). Returns None when no source has enough data.
+    """
+    klines = _fetch_1m_klines_rc(symbol, limit=6)
+    if klines and len(klines) >= 6:
+        return klines[:-1]  # drop the in-progress candle
     try:
-        return [{"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
-                 "close": float(k[4]), "volume": float(k[5])} for k in data]
+        import data_collector as _dc_rc
+        buf = list(_dc_rc.ws_candles.get(symbol, []))[-6:]
+        if len(buf) >= 5:
+            return [{"open": float(r[1]), "high": float(r[2]), "low": float(r[3]),
+                     "close": float(r[4]), "volume": float(r[5])} for r in buf[-5:]]
     except Exception:
-        return None
+        pass
+    return None
+
 
 def is_reversal_confirmed(symbol: str) -> tuple:
-    """Returns (confirmed: bool, reason: str). Requires green candle + volume surge."""
+    """Returns (confirmed: bool, reason: str).
+
+    Evaluates the last COMPLETED 1m candle (green + volume surge vs the prior
+    4 completed candles) — never the in-progress candle, whose partial volume
+    made confirmation near-impossible at arbitrary buy moments. When no candle
+    data is available from any source (REST + WS), PASSES with a throttled
+    warning: the pre-buy fresh re-check has already validated momentum, and
+    data unavailability alone must never permanently block buying."""
+    global _last_reversal_nodata_log
     now = time.time()
     cached_rc = _reversal_cache.get(symbol)
     if cached_rc and (now - cached_rc["ts"]) < _REVERSAL_TTL_SEC:
         return cached_rc["confirmed"], cached_rc.get("reason", "cached")
-    klines = _fetch_1m_klines_rc(symbol, limit=5)
-    if not klines or len(klines) < 5:
-        _reversal_cache[symbol] = {"ts": now, "confirmed": False, "reason": "no_data"}
-        return False, "no_data"
-    last = klines[-1]
+    candles = _reversal_candles(symbol)
+    if not candles or len(candles) < 5:
+        if now - _last_reversal_nodata_log >= 60.0:
+            _last_reversal_nodata_log = now
+            try:
+                database.log_activity(
+                    f"{symbol}: reversal confirmation has no candle data (REST+WS) — "
+                    f"passing through (fresh re-check already validated momentum)", "warn"
+                )
+            except Exception:
+                pass
+        _reversal_cache[symbol] = {"ts": now, "confirmed": True, "reason": "no_data_pass"}
+        return True, "no_data_pass"
+    last = candles[-1]          # last COMPLETED candle
+    prev = candles[:-1]         # the 4 completed candles before it
     if last["close"] <= last["open"]:
         _reversal_cache[symbol] = {"ts": now, "confirmed": False, "reason": "last_candle_red"}
         return False, "last_candle_red"
-    avg_prev_vol = sum(c["volume"] for c in klines[:-1]) / 4.0
+    avg_prev_vol = sum(c["volume"] for c in prev) / 4.0
     if avg_prev_vol > 0 and last["volume"] < avg_prev_vol * 1.15:
         _reversal_cache[symbol] = {"ts": now, "confirmed": False, "reason": "weak_volume"}
         return False, "weak_volume"
-    recent_low = min(c["low"] for c in klines[:-1])
+    recent_low = min(c["low"] for c in prev)
     if last["close"] <= recent_low:
         _reversal_cache[symbol] = {"ts": now, "confirmed": False, "reason": "still_below_lows"}
         return False, "still_below_lows"
     _reversal_cache[symbol] = {"ts": now, "confirmed": True, "reason": "ok"}
     return True, "ok"
+
+
+# ── Pre-buy fresh kline fetch — multi-source, never fail-closed ───────────────
+
+def _fetch_fresh_1m_candles(sym: str, limit: int = 50, min_candles: int = 36) -> list:
+    """Fetch fresh 1m OHLCV candles for the pre-buy re-check.
+
+    limit=50 gives MACD parity with the 60s scan (histogram[-2] needs >=36
+    closes — the old limit=30 made the macd signal structurally impossible).
+
+    Source order: every Binance REST base in _KLINE_BASES (per-base backoff
+    keys so one dead host doesn't blind the others), then the in-memory
+    WebSocket closed-candle buffer, then DB candles.
+
+    Returns a list of candle dicts (open/high/low/close/volume) with at least
+    ``min_candles`` entries, or [] when NO source has enough data. Callers
+    must treat [] as "no fresh data available" and proceed on the cached
+    signal decision — never as a failed signal check.
+    """
+    import urllib.parse as _up_fr
+    qs = _up_fr.urlencode({"symbol": sym, "interval": "1m", "limit": limit})
+    for _base in _KLINE_BASES:
+        _src = f"klines_pre_buy_{_base.split('//', 1)[-1].split('.', 1)[0]}"
+        ok, raw, _, _ = _binance_request(f"{_base}/api/v3/klines?{qs}",
+                                         timeout=2.0, source=_src)
+        if not ok or not isinstance(raw, list) or len(raw) < min_candles:
+            continue
+        try:
+            return [{"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+                     "close": float(k[4]), "volume": float(k[5])} for k in raw]
+        except Exception:
+            continue
+    try:
+        import data_collector as _dc_fr
+        buf = list(_dc_fr.ws_candles.get(sym, []))
+        if len(buf) >= min_candles:
+            return [{"open": float(r[1]), "high": float(r[2]), "low": float(r[3]),
+                     "close": float(r[4]), "volume": float(r[5])} for r in buf[-limit:]]
+    except Exception:
+        pass
+    try:
+        rows = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=limit)
+        if len(rows) >= min_candles:
+            return [{"open":   float(r.get("open") or r["close"]),
+                     "high":   float(r.get("high") or r["close"]),
+                     "low":    float(r.get("low") or r["close"]),
+                     "close":  float(r["close"]),
+                     "volume": float(r.get("volume") or 0.0)} for r in rows]
+    except Exception:
+        pass
+    return []
+
 
 def _floor_qty(qty: float, symbol: str = "", decimals: int = 8) -> float:
     """Floor quantity to the symbol's LOT_SIZE stepSize to avoid Binance -1111 errors.
@@ -1633,7 +1756,14 @@ def evaluate_signals(candles: list) -> dict:
     candles: list of dicts with keys close, volume, high, low.
     When high/low are unavailable (tick data), pass high=low=close — ATR will
     return None → atr_is_tradeable returns False → atr signal = False.
+
+    Short/empty input returns all-False instead of raising (the [-2]/[-3]
+    indexing below needs at least 3 candles) — callers must decide whether
+    thin data means "skip the check", never rely on an IndexError.
     """
+    if not candles or len(candles) < 3:
+        return {"trend": False, "rsi": False, "macd": False,
+                "volume": False, "obv": False, "atr": False}
     closes  = [c["close"]  for c in candles]
     volumes = [c["volume"] for c in candles]
 
@@ -1702,7 +1832,14 @@ def update_coin_signals(symbol: str, closes: list, volumes: list):
         rsi_display = rsi_list[-2] if rsi_list[-2] is not None else 0.0
 
         with _signal_cache_lock:
-            _signal_cache[symbol] = {
+            # MERGE into the previous entry instead of replacing it — the old
+            # replace dropped klines_1m/low_24h/stoch_rsi_val/5m_ts written by
+            # the REST scan, starving M4_micro_pullback (mandatory!), R1 and
+            # M2 of data every time a 1m kline closed, and defeating the 180s
+            # 5m-veto cache (5m_ts loss forced a REST refetch every scan).
+            prev  = _signal_cache.get(symbol, {})  # re-read under the write lock
+            entry = dict(prev)
+            entry.update({
                 "signals":  signals,
                 "score":    score,
                 "price":    closes[-1],
@@ -1710,7 +1847,33 @@ def update_coin_signals(symbol: str, closes: list, volumes: list):
                 "bb_ok":    prev.get("bb_ok",  False),  # preserved from last REST scan
                 "5m_ok":    prev.get("5m_ok",  False),  # preserved from last REST scan
                 "ts":       time.time(),
-            }
+            })
+            # Append the newly closed candle to klines_1m so R1/M4 keep seeing
+            # fresh data between REST scans (cap at 60 — more than the engine
+            # needs). Skip the append when the REST scan already recorded it.
+            try:
+                _k1        = list(entry.get("klines_1m") or [])
+                _new_close = float(closes[-1])
+                _new_vol   = float(volumes[-1]) if volumes else 0.0
+                _last_k    = _k1[-1] if _k1 else None
+                _is_dup = bool(
+                    _last_k
+                    and abs(float(_last_k.get("close", 0)) - _new_close) < 1e-12
+                    and abs(float(_last_k.get("volume", 0)) - _new_vol) < 1e-12
+                )
+                if not _is_dup:
+                    _open = float(closes[-2]) if len(closes) >= 2 else _new_close
+                    _k1.append({
+                        "open":   _open,
+                        "high":   max(_open, _new_close),
+                        "low":    min(_open, _new_close),
+                        "close":  _new_close,
+                        "volume": _new_vol,
+                    })
+                entry["klines_1m"] = _k1[-60:]
+            except Exception:
+                pass
+            _signal_cache[symbol] = entry
     except Exception as e:
         print(f"[TradeEngine] Signal cache error {symbol}: {e}")
 
@@ -2319,15 +2482,37 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     global _last_buy_check, _buys_this_scan, _last_buy_ts
     _buys_this_scan = 0  # reset per-scan counter each invocation
 
+    # Load strategy once up front (_load_strategy is mtime-cached — cheap).
+    strategy = _load_strategy()
+    _pre_min_sigs = int(strategy.get("min_signals", config.MIN_SIGNALS_TO_BUY))
+    # Engine-aware pre-gate: when the signal engine is enabled the legacy
+    # 6-signal score is NOT the buy criterion, so the any_ready shortcut must
+    # not gate the engine's own per-coin evaluation.
+    _pre_engine_active = (
+        SIGNAL_REGISTRY_AVAILABLE
+        and bool(strategy.get("signal_engine", {}).get("enabled", False))
+    )
+
+    # Paused bot: check BEFORE the any_ready pre-gate — previously this warn
+    # sat below the pre-gate and was unreachable unless a coin coincidentally
+    # passed the legacy score, so a silently-paused bot logged nothing.
+    if not strategy.get("trading_active", True):
+        global _last_paused_log
+        _now_p = time.time()
+        if _now_p - _last_paused_log >= 60.0:
+            _last_paused_log = _now_p
+            database.log_activity("Buy check: trading_active=False — bot is paused", "warn")
+        return
+
     # Fast pre-check: any coin signalling BUY? (no lock needed for scalar read)
     # Use the runtime min_signals setting — the hardcoded config default would
-    # silently defeat a user threshold set below it (_load_strategy is mtime-cached).
-    _pre_min_sigs = int(_load_strategy().get("min_signals", config.MIN_SIGNALS_TO_BUY))
+    # silently defeat a user threshold set below it. Legacy path only: with the
+    # signal engine active we proceed to the per-coin loop and let it decide.
     with _signal_cache_lock:
         any_ready = any(v["score"] >= _pre_min_sigs for v in _signal_cache.values())
         cache_size = len(_signal_cache)
 
-    if not any_ready:
+    if cache_size == 0 or (not any_ready and not _pre_engine_active):
         global _last_no_signal_log
         now_ns = time.time()
         if now_ns - _last_no_signal_log >= 60.0:
@@ -2340,6 +2525,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 database.log_activity(
                     f"Signal cache empty — data sources: ticks={n_ticks}, samples={n_samples}, ws_candles={n_ws}", "info"
                 )
+                _record_rejection("(all)", 0, "signal_cache_empty",
+                                  f"ticks={n_ticks} samples={n_samples} ws_candles={n_ws}")
             else:
                 with _signal_cache_lock:
                     snap = dict(_signal_cache)
@@ -2351,6 +2538,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 database.log_activity(
                     f"Buy check: {cache_size} coins, none at score≥{_pre_min_sigs} — top5: {detail}", "info"
                 )
+                if top:
+                    _record_rejection(top[0][0], top[0][1].get("score", 0),
+                                      "pre_gate_below_min_signals",
+                                      f"none of {cache_size} coins at score>={_pre_min_sigs}")
         return
 
     # Throttle: don't call get_account() faster than every 1 s
@@ -2358,11 +2549,6 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     if now - _last_buy_check < 0.1:
         return
     _last_buy_check = now
-
-    strategy = _load_strategy()
-    if not strategy.get("trading_active", True):
-        database.log_activity("Buy check: trading_active=False — bot is paused", "warn")
-        return
 
     # Always refresh risk params first — even when at capacity, so the sell monitor
     # uses current TP/SL settings rather than stale cached values.
@@ -2456,9 +2642,17 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                                       f"pct_24h={_btc['pct_24h']} pct_4h={_btc['pct_4h']}")
             return
 
-    # Read mandatory signal thresholds once (hot-reloadable from strategy.json)
+    # Read mandatory signal thresholds once (hot-reloadable from strategy.json).
+    # Single source of truth for the RSI buy threshold: the nested
+    # signal_thresholds key (what the UI writes and the engine's M1 reads)
+    # first, then the legacy root key, then 40 — the old root-only read left
+    # the legacy gate and the engine enforcing two different thresholds.
     mandatory_enabled = bool(strategy.get("mandatory_signals_enabled", True))
-    rsi_threshold     = float(strategy.get("rsi_buy_threshold", 40.0))
+    rsi_threshold     = float(
+        strategy.get("signal_thresholds", {}).get(
+            "rsi_buy_threshold", strategy.get("rsi_buy_threshold", 40.0)
+        )
+    )
 
     for sym, cached in cache_snapshot.items():
         # Re-check capacity before every individual buy — the pre-loop check only
@@ -2481,7 +2675,6 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             rem = int(_loss_cooldown[sym] - time.time())
             _record_rejection(sym, cached["score"], "loss_cooldown", f"{rem}s remaining")
             database.log_activity(f"{sym}: buy skipped — post-slippage-loss cooldown ({rem}s remaining)", "info")
-            _record_rejection(sym, cached["score"], "loss_cooldown", f"{rem}s remaining")
             continue
 
         with _positions_lock:
@@ -2522,7 +2715,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _dec = _sr_evaluate_buy_decision(sym, _sig_data, strategy)
             _buy_decision = _dec
             if not _dec["allowed"]:
-                _record_rejection(sym, score, _dec["reason"],
+                # Record the ENGINE score — the legacy score is irrelevant on
+                # this path and previously hid these rejections behind the
+                # (now removed) score<3 filter.
+                _record_rejection(sym, _dec.get("score", score), _dec["reason"],
                                   f"score={_dec['score']} fired={_dec['fired_signals']}")
                 continue
             # Passed new engine — fall through to existing veto checks below
@@ -2698,6 +2894,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # Binance minimum notional is $10 for most spot pairs — reject early
         # so we don't waste an API call and get a cryptic -1013 error.
         if mode == "live" and budget < 10.0:
+            _record_rejection(sym, score, "min_notional",
+                              f"budget=${budget:.2f} < $10 Binance minimum")
             database.log_activity(
                 f"{sym}: buy skipped — budget ${budget:.2f} < $10 Binance minimum notional "
                 f"(increase trade size in Settings)", "warn"
@@ -2745,51 +2943,85 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             break
 
         # ── Fresh signal re-check before committing ────────────────────────────
-        # Cache can be 30-60s stale. A single REST kline fetch verifies signals
-        # are still valid at execution time — eliminates stale-cache buys.
+        # Cache can be 30-60s stale. Re-verify at execution time using fresh
+        # candles (REST multi-base → WS buffer → DB, 50 klines for MACD parity
+        # with the scan). When the signal engine approved this buy, re-verify
+        # with the SAME engine — not the legacy min_signals score, which tests
+        # the opposite (momentum-up) hypothesis of an engine dip entry. When
+        # no data source is available, proceed on the cached decision (the
+        # scanner refreshed it ≤60s ago) — data unavailability alone must
+        # never fail-closed and block every buy.
         try:
-            import urllib.parse as _up_kb
-            _fresh_url = (
-                f"https://data-api.binance.vision/api/v3/klines?"
-                + _up_kb.urlencode({"symbol": sym, "interval": "1m", "limit": 30})
-            )
-            _ok_kb, _raw, _, _ = _binance_request(_fresh_url, timeout=2.0, source="klines_pre_buy")
-            if not _ok_kb or not isinstance(_raw, list):
-                _raw = []
-            _fresh_closes  = [float(k[4]) for k in _raw]
-            _fresh_volumes = [float(k[5]) for k in _raw]
-            _fresh_candles = [
-                {"high": float(k[2]), "low": float(k[3]),
-                 "close": float(k[4]), "volume": float(k[5])}
-                for k in _raw
-            ]
-            _fresh_sigs  = evaluate_signals(_fresh_candles)
-            _fresh_score = sum(_fresh_sigs.values())
-            if _fresh_score < min_sigs:
-                cache_age = round(time.time() - cached.get("ts", 0), 1)
-                database.log_activity(
-                    f"[SKIP] {sym}: fresh re-check FAILED — score {_fresh_score}/6 < {min_sigs} "
-                    f"(cache had {score}/6, age={cache_age}s)", "warn"
-                )
-                _record_rejection(sym, score, "stale_signals", f"fresh={_fresh_score} cache={score} age={cache_age}s")
-                _release_buy_claim()
-                continue
-            _live_price = _fresh_closes[-1]
-            if price > 0 and abs(_live_price - price) / price > 0.005:
-                database.log_activity(
-                    f"[SKIP] {sym}: price moved {(_live_price - price)/price*100:.2f}% "
-                    f"since cache (${price:.4f} → ${_live_price:.4f}) — skipping", "warn"
-                )
-                _release_buy_claim()
-                continue
-            price = _live_price
-            _client().update_price(sym, price)
+            _fresh_candles = _fetch_fresh_1m_candles(sym)
+            if not _fresh_candles:
+                global _last_fresh_nodata_log
+                _now_fr = time.time()
+                if _now_fr - _last_fresh_nodata_log >= 60.0:
+                    _last_fresh_nodata_log = _now_fr
+                    database.log_activity(
+                        f"{sym}: pre-buy fresh re-check has no data source (REST/WS/DB) — "
+                        f"proceeding on cached signals "
+                        f"(age={round(time.time() - cached.get('ts', 0), 1)}s)", "warn"
+                    )
+            else:
+                _fresh_closes = [c["close"] for c in _fresh_candles]
+                _fresh_sigs   = evaluate_signals(_fresh_candles)
+                if signal_engine_active:
+                    # Re-run the engine that approved the buy on the fresh data.
+                    _fresh_rsi_list = indicators.calc_rsi(_fresh_closes, 14)
+                    _fresh_rsi = _fresh_rsi_list[-2] if _fresh_rsi_list[-2] is not None else 0.0
+                    try:
+                        _fresh_stoch = indicators.calc_stoch_rsi(_fresh_closes)
+                    except Exception:
+                        _fresh_stoch = cached.get("stoch_rsi_val")
+                    _fresh_data = {
+                        **_fresh_sigs,
+                        "rsi_value":       _fresh_rsi,
+                        "current_price":   _fresh_closes[-1],
+                        "low_24h":         cached.get("low_24h"),
+                        "klines_1m":       _fresh_candles[-15:],
+                        "stoch_rsi_value": _fresh_stoch,
+                    }
+                    _fresh_dec = _sr_evaluate_buy_decision(sym, _fresh_data, strategy)
+                    if not _fresh_dec["allowed"]:
+                        cache_age = round(time.time() - cached.get("ts", 0), 1)
+                        database.log_activity(
+                            f"[SKIP] {sym}: fresh engine re-check FAILED — "
+                            f"{_fresh_dec['reason']} (cache age={cache_age}s)", "warn"
+                        )
+                        _record_rejection(sym, _fresh_dec.get("score", score), "stale_signals",
+                                          f"fresh_engine={_fresh_dec['reason']} age={cache_age}s")
+                        _release_buy_claim()
+                        continue
+                else:
+                    _fresh_score = sum(_fresh_sigs.values())
+                    if _fresh_score < min_sigs:
+                        cache_age = round(time.time() - cached.get("ts", 0), 1)
+                        database.log_activity(
+                            f"[SKIP] {sym}: fresh re-check FAILED — score {_fresh_score}/6 < {min_sigs} "
+                            f"(cache had {score}/6, age={cache_age}s)", "warn"
+                        )
+                        _record_rejection(sym, score, "stale_signals",
+                                          f"fresh={_fresh_score} cache={score} age={cache_age}s")
+                        _release_buy_claim()
+                        continue
+                _live_price = _fresh_closes[-1]
+                if price > 0 and abs(_live_price - price) / price > 0.005:
+                    database.log_activity(
+                        f"[SKIP] {sym}: price moved {(_live_price - price)/price*100:.2f}% "
+                        f"since cache (${price:.4f} → ${_live_price:.4f}) — skipping", "warn"
+                    )
+                    _release_buy_claim()
+                    continue
+                price = _live_price
+                _client().update_price(sym, price)
         except Exception as _fresh_e:
+            # Unexpected error (not data unavailability — that path never
+            # raises). Proceed on the cached decision rather than reinstating
+            # the old fail-closed skip that killed every buy.
             database.log_activity(
-                f"[SKIP] {sym}: fresh re-check failed ({_fresh_e}) — skipping for safety", "warn"
+                f"{sym}: fresh re-check errored ({_fresh_e}) — proceeding on cached signals", "warn"
             )
-            _release_buy_claim()
-            continue
 
         # ── Reversal confirmation ──────────────────────────────────────────────
         if bool(strategy.get("reversal_confirmation_enabled", True)):
@@ -4028,8 +4260,36 @@ async def _refresh_signal_cache():
         if _5m_age >= 180:
             try:
                 candles_5m = await asyncio.to_thread(_dc.fetch_5m_candles, sym)
-                five_m_ok  = indicators.is_5m_bullish(candles_5m)
-                _5m_ts     = time.time()
+                if not candles_5m or len(candles_5m) < 21:
+                    # Cold start: the WS 5m buffer needs ~105 min to refill
+                    # after a restart. Derive 5m candles from stored 1m
+                    # history so the veto can evaluate real trend data.
+                    try:
+                        _db_1m = await asyncio.to_thread(
+                            database.get_candles, sym, config.CANDLE_TIMEFRAME, 130
+                        )
+                        _derived_5m = indicators.aggregate_candles(_db_1m, group=5)
+                        if len(_derived_5m) >= 21:
+                            candles_5m = _derived_5m
+                    except Exception:
+                        pass
+                if not candles_5m or len(candles_5m) < 21:
+                    # Still not enough data — this is data availability, not a
+                    # downtrend. Stay NEUTRAL (pass) during warmup instead of
+                    # vetoing every coin '5m downtrend' for up to ~105 min
+                    # after each restart.
+                    five_m_ok = True
+                    global _warned_5m_warmup
+                    if not _warned_5m_warmup:
+                        _warned_5m_warmup = True
+                        database.log_activity(
+                            "5m veto warmup: <21 five-minute candles available "
+                            "(WS buffer refilling, REST/DB thin) — treating 5m "
+                            "trend as neutral until data accumulates", "warn"
+                        )
+                else:
+                    five_m_ok = indicators.is_5m_bullish(candles_5m)
+                _5m_ts = time.time()
             except Exception:
                 five_m_ok  = prev.get("5m_ok", True)
                 _5m_ts     = prev.get("5m_ts", 0)
