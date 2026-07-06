@@ -233,65 +233,81 @@ async def lifespan(app: FastAPI):
             _starting = float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
             database.save_setting("paper_starting_balance", str(_starting))
 
-        # 3. Restore open positions + coins + balance from SQLite / Supabase
-        trade_engine.load_positions_from_db()
-        steps.append("positions OK")
+        # 3+. Everything below involves network I/O (Binance account fetch,
+        # orphan scan, Supabase) — it MUST NOT block the lifespan, or uvicorn
+        # won't accept connections and nginx serves 502 for the whole init
+        # (10-30 s on every deploy). Defer it to a background task; the API
+        # starts serving immediately and endpoints tolerate partial state.
+        async def _deferred_init():
+            try:
+                # 3. Restore open positions + coins + balance from SQLite / Supabase
+                await asyncio.to_thread(trade_engine.load_positions_from_db)
+                steps.append("positions OK")
 
-        # 3b. Start REST price refresher for held positions (2s interval — critical for
-        #     low-WS-volume coins that can go minutes stale without this)
-        trade_engine.start_held_position_refresher()
-        steps.append("held_price_refresher OK")
-        trade_engine.start_capital_recycler()
-        steps.append("capital_recycler OK")
-        trade_engine.start_phantom_checker()
-        steps.append("phantom_checker OK")
+                # 3b. Start REST price refresher for held positions (2s interval —
+                #     critical for low-WS-volume coins that can go minutes stale)
+                trade_engine.start_held_position_refresher()
+                steps.append("held_price_refresher OK")
+                trade_engine.start_capital_recycler()
+                steps.append("capital_recycler OK")
+                trade_engine.start_phantom_checker()
+                steps.append("phantom_checker OK")
 
-        # 4. Apply startup defaults and auto-resume logic.
-        #    stop_loss and smart_hold are ALWAYS forced OFF on every deploy —
-        #    the user must explicitly enable them each session.
-        #    trading_active is preserved so a running bot resumes after a redeploy.
-        _s = _load_strategy()
-        _auto_patch: dict = {
-            "pause_reason": None,
-        }
-        if "trading_active" not in _s:
-            # Brand-new deploy — don't auto-start, let user press Start
-            _auto_patch["trading_active"] = False
-        # else: preserve existing trading_active (resumes running bot after redeploy)
-        if not _s.get("initial_balance_usdt"):
-            _auto_patch["initial_balance_usdt"] = _get_usdt_balance() or float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
-        _write_strategy_patch(_auto_patch)
-        steps.append(f"trading_active={'resume' if _s.get('trading_active') else 'off'}")
+                # 4. Apply startup defaults and auto-resume logic.
+                #    trading_active is preserved so a running bot resumes after a redeploy.
+                _s = _load_strategy()
+                _auto_patch: dict = {
+                    "pause_reason": None,
+                }
+                if "trading_active" not in _s:
+                    # Brand-new deploy — don't auto-start, let user press Start
+                    _auto_patch["trading_active"] = False
+                # else: preserve existing trading_active (resumes running bot after redeploy)
+                if not _s.get("initial_balance_usdt"):
+                    _bal = await asyncio.to_thread(_get_usdt_balance)
+                    _auto_patch["initial_balance_usdt"] = _bal or float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
+                _write_strategy_patch(_auto_patch)
+                steps.append(f"trading_active={'resume' if _s.get('trading_active') else 'off'}")
 
-        # 5. History download — daemon thread, never blocks health-check
-        threading.Thread(target=data_collector.download_history, daemon=True).start()
-        steps.append("history_dl started")
+                # 5. History download — daemon thread, never blocks
+                threading.Thread(target=data_collector.download_history, daemon=True).start()
+                steps.append("history_dl started")
 
-        # 6. Register price/kline callbacks
-        data_collector.register_price_callback(trade_engine.realtime_monitor)
-        data_collector.register_kline_callback(trade_engine.update_coin_signals)
-        steps.append("callbacks OK")
+                # 6. Register price/kline callbacks
+                data_collector.register_price_callback(trade_engine.realtime_monitor)
+                data_collector.register_kline_callback(trade_engine.update_coin_signals)
+                steps.append("callbacks OK")
 
-        # 7. Launch async tasks
-        _spawn_bg_task(data_collector.start_websocket(), "websocket")
-        _spawn_bg_task(strategy_engine.strategy_loop(), "strategy_loop")
-        _spawn_bg_task(trade_engine.signal_scanner(data_collector.prices), "signal_scanner")
-        _spawn_bg_task(trade_engine.position_guardian(), "position_guardian")
-        _spawn_bg_task(_supabase_periodic_sync(), "supabase_sync")
-        _spawn_bg_task(_anomaly_checker(), "anomaly_checker")
-        steps.append("async tasks launched")
+                # 7. Launch async tasks
+                _spawn_bg_task(data_collector.start_websocket(), "websocket")
+                _spawn_bg_task(strategy_engine.strategy_loop(), "strategy_loop")
+                _spawn_bg_task(trade_engine.signal_scanner(data_collector.prices), "signal_scanner")
+                _spawn_bg_task(trade_engine.position_guardian(), "position_guardian")
+                _spawn_bg_task(_supabase_periodic_sync(), "supabase_sync")
+                _spawn_bg_task(_anomaly_checker(), "anomaly_checker")
+                steps.append("async tasks launched")
 
-        # 8. Futures paper-trading agent (completely separate parallel process)
-        if config.FUTURES_ENABLED:
-            import futures_engine
-            futures_engine.init_futures_engine()
-            _spawn_bg_task(futures_engine.mark_price_loop(), "futures_mark_price")
-            _spawn_bg_task(futures_engine.signal_scanner_loop(), "futures_signal_scanner")
-            steps.append("futures tasks launched")
+                # 8. Futures paper-trading agent (completely separate parallel process)
+                if config.FUTURES_ENABLED:
+                    import futures_engine
+                    futures_engine.init_futures_engine()
+                    _spawn_bg_task(futures_engine.mark_price_loop(), "futures_mark_price")
+                    _spawn_bg_task(futures_engine.signal_scanner_loop(), "futures_signal_scanner")
+                    steps.append("futures tasks launched")
 
-        msg = "Bot ready — " + " | ".join(steps)
-        print(f"[ControlAPI] {msg}")
-        database.log_activity(msg, "info")
+                msg = "Bot ready — " + " | ".join(steps)
+                print(f"[ControlAPI] {msg}")
+                database.log_activity(msg, "info")
+            except Exception as exc:
+                err = f"STARTUP ERROR at step {steps[-1] if steps else '?'}: {exc}"
+                print(f"[ControlAPI] {err}")
+                try:
+                    database.log_activity(err, "error")
+                except Exception:
+                    pass
+
+        _spawn_bg_task(_deferred_init(), "deferred_init")
+        print("[ControlAPI] HTTP up — deferred init running in background")
 
     except Exception as exc:
         err = f"STARTUP ERROR at step {steps[-1] if steps else '?'}: {exc}"
