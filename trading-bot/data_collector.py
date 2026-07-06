@@ -32,6 +32,8 @@ _ws_health: Dict = {
     "disconnect_count":   0,
     "last_connect_ts":    0.0,
     "last_disconnect_ts": 0.0,
+    "subscribed_coins":   0,
+    "resubscribe_count":  0,
 }
 
 # In-memory rolling candle buffer — filled by WebSocket kline-close events.
@@ -78,6 +80,73 @@ def register_kline_callback(cb: Callable[[str, list, list], None]):
     """Wire kline-close events into trade_engine.update_coin_signals."""
     global _kline_callback
     _kline_callback = cb
+
+
+# ── Dynamic watchlist ─────────────────────────────────────────────────────────
+# The WS stream list is rebuilt on every (re)connect from the persisted
+# watchlist (strategy.json approved_coins — the same file /api/coins writes)
+# so dashboard changes actually re-subscribe. A watcher task also polls the
+# persisted list every _WATCHLIST_POLL_SEC as a self-healing fallback, so the
+# fix works even if control_api never calls refresh_watchlist().
+
+_reconnect_requested = threading.Event()
+_WATCHLIST_POLL_SEC  = 60
+
+# Binance combined streams allow ~1024 streams per connection. Klines (1m+5m)
+# are essential for signals and are always kept; miniTicker / @trade are
+# dropped first when the coin list would blow the budget.
+_MAX_COMBINED_STREAMS = 1000
+
+
+def refresh_watchlist():
+    """Signal the WS loop to reconnect and rebuild its stream list from the
+    persisted watchlist. Thread-safe (just sets an Event); safe to call at any
+    time, including before the WS loop has started. control_api's /api/coins
+    handler can call this right after writing approved_coins; even without
+    that hook the WS loop self-heals via its ~60s watchlist poll."""
+    _reconnect_requested.set()
+    print("[DataCollector] Watchlist refresh requested — WebSocket will resubscribe")
+
+
+def _load_persisted_watchlist() -> list:
+    """Symbols the WS feed should stream: the user's approved coins from
+    strategy.json (written by /api/coins), union any symbols with open
+    positions (held coins must keep streaming prices for the sell path),
+    falling back to config.WATCHED_COINS when nothing is persisted."""
+    coins: list = []
+    try:
+        with open(config.STRATEGY_FILE) as f:
+            s = json.load(f)
+        coins = [
+            str(c.get("symbol", "")).upper()
+            for c in s.get("approved_coins", [])
+            if c.get("approved") and str(c.get("symbol", "")).upper().endswith("USDT")
+        ]
+    except Exception:
+        coins = []
+    if not coins:
+        coins = list(config.WATCHED_COINS)
+
+    # Union with open-position symbols (guarded — trade_engine may not be
+    # importable yet during early startup).
+    try:
+        import trade_engine as _te
+        with _te._positions_lock:
+            pos_syms = [str(p.get("symbol", "")).upper() for p in _te._positions]
+        for sym in pos_syms:
+            if sym and sym not in coins:
+                coins.append(sym)
+    except Exception:
+        pass
+
+    # De-dupe preserving order
+    seen: set = set()
+    out: list = []
+    for c in coins:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
 
 
 # ── REST historical download ────────────────────────────────────────────
@@ -202,14 +271,106 @@ def _compute_and_save(symbol: str, raw_klines: list, save_all: bool = False):
             database.save_candle(symbol, config.CANDLE_TIMEFRAME, row)
 
 
+_bootstrap_5m_done = False
+_bootstrap_5m_lock = threading.Lock()
+
+
+def _bootstrap_5m_from_db():
+    """Cold-start seed for ws_candles_5m: synthesize 5m candles from the 1m
+    candles already persisted in SQLite. Without this, ws_candles_5m starts
+    empty on every restart and the 5m veto blocks all buys for ~105 minutes
+    (21 × 5m) until enough live WS candles accumulate.
+
+    Each aligned bucket of 5 consecutive 1m candles becomes one 5m candle:
+    o = first open, h = max high, l = min low, c = last close, v = sum volume.
+    Only complete, fully-elapsed buckets are used; the most recent
+    _WS_5M_CANDLE_MAX per coin are kept. Runs once per process."""
+    global _bootstrap_5m_done
+    with _bootstrap_5m_lock:
+        if _bootstrap_5m_done:
+            return
+        _bootstrap_5m_done = True
+
+    if config.CANDLE_TIMEFRAME != "1m":
+        return  # can only synthesize 5m candles from 1m history
+
+    seeded = 0
+    total = 0
+    now_ms = int(time.time() * 1000)
+    try:
+        coins = _load_persisted_watchlist()
+    except Exception:
+        coins = list(config.WATCHED_COINS)
+
+    for sym in coins:
+        try:
+            if len(ws_candles_5m.get(sym, [])) >= _MIN_CANDLES_5M:
+                continue  # live buffer already usable — don't touch it
+            rows = database.get_candles(sym, "1m", limit=5 * (_WS_5M_CANDLE_MAX + 2))
+            if len(rows) < 5:
+                continue
+
+            buckets: Dict[int, list] = {}
+            for r in rows:
+                try:
+                    ot = int(r["open_time"])
+                except Exception:
+                    continue
+                buckets.setdefault(ot - (ot % 300_000), []).append(r)
+
+            synth = []
+            for start in sorted(buckets):
+                if start + 300_000 > now_ms:
+                    continue  # 5m window not fully elapsed — candle not closed
+                group = sorted(buckets[start], key=lambda g: int(g["open_time"]))
+                if len(group) != 5:
+                    continue  # gap in 1m history — skip incomplete bucket
+                if [int(g["open_time"]) for g in group] != [start + i * 60_000 for i in range(5)]:
+                    continue  # misaligned rows
+                synth.append([
+                    start,
+                    float(group[0]["open"]),
+                    max(float(g["high"]) for g in group),
+                    min(float(g["low"]) for g in group),
+                    float(group[-1]["close"]),
+                    sum(float(g["volume"]) for g in group),
+                ])
+            if not synth:
+                continue
+
+            # Merge with anything the live WS already collected (WS entries win)
+            buf = ws_candles_5m.setdefault(sym, [])
+            have = {int(k[0]) for k in buf}
+            merged = [k for k in synth if int(k[0]) not in have] + list(buf)
+            merged.sort(key=lambda k: int(k[0]))
+            ws_candles_5m[sym] = merged[-_WS_5M_CANDLE_MAX:]
+            seeded += 1
+            total += len(ws_candles_5m[sym])
+        except Exception as e:
+            print(f"[DataCollector] 5m bootstrap error ({sym}): {e}")
+
+    if seeded:
+        print(f"[DataCollector] 5m bootstrap: seeded {seeded} coins "
+              f"({total} synthesized 5m candles) from stored 1m history")
+    else:
+        print("[DataCollector] 5m bootstrap: no usable 1m history — 5m buffers start empty")
+
+
 def download_history():
     """Download 1000 hourly candles per coin on first run."""
+    # Seed 5m buffers from stored 1m candles first — this must run even when
+    # the candle table is already populated (i.e. after every restart).
+    try:
+        _bootstrap_5m_from_db()
+    except Exception as e:
+        print(f"[DataCollector] 5m bootstrap failed: {e}")
+
     if not database.candles_table_empty():
         print("[DataCollector] Candle history already loaded — skipping download.")
         return
 
     print(f"[DataCollector] Downloading {config.CANDLE_LOOKBACK * 20} candles per coin…")
-    for coin in config.WATCHED_COINS:
+    for coin in _load_persisted_watchlist():
         try:
             raw = _fetch_klines_rest(coin, config.CANDLE_TIMEFRAME, limit=1000)
             _compute_and_save(coin, raw, save_all=True)
@@ -223,18 +384,38 @@ def download_history():
 # ── Live WebSocket ─────────────────────────────────────────────────────────────────────────────
 
 def _build_ws_url(coins: list) -> str:
+    """Compose the combined-stream URL, respecting Binance's per-connection
+    stream budget. Klines (1m + 5m) are essential for signal computation and
+    are always included for every coin; miniTicker (1s price roll-up, feeds
+    the sell path) is next; per-trade tick streams are optional and dropped
+    first when the watchlist is large."""
+    n = len(coins)
+    suffixes = [f"kline_{config.CANDLE_TIMEFRAME}", "kline_5m"]   # 2 per coin, always
+    if n * 3 <= _MAX_COMBINED_STREAMS:
+        suffixes.append("miniTicker")                             # 3 per coin
+    if n * 4 <= _MAX_COMBINED_STREAMS:
+        suffixes.append("trade")                                  # 4 per coin
+    dropped = [s for s in ("trade", "miniTicker") if s not in suffixes]
+    if dropped:
+        print(f"[DataCollector] {n} coins would exceed the stream budget "
+              f"({_MAX_COMBINED_STREAMS}) — dropping {dropped} streams, klines kept for all")
     streams = "/".join(
-        f"{coin.lower()}@trade/"
-        f"{coin.lower()}@kline_{config.CANDLE_TIMEFRAME}/"
-        f"{coin.lower()}@kline_5m/"
-        f"{coin.lower()}@miniTicker"
-        for coin in coins
+        f"{coin.lower()}@{suffix}" for coin in coins for suffix in suffixes
     )
     return f"wss://data-stream.binance.vision/stream?streams={streams}"
 
 
+# Cache exchangeInfo verification so rapid resubscribes/reconnects don't
+# hammer the endpoint; keyed by the exact coin set.
+_verify_cache: Dict = {"key": None, "ok": None, "ts": 0.0}
+_VERIFY_TTL_SEC = 600
+
+
 async def _verify_symbols(coins: list) -> list:
     """Return only coins that Binance confirms exist as USDT pairs."""
+    key = frozenset(coins)
+    if _verify_cache["key"] == key and time.time() - _verify_cache["ts"] < _VERIFY_TTL_SEC:
+        return list(_verify_cache["ok"])
     try:
         def _fetch():
             url = "https://data-api.binance.vision/api/v3/exchangeInfo?permissions=SPOT"
@@ -246,6 +427,9 @@ async def _verify_symbols(coins: list) -> list:
         bad   = [c for c in coins if c not in valid]
         if bad:
             print(f"[DataCollector] Dropping invalid symbols: {bad}")
+        _verify_cache["key"] = key
+        _verify_cache["ok"]  = list(ok)
+        _verify_cache["ts"]  = time.time()
         return ok
     except Exception as e:
         print(f"[DataCollector] Symbol verification failed ({e}) — using full coin list")
@@ -279,29 +463,92 @@ def _persist_and_signal(sym: str, closed: list, buf_snapshot: list):
         print(f"[DataCollector] Candle persist/signal error ({sym}): {e}")
 
 
+async def _watchlist_watcher(ws, desired_set: set):
+    """Runs alongside an open WS connection. Closes the socket — so the
+    reconnect loop rebuilds the stream list — when refresh_watchlist() was
+    called or the persisted watchlist (strategy.json approved_coins ∪ open
+    positions) no longer matches what this connection subscribed to. The
+    ~60s poll is a self-healing fallback that keeps /api/coins changes
+    effective even if control_api never calls refresh_watchlist()."""
+    try:
+        while True:
+            # Check the explicit refresh flag every second for responsiveness;
+            # fall back to re-reading the persisted list every poll interval.
+            for _ in range(_WATCHLIST_POLL_SEC):
+                await asyncio.sleep(1.0)
+                if _reconnect_requested.is_set():
+                    break
+            changed = _reconnect_requested.is_set()
+            if not changed:
+                try:
+                    current = set(await asyncio.to_thread(_load_persisted_watchlist))
+                    changed = current != desired_set
+                except Exception:
+                    changed = False
+            if changed:
+                _ws_health["resubscribe_count"] = _ws_health.get("resubscribe_count", 0) + 1
+                print("[DataCollector] Watchlist changed — closing WebSocket to resubscribe")
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                return
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[DataCollector] Watchlist watcher error: {e}")
+
+
 async def _start_websocket_loop():
     """
     Async WebSocket loop with exponential-backoff reconnect.
     On each trade event: update prices, call trade_engine via callback.
     On closed kline: update candle DB.
+    The stream list is rebuilt from the persisted watchlist on every
+    (re)connect, so /api/coins changes take effect without a restart.
     """
     global last_ws_message_ts
     import websockets
     backoff = 1
     loop = asyncio.get_running_loop()
 
-    # Verify symbols once on startup so invalid coins don't break the connection
-    active_coins = await _verify_symbols(config.WATCHED_COINS)
+    # Cold-start: seed 5m buffers from stored 1m candles (idempotent — also
+    # attempted from download_history) so the 5m veto works right away.
+    try:
+        await asyncio.to_thread(_bootstrap_5m_from_db)
+    except Exception as e:
+        print(f"[DataCollector] 5m bootstrap failed: {e}")
 
     while True:
+        # Rebuild the stream list on every (re)connect: persisted watchlist
+        # (/api/coins → strategy.json approved_coins) ∪ open-position symbols,
+        # falling back to config.WATCHED_COINS when nothing is persisted.
+        _reconnect_requested.clear()
+        try:
+            desired = await asyncio.to_thread(_load_persisted_watchlist)
+        except Exception:
+            desired = list(config.WATCHED_COINS)
+        desired_set = set(desired)
+
+        # Drop symbols Binance doesn't trade (invalid/delisted) — cached 10 min
+        active_coins = await _verify_symbols(desired)
+        if len(active_coins) * 2 > _MAX_COMBINED_STREAMS:
+            keep = _MAX_COMBINED_STREAMS // 2
+            print(f"[DataCollector] Watchlist too large ({len(active_coins)} coins) — "
+                  f"subscribing the first {keep}")
+            active_coins = active_coins[:keep]
+
         url = _build_ws_url(active_coins)
         print(f"[DataCollector] Connecting WebSocket ({len(active_coins)} coins)…")
+        watcher = None
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=30, open_timeout=10) as ws:
                 backoff = 1  # reset on successful connect
-                _ws_health["connected"]       = True
-                _ws_health["connect_count"]  += 1
-                _ws_health["last_connect_ts"] = time.time()
+                _ws_health["connected"]        = True
+                _ws_health["connect_count"]   += 1
+                _ws_health["last_connect_ts"]  = time.time()
+                _ws_health["subscribed_coins"] = len(active_coins)
+                watcher = loop.create_task(_watchlist_watcher(ws, desired_set))
                 print("[DataCollector] WebSocket connected ✓")
                 if _ws_health["disconnect_count"] > 0:
                     try:
@@ -395,6 +642,12 @@ async def _start_websocket_loop():
                     except Exception as e:
                         print(f"[DataCollector] Message error: {e}")
 
+            # Graceful close (e.g. watchlist resubscribe) — loop reconnects
+            # immediately with a freshly rebuilt stream list, no backoff.
+            _ws_health["connected"]          = False
+            _ws_health["last_disconnect_ts"] = time.time()
+            print("[DataCollector] WebSocket closed — rebuilding stream list…")
+
         except Exception as e:
             _ws_health["connected"]            = False
             _ws_health["disconnect_count"]    += 1
@@ -427,6 +680,10 @@ async def _start_websocket_loop():
 
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
+        finally:
+            # Never leak watcher tasks across reconnects.
+            if watcher is not None:
+                watcher.cancel()
 
 
 _ws_thread: Optional[threading.Thread] = None

@@ -200,6 +200,78 @@ def is_5m_bullish(candles_5m: list) -> bool:
     return ema9[-1] > ema21[-1] and closes[-1] > ema21[-1]
 
 
+def aggregate_candles(candles_1m: list, group: int = 5) -> list:
+    """Aggregate 1m candles into N-minute candles (default 5m).
+
+    Accepts a list of dicts with at least a ``close`` key (``open``/``high``/
+    ``low``/``volume`` are used when present). When ``open_time`` (ms) is
+    available, candles are bucketed on real N-minute boundaries; otherwise they
+    are chunked sequentially from the NEWEST candle backwards so the most
+    recent aggregate always ends on the latest close. The trailing in-progress
+    bucket is dropped only in the time-bucketed path (sequential chunks are
+    complete by construction). Used to derive a 5m view from stored 1m history
+    right after a restart, while the WebSocket 5m buffer refills.
+    """
+    if not candles_1m or group <= 1:
+        return list(candles_1m or [])
+
+    def _f(c, key, fallback=None):
+        v = c.get(key)
+        if v is None and fallback is not None:
+            v = c.get(fallback)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _merge(chunk: list) -> Optional[dict]:
+        closes = [_f(c, "close") for c in chunk]
+        closes = [c for c in closes if c is not None]
+        if not closes:
+            return None
+        opens = _f(chunk[0], "open", "close")
+        highs = [(_f(c, "high", "close")) for c in chunk]
+        lows  = [(_f(c, "low",  "close")) for c in chunk]
+        vols  = [(_f(c, "volume") or 0.0) for c in chunk]
+        out = {
+            "open":   opens if opens is not None else closes[0],
+            "high":   max(h for h in highs if h is not None),
+            "low":    min(l for l in lows if l is not None),
+            "close":  closes[-1],
+            "volume": sum(vols),
+        }
+        ot = chunk[0].get("open_time")
+        if ot is not None:
+            out["open_time"] = ot
+        return out
+
+    bucket_ms = group * 60 * 1000
+    if all(c.get("open_time") is not None for c in candles_1m):
+        buckets: dict = {}
+        order: list = []
+        for c in candles_1m:
+            key = int(c["open_time"]) // bucket_ms
+            if key not in buckets:
+                buckets[key] = []
+                order.append(key)
+            buckets[key].append(c)
+        # Drop the trailing (possibly in-progress) bucket when incomplete
+        if order and len(buckets[order[-1]]) < group:
+            order.pop()
+        merged = [_merge(buckets[k]) for k in order]
+        return [m for m in merged if m is not None]
+
+    # No timestamps — chunk backwards from the newest candle in full groups
+    chunks = []
+    i = len(candles_1m)
+    while i - group >= 0:
+        chunks.append(candles_1m[i - group: i])
+        i -= group
+    chunks.reverse()
+    merged = [_merge(ch) for ch in chunks]
+    return [m for m in merged if m is not None]
+
+
 def calc_atr(candles: list, period: int = 14) -> Optional[float]:
     """Average True Range over candles (list of dicts with high/low/close)."""
     trs = []
