@@ -1845,7 +1845,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 let label: string;
                 let labelColor: string;
                 if (allowed) {
+                  // buy_allowed now reflects the bot's FULL gate chain (signals +
+                  // vetoes + cooldowns + macro gate + capacity + paused state):
+                  // BUY here means the bot will actually enter given budget.
                   label = 'BUY';  labelColor = 'bg-gain/20 text-gain';
+                } else if (sig.signal_engine_allowed && (sig.gate_blockers?.length ?? 0) > 0) {
+                  // Signals fired but an execution gate blocks the entry — the
+                  // tooltip (reason) names the exact blocker(s).
+                  label = 'GATE'; labelColor = 'bg-amber-500/20 text-amber-400';
                 } else if (reason.startsWith('veto_')) {
                   label = 'VETO'; labelColor = 'bg-orange-500/20 text-orange-400';
                 } else if (reason.startsWith('mandatory_')) {
