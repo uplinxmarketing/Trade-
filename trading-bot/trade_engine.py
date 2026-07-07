@@ -206,8 +206,32 @@ def _get_breakeven_mult(entry_price: float, symbol: str = "") -> float:
         buf = 0.30
     return _FEE_FLOOR * (1.0 + buf / 100.0)
 
-def compute_real_breakeven_price(pos: dict, min_profit: float = 0.003) -> float:
+def _min_profit_usdt() -> float:
+    """Minimum net profit (USDT) any take-profit sell must clear.
+
+    Read from strategy.json exits.min_profit_usdt (default 0.01), clamped to
+    >= 0.001. _load_strategy() is mtime-cached, so edits hot-reload without a
+    restart.
+
+    PARITY RULE (A1): this SAME value MUST be used by the sell trigger
+    (compute_real_breakeven_price), the profit gate (_profitable_sell_check),
+    and any (future) breakeven-move stop. If they ever resolve different
+    numbers, the trigger fires sells that the gate then vetoes forever.
+    """
+    try:
+        raw = _load_strategy().get("exits", {}).get("min_profit_usdt", 0.01)
+        return max(0.001, float(raw))
+    except Exception:
+        return 0.01
+
+
+def compute_real_breakeven_price(pos: dict, min_profit: Optional[float] = None) -> float:
     """Return the REAL price at which selling pos would net at least min_profit USDT.
+
+    min_profit=None (the default — use it everywhere) resolves via
+    _min_profit_usdt() so trigger, gate and future breakeven-move stop all read
+    the same config value and can never disagree. Only pass an explicit value
+    in tests.
 
     Uses ACTUAL deployed capital (qty * entry_price), not the requested budget.
     This matters when lot-step rounding reduces the actual quantity below what
@@ -219,6 +243,8 @@ def compute_real_breakeven_price(pos: dict, min_profit: float = 0.003) -> float:
     trigger and profit gate use identical math and never disagree.
     """
     try:
+        if min_profit is None:
+            min_profit = _min_profit_usdt()
         entry_price = float(pos.get("entry_price") or pos.get("avg_entry_price") or 0)
         buy_fee     = float(pos.get("buy_fee_usdt") or 0)
         qty         = float(pos.get("quantity", 0))
@@ -255,6 +281,29 @@ _MIN_HOLD_SEC = 10.0
 
 # Per-symbol throttle for SELL_TRACE diagnostic log (1 per 60s per symbol)
 _sell_trace_log_ts: Dict[str, float] = {}
+
+# ── Shadow-eval log dedupe (B Step 5) ─────────────────────────────────────────
+# The shadow disagreement/failure logs fire on every buy-loop pass — for a
+# persistently disagreeing symbol that's one diag row every few seconds.
+# Dedupe per (symbol, reason): identical entries within 15 min are only
+# counted; the next emitted line carries "(×N in last 15m)".
+_shadow_log_dedupe: Dict[Tuple[str, str], dict] = {}
+_SHADOW_DEDUPE_WINDOW_SEC = 900.0  # 15 minutes
+
+
+def _log_shadow_dedup(symbol: str, reason: str, message: str) -> None:
+    """Emit a signal_shadow diag line, deduped per (symbol, reason) per 15 min."""
+    key = (symbol, reason)
+    now = time.time()
+    ent = _shadow_log_dedupe.get(key)
+    if ent and (now - ent["last_ts"]) < _SHADOW_DEDUPE_WINDOW_SEC:
+        ent["suppressed"] += 1
+        return
+    suffix = ""
+    if ent and ent["suppressed"] > 0:
+        suffix = f" (×{ent['suppressed'] + 1} in last 15m)"
+    _shadow_log_dedupe[key] = {"last_ts": now, "suppressed": 0}
+    log_diag_issue("signal_shadow", "warn", message + suffix)
 
 # WebSocket price freshness — updated by data_collector on every @trade or @miniTicker event.
 # Used by the pre-sell check to decide whether a REST re-fetch is needed.
@@ -568,7 +617,28 @@ _signal_scanner_health: Dict = {
     "last_duration_ms": 0.0,
     "scans_completed":  0,
     "interval_sec":     float(30),  # will be updated at runtime from config.SCAN_INTERVAL_SEC
+    # C §6.1 scan stabilizers
+    "scan_skipped_overlap":   0,      # refreshes skipped because one was already in flight
+    "effective_interval_sec": float(30),  # adaptive sleep (>= SCAN_INTERVAL_SEC, <= 600)
+    "universe_size":          0,      # symbols in the last scan pass
 }
+
+# C §6.1a — single-flight guard: only ONE _refresh_signal_cache may run at a
+# time. Overlapping invocations are SKIPPED (never queued) via
+# acquire(blocking=False); a second concurrent refresh must never stack up.
+_signal_refresh_inflight = threading.Lock()
+
+# C §6.1c — hard budgets for a refresh pass
+_SCAN_SYMBOL_FETCH_TIMEOUT_SEC = 5.0    # per-symbol REST fetch ceiling (one retry)
+_SCAN_PASS_BUDGET_SEC          = 120.0  # whole-pass ceiling, checked at batch boundaries
+
+# C §6.1d — low_24h cache: {sym: (value, ts)}; reused within 10 minutes so the
+# 1440-row DB read (heaviest per-scan cost) runs at most once per symbol per window.
+_low24h_cache: Dict[str, Tuple[Optional[float], float]] = {}
+_LOW24H_CACHE_TTL_SEC = 600.0
+
+# Throttle for the "universe is empty" warning (once per 10 min, not every pass)
+_last_empty_universe_warn_ts: float = 0.0
 
 # New exit-mode flags (strategy.json controlled)
 _take_profit_enabled: bool = True    # False → exit at breakeven (fees covered) only
@@ -834,14 +904,17 @@ def _profitable_sell_check(pos: dict, price: float, force_fresh: bool = False) -
     est_sell_fee  = gross_quote * _fee_rate
     net_returned  = gross_quote - est_sell_fee
     # GATE == TRIGGER: this check must verify exactly the same threshold the
-    # sell trigger fires at (compute_real_breakeven_price min_profit=0.003).
-    # It previously demanded max(0.003+slippage, cost*tp_pct) NET — i.e. more
-    # profit than the price at the exit target delivers after fees — so every
-    # take-profit sell was vetoed AT the target and only executed 0.05-0.25%
-    # higher (or never, if price retreated). The trigger already guarantees
-    # price >= max(breakeven, entry*tp); the gate only needs to confirm the
-    # sell nets a real profit, not re-add its own margin on top.
-    min_profit = 0.003
+    # sell trigger fires at (compute_real_breakeven_price with the default
+    # min_profit resolved via _min_profit_usdt()). The SAME config value MUST
+    # be used in the BEP trigger, this profit gate, and any (future)
+    # breakeven-move stop — see _min_profit_usdt.
+    # The gate previously demanded max(min_profit+slippage, cost*tp_pct) NET —
+    # i.e. more profit than the price at the exit target delivers after fees —
+    # so every take-profit sell was vetoed AT the target and only executed
+    # 0.05-0.25% higher (or never, if price retreated). The trigger already
+    # guarantees price >= max(breakeven, entry*tp); the gate only needs to
+    # confirm the sell nets a real profit, not re-add its own margin on top.
+    min_profit = _min_profit_usdt()
     estimated_profit = net_returned - actual_cost
     return estimated_profit >= min_profit
 
@@ -2102,7 +2175,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
                 _fresh_now = _rest_px.get(sym, 0) or price
                 database.log_activity(
                     f"SELL ABORTED {sym} ({reason}): freshest REST price ${_fresh_now:.6f} "
-                    f"would not net the 0.003 USDT minimum profit. "
+                    f"would not net the {_min_profit_usdt():.4f} USDT minimum profit. "
                     f"Position held — will retry on next favourable tick (log throttled 60s).",
                     "warn"
                 )
@@ -2836,12 +2909,16 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 _new_dec = _sr_evaluate_buy_decision(sym, _shadow_data, strategy)
                 _old_allowed = True  # reached this point → old engine approved
                 if _old_allowed != _new_dec["allowed"]:
-                    log_diag_issue(
-                        "signal_shadow", "warn",
+                    # B Step 5: deduped per (symbol, reason) — see _log_shadow_dedup
+                    _log_shadow_dedup(
+                        sym, str(_new_dec["reason"]),
                         f"{sym}: old=True new={_new_dec['allowed']} reason={_new_dec['reason']}",
                     )
             except Exception as _shadow_exc:
-                log_diag_issue("signal_shadow", "warn", f"Shadow eval failed for {sym}: {_shadow_exc}")
+                _log_shadow_dedup(
+                    sym, f"shadow_eval_failed:{type(_shadow_exc).__name__}",
+                    f"Shadow eval failed for {sym}: {_shadow_exc}",
+                )
 
         budget = get_budget_for_coin(sym, usdt_balance)
         if budget <= 0:
@@ -3104,6 +3181,13 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         pos_record = {
             "symbol":             sym,
             "entry_price":        fill_price,
+            # B Step 4 — origin tag: this buy was decided by the automated
+            # scanner (vs. a user-initiated/manual buy). Lives in the in-memory
+            # position dict + activity log only: the positions and trades
+            # tables are fixed-column INSERTs (database.save_position /
+            # database.log_trade), so persisting it would need a schema
+            # migration. save_position ignores unknown keys — safe to carry.
+            "origin":             "auto",
             "exit_target":        exit_target,
             "breakeven_mult_at_buy": round(_bep_mult_buy, 8),
             "quantity":           qty,
@@ -3175,7 +3259,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             f"OBV{'✓'   if sigs.get('obv')    else '✗'} "
             f"ATR{'✓'   if sigs.get('atr')    else '✗'}] "
             f"| score:{score}/6 regime:{_regime_tag} | EXIT TARGET=${exit_target:.4f} "
-            f"| qty={qty:.6f} | cache_age:{cache_age}s"
+            f"| qty={qty:.6f} | cache_age:{cache_age}s | origin:auto"
         )
         print(f"[RealtimeBuy] {msg}")
         database.log_activity(msg, "info")
@@ -4109,6 +4193,11 @@ async def signal_scanner(prices: dict):
     supplement, but buys MUST fire even when WebSocket is slow or disconnected.
     """
     _signal_scanner_health["interval_sec"] = float(config.SCAN_INTERVAL_SEC)
+    # C §6.1b — adaptive interval: starts at the configured value; stretched
+    # when a pass runs long, decayed back when passes get fast again.
+    _base_interval = float(config.SCAN_INTERVAL_SEC)
+    _effective_interval = _base_interval
+    _signal_scanner_health["effective_interval_sec"] = _effective_interval
     while True:
         _t0_scan = time.time()
         try:
@@ -4124,11 +4213,35 @@ async def signal_scanner(prices: dict):
                 detail=str(e),
             )
         finally:
+            _duration_sec = time.time() - _t0_scan
             _signal_scanner_health["last_refresh_ts"]  = time.time()
-            _signal_scanner_health["last_duration_ms"] = round((time.time() - _t0_scan) * 1000, 1)
+            _signal_scanner_health["last_duration_ms"] = round(_duration_sec * 1000, 1)
             _signal_scanner_health["scans_completed"] += 1
 
-        await asyncio.sleep(config.SCAN_INTERVAL_SEC)
+            # C §6.1b — duration telemetry + adaptive interval.
+            # Slow pass (>0.8× current interval): next sleep = duration × 1.5,
+            # capped at 600s, floored at SCAN_INTERVAL_SEC. Fast pass
+            # (<0.5× SCAN_INTERVAL_SEC): decay back toward SCAN_INTERVAL_SEC.
+            if _duration_sec > 0.8 * _effective_interval:
+                _new_interval = min(600.0, max(_base_interval, _duration_sec * 1.5))
+                log.warning(
+                    "[SignalScanner] Slow scan pass: duration=%.1fs > 0.8×interval "
+                    "(%.1fs) — stretching next interval to %.1fs",
+                    _duration_sec, _effective_interval, _new_interval,
+                )
+                _effective_interval = _new_interval
+            elif (_duration_sec < 0.5 * _base_interval
+                  and _effective_interval > _base_interval):
+                # Halve the stretch each fast pass until back at the base.
+                _effective_interval = max(
+                    _base_interval,
+                    _base_interval + (_effective_interval - _base_interval) * 0.5,
+                )
+                if _effective_interval - _base_interval < 1.0:
+                    _effective_interval = _base_interval
+            _signal_scanner_health["effective_interval_sec"] = round(_effective_interval, 1)
+
+        await asyncio.sleep(_effective_interval)
 
 
 
@@ -4163,8 +4276,31 @@ async def _refresh_signal_cache():
     Refresh the in-memory signal cache concurrently (asyncio.gather).
     Falls back to DB candles if REST is geo-blocked.
     Never executes trades.
+
+    C §6.1a — single-flight skip-not-queue: if a refresh is already in flight,
+    this invocation is SKIPPED (counted in scan_skipped_overlap). Nothing may
+    ever queue a second concurrent refresh behind a running one.
     """
+    if not _signal_refresh_inflight.acquire(blocking=False):
+        _signal_scanner_health["scan_skipped_overlap"] += 1
+        log.warning(
+            "[SignalScanner] Refresh already in flight — skipping this "
+            "invocation (skipped %d total)",
+            _signal_scanner_health["scan_skipped_overlap"],
+        )
+        return
+    try:
+        await _refresh_signal_cache_locked()
+    finally:
+        _signal_refresh_inflight.release()
+
+
+async def _refresh_signal_cache_locked():
+    """Body of the signal-cache refresh. Only ever runs under the single-flight
+    guard in _refresh_signal_cache — do not call directly."""
     import aiohttp
+    global _last_empty_universe_warn_ts
+    _pass_t0 = time.time()
     strategy = _load_strategy()
     if not strategy:
         return
@@ -4174,17 +4310,43 @@ async def _refresh_signal_cache():
         for c in strategy.get("approved_coins", [])
         if c.get("approved")
     ]
+    # C §6.1e — universe telemetry + logging (warn when empty, throttled 10 min)
+    _signal_scanner_health["universe_size"] = len(approved_coins)
     if not approved_coins:
+        if time.time() - _last_empty_universe_warn_ts >= 600.0:
+            _last_empty_universe_warn_ts = time.time()
+            log.warning("[SignalScanner] Signal scan: scanning 0 symbols — approved-coin universe is EMPTY, no buys possible")
+            try:
+                database.log_activity(
+                    "Signal scan: 0 approved symbols — universe is empty, the bot cannot buy anything",
+                    "warn",
+                )
+            except Exception:
+                pass
         return
+    log.info("Signal scan: scanning %d symbols", len(approved_coins))
 
     async def _refresh_one(session, sym: str) -> bool:
         import data_collector as _dc
         MIN = 16          # matches _dc._MIN_CANDLES — enough for RSI to fire
         closes = volumes = candles = None
+        raw = None
 
         # 1. Try Binance REST (fastest, most data — includes full OHLC for ATR)
+        # C §6.1c — hard budget: the multi-base loop inside _fetch_klines can
+        # stack 6 bases × 3s; bound EACH attempt to 5s total and allow exactly
+        # ONE retry, so a symbol can never hold the pass for more than ~10s.
         try:
-            raw     = await _fetch_klines(session, sym)
+            for _attempt in (1, 2):
+                try:
+                    raw = await asyncio.wait_for(
+                        _fetch_klines(session, sym),
+                        timeout=_SCAN_SYMBOL_FETCH_TIMEOUT_SEC,
+                    )
+                    break
+                except Exception:
+                    if _attempt == 2:
+                        raise
             closes  = [float(k[4]) for k in raw]
             volumes = [float(k[5]) for k in raw]
             candles = [
@@ -4193,7 +4355,7 @@ async def _refresh_signal_cache():
                 for k in raw
             ]
         except Exception:
-            pass
+            raw = None
 
         # 2. Fall back to DB candles (populated by download_history / kline saves)
         if not closes or len(closes) < MIN:
@@ -4298,15 +4460,23 @@ async def _refresh_signal_cache():
             _5m_ts    = prev.get("5m_ts", 0)
 
         # Phase 2: extra fields for new signal registry
-        # low_24h — minimum low over last 24h from DB candles (no new REST call)
-        try:
-            _db_rows_24h = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=1440)
-            if len(_db_rows_24h) >= 60:
-                low_24h = min(float(r.get("low") or r["close"]) for r in _db_rows_24h)
-            else:
-                low_24h = min(c["low"] for c in candles) if candles else None
-        except Exception:
-            low_24h = None
+        # low_24h — minimum low over last 24h from DB candles (no new REST call).
+        # C §6.1d — this 1440-row read is the heaviest per-scan cost; cache the
+        # value per symbol for 10 minutes and reuse within the window.
+        _l24_cached = _low24h_cache.get(sym)
+        if _l24_cached is not None and (time.time() - _l24_cached[1]) < _LOW24H_CACHE_TTL_SEC:
+            low_24h = _l24_cached[0]
+        else:
+            try:
+                _db_rows_24h = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=1440)
+                if len(_db_rows_24h) >= 60:
+                    low_24h = min(float(r.get("low") or r["close"]) for r in _db_rows_24h)
+                else:
+                    low_24h = min(c["low"] for c in candles) if candles else None
+            except Exception:
+                low_24h = None
+            if low_24h is not None:
+                _low24h_cache[sym] = (low_24h, time.time())
 
         # klines_1m — last 15 candles with OHLCV (R1 reversal + M4 micro-pullback)
         try:
@@ -4346,9 +4516,24 @@ async def _refresh_signal_cache():
         return True
 
     results = []
+    aborted_remaining = 0
     async with aiohttp.ClientSession() as session:
         batch_size = 5
         for i in range(0, len(approved_coins), batch_size):
+            # C §6.1c — whole-pass ceiling: check elapsed at each batch boundary
+            # and abort cleanly. Un-refreshed symbols keep their previous cache
+            # entries (the cache is never cleared, only overwritten).
+            _elapsed = time.time() - _pass_t0
+            if _elapsed > _SCAN_PASS_BUDGET_SEC:
+                aborted_remaining = len(approved_coins) - i
+                log.warning(
+                    "[SignalScanner] Pass exceeded %.0fs budget (%.1fs elapsed) — "
+                    "aborting with %d/%d symbols un-refreshed (they keep their "
+                    "previous cache entries)",
+                    _SCAN_PASS_BUDGET_SEC, _elapsed,
+                    aborted_remaining, len(approved_coins),
+                )
+                break
             batch = approved_coins[i:i + batch_size]
             batch_results = await asyncio.gather(
                 *[_refresh_one(session, sym) for sym in batch],
@@ -4361,8 +4546,11 @@ async def _refresh_signal_cache():
     updated = sum(1 for r in results if r is True)
     with _signal_cache_lock:
         ready = sum(1 for v in _signal_cache.values() if v["score"] >= config.MIN_SIGNALS_TO_BUY)
+    _abort_note = (f", ABORTED at {_SCAN_PASS_BUDGET_SEC:.0f}s budget with "
+                   f"{aborted_remaining} un-refreshed" if aborted_remaining else "")
     database.log_activity(
-        f"Signal cache refreshed: {updated}/{len(approved_coins)} coins updated, "
-        f"{ready} at score≥{config.MIN_SIGNALS_TO_BUY}",
+        f"Signal scan: scanning {len(approved_coins)} symbols — "
+        f"{updated}/{len(approved_coins)} updated, "
+        f"{ready} at score≥{config.MIN_SIGNALS_TO_BUY}{_abort_note}",
         "info",
     )
