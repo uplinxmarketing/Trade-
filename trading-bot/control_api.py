@@ -352,6 +352,87 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("v2_migration", exc)
 
+            # 4d. Part G (G1c) — ONE-TIME F3 signal-roles drift migration.
+            #     A prior CODE-default version persisted stale roles into
+            #     strategy.json (min_scored=4, T1_ema_short_long=scored,
+            #     X1_atr_sufficient=scored) which now override the F3 registry
+            #     defaults. Guarded by a stored marker so it runs exactly once —
+            #     a later DELIBERATE user change is never clobbered.
+            try:
+                if not database.get_setting("roles_f3_migrated"):
+                    _sp_f3 = _load_strategy()
+                    _se_f3 = _sp_f3.get("signal_engine")
+                    _se_f3 = dict(_se_f3) if isinstance(_se_f3, dict) else {}
+                    _roles_f3 = dict(_se_f3.get("roles")) if isinstance(
+                        _se_f3.get("roles"), dict) else {}
+                    try:
+                        _min_scored_f3 = int(_se_f3.get("min_scored"))
+                    except (TypeError, ValueError):
+                        _min_scored_f3 = None
+                    _drifted = (
+                        _roles_f3.get("T1_ema_short_long") != "mandatory"
+                        or _roles_f3.get("X1_atr_sufficient") == "scored"
+                        or _min_scored_f3 != 3
+                    )
+                    if _drifted:
+                        _roles_f3["T1_ema_short_long"]  = "mandatory"
+                        _roles_f3["X1_atr_sufficient"]  = "off"
+                        _roles_f3["X1_atr_untradeable"] = "veto"
+                        for _sid in ("M3_macd_rising", "V1_volume_above_average",
+                                     "V2_obv_rising", "M4_micro_pullback",
+                                     "R1_reversal_confirmed", "T2_ema50_15m_slope"):
+                            if _roles_f3.get(_sid) != "scored":
+                                _roles_f3[_sid] = "scored"
+                        _se_f3["roles"] = _roles_f3
+                        _se_f3["min_scored"] = 3
+                        # entries.min_score ⇄ signal_engine.min_scored sync is
+                        # applied by _apply_alias_sync from the signal_engine
+                        # patch; pass entries too so the write is explicit.
+                        _f3_patch = {
+                            "signal_engine": _se_f3,
+                            "entries": {**(_sp_f3.get("entries")
+                                           if isinstance(_sp_f3.get("entries"), dict) else {}),
+                                        "min_score": 3},
+                        }
+                        _raw_before_f3 = _load_strategy()
+                        _write_strategy_patch(_f3_patch)
+                        try:
+                            import strategy_config as _scfg_f3
+                            database.save_config_version(
+                                "migration-f3-roles",
+                                _scfg_f3.diff_views(_raw_before_f3, _load_strategy()),
+                                _load_strategy())
+                        except Exception:
+                            pass
+                        database.log_activity(
+                            "F3 roles migration: T1_ema_short_long→mandatory, "
+                            "X1_atr_sufficient→off, X1_atr_untradeable→veto, "
+                            "min_scored→3 (one-time)", "info")
+                        steps.append("f3_roles_migration applied")
+                    else:
+                        steps.append("f3_roles_migration noop")
+                    database.save_setting("roles_f3_migrated", "1")
+                else:
+                    steps.append("f3_roles_migration already-done")
+            except Exception as exc:
+                _step_failed("f3_roles_migration", exc)
+
+            # 4e. Part G (G2) — validate approved_coins against exchangeInfo on
+            #     startup (records invalid symbols; never removes them). Fails
+            #     open when exchangeInfo is unavailable.
+            try:
+                _uni = _validate_universe()
+                if _uni.get("invalid"):
+                    database.log_activity(
+                        "Universe validation: " + str(len(_uni["invalid"]))
+                        + " approved coin(s) not TRADING — "
+                        + ", ".join(f"{i['symbol']}({i['status'] or '?'}"
+                                    + (f"→{i['suggested_rename']}" if i.get('suggested_rename') else "")
+                                    + ")" for i in _uni["invalid"][:20]), "warn")
+                steps.append(f"universe_validation ({_uni.get('covered')}/{_uni.get('expected_valid')} valid)")
+            except Exception as exc:
+                _step_failed("universe_validation", exc)
+
             # 5. History download — daemon thread, never blocks
             try:
                 threading.Thread(target=data_collector.download_history, daemon=True).start()
@@ -565,6 +646,28 @@ async def _daily_maintenance_loop():
                 print("[Maintenance] nightly edge report rebuilt")
         except Exception as e:
             print(f"[Maintenance] nightly attribution failed: {e}")
+        # Part G (G4.1) — prune buy_rejections + entry_snapshots per
+        # data.eval_retention_days (default 14). Guarded/CREATE-safe.
+        try:
+            _fn = getattr(database, "prune_evaluations_from_config", None)
+            if _fn is not None:
+                pruned = await _aio.to_thread(_fn)
+                print(f"[Maintenance] eval prune: {pruned}")
+        except Exception as e:
+            print(f"[Maintenance] eval prune failed: {e}")
+        # Part G (G2) — re-validate approved_coins against exchangeInfo daily;
+        # record (never remove) any symbol no longer TRADING. Fails open.
+        try:
+            _uni = await _aio.to_thread(_validate_universe)
+            if _uni.get("invalid"):
+                database.log_activity(
+                    "Universe validation (daily): " + str(len(_uni["invalid"]))
+                    + " approved coin(s) not TRADING — "
+                    + ", ".join(f"{i['symbol']}({i['status'] or '?'}"
+                                + (f"→{i['suggested_rename']}" if i.get('suggested_rename') else "")
+                                + ")" for i in _uni["invalid"][:20]), "warn")
+        except Exception as e:
+            print(f"[Maintenance] universe validation failed: {e}")
         # §3.6 — warn when any fees.per_symbol_overrides entry is >30 days
         # unreviewed ('_reviewed_ts' absent or old): Binance fee promos change
         # monthly, and a withdrawn promo silently left at maker_pct=0 corrupts
@@ -758,6 +861,49 @@ def _write_strategy_patch(patch: dict):
         _API_ALL_CACHE["data"] = None
     except NameError:
         pass
+
+
+def _validate_universe() -> dict:
+    """Part G (G2) — validate strategy.json approved_coins against the cached
+    exchangeInfo. Returns
+        {valid:[sym...],
+         invalid:[{symbol,status,suggested_rename}...],
+         covered, expected_valid, exchange_info_available}.
+    Fails open: when exchangeInfo is unavailable (empty tradeable set) NOTHING
+    is marked invalid so a fetch outage never nukes the coin list. Records but
+    NEVER removes symbols from strategy.json."""
+    import exchange_info as _ei
+    s = _load_strategy()
+    approved: list = []
+    for c in s.get("approved_coins", []) or []:
+        sym = c.get("symbol") if isinstance(c, dict) else c
+        if sym:
+            approved.append(sym)
+    approved = list(dict.fromkeys(approved))  # dedupe, preserve order
+    try:
+        tradeable = _ei.get_tradeable_symbols()
+    except Exception:
+        tradeable = set()
+    if not tradeable:  # fail open — cannot validate without exchangeInfo
+        return {"valid": approved, "invalid": [], "covered": len(approved),
+                "expected_valid": len(approved), "exchange_info_available": False}
+    valid: list = []
+    invalid: list = []
+    for sym in approved:
+        if sym in tradeable:
+            valid.append(sym)
+            continue
+        try:
+            st = _ei.symbol_status(sym)
+        except Exception:
+            st = ""
+        invalid.append({
+            "symbol":           sym,
+            "status":           st,
+            "suggested_rename": _ei.RENAMED_SYMBOLS.get(sym),
+        })
+    return {"valid": valid, "invalid": invalid, "covered": len(valid),
+            "expected_valid": len(approved), "exchange_info_available": True}
 
 
 def _flush_db_state():
@@ -1010,12 +1156,34 @@ def _fetch_account_direct() -> dict:
         return {}
 
 
-def _get_cached_account() -> dict:
+def _trigger_async_account_refresh() -> None:
+    """G4.4 — kick a background thread to refresh the account cache without
+    blocking the caller. No-op when a refresh is already in flight (the
+    single-flight _acct_refresh_lock is already held)."""
+    if _acct_refresh_lock.locked():
+        return
+    def _refresh():
+        try:
+            _get_cached_account(block=True)
+        except Exception:
+            pass
+    try:
+        threading.Thread(target=_refresh, daemon=True, name="acct-refresh").start()
+    except Exception:
+        pass
+
+
+def _get_cached_account(block: bool = True) -> dict:
     """Return cached Binance account dict, refreshing at most every ACCT_CACHE_TTL s.
 
     Single-flight: only one thread performs the (slow) network fetch; concurrent
     callers get the stale cache. Failed live fetches are negative-cached for
-    _ACCT_FAIL_TTL s so a broken connection doesn't stampede signed requests."""
+    _ACCT_FAIL_TTL s so a broken connection doesn't stampede signed requests.
+
+    G4.4 — when block=False, a live-mode call that would otherwise perform a
+    cold signed fetch instead triggers an async refresh and returns the current
+    (possibly stale/empty) cache immediately, so latency-sensitive endpoints
+    like /api/wallet never wait on the network."""
     global _acct_cache, _acct_cache_ts, _acct_last_success_ts, _acct_fail_ts
     from connection import get_mode, client as _client
     now = time.time()
@@ -1028,6 +1196,11 @@ def _get_cached_account() -> dict:
         with _acct_cache_lock:
             if now - _acct_fail_ts < _ACCT_FAIL_TTL:
                 return _acct_cache  # recent failure — serve stale, don't hammer
+        if not block:
+            # Non-blocking caller: refresh in the background, serve cache now.
+            _trigger_async_account_refresh()
+            with _acct_cache_lock:
+                return _acct_cache
         if not _acct_refresh_lock.acquire(blocking=False):
             # Another thread is already fetching — serve stale cache immediately
             with _acct_cache_lock:
@@ -1594,7 +1767,9 @@ def api_wallet():
         from trade_engine import get_open_positions, _rest_px
         from data_collector import prices as live_prices
 
-        acc = _get_cached_account()
+        # G4.4 — never block the wallet response on a cold signed fetch; serve
+        # the 20s cache and let a background thread refresh it.
+        acc = _get_cached_account(block=False)
         # A stale cache still contains balances — only report the fetch as OK
         # when the last SUCCESSFUL refresh is recent (3x TTL grace window).
         _stale_age = (time.time() - _acct_last_success_ts) if _acct_last_success_ts > 0 else None
@@ -2576,9 +2751,13 @@ def api_signals_summary(limit: int = 30):
 
 
 @app.get("/api/proxy/binance/ticker/24hr")
-async def api_proxy_ticker_24hr(symbols: str = None, symbol: str = None):
+def api_proxy_ticker_24hr(symbols: str = None, symbol: str = None):
     """Chunked proxy for Binance 24hr ticker — avoids 400s from large symbol lists.
-    Also accepts a single `symbol` param (MarketStatsBar/OrderBookPanel use it)."""
+    Also accepts a single `symbol` param (MarketStatsBar/OrderBookPanel use it).
+
+    Plain def (G4.2): the body does blocking urllib fetches with no awaits, so
+    running it as async blocked the event loop — FastAPI now runs it in the
+    threadpool instead."""
     import urllib.request as _ur
     import urllib.parse as _up
     if symbol and not symbols:
@@ -2928,8 +3107,12 @@ def api_alert_acknowledge(alert_id: int):
 
 
 @app.get("/api/proxy/binance/{path:path}")
-async def api_proxy_binance(path: str, request: Request):
-    """Server-side proxy for Binance REST API — avoids browser CORS restrictions."""
+def api_proxy_binance(path: str, request: Request):
+    """Server-side proxy for Binance REST API — avoids browser CORS restrictions.
+
+    Plain def (G4.2): blocking urllib fetch with no awaits; runs in the
+    FastAPI threadpool instead of stalling the event loop. request.query_params
+    is a sync property, so no request body await is needed."""
     import urllib.request as _ur
     import urllib.error as _ue
     qs = str(request.query_params)
@@ -3450,13 +3633,24 @@ def api_diagnostics_log_clear():
     return {"ok": True, "cleared": n}
 
 
+_BUNDLE_CACHE: dict = {"text": None, "ts": 0.0}
+_BUNDLE_CACHE_TTL = 5.0  # G4.3 — collapse rapid re-clicks / double-fetches
+
+
 @app.get("/api/diagnostics/bundle")
 def api_diagnostics_bundle():
     """One-click full diagnostic bundle — plaintext report aggregating version,
     health, limits, scanner, telemetry, gate blockers, risk, analytics and
     recent errors, formatted for pasting into a chat for remote diagnosis.
     Every section is independently guarded: a broken subsystem shows its error
-    instead of killing the report (that would defeat the purpose)."""
+    instead of killing the report (that would defeat the purpose).
+
+    G4.3 — the assembled report is cached for 5s so back-to-back requests
+    (double-clicks, retries) reuse one snapshot instead of re-querying every
+    subsystem."""
+    _now_b = time.time()
+    if _BUNDLE_CACHE["text"] is not None and (_now_b - _BUNDLE_CACHE["ts"]) < _BUNDLE_CACHE_TTL:
+        return Response(content=_BUNDLE_CACHE["text"], media_type="text/plain")
     import io
     out = io.StringIO()
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -3717,7 +3911,10 @@ def api_diagnostics_bundle():
     safe(_cfg, "config")
 
     out.write("\n===== END OF BUNDLE =====\n")
-    return Response(content=out.getvalue(), media_type="text/plain")
+    _text_b = out.getvalue()
+    _BUNDLE_CACHE["text"] = _text_b
+    _BUNDLE_CACHE["ts"] = time.time()
+    return Response(content=_text_b, media_type="text/plain")
 
 
 @app.get("/api/diagnostics/log/text")
@@ -5284,6 +5481,19 @@ def api_signal_engine_config_post(update: SignalEngineUpdate):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.get("/api/universe/validate")
+def api_universe_validate():
+    """Part G (G2) — validate approved_coins against exchangeInfo status.
+    {valid, invalid:[{symbol,status,suggested_rename}], covered, expected_valid,
+     exchange_info_available}. Fails open (nothing invalid) when exchangeInfo
+    is unavailable; records invalid symbols but never removes them."""
+    try:
+        return _validate_universe()
+    except Exception as e:
+        return {"valid": [], "invalid": [], "covered": 0, "expected_valid": 0,
+                "exchange_info_available": False, "error": f"{type(e).__name__}: {e}"}
+
+
 @app.get("/api/version")
 def api_version():
     return _read_frontend_version()
@@ -5397,6 +5607,23 @@ def api_update():
         _env = dict(os.environ)
         _env["PATH"] = _env.get("PATH", "") + ":/usr/local/bin:/usr/bin:/bin"
         _git = _sh.which("git", path=_env["PATH"]) or "git"
+
+        # G3.3 — capture the served index.html asset signature BEFORE the pull
+        # so we can detect a build that changed frontend source but produced an
+        # identical served bundle (stale/failed build shipping old UI).
+        def _index_asset_sig() -> tuple:
+            import re as _re
+            for _cand in (app_dir / "dist" / "index.html",
+                          app_dir / "trading-bot" / "dist" / "index.html"):
+                try:
+                    if _cand.exists():
+                        return tuple(sorted(set(_re.findall(
+                            r"/assets/[A-Za-z0-9_\-.]+", _cand.read_text()))))
+                except Exception:
+                    pass
+            return ()
+        _pre_sig = _index_asset_sig()
+        _frontend_changed = False
         try:
             # -c safe.directory covers root-owned checkouts ("dubious
             # ownership") when the service user differs from the repo owner.
@@ -5404,6 +5631,23 @@ def api_update():
                             "fetch", "origin", "main"],
                            cwd=str(app_dir), check=True, timeout=60,
                            env=_env, capture_output=True, text=True)
+            # Which files does the pull change? (best-effort; used only for the
+            # G3.3 stale-build warning below.)
+            try:
+                _diff = subprocess.run(
+                    [_git, "-c", f"safe.directory={app_dir}",
+                     "diff", "--name-only", "HEAD", "origin/main"],
+                    cwd=str(app_dir), timeout=30, env=_env,
+                    capture_output=True, text=True)
+                _changed = [ln.strip() for ln in (_diff.stdout or "").splitlines() if ln.strip()]
+                _frontend_changed = any(
+                    p.startswith("src/") or p.startswith("public/")
+                    or p in ("index.html", "package.json", "vite.config.ts",
+                             "tailwind.config.ts")
+                    or p.startswith("dist/")
+                    for p in _changed)
+            except Exception:
+                pass
             subprocess.run([_git, "-c", f"safe.directory={app_dir}",
                             "reset", "--hard", "origin/main"],
                            cwd=str(app_dir), check=True, timeout=60,
@@ -5441,6 +5685,23 @@ def api_update():
                 print("[Update] npm not found — using committed dist/", flush=True)
         except Exception as exc:
             print(f"[Update] npm build skipped/failed ({exc}) — using committed dist/", flush=True)
+        # G3.3 — loud warning (never fatal) when the pull changed frontend
+        # source but the served index.html asset hashes are unchanged: the UI
+        # would ship stale despite a "successful" update.
+        try:
+            _post_sig = _index_asset_sig()
+            if _frontend_changed and _pre_sig and _post_sig and _pre_sig == _post_sig:
+                _msg = ("UPDATE WARNING: frontend files changed in the pull but the "
+                        "served index.html asset hash did NOT change — the build may "
+                        "have failed or served a stale dist/. Users may see old UI. "
+                        f"assets={list(_post_sig)[:4]}")
+                print(f"[Update] {_msg}", flush=True)
+                try:
+                    database.log_activity(_msg, "error")
+                except Exception:
+                    pass
+        except Exception as _sig_exc:
+            print(f"[Update] asset-hash check skipped: {_sig_exc}", flush=True)
         print("[Update] Restarting bot", flush=True)
         # Flush pending DB state, then restart the current Python process in-place
         _flush_db_state()
@@ -6624,10 +6885,21 @@ def start_control_api():
             from fastapi.staticfiles import StaticFiles
             from fastapi.responses import FileResponse as _FR
 
+            # G3.2 — hashed asset filenames change every build, so they are
+            # safe (and desirable) to cache forever with immutable.
+            class _ImmutableStatic(StaticFiles):
+                def file_response(self, *args, **kwargs):
+                    resp = super().file_response(*args, **kwargs)
+                    try:
+                        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+                    except Exception:
+                        pass
+                    return resp
+
             # Hashed assets (filename changes every build) — long cache is safe
             _assets_dir = dist / "assets"
             if _assets_dir.exists():
-                app.mount("/assets", StaticFiles(directory=str(_assets_dir)), name="assets")
+                app.mount("/assets", _ImmutableStatic(directory=str(_assets_dir)), name="assets")
 
             # index.html must NEVER be cached — it references hashed bundles
             _index_path = dist / "index.html"

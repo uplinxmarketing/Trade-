@@ -11,9 +11,23 @@ log = logging.getLogger(__name__)
 _exchange_info_cache = {
     "last_fetched_ts": 0.0,
     "symbol_filters": {},
+    "symbol_status": {},   # symbol → Binance status string (e.g. "TRADING")
 }
 _exchange_info_lock = Lock()
 _EXCHANGE_INFO_TTL_SEC = 86400  # 24h — exchangeInfo is weight 20 (addendum 6.4); the -1013 error path already forces a refresh on symbol errors
+
+# G2 — known Binance symbol renames/migrations (2024-2025). Used to SUGGEST a
+# replacement for a now-invalid approved coin; never applied automatically.
+# NOTE: verify each mapping before acting — token migrations occasionally ship
+# with new tickers or conversion ratios.
+RENAMED_SYMBOLS = {
+    "MATICUSDT":  "POLUSDT",   # Polygon MATIC → POL
+    "FTMUSDT":    "SUSDT",     # Fantom FTM → Sonic (S)
+    "AGIXUSDT":   "ASIUSDT",   # SingularityNET → ASI merger
+    "OCEANUSDT":  "ASIUSDT",   # Ocean Protocol → ASI merger
+    "EOSUSDT":    "AUSDT",     # EOS → Vaulta (A)
+    "MKRUSDT":    "SKYUSDT",   # Maker MKR → Sky
+}
 
 
 def _fetch_exchange_info():
@@ -27,10 +41,12 @@ def _fetch_exchange_info():
         return None
 
     filters = {}
+    statuses = {}
     for sym_info in data.get("symbols", []):
         symbol = sym_info.get("symbol")
         if not symbol:
             continue
+        statuses[symbol] = sym_info.get("status", "")
         step_size = 0.0
         min_qty = 0.0
         min_notional = 0.0
@@ -51,20 +67,51 @@ def _fetch_exchange_info():
                     pass
         if step_size > 0:
             filters[symbol] = {"step_size": step_size, "min_qty": min_qty, "min_notional": min_notional}
-    return filters
+    return filters, statuses
+
+
+def _refresh_locked(now: float) -> None:
+    """Refresh the exchangeInfo cache if stale/empty. Caller MUST hold
+    _exchange_info_lock. Fails open: a failed fetch leaves the old cache
+    intact (possibly empty on a cold start)."""
+    age = now - _exchange_info_cache["last_fetched_ts"]
+    if age > _EXCHANGE_INFO_TTL_SEC or not _exchange_info_cache["symbol_filters"]:
+        result = _fetch_exchange_info()
+        if result:
+            new_filters, new_statuses = result
+            if new_filters:
+                _exchange_info_cache["symbol_filters"] = new_filters
+                _exchange_info_cache["symbol_status"] = new_statuses
+                _exchange_info_cache["last_fetched_ts"] = now
+                log.info("Refreshed exchangeInfo: %d symbols cached", len(new_filters))
 
 
 def get_symbol_filters(symbol: str) -> dict:
     now = time.time()
     with _exchange_info_lock:
-        age = now - _exchange_info_cache["last_fetched_ts"]
-        if age > _EXCHANGE_INFO_TTL_SEC or not _exchange_info_cache["symbol_filters"]:
-            new_filters = _fetch_exchange_info()
-            if new_filters:
-                _exchange_info_cache["symbol_filters"] = new_filters
-                _exchange_info_cache["last_fetched_ts"] = now
-                log.info("Refreshed exchangeInfo: %d symbols cached", len(new_filters))
+        _refresh_locked(now)
         return _exchange_info_cache["symbol_filters"].get(symbol, {})
+
+
+def get_tradeable_symbols() -> set:
+    """Set of symbols whose exchangeInfo status is 'TRADING' (reuses the 24h
+    cache). Fails open: an empty/unavailable cache returns an empty set — the
+    universe validator treats that as 'cannot validate' and marks nothing
+    invalid."""
+    now = time.time()
+    with _exchange_info_lock:
+        _refresh_locked(now)
+        return {sym for sym, st in _exchange_info_cache["symbol_status"].items()
+                if st == "TRADING"}
+
+
+def symbol_status(sym: str) -> str:
+    """Binance status string for `sym` (e.g. 'TRADING', 'BREAK', 'HALT'), or ''
+    when the symbol is unknown / exchangeInfo is unavailable (fail open)."""
+    now = time.time()
+    with _exchange_info_lock:
+        _refresh_locked(now)
+        return _exchange_info_cache["symbol_status"].get(sym, "")
 
 
 def round_quantity_to_step(quantity: float, step_size: float) -> float:
