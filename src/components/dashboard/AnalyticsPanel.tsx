@@ -119,6 +119,8 @@ function Unavailable({ what }: { what: string }) {
 export function AnalyticsPanel({ baseUrl = '' }: { baseUrl?: string }) {
   const [mode, setMode] = useState<Mode>('all');
   const [days, setDays] = useState(30);
+  // When on, append ?since_deploy=1 so expectancy reflects only post-fix trades.
+  const [sinceDeploy, setSinceDeploy] = useState(false);
 
   const [stats, setStats] = useState<ExpectancyStats | null>(null);
   const [statsError, setStatsError] = useState(false);
@@ -132,7 +134,10 @@ export function AnalyticsPanel({ baseUrl = '' }: { baseUrl?: string }) {
   // ── Expectancy (polled every 30s) ────────────────────────────────────────
   const loadStats = useCallback(async () => {
     try {
-      const res = await fetch(`${baseUrl}/api/stats/expectancy?days=${days}&mode=${mode}`, { cache: 'no-store' });
+      const res = await fetch(
+        `${baseUrl}/api/stats/expectancy?days=${days}&mode=${mode}${sinceDeploy ? '&since_deploy=1' : ''}`,
+        { cache: 'no-store' },
+      );
       if (!res.ok) throw new Error(`http ${res.status}`);
       const data = await res.json();
       if (data && typeof data === 'object' && 'error' in data && data.error) throw new Error(String(data.error));
@@ -143,7 +148,7 @@ export function AnalyticsPanel({ baseUrl = '' }: { baseUrl?: string }) {
     } finally {
       setStatsLoading(false);
     }
-  }, [baseUrl, days, mode]);
+  }, [baseUrl, days, mode, sinceDeploy]);
 
   useEffect(() => {
     setStatsLoading(true);
@@ -211,10 +216,19 @@ export function AnalyticsPanel({ baseUrl = '' }: { baseUrl?: string }) {
             </button>
           ))}
         </div>
-        <div className="flex gap-1">
+        <div className="flex gap-1 items-center">
+          <button
+            onClick={() => setSinceDeploy(v => !v)}
+            title="Show expectancy for trades since the last deploy only (post-fix). Ignored gracefully if the backend doesn't support it."
+            className={`text-[8px] px-1.5 py-0.5 border rounded transition-colors ${
+              sinceDeploy ? 'border-accent text-accent bg-accent/10' : 'border-border text-muted-foreground hover:border-accent/50'
+            }`}>
+            Since deploy
+          </button>
           {DAY_OPTIONS.map(d => (
             <button key={d} onClick={() => setDays(d)}
-              className={`text-[8px] px-1.5 py-0.5 border rounded transition-colors ${
+              disabled={sinceDeploy}
+              className={`text-[8px] px-1.5 py-0.5 border rounded transition-colors disabled:opacity-40 ${
                 days === d ? 'border-accent text-accent bg-accent/10' : 'border-border text-muted-foreground hover:border-accent/50'
               }`}>
               {d}d

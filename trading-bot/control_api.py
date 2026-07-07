@@ -19,6 +19,12 @@ from typing import Optional
 # browser can detect new deployments even when the version string is unchanged.
 _DEPLOY_ID = str(uuid.uuid4())
 
+# H4 — process start timestamp, captured once at import. Used as the
+# "since current deploy" boundary for diagnostics/analytics range filters.
+# A restart (os.execv on update) re-imports this module and re-stamps it, so
+# "since_deploy" always means "since the currently-running build started".
+_PROCESS_START_TS = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
 # GitHub raw version URL — bot polls this to detect available updates.
 _GITHUB_VERSION_URL = (
     "https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/public/version.json"
@@ -3340,9 +3346,24 @@ def _compute_health_snapshot() -> dict:
     # unscanned.
     try:
         sc = engine.get("scanner") if isinstance(engine.get("scanner"), dict) else {}
+        stale_syms = list(engine.get("stale_signal_syms") or [])
+        # H3: the engine computes staleness over the RAW approved list, which
+        # still includes delisted/renamed tickers (AGIX/EOS/MATIC…). Those are
+        # excluded from the stream universe, so they can never be "fresh" — do
+        # not let them hold health yellow forever. Subtract the data collector's
+        # excluded set before counting.
+        try:
+            import data_collector as _dc_excl
+            _excluded = set(getattr(_dc_excl, "get_excluded_symbols", lambda: {})() or {})
+        except Exception:
+            _excluded = set()
+        stale_syms = [s for s in stale_syms if s not in _excluded]
         stale_n = _health_num(sc.get("stale_signal_count"))
+        # Recompute the count from the filtered list when we have symbol detail,
+        # else fall back to the engine's number minus the excluded overlap.
+        if stale_syms or _excluded:
+            stale_n = float(len(stale_syms)) if (engine.get("stale_signal_syms") is not None) else stale_n
         if stale_n is not None and stale_n > 0:
-            stale_syms = engine.get("stale_signal_syms") or []
             listed = (": " + ", ".join(str(s) for s in stale_syms[:10])) if stale_syms else ""
             warns.append(f"{stale_n:.0f} symbol(s) have stale signal data{listed}.")
     except Exception:
@@ -3633,27 +3654,103 @@ def api_diagnostics_log_clear():
     return {"ok": True, "cleared": n}
 
 
-_BUNDLE_CACHE: dict = {"text": None, "ts": 0.0}
+# H4.3 — bundle cache is keyed by resolved range so different ranges don't
+# clobber each other's 5s snapshot: {range_key: {"text": str, "ts": float}}.
+_BUNDLE_CACHE: dict = {}
 _BUNDLE_CACHE_TTL = 5.0  # G4.3 — collapse rapid re-clicks / double-fetches
 
 
+def _resolve_range(range_val: str, from_iso: Optional[str], to_iso: Optional[str]):
+    """H4.1 — turn a range spec into (from_iso, to_iso, label, cache_key).
+
+    range: 1h|6h|24h|since_deploy|all (default since_deploy). Explicit from/to
+    (ISO) override the preset. from_iso is None for 'all'. to_iso defaults to
+    now. All timestamps are naive-UTC 'YYYY-MM-DDTHH:MM:SS' to compare directly
+    against the DB / activity-log string timestamps."""
+    now = datetime.now(timezone.utc)
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%S")
+    rv = (range_val or "since_deploy").strip().lower()
+    _hours = {"1h": 1, "6h": 6, "24h": 24}
+    frm = None
+    if from_iso or to_iso:
+        frm = (from_iso or None)
+        to_iso = to_iso or now_iso
+        label = f"{frm or 'beginning'} → {to_iso}"
+        return frm, to_iso, label, f"custom:{frm}:{to_iso}"
+    if rv in _hours:
+        frm = (now - timedelta(hours=_hours[rv])).strftime("%Y-%m-%dT%H:%M:%S")
+        return frm, now_iso, f"{frm} → now (last {rv})", rv
+    if rv == "all":
+        return None, now_iso, "beginning → now (all history)", "all"
+    # default: since_deploy
+    frm = _PROCESS_START_TS
+    return (frm, now_iso,
+            f"{frm} → now (since deploy {_DEPLOY_ID[:8]})", "since_deploy")
+
+
 @app.get("/api/diagnostics/bundle")
-def api_diagnostics_bundle():
+def api_diagnostics_bundle(
+    range: str = Query("since_deploy"),
+    from_iso: Optional[str] = Query(None, alias="from"),
+    to_iso: Optional[str] = Query(None, alias="to"),
+):
     """One-click full diagnostic bundle — plaintext report aggregating version,
     health, limits, scanner, telemetry, gate blockers, risk, analytics and
     recent errors, formatted for pasting into a chat for remote diagnosis.
     Every section is independently guarded: a broken subsystem shows its error
     instead of killing the report (that would defeat the purpose).
 
-    G4.3 — the assembled report is cached for 5s so back-to-back requests
-    (double-clicks, retries) reuse one snapshot instead of re-querying every
-    subsystem."""
+    H4.1 — a `range` (1h|6h|24h|since_deploy|all, default since_deploy) plus
+    optional from/to ISO scopes every TIME-BASED section to that window so
+    post-fix bundles don't drown in pre-fix noise. Sections that can't be
+    time-filtered (config, health, open positions) print a note.
+
+    G4.3/H4.3 — the assembled report is cached for 5s PER RANGE so back-to-back
+    requests (double-clicks, retries) reuse one snapshot per range instead of
+    re-querying every subsystem."""
+    _range_from, _range_to, _range_label, _cache_key = _resolve_range(range, from_iso, to_iso)
     _now_b = time.time()
-    if _BUNDLE_CACHE["text"] is not None and (_now_b - _BUNDLE_CACHE["ts"]) < _BUNDLE_CACHE_TTL:
-        return Response(content=_BUNDLE_CACHE["text"], media_type="text/plain")
+    _cached = _BUNDLE_CACHE.get(_cache_key)
+    if _cached is not None and (_now_b - _cached["ts"]) < _BUNDLE_CACHE_TTL:
+        return Response(content=_cached["text"], media_type="text/plain")
     import io
     out = io.StringIO()
     now_iso = datetime.now(timezone.utc).isoformat()
+
+    # H4.1 — number of days spanned by the range (ceil), for day-based helpers.
+    def _range_days() -> int:
+        if _range_from is None:
+            return 3650
+        try:
+            _f = datetime.strptime(_range_from[:19], "%Y-%m-%dT%H:%M:%S")
+            _t = datetime.strptime(_range_to[:19], "%Y-%m-%dT%H:%M:%S")
+            _secs = max(1.0, (_t - _f).total_seconds())
+            import math as _m
+            return max(1, int(_m.ceil(_secs / 86400.0)))
+        except Exception:
+            return 30
+
+    # H4.1 — hours spanned by the range (for hour-based helpers, capped by caller).
+    def _range_hours() -> float:
+        if _range_from is None:
+            return 168.0
+        try:
+            _f = datetime.strptime(_range_from[:19], "%Y-%m-%dT%H:%M:%S")
+            _t = datetime.strptime(_range_to[:19], "%Y-%m-%dT%H:%M:%S")
+            return max(0.5, (_t - _f).total_seconds() / 3600.0)
+        except Exception:
+            return 24.0
+
+    def _in_range(ts) -> bool:
+        """True if an ISO-ish timestamp string falls within [_range_from, _range_to]."""
+        if not ts:
+            return True
+        s = str(ts)[:19].replace(" ", "T")
+        if _range_from is not None and s < _range_from[:19]:
+            return False
+        if _range_to is not None and s > _range_to[:19]:
+            return False
+        return True
 
     def section(title):
         out.write(f"\n===== {title} =====\n")
@@ -3666,6 +3763,7 @@ def api_diagnostics_bundle():
             return None
 
     out.write(f"WOLFBOT DIAGNOSTIC BUNDLE — {now_iso}\n")
+    out.write(f"RANGE: {_range_label}\n")
 
     # -- Version / deploy --------------------------------------------------
     section("VERSION")
@@ -3754,6 +3852,7 @@ def api_diagnostics_bundle():
     # -- Gate blockers distribution (why coins aren't being bought) ----------
     section("GATE BLOCKERS (current signals snapshot)")
     def _gates():
+        out.write("  NOTE: gate blockers are a live snapshot (not scoped to RANGE)\n")
         res = api_signals_summary(limit=100)
         reasons: dict = {}
         allowed = 0
@@ -3772,6 +3871,9 @@ def api_diagnostics_bundle():
     section("SIGNAL TELEMETRY (24h fire rates)")
     def _tel():
         import signal_registry as _sr
+        if _cache_key != "24h":
+            out.write("  NOTE: telemetry fire rates are a fixed rolling 24h window "
+                      f"(not scoped to RANGE {_cache_key})\n")
         tel = _sr.get_signal_telemetry()
         sigs = tel.get("signals", tel) or {}
         for sid, v in sorted(sigs.items()):
@@ -3782,36 +3884,44 @@ def api_diagnostics_bundle():
             out.write("  (no evaluations yet)\n")
     safe(_tel, "telemetry")
 
-    # -- Analytics / expectancy (7d and 30d) ----------------------------------
-    for days in (7, 30):
-        section(f"ANALYTICS {days}d")
-        def _an(days=days):
-            ex = api_stats_expectancy(days=days)
-            out.write(f"  trades={ex.get('trades')} win_rate={ex.get('win_rate')}% "
-                      f"avg_win={ex.get('avg_win')} avg_loss={ex.get('avg_loss')} "
-                      f"expectancy={ex.get('expectancy_per_trade')} "
-                      f"profit_factor={ex.get('profit_factor')}\n")
-            if ex.get("note"):
-                out.write(f"  NOTE: {ex.get('note')}\n")
-            else:
-                out.write(f"  data_start={ex.get('data_start_ts')}\n")
-            out.write(f"  total_fees={ex.get('total_fees')} "
-                      f"fee_share={ex.get('fee_share_of_gross')} "
-                      f"avg_hold={ex.get('avg_hold_time_sec')}s\n")
-            labels = ex.get("exit_labels") or {}
-            if labels:
-                out.write("  exits: " + ", ".join(
-                    f"{k}={v.get('count')}({v.get('net_pnl'):+.2f})"
-                    for k, v in sorted(labels.items())) + "\n")
-            per = ex.get("per_symbol") or []
-            for row in per[:8]:
-                out.write(f"    {row.get('symbol'):<12} trades={row.get('trades')} "
-                          f"pnl={row.get('net_pnl'):+.2f} wr={row.get('win_rate')}%\n")
-        safe(_an, f"analytics{days}")
+    # -- Analytics / expectancy (scoped to RANGE) -----------------------------
+    # H4.1 — analytics is time-based, so scope it to the requested range instead
+    # of the old fixed 7d/30d. since_deploy uses the process-start filter; other
+    # ranges map to an equivalent day window (from/to are honoured via days).
+    _an_days = _range_days()
+    _an_since_deploy = 1 if _cache_key == "since_deploy" else 0
+    section(f"ANALYTICS (RANGE {_cache_key}, ~{_an_days}d)")
+    def _an(days=_an_days, sd=_an_since_deploy):
+        ex = api_stats_expectancy(days=days, since_deploy=sd)
+        out.write(f"  config_hash={ex.get('config_hash')} "
+                  f"process_start={ex.get('process_start')} "
+                  f"since_deploy={ex.get('since_deploy')}\n")
+        out.write(f"  trades={ex.get('trades')} win_rate={ex.get('win_rate')}% "
+                  f"avg_win={ex.get('avg_win')} avg_loss={ex.get('avg_loss')} "
+                  f"expectancy={ex.get('expectancy_per_trade')} "
+                  f"profit_factor={ex.get('profit_factor')}\n")
+        if ex.get("note"):
+            out.write(f"  NOTE: {ex.get('note')}\n")
+        else:
+            out.write(f"  data_start={ex.get('data_start_ts')}\n")
+        out.write(f"  total_fees={ex.get('total_fees')} "
+                  f"fee_share={ex.get('fee_share_of_gross')} "
+                  f"avg_hold={ex.get('avg_hold_time_sec')}s\n")
+        labels = ex.get("exit_labels") or {}
+        if labels:
+            out.write("  exits: " + ", ".join(
+                f"{k}={v.get('count')}({v.get('net_pnl'):+.2f})"
+                for k, v in sorted(labels.items())) + "\n")
+        per = ex.get("per_symbol") or []
+        for row in per[:8]:
+            out.write(f"    {row.get('symbol'):<12} trades={row.get('trades')} "
+                      f"pnl={row.get('net_pnl'):+.2f} wr={row.get('win_rate')}%\n")
+    safe(_an, "analytics")
 
     # -- Exit-R distribution (F1/F9) -------------------------------------------
     section("EXIT-R (planned vs realized)")
     def _exitr():
+        out.write("  NOTE: exit-R stats are engine-lifetime (not scoped to RANGE)\n")
         er = api_diagnostics_exit_r()
         if not er.get("available"):
             out.write(f"  unavailable: {er.get('reason') or er.get('error')}\n")
@@ -3830,9 +3940,11 @@ def api_diagnostics_bundle():
     safe(_exitr, "exit_r")
 
     # -- Chronic spread (E1) vetoes (F10) --------------------------------------
-    section("SPREAD-VETO STATS (E1, 24h)")
+    # H4.1 — scope the veto window to the range (endpoint caps at 168h).
+    _veto_hours = min(168.0, _range_hours())
+    section(f"SPREAD-VETO STATS (E1, {_veto_hours:.1f}h)")
     def _veto():
-        vs = api_diagnostics_veto_stats(hours=24.0)
+        vs = api_diagnostics_veto_stats(hours=_veto_hours)
         if vs.get("error"):
             out.write(f"  error: {vs.get('error')}\n")
             return
@@ -3866,13 +3978,14 @@ def api_diagnostics_bundle():
     safe(_pos, "positions")
 
     # -- Recent errors & warnings ----------------------------------------------
-    section("RECENT ERRORS / WARNINGS (last 40)")
+    section("RECENT ERRORS / WARNINGS (last 40, scoped to RANGE)")
     def _errs():
         entries = database.get_activity_log(limit=400)
         picked = [e for e in entries
-                  if str(e.get("severity", e.get("level", ""))).lower() in ("error", "warn", "warning")][:40]
+                  if str(e.get("severity", e.get("level", ""))).lower() in ("error", "warn", "warning")
+                  and _in_range(e.get("timestamp", e.get("ts", "")))][:40]
         if not picked:
-            out.write("  none\n")
+            out.write("  none in range\n")
         for e in picked:
             ts = e.get("timestamp", e.get("ts", ""))
             sev = str(e.get("severity", e.get("level", "?"))).upper()[:5]
@@ -3895,6 +4008,7 @@ def api_diagnostics_bundle():
     # -- Config snapshot ----------------------------------------------------------
     section("CONFIG (resolved key settings)")
     def _cfg():
+        out.write("  NOTE: config is a point-in-time snapshot (not scoped to RANGE)\n")
         import strategy_config as _scfg
         raw = _load_strategy()
         view = _scfg.current_v2_view(raw)
@@ -3912,8 +4026,7 @@ def api_diagnostics_bundle():
 
     out.write("\n===== END OF BUNDLE =====\n")
     _text_b = out.getvalue()
-    _BUNDLE_CACHE["text"] = _text_b
-    _BUNDLE_CACHE["ts"] = time.time()
+    _BUNDLE_CACHE[_cache_key] = {"text": _text_b, "ts": time.time()}
     return Response(content=_text_b, media_type="text/plain")
 
 
@@ -4510,6 +4623,13 @@ def _risk_compact_summary() -> dict:
                 if isinstance(slots, dict):
                     out["effective_slots"] = slots.get("effective_slots")
                     out["degraded"]        = bool(slots.get("degraded"))
+        # H1: surface stuck-position count so the UI can raise a persistent
+        # "position stuck — manual action may be required" banner.
+        _gsp = getattr(_te, "get_stuck_positions", None)
+        if callable(_gsp):
+            stuck = _gsp()
+            if isinstance(stuck, dict) and stuck:
+                out["stuck_positions"] = list(stuck.keys())
     except Exception:
         pass
     return out
@@ -5499,6 +5619,51 @@ def api_version():
     return _read_frontend_version()
 
 
+def _served_dist_index():
+    """(dist_path, index_html_path) for the dist/ actually served, using the
+    same repo-root-wins resolution as start_control_api. Returns (None, None)
+    when no dist/ is present (API-only mode)."""
+    import pathlib as _pl
+    for _d in (_pl.Path(__file__).parent.parent / "dist",
+               _pl.Path(__file__).parent / "dist"):
+        if _d.exists():
+            return _d, (_d / "index.html")
+    return None, None
+
+
+@app.get("/api/version/served")
+def api_version_served(response: Response):
+    """H2.3 — report the SERVED frontend bundle so the operator/frontend can
+    verify the browser loaded the same asset hash the server is serving. Reads
+    the on-disk index.html the SPA route serves and extracts the main entry
+    bundle filename (assets/index-*.js). Never cached."""
+    import re as _re
+    response.headers["Cache-Control"] = "no-store"
+    v = _read_frontend_version()
+    dist_path, index_path = _served_dist_index()
+    index_asset = None
+    all_assets: list = []
+    try:
+        if index_path and index_path.exists():
+            _html = index_path.read_text()
+            all_assets = sorted(set(_re.findall(r"/assets/[A-Za-z0-9_\-.]+", _html)))
+            _main = [a for a in all_assets if _re.search(r"/assets/index-.*\.js$", a)]
+            index_asset = (_main[0] if _main else (all_assets[0] if all_assets else None))
+    except Exception as e:
+        return {"version": v.get("version"), "commit": v.get("commit"),
+                "deployId": _DEPLOY_ID, "dist_path": str(dist_path) if dist_path else None,
+                "index_asset": None, "error": f"{type(e).__name__}: {e}"}
+    return {
+        "version": v.get("version"),
+        "buildTime": v.get("buildTime"),
+        "commit": v.get("commit"),
+        "deployId": _DEPLOY_ID,
+        "index_asset": index_asset,
+        "assets": all_assets,
+        "dist_path": str(dist_path) if dist_path else None,
+    }
+
+
 @app.get("/version.json")
 def serve_version_json(response: Response):
     """
@@ -5622,7 +5787,20 @@ def api_update():
                 except Exception:
                     pass
             return ()
+
+        def _index_main_js() -> str:
+            """The referenced main entry bundle (assets/index-*.js) served by the
+            on-disk index.html — the single filename whose hash MUST change when
+            the frontend changes."""
+            import re as _re
+            for _s in (_index_asset_sig(),):
+                for _a in _s:
+                    if _re.search(r"/assets/index-.*\.js$", _a):
+                        return _a
+            return "(none)"
         _pre_sig = _index_asset_sig()
+        _pre_main = _index_main_js()
+        print(f"[Update] served main asset BEFORE pull: {_pre_main}", flush=True)
         _frontend_changed = False
         try:
             # -c safe.directory covers root-owned checkouts ("dubious
@@ -5690,12 +5868,16 @@ def api_update():
         # would ship stale despite a "successful" update.
         try:
             _post_sig = _index_asset_sig()
+            _post_main = _index_main_js()
+            print(f"[Update] served main asset AFTER pull:  {_post_main} "
+                  f"(frontend_changed={_frontend_changed})", flush=True)
             if _frontend_changed and _pre_sig and _post_sig and _pre_sig == _post_sig:
-                _msg = ("UPDATE WARNING: frontend files changed in the pull but the "
-                        "served index.html asset hash did NOT change — the build may "
-                        "have failed or served a stale dist/. Users may see old UI. "
-                        f"assets={list(_post_sig)[:4]}")
-                print(f"[Update] {_msg}", flush=True)
+                _msg = ("SERVED BUNDLE UNCHANGED AFTER UPDATE — dist may be stale, run "
+                        "npm build. The pull changed frontend files (dist/ or src/) but "
+                        f"the served index.html main asset ({_post_main}) did NOT change — "
+                        "the build may have failed or served a stale dist/. Users may see "
+                        f"old UI. assets={list(_post_sig)[:4]}")
+                print(f"[Update] ERROR: {_msg}", flush=True)
                 try:
                     database.log_activity(_msg, "error")
                 except Exception:
@@ -6018,9 +6200,17 @@ def api_backtest_status(job_id: str):
 # ── Expectancy stats ─────────────────────────────────────────────────────────
 
 @app.get("/api/stats/expectancy")
-def api_stats_expectancy(days: int = 30, mode: Optional[str] = None):
+def api_stats_expectancy(days: int = 30, mode: Optional[str] = None,
+                         since_deploy: int = 0, config_hash: Optional[str] = None):
     """Expectancy / fee / exit-label breakdown from the trades table.
-    Default mode filter = current get_mode(); ?mode=paper|live|all overrides."""
+    Default mode filter = current get_mode(); ?mode=paper|live|all overrides.
+
+    H4.2 — since_deploy=1 pins the window start to the current process start
+    (_PROCESS_START_TS) so "since current deploy" is one click. config_hash is a
+    best-effort filter: the trades table has no config_hash column (fixed
+    schema), so it is only used to LABEL the payload (note when it can't filter).
+    The payload is always labelled with the active config_hash and process_start
+    so cross-config comparisons are never unlabelled."""
     try:
         import sqlite3 as _sq
         days = max(1, min(3650, int(days)))
@@ -6028,8 +6218,22 @@ def api_stats_expectancy(days: int = 30, mode: Optional[str] = None):
             m = (mode or get_mode() or "paper").strip().lower()
         except Exception:
             m = (mode or "all").strip().lower()
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)
-                  ).strftime("%Y-%m-%dT%H:%M:%S")
+        _use_deploy = bool(since_deploy)
+        if _use_deploy:
+            cutoff = _PROCESS_START_TS
+        else:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)
+                      ).strftime("%Y-%m-%dT%H:%M:%S")
+
+        # Active config hash (for labelling; best-effort).
+        try:
+            _active_cfg_hash = database.config_hash(_load_strategy())
+        except Exception:
+            _active_cfg_hash = None
+        _cfg_hash_note = None
+        if config_hash:
+            _cfg_hash_note = ("config_hash filter requested but trades store no "
+                              "config_hash column — payload labelled, not filtered")
 
         where = ["exit_price IS NOT NULL", "net_profit IS NOT NULL",
                  "timestamp_sell >= ?"]
@@ -6121,10 +6325,18 @@ def api_stats_expectancy(days: int = 30, mode: Optional[str] = None):
         if truncated:
             note = f"data since {str(data_start_ts)[:10]} (window truncated by available history)"
 
+        # H4.2 — merge the config-hash note (if any) with the F8 truncation note.
+        if _cfg_hash_note:
+            note = f"{note} | {_cfg_hash_note}" if note else _cfg_hash_note
+
         return {
             "days": days,
             "mode": m,
             "trades": n,
+            "since_deploy": _use_deploy,
+            "process_start": _PROCESS_START_TS,
+            "config_hash": _active_cfg_hash,
+            "config_hash_filter": config_hash,
             "window_start_ts": cutoff,
             "data_start_ts": data_start_ts,
             "earliest_trade_ts": earliest_overall,

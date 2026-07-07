@@ -12,17 +12,27 @@ interface TopBarProps {
 
 const APP_VERSION = __APP_VERSION__;
 
+type DiagRange = 'since_deploy' | '1h' | '6h' | '24h' | 'all';
+const DIAG_RANGE_OPTIONS: { value: DiagRange; label: string }[] = [
+  { value: 'since_deploy', label: 'Since deploy' },
+  { value: '1h',  label: 'Last 1h' },
+  { value: '6h',  label: 'Last 6h' },
+  { value: '24h', label: 'Last 24h' },
+  { value: 'all', label: 'All' },
+];
+
 const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
   const { updateAvailable, checking, updating, checkForUpdates, applyUpdate } = useUpdateChecker();
-  const { backendVersion, mismatch, reloadNow } = useBackendVersion();
+  const { backendVersion, mismatch, reloadNow, servedAsset, currentAsset, assetMismatch } = useBackendVersion();
   const [reconciling, setReconciling] = useState(false);
   const [copyingDiag, setCopyingDiag] = useState(false);
+  const [diagRange, setDiagRange] = useState<DiagRange>('since_deploy');
 
   const handleCopyDiagnostics = async () => {
     setCopyingDiag(true);
     const toastId = toast.loading('Collecting diagnostics…');
     try {
-      const res = await fetch('/api/diagnostics/bundle', { cache: 'no-store' });
+      const res = await fetch(`/api/diagnostics/bundle?range=${encodeURIComponent(diagRange)}`, { cache: 'no-store' });
       if (!res.ok) {
         toast.error('Diagnostics fetch failed', { id: toastId, description: `HTTP ${res.status}` });
         return;
@@ -112,7 +122,11 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
           {mismatch ? (
             <span
               className="text-xs font-mono text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded"
-              title="Your browser bundle is older than the running backend. Reload to update."
+              title={
+                (assetMismatch
+                  ? `Browser is on a STALE cached bundle. Server serves ${servedAsset}; this page loaded ${currentAsset}. Reload to update.`
+                  : 'Your browser bundle is older than the running backend. Reload to update.')
+              }
             >
               UI v{APP_VERSION} · server v{backendVersion}
             </span>
@@ -153,16 +167,33 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
             </button>
           )}
 
-          {/* Copy diagnostics bundle — one click, paste into chat for remote diagnosis */}
-          <button
-            onClick={handleCopyDiagnostics}
-            disabled={copyingDiag}
-            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-            title="Copy the full diagnostic report (version, health, errors, gate blockers, telemetry, analytics, config) to the clipboard"
-          >
-            <ClipboardCopy className={`w-3.5 h-3.5 ${copyingDiag ? 'animate-spin' : ''}`} />
-            <span className="hidden sm:inline">Copy diagnostics</span>
-          </button>
+          {/* Copy diagnostics bundle — pick a time range, then one click to
+              copy (falls back to a file download if the clipboard is blocked) */}
+          <div className="flex items-center gap-1">
+            <button
+              onClick={handleCopyDiagnostics}
+              disabled={copyingDiag}
+              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+              title="Copy the diagnostic report (version, health, errors, gate blockers, telemetry, analytics, config) for the selected time range to the clipboard"
+            >
+              <ClipboardCopy className={`w-3.5 h-3.5 ${copyingDiag ? 'animate-spin' : ''}`} />
+              <span className="hidden sm:inline">Copy diagnostics</span>
+            </button>
+            <select
+              value={diagRange}
+              onChange={e => setDiagRange(e.target.value as DiagRange)}
+              disabled={copyingDiag}
+              aria-label="Diagnostics time range"
+              title="Time range for the diagnostics bundle"
+              className="bg-secondary border border-border rounded px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring cursor-pointer disabled:opacity-60"
+            >
+              {DIAG_RANGE_OPTIONS.map(o => (
+                <option key={o.value} value={o.value} className="bg-card text-foreground">
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
 
           {/* Backend-version mismatch: browser bundle is stale relative to the
               running backend. Distinct from the git-based update checker below. */}
@@ -170,7 +201,11 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
             <button
               onClick={reloadNow}
               className="flex items-center gap-1.5 px-3 py-1 rounded-md bg-loss/15 border border-loss/50 text-loss text-xs font-semibold hover:bg-loss/25 transition-colors animate-pulse"
-              title="A newer backend version is running than the bundle your browser loaded. Click to hard-reload."
+              title={
+                assetMismatch
+                  ? `Browser is on a stale cached bundle (server serves ${servedAsset}, this page loaded ${currentAsset}). Click to clear caches + service workers and hard-reload.`
+                  : 'A newer backend version is running than the bundle your browser loaded. Click to hard-reload.'
+              }
             >
               <AlertTriangle className="w-3.5 h-3.5" />
               New version {backendVersion} deployed — click to reload

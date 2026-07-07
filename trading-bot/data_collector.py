@@ -189,14 +189,20 @@ def notify_positions_changed():
     _positions_changed.set()
 
 
-# ── G2: dead/renamed-ticker exclusion ────────────────────────────────────────
-# Delisted or renamed symbols (AGIX, EOS, FTM, LRC, MATIC, OCEAN, MKR, TON, …)
-# never subscribe. Filter the stream universe through exchange_info's tradeable
-# set so they are DROPPED (with a one-time WARN each) instead of being
-# auto-resubscribed forever by the F5 reconcile. The tradeable set is cached
-# locally with a 1 h TTL so the reconcile checks excluded symbols at most once
-# per hour (they could get relisted). Everything fails OPEN: when exchange_info
-# is unavailable the universe is used unchanged.
+# ── G2/H3: dead/renamed-ticker exclusion ─────────────────────────────────────
+# Delisted or renamed symbols (AGIX, EOS, FTM, LRC, MATIC, OCEAN, MKR) never
+# subscribe. Filter the stream universe through exchange_info's tradeable set so
+# they are DROPPED (with a one-time WARN each) instead of being auto-resubscribed
+# forever by the F5 reconcile. The tradeable set is cached locally with a 1 h TTL
+# so the reconcile checks excluded symbols at most once per hour.
+#
+# H3: the live-tradeable tier fails OPEN (unavailable set → no filtering), which
+# on the VPS left the dead tickers in the universe forever because the
+# exchangeInfo fetch is unreliable there. So exchange_info.KNOWN_DELISTED is now
+# dropped UNCONDITIONALLY by _filter_tradeable, even with no live fetch. TON is
+# NOT in that set: it is re-checked individually against the live tradeable set,
+# and if TON (TONUSDT) is TRADING its subscription failure is a SEPARATE real
+# bug ('ws_subscribe_failed'), not a delisting.
 
 _tradeable_cache: Dict = {"symbols": None, "ts": 0.0}
 _TRADEABLE_TTL_SEC = 3600.0                 # 1 h — excluded symbols re-checked ≤1/h
@@ -240,7 +246,9 @@ def _get_tradeable_symbols() -> Optional[set]:
 
 
 def _symbol_status(sym: str) -> str:
-    """Best-effort non-TRADING status string for a dropped symbol."""
+    """Best-effort non-TRADING status string for a dropped symbol. Returns
+    'DELISTED' for exchange_info.KNOWN_DELISTED even with no live exchangeInfo
+    (symbol_status handles that hardcoded verdict itself)."""
     fn = getattr(exchange_info, "symbol_status", None) if exchange_info else None
     if fn is not None:
         try:
@@ -252,25 +260,55 @@ def _symbol_status(sym: str) -> str:
     return "UNKNOWN"
 
 
+def _known_delisted() -> set:
+    """H3: the hardcoded delisted/renamed set from exchange_info, or an empty
+    set when exchange_info (or the attribute) is unavailable. This is the ONLY
+    part of the filter that does not fail open — these tickers are dropped even
+    when a live tradeable set can't be fetched."""
+    if exchange_info is None:
+        return set()
+    try:
+        return set(getattr(exchange_info, "KNOWN_DELISTED", None) or set())
+    except Exception:
+        return set()
+
+
 def _filter_tradeable(coins: list) -> list:
-    """G2: drop non-TRADING (delisted/renamed) symbols from the stream
-    universe using the cached tradeable set. Fails OPEN — when the set is
-    unavailable the list is returned unchanged. Dropped symbols + their status
-    are recorded in _excluded_symbols and WARN-logged exactly ONCE each (not
-    once per reconcile pass)."""
-    tradeable = _get_tradeable_symbols()
-    if not tradeable:
-        return list(coins)
+    """G2/H3: drop non-TRADING (delisted/renamed) symbols from the stream
+    universe.
+
+    H3 change — two tiers:
+      1. exchange_info.KNOWN_DELISTED is dropped UNCONDITIONALLY (status
+         'DELISTED'), even when the live tradeable set is None/empty because
+         exchangeInfo is unreachable. This is what finally removes the 8 dead
+         tickers on the VPS where the fetch fails and the filter used to fail
+         open, keeping them forever.
+      2. When a live tradeable set IS available, any OTHER non-TRADING symbol
+         is also dropped (the original G2 fail-open behaviour for the unknowns).
+
+    Dropped symbols + their status are recorded in _excluded_symbols and
+    WARN-logged exactly ONCE each (not once per reconcile pass)."""
+    tradeable = _get_tradeable_symbols()   # None/empty when exchangeInfo is down
+    delisted = _known_delisted()
     kept: list = []
     dropped: list = []
     for c in coins:
-        (kept if c in tradeable else dropped).append(c)
+        if c in delisted:
+            dropped.append(c)                       # tier 1 — always
+        elif tradeable and c not in tradeable:
+            dropped.append(c)                       # tier 2 — only when known
+        else:
+            kept.append(c)
     to_warn: list = []
     with _excluded_lock:
         # A previously-excluded symbol that is tradeable again (relisted) is
         # cleared so it can re-subscribe and WARN afresh if it re-delists.
+        # KNOWN_DELISTED entries are never "relisted" this way — they stay
+        # dropped until the hardcoded set is edited.
         for c in coins:
-            if c in tradeable and _excluded_symbols.pop(c, None) is not None:
+            if c in delisted:
+                continue
+            if tradeable and c in tradeable and _excluded_symbols.pop(c, None) is not None:
                 _excluded_warned.discard(c)
         for c in dropped:
             if c not in _excluded_symbols:
@@ -289,6 +327,19 @@ def _filter_tradeable(coins: list) -> list:
         except Exception:
             pass
     return kept
+
+
+def get_excluded_symbols() -> Dict[str, str]:
+    """H3: public {symbol: status} map of symbols dropped from the stream
+    universe (delisted/renamed/non-TRADING). The control_api health layer MUST
+    subtract these from the engine's stale-signal count and from any coverage/
+    uncovered accounting that is computed over the RAW approved list — they are
+    intentionally not covered, so they must not turn health yellow.
+
+    Populated lazily by _filter_tradeable during watchlist loads; call
+    _load_persisted_watchlist() first if you need it warm on a cold process."""
+    with _excluded_lock:
+        return dict(_excluded_symbols)
 
 
 def _bookticker_universe_enabled() -> bool:
