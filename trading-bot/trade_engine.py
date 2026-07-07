@@ -2796,14 +2796,31 @@ def _next_utc_midnight_ts() -> float:
     return nxt.timestamp()
 
 
+def _daily_limit_snapshot() -> tuple:
+    """(limit_pct, limit_usdt) resolved FRESH from strategy.json on every call
+    (Part E: a UI edit to risk.daily_loss_stop_pct must apply immediately, not
+    after the 30 s PnL cache expires). effective_slots() reads config fresh
+    too; only its balance snapshot is cached."""
+    slots = effective_slots()
+    try:
+        pct = float(_risk_cfg()["daily_loss_stop_pct"])
+    except Exception:
+        pct = _RISK_DEFAULTS["daily_loss_stop_pct"]
+    limit_usdt = max(0.0, pct / 100.0 * float(slots["effective_allocation"]))
+    return pct, round(limit_usdt, 6)
+
+
 def _daily_pnl_state() -> dict:
     """Realized (trades table, timestamp_sell in today UTC, current mode) +
     unrealized (open positions, fee-adjusted estimate at freshest price) PnL.
-    Cached 30 s. Never raises."""
+    PnL numbers are cached 30 s; limit_pct/limit_usdt are recomputed from the
+    hot config on EVERY call so risk.daily_loss_stop_pct edits apply without
+    waiting out the cache. Never raises."""
     now = time.time()
     cached = _daily_pnl_cache.get("data")
     if cached and now - _daily_pnl_cache["ts"] < _DAILY_PNL_TTL_SEC:
-        return cached
+        pct, limit_usdt = _daily_limit_snapshot()
+        return {**cached, "limit_pct": pct, "limit_usdt": limit_usdt}
     day = _utc_day_str()
     rows = _risk_db_rows(
         "SELECT COALESCE(SUM(net_profit), 0.0) AS pnl FROM trades "
@@ -2828,19 +2845,14 @@ def _daily_pnl_state() -> dict:
             unrealized += proceeds - (qty * entry + buy_fee)
     except Exception:
         pass
-    slots = effective_slots()
-    try:
-        pct = float(_risk_cfg()["daily_loss_stop_pct"])
-    except Exception:
-        pct = _RISK_DEFAULTS["daily_loss_stop_pct"]
-    limit_usdt = max(0.0, pct / 100.0 * float(slots["effective_allocation"]))
+    pct, limit_usdt = _daily_limit_snapshot()
     data = {
         "day":        day,
         "realized":   round(realized, 6),
         "unrealized": round(unrealized, 6),
         "pnl_today":  round(realized + unrealized, 6),
         "limit_pct":  pct,
-        "limit_usdt": round(limit_usdt, 6),
+        "limit_usdt": limit_usdt,
     }
     _daily_pnl_cache["ts"] = now
     _daily_pnl_cache["data"] = data

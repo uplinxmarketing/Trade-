@@ -5,7 +5,7 @@ import {
   RotateCcw, ChevronDown, ChevronUp, FlaskConical,
   Pencil, Check, X, BookOpen, Activity, Eye, EyeOff,
   ShoppingCart, Banknote, RefreshCw, Settings2, Shield,
-  BarChart3, History,
+  BarChart3, History, SlidersHorizontal, ListChecks, FileClock,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { supabase } from '@/integrations/supabase/client';
@@ -19,6 +19,9 @@ import { DiagnosticsTab } from './DiagnosticsTab';
 import { AnalyticsPanel } from './AnalyticsPanel';
 import { BacktestPanel } from './BacktestPanel';
 import { RiskPanel } from './RiskPanel';
+import { StrategySettingsPanel } from './StrategySettingsPanel';
+import { SignalsEditorPanel } from './SignalsEditorPanel';
+import { ConfigHistoryPanel } from './ConfigHistoryPanel';
 
 // ── Simple 4-signal analyser (no API key, Binance public data only) ────────────────────
 const BIN = '/api/proxy/binance';
@@ -236,12 +239,6 @@ interface AgentFieldsProps {
   budgetMode: 'fixed'|'percent'|'capped'; setBudgetMode: (m: 'fixed'|'percent'|'capped') => void;
   budgetValue: number;     setBudgetValue: (n: number) => void;
   allocation: number;      setAllocation: (n: number) => void;
-  slEnabled: boolean;      setSlEnabled: (v: boolean) => void;
-  stopLoss: number;        setStopLoss: (n: number) => void;
-  tpEnabled: boolean;      setTpEnabled: (v: boolean) => void;
-  takeProfit: number;      setTakeProfit: (n: number) => void;
-  smartHold: boolean;      setSmartHold: (v: boolean) => void;
-  trailingStop: number;    setTrailingStop: (n: number) => void;
   reinvest: boolean;       setReinvest: (v: boolean) => void;
   maxPositions: number;    setMaxPositions: (n: number) => void;
   minSignals: number;      setMinSignals: (n: number) => void;
@@ -258,9 +255,6 @@ const Toggle = ({ on, onChange, color = 'bg-accent/80' }: { on: boolean; onChang
 const AgentTradingFields = React.memo(({
   budgetMode, setBudgetMode, budgetValue, setBudgetValue,
   allocation, setAllocation,
-  slEnabled, setSlEnabled, stopLoss, setStopLoss,
-  tpEnabled, setTpEnabled, takeProfit, setTakeProfit,
-  smartHold, setSmartHold, trailingStop, setTrailingStop,
   reinvest, setReinvest,
   maxPositions, setMaxPositions, minSignals, setMinSignals,
 }: AgentFieldsProps) => (
@@ -304,64 +298,20 @@ const AgentTradingFields = React.memo(({
       </div>
     </div>
 
-    {/* ── Stop Loss ── */}
-    <div className="bg-muted/30 rounded-md px-3 py-2.5 space-y-2">
-      <div className="flex items-center justify-between">
-        <div>
-          <p className="text-xs font-semibold">Stop Loss</p>
-          <p className="text-[9px] text-muted-foreground">{slEnabled ? 'Auto-exit when position loses this %' : 'OFF — hold through drawdowns'}</p>
-        </div>
-        <Toggle on={slEnabled} onChange={() => setSlEnabled(!slEnabled)} color="bg-loss/80" />
-      </div>
-      {slEnabled && (
-        <div className="flex items-center gap-2">
-          <input type="number" min="0.1" max="50" step="0.1"
-            value={stopLoss}
-            onChange={e => setStopLoss(parseFloat(e.target.value) || 2)}
-            className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-loss/60" />
-          <span className="text-xs text-muted-foreground">% below entry</span>
-        </div>
-      )}
-    </div>
-
-    {/* ── Take Profit ── */}
-    <div className="bg-muted/30 rounded-md px-3 py-2.5 space-y-2">
-      <div className="flex items-center justify-between">
-        <div>
-          <p className="text-xs font-semibold">Take Profit</p>
-          <p className="text-[9px] text-muted-foreground">{tpEnabled ? 'Auto-exit when position gains this %' : 'OFF — hold indefinitely'}</p>
-        </div>
-        <Toggle on={tpEnabled} onChange={() => setTpEnabled(!tpEnabled)} color="bg-gain/80" />
-      </div>
-      {tpEnabled && (
-        <div className="flex items-center gap-2">
-          <input type="number" min="0.1" max="100" step="0.1"
-            value={takeProfit}
-            onChange={e => setTakeProfit(parseFloat(e.target.value) || 0.5)}
-            className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-gain/60" />
-          <span className="text-xs text-muted-foreground">% above entry</span>
-        </div>
-      )}
-    </div>
-
-    {/* ── Smart Hold ── */}
-    <div className="bg-muted/30 rounded-md px-3 py-2.5 space-y-2">
-      <div className="flex items-center justify-between">
-        <div>
-          <p className="text-xs font-semibold">Smart Hold</p>
-          <p className="text-[9px] text-muted-foreground">{smartHold ? 'Hold while bullish; exit when signals turn or price drops from peak' : 'OFF — exit immediately at profit target'}</p>
-        </div>
-        <Toggle on={smartHold} onChange={() => setSmartHold(!smartHold)} color="bg-accent/80" />
-      </div>
-      {smartHold && (
-        <div className="flex items-center gap-2">
-          <input type="number" min="0.1" max="10" step="0.1"
-            value={trailingStop}
-            onChange={e => setTrailingStop(parseFloat(e.target.value) || 0.5)}
-            className="w-24 bg-muted/40 border border-border rounded px-2 py-1 text-xs font-mono focus:outline-none focus:border-accent/60" />
-          <span className="text-xs text-muted-foreground">% trailing drop from peak</span>
-        </div>
-      )}
+    {/* ── Exit management moved (Part E dead-field removal) ──
+        The old Stop Loss / Take Profit / Smart Hold controls wrote the legacy
+        root keys (stop_loss_pct, take_profit_pct, smart_hold_enabled,
+        trailing_stop_pct) which the engine only reads on its pre-v2 legacy
+        path. Since the v2 migration always creates the `exits` block, ALL
+        exits are governed by Strategy Settings → Exits (ATR stop k_sl +
+        clamps, hard SL, reward:risk TP, breakeven move, trailing, smart-hold
+        score gate) — the removed controls saved but changed nothing. */}
+    <div className="bg-muted/30 rounded-md px-3 py-2.5">
+      <p className="text-xs font-semibold">Exits (stop-loss / take-profit / trailing)</p>
+      <p className="text-[9px] text-muted-foreground">
+        Configured in <span className="font-semibold">Strategy Settings → Exits</span> below
+        (ATR stop, hard stop, reward:risk take-profit, trailing). Changes apply live.
+      </p>
     </div>
 
     {/* ── Reinvest Profits ── */}
@@ -424,6 +374,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [showAnalytics, setShowAnalytics] = useState(false);
   const [showBacktest, setShowBacktest] = useState(false);
   const [showRisk, setShowRisk] = useState(false);
+  // Phase 5 §5.2 — strategy editor sections
+  const [showStrategySettings, setShowStrategySettings] = useState(false);
+  const [showSignalsEditor, setShowSignalsEditor] = useState(false);
+  const [showConfigHistory, setShowConfigHistory] = useState(false);
   // Phase 4 §4.4 — compact breaker summary carried on the /api/all poll.
   const [riskSummary, setRiskSummary] = useState<{
     daily_stopped?: boolean; consec_paused?: boolean;
@@ -434,19 +388,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [stopLossEnabled, setStopLossEnabled]         = useState(false);
-  const [stopLossPct, setStopLossPct]                 = useState(2.0);
-  const [takeProfitEnabled, setTakeProfitEnabled]     = useState(true);
-  const [takeProfitPct, setTakeProfitPct]             = useState(0.5);
-  const [smartHoldEnabled, setSmartHoldEnabled]       = useState(false);
-  const [trailingStopPct, setTrailingStopPct]         = useState(0.5);
+  // Part E: legacy exit settings (stop_loss_*, take_profit_*, smart_hold,
+  // trailing_stop) were removed from this panel — the v2 `exits` block in
+  // Strategy Settings is the single exit-tuning surface.
   const [reinvestProfits, setReinvestProfits]         = useState(false);
   const [maxPositions, setMaxPositions]               = useState(10);
   const [minSignals, setMinSignals]                   = useState(4);
   const [settingsDraft, setSettingsDraft]             = useState({
-    stopLossEnabled: false, stopLossPct: 2.0,
-    takeProfitEnabled: true, takeProfitPct: 0.5,
-    smartHoldEnabled: false, trailingStopPct: 0.5,
     reinvestProfits: false,
     maxPositions: 10, minSignals: 4,
   });
@@ -481,13 +429,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [setupBudgetValue, setSetupBudgetValue] = useState(10);
   // Bot Allocation: total USDT from wallet the bot may use (0 = unlimited)
   const [setupAllocation, setSetupAllocation]   = useState(0);
-  // Risk settings (all toggles + values)
-  const [setupSlEnabled, setSetupSlEnabled]         = useState(false);
-  const [setupStopLoss, setSetupStopLoss]           = useState(2.0);
-  const [setupTpEnabled, setSetupTpEnabled]         = useState(true);
-  const [setupTakeProfit, setSetupTakeProfit]       = useState(0.5);
-  const [setupSmartHold, setSetupSmartHold]         = useState(false);
-  const [setupTrailingStop, setSetupTrailingStop]   = useState(0.5);
+  // Risk settings (exit tuning lives in Strategy Settings → Exits)
   const [setupReinvest, setSetupReinvest]           = useState(false);
   const [setupMaxPositions, setSetupMaxPositions]   = useState(10);
   const [setupMinSignals, setSetupMinSignals]       = useState(4);
@@ -519,12 +461,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       .then(r => r.ok ? r.json() : null)
       .then(d => {
         if (!d) return;
-        if (d.stop_loss_enabled   !== undefined) setStopLossEnabled(Boolean(d.stop_loss_enabled));
-        if (d.stop_loss_pct       !== undefined) { setStopLossPct(Number(d.stop_loss_pct)); }
-        if (d.take_profit_enabled !== undefined) setTakeProfitEnabled(Boolean(d.take_profit_enabled));
-        if (d.take_profit_pct     !== undefined) { setTakeProfitPct(Number(d.take_profit_pct)); }
-        if (d.smart_hold_enabled  !== undefined) setSmartHoldEnabled(Boolean(d.smart_hold_enabled));
-        if (d.trailing_stop_pct   !== undefined) setTrailingStopPct(Number(d.trailing_stop_pct));
         if (d.reinvest_profits    !== undefined) setReinvestProfits(Boolean(d.reinvest_profits));
         if (d.max_positions       !== undefined) setMaxPositions(Number(d.max_positions));
         if (d.min_signals         !== undefined) setMinSignals(Number(d.min_signals));
@@ -586,79 +522,23 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (isServerMode || !isRunningRef.current) return;
     setScanning(true);
     setAgentStatus(`Scanning ${selectedCoins.length} coins…`);
+    // Part E dead-code removal: the browser-local paper-trading loop
+    // (Supabase positions + localStorage budget allocation) is permanently
+    // unreachable — isServerMode is hardwired true and the VPS bot owns ALL
+    // entries/exits/sizing. Leaving it here shadowed the server-side sizing
+    // config with the dead localStorage paper_wallet_config path and it no
+    // longer type-checked against the current lib/trading-engine API.
     try {
-      const fresh = await loadData() as any;
-      const bal = balanceRef.current;
-      const pos = positionsRef.current;
-      if (bal < MIN_USDT) { setAgentStatus('Insufficient balance'); setScanning(false); return; }
-
-      // Exit check
-      const exitResults = checkExits(pos.map(p => ({
-        symbol: p.symbol, quantity: p.quantity,
-        avg_entry_price: p.avg_entry_price,
-        current_price: prices[p.symbol] ?? p.avg_entry_price,
-        stop_loss_pct: stopLossEnabled ? stopLossPct / 100 : null,
-        take_profit_pct: takeProfitEnabled ? takeProfitPct / 100 : null,
-      })), prices);
-
-      for (const ex of exitResults) {
-        if (!ex.should_exit) continue;
-        const pos_ = pos.find(p => p.symbol === ex.symbol);
-        if (!pos_) continue;
-        const exitPrice = prices[ex.symbol] ?? pos_.avg_entry_price;
-        const pnl = (exitPrice - pos_.avg_entry_price) * pos_.quantity * (1 - TAKER_FEE);
-        const newBal = bal + pos_.avg_entry_price * pos_.quantity + pnl;
-        await supabase.from('positions').update({ status: 'closed', updated_at: new Date().toISOString() })
-          .eq('user_session', SESSION).eq('symbol', ex.symbol).eq('status', 'open');
-        await supabase.from('trades').insert({
-          user_session: SESSION, symbol: ex.symbol, side: 'SELL',
-          price: exitPrice, quantity: pos_.quantity, pnl,
-          reason: ex.reason, created_at: new Date().toISOString(),
-        });
-        await supabase.from('bot_config').update({ current_balance: newBal, updated_at: new Date().toISOString() })
-          .eq('user_session', SESSION);
-        balanceRef.current = newBal;
-        addLog(`SELL ${ex.symbol} @ ${exitPrice.toFixed(4)} • PnL ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USDT`);
-      }
-
-      // Exit checker only runs in local mode — server handles exits server-side
-      if (pos.length >= MAX_POSITIONS) { setAgentStatus('Max positions held'); setScanning(false); return; }
-
-      // Buy scan
       const signals: CoinSignal[] = [];
       for (const sym of selectedCoins) {
-        if (pos.find(p => p.symbol === sym)) continue;
         const sig = await analyseCoin(sym);
         signals.push(sig);
-        if (sig.signal === 'BUY') {
-          const alloc = getAllocation(balanceRef.current, sym);
-          if (alloc < MIN_USDT) continue;
-          const price = prices[sym] ?? sig.price;
-          const qty = alloc / price;
-          const cost = qty * price * (1 + TAKER_FEE);
-          if (balanceRef.current < cost) continue;
-          await supabase.from('positions').insert({
-            user_session: SESSION, symbol: sym, status: 'open',
-            quantity: qty, avg_entry_price: price,
-            created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-          });
-          const nb = balanceRef.current - cost;
-          await supabase.from('bot_config').update({ current_balance: nb, updated_at: new Date().toISOString() })
-            .eq('user_session', SESSION);
-          await supabase.from('trades').insert({
-            user_session: SESSION, symbol: sym, side: 'BUY',
-            price, quantity: qty, pnl: null,
-            reason: sig.reason, created_at: new Date().toISOString(),
-          });
-          balanceRef.current = nb;
-          addLog(`BUY ${sym} @ ${price.toFixed(4)} • ${alloc.toFixed(2)} USDT`);
-        }
       }
       setCoinSignals(signals);
     } catch (e: any) { addLog(`[cycle] error: ${e.message}`); }
     setScanning(false);
     await loadData();
-  }, [selectedCoins, prices, stopLossEnabled, stopLossPct, takeProfitEnabled, takeProfitPct, addLog, loadData]);
+  }, [selectedCoins, addLog, loadData]);
 
   // ── Countdown timer ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -762,12 +642,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     // Update committed state from server — never touch settingsDraft here.
     // The draft is only reset when the user opens the settings panel, so
     // in-progress edits are never overwritten by a background poll.
-    if (s.stop_loss_enabled   !== undefined) setStopLossEnabled(Boolean(s.stop_loss_enabled));
-    if (s.stop_loss_pct       !== undefined) setStopLossPct(Number(s.stop_loss_pct));
-    if (s.take_profit_enabled !== undefined) setTakeProfitEnabled(Boolean(s.take_profit_enabled));
-    if (s.take_profit_pct     !== undefined) setTakeProfitPct(Number(s.take_profit_pct));
-    if (s.smart_hold_enabled  !== undefined) setSmartHoldEnabled(Boolean(s.smart_hold_enabled));
-    if (s.trailing_stop_pct   !== undefined) setTrailingStopPct(Number(s.trailing_stop_pct));
     if (s.reinvest_profits    !== undefined) setReinvestProfits(Boolean(s.reinvest_profits));
     if (s.max_positions       !== undefined) setMaxPositions(Number(s.max_positions));
     if (s.min_signals         !== undefined) setMinSignals(Number(s.min_signals));
@@ -925,12 +799,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         budget_total_cap_usdt: setupBudgetMode === 'capped'  ? setupBudgetValue : undefined,
       };
       const settingsPayload = {
-        stop_loss_enabled:   setupSlEnabled,
-        stop_loss_pct:       setupStopLoss,
-        take_profit_enabled: setupTpEnabled,
-        take_profit_pct:     setupTakeProfit,
-        smart_hold_enabled:  setupSmartHold,
-        trailing_stop_pct:   setupTrailingStop,
         reinvest_profits:    setupReinvest,
         max_positions:       setupMaxPositions,
         min_signals:         setupMinSignals,
@@ -944,9 +812,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       return false;
     }
   }, [
-    setupBudgetMode, setupBudgetValue, setupAllocation,
-    setupSlEnabled, setupStopLoss, setupTpEnabled, setupTakeProfit,
-    setupSmartHold, setupTrailingStop, setupReinvest,
+    setupBudgetMode, setupBudgetValue, setupAllocation, setupReinvest,
     setupMaxPositions, setupMinSignals,
     botUrl]);
 
@@ -1126,12 +992,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            stop_loss_enabled:   settingsDraft.stopLossEnabled,
-            stop_loss_pct:       settingsDraft.stopLossPct,
-            take_profit_enabled: settingsDraft.takeProfitEnabled,
-            take_profit_pct:     settingsDraft.takeProfitPct,
-            smart_hold_enabled:  settingsDraft.smartHoldEnabled,
-            trailing_stop_pct:   settingsDraft.trailingStopPct,
             reinvest_profits:    settingsDraft.reinvestProfits,
             max_positions:       settingsDraft.maxPositions,
             min_signals:         settingsDraft.minSignals,
@@ -1151,12 +1011,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       ]);
       if (!settingsRes.ok) throw new Error(`settings HTTP ${settingsRes.status}`);
       if (!configRes.ok)   throw new Error(`config HTTP ${configRes.status}`);
-      setStopLossEnabled(settingsDraft.stopLossEnabled);
-      setStopLossPct(settingsDraft.stopLossPct);
-      setTakeProfitEnabled(settingsDraft.takeProfitEnabled);
-      setTakeProfitPct(settingsDraft.takeProfitPct);
-      setSmartHoldEnabled(settingsDraft.smartHoldEnabled);
-      setTrailingStopPct(settingsDraft.trailingStopPct);
       setReinvestProfits(settingsDraft.reinvestProfits);
       setMaxPositions(settingsDraft.maxPositions);
       setMinSignals(settingsDraft.minSignals);
@@ -1235,12 +1089,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                   ]);
                   if (s?.ok) {
                     setSettingsDraft({
-                      stopLossEnabled:   Boolean(s.stop_loss_enabled),
-                      stopLossPct:       Number(s.stop_loss_pct ?? 2.0),
-                      takeProfitEnabled: Boolean(s.take_profit_enabled),
-                      takeProfitPct:     Number(s.take_profit_pct ?? 0.1),
-                      smartHoldEnabled:  Boolean(s.smart_hold_enabled),
-                      trailingStopPct:   Number(s.trailing_stop_pct ?? 0.5),
                       reinvestProfits:   Boolean(s.reinvest_profits),
                       maxPositions:      Number(s.max_positions ?? 20),
                       minSignals:        Number(s.min_signals ?? 3),
@@ -1416,20 +1264,17 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             <div className="bg-muted/20 border border-border rounded-lg p-4 space-y-4">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-semibold">Bot Settings</span>
-                <button onClick={() => { setSettingsDraft({ stopLossEnabled, stopLossPct, takeProfitEnabled, takeProfitPct, smartHoldEnabled, trailingStopPct, reinvestProfits, maxPositions, minSignals }); }}
+                <button onClick={() => { setSettingsDraft({ reinvestProfits, maxPositions, minSignals }); }}
                   className="text-[10px] text-muted-foreground hover:text-foreground">Reload from server</button>
               </div>
+              <p className="text-[9px] text-muted-foreground/70 italic">
+                Full strategy editor available in <span className="font-semibold not-italic">Strategy Settings</span> below.
+              </p>
 
               <AgentTradingFields
                 budgetMode={setupBudgetMode} setBudgetMode={setSetupBudgetMode}
                 budgetValue={setupBudgetValue} setBudgetValue={setSetupBudgetValue}
                 allocation={setupAllocation} setAllocation={setSetupAllocation}
-                slEnabled={settingsDraft.stopLossEnabled} setSlEnabled={v => setSettingsDraft(d => ({...d, stopLossEnabled: v}))}
-                stopLoss={settingsDraft.stopLossPct} setStopLoss={v => setSettingsDraft(d => ({...d, stopLossPct: v}))}
-                tpEnabled={settingsDraft.takeProfitEnabled} setTpEnabled={v => setSettingsDraft(d => ({...d, takeProfitEnabled: v}))}
-                takeProfit={settingsDraft.takeProfitPct} setTakeProfit={v => setSettingsDraft(d => ({...d, takeProfitPct: v}))}
-                smartHold={settingsDraft.smartHoldEnabled} setSmartHold={v => setSettingsDraft(d => ({...d, smartHoldEnabled: v}))}
-                trailingStop={settingsDraft.trailingStopPct} setTrailingStop={v => setSettingsDraft(d => ({...d, trailingStopPct: v}))}
                 reinvest={settingsDraft.reinvestProfits} setReinvest={v => setSettingsDraft(d => ({...d, reinvestProfits: v}))}
                 maxPositions={settingsDraft.maxPositions} setMaxPositions={v => setSettingsDraft(d => ({...d, maxPositions: v}))}
                 minSignals={settingsDraft.minSignals} setMinSignals={v => setSettingsDraft(d => ({...d, minSignals: v}))}
@@ -1832,6 +1677,50 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         </div>
       )}
 
+      {/* Strategy Settings — schema-driven full strategy editor (server mode only, §5.2.1) */}
+      {isServerMode && (
+        <div className="border-t border-border">
+          <button
+            onClick={() => setShowStrategySettings(!showStrategySettings)}
+            className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/20 transition-colors">
+            <div className="flex items-center gap-2">
+              <SlidersHorizontal className="w-3.5 h-3.5 text-muted-foreground" />
+              <span className="text-xs font-semibold">Strategy Settings</span>
+            </div>
+            {showStrategySettings
+              ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
+              : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
+          </button>
+          {showStrategySettings && (
+            <div className="px-4 pb-4">
+              <StrategySettingsPanel baseUrl={botUrl} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Signals Editor — roles / thresholds / 24h impact (server mode only, §5.2.2) */}
+      {isServerMode && (
+        <div className="border-t border-border">
+          <button
+            onClick={() => setShowSignalsEditor(!showSignalsEditor)}
+            className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/20 transition-colors">
+            <div className="flex items-center gap-2">
+              <ListChecks className="w-3.5 h-3.5 text-muted-foreground" />
+              <span className="text-xs font-semibold">Signals Editor</span>
+            </div>
+            {showSignalsEditor
+              ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
+              : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
+          </button>
+          {showSignalsEditor && (
+            <div className="px-4 pb-4">
+              <SignalsEditorPanel baseUrl={botUrl} />
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Risk breakers — daily stop / loss streak / slots / BNB / correlation (server mode only) */}
       {isServerMode && (
         <div className="border-t border-border">
@@ -1896,6 +1785,28 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           {showBacktest && (
             <div className="px-4 pb-4">
               <BacktestPanel baseUrl={botUrl} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Config History — version list + rollback (server mode only, §5.2.6) */}
+      {isServerMode && (
+        <div className="border-t border-border">
+          <button
+            onClick={() => setShowConfigHistory(!showConfigHistory)}
+            className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/20 transition-colors">
+            <div className="flex items-center gap-2">
+              <FileClock className="w-3.5 h-3.5 text-muted-foreground" />
+              <span className="text-xs font-semibold">Config History</span>
+            </div>
+            {showConfigHistory
+              ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
+              : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
+          </button>
+          {showConfigHistory && (
+            <div className="px-4 pb-4">
+              <ConfigHistoryPanel baseUrl={botUrl} />
             </div>
           )}
         </div>
