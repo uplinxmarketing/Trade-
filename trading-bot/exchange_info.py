@@ -29,6 +29,26 @@ RENAMED_SYMBOLS = {
     "MKRUSDT":    "SKYUSDT",   # Maker MKR → Sky
 }
 
+# H3 — hardcoded known-delisted/renamed set (2024-2025 Binance spot). Used as a
+# FALLBACK that works even when a live exchangeInfo fetch is unreachable (VPS
+# geo-block / transient error): symbol_status() returns 'DELISTED' for these
+# WITHOUT needing the network, and data_collector drops them UNCONDITIONALLY
+# (its tradeable filter otherwise fails open when exchangeInfo is down).
+#   MATIC→POL, FTM→S, AGIX/OCEAN→ASI, EOS→A(Vaulta), MKR→SKY, LRC delisted.
+# NOTE: verify periodically — a relist or a new rename ticker would make an
+# entry here wrong. TON (TONUSDT) is deliberately NOT included: re-check it
+# individually against a live fetch; if it is TRADING its subscription failure
+# is a separate real bug (see data_collector), not a delisting.
+KNOWN_DELISTED = {
+    "AGIXUSDT",
+    "OCEANUSDT",
+    "MATICUSDT",
+    "FTMUSDT",
+    "EOSUSDT",
+    "MKRUSDT",
+    "LRCUSDT",
+}
+
 
 def _fetch_exchange_info():
     url = "https://api.binance.com/api/v3/exchangeInfo"
@@ -97,17 +117,27 @@ def get_tradeable_symbols() -> set:
     """Set of symbols whose exchangeInfo status is 'TRADING' (reuses the 24h
     cache). Fails open: an empty/unavailable cache returns an empty set — the
     universe validator treats that as 'cannot validate' and marks nothing
-    invalid."""
+    invalid.
+
+    H3: KNOWN_DELISTED symbols are always subtracted, so even a stale cache
+    that still lists one of them as TRADING never reports it tradeable."""
     now = time.time()
     with _exchange_info_lock:
         _refresh_locked(now)
         return {sym for sym, st in _exchange_info_cache["symbol_status"].items()
-                if st == "TRADING"}
+                if st == "TRADING" and sym not in KNOWN_DELISTED}
 
 
 def symbol_status(sym: str) -> str:
     """Binance status string for `sym` (e.g. 'TRADING', 'BREAK', 'HALT'), or ''
-    when the symbol is unknown / exchangeInfo is unavailable (fail open)."""
+    when the symbol is unknown / exchangeInfo is unavailable (fail open).
+
+    H3: symbols in KNOWN_DELISTED always resolve to 'DELISTED' — this does NOT
+    require a live exchangeInfo fetch, so the caller can filter dead tickers
+    even when the endpoint is unreachable from the VPS. The hardcoded verdict
+    also wins over a stale cache that might still say 'TRADING'."""
+    if sym in KNOWN_DELISTED:
+        return "DELISTED"
     now = time.time()
     with _exchange_info_lock:
         _refresh_locked(now)

@@ -14,8 +14,27 @@ const SEEN_DEPLOY  = 'tradebot_deploy_id';
 
 interface VersionInfo { version: string; buildTime: string; commit: string; deployId?: string; }
 
+// Bulletproof cache-busting reload — unregister service workers and wipe the
+// Cache API before navigating, then use location.replace() so the stale entry
+// leaves history. A plain href/reload can land right back on a cached bundle.
+async function bulletproofReload(): Promise<void> {
+  try {
+    if ('serviceWorker' in navigator) {
+      const rs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(rs.map(r => r.unregister()));
+    }
+  } catch { /* ignore */ }
+  try {
+    if (window.caches) {
+      const ks = await caches.keys();
+      await Promise.all(ks.map(k => caches.delete(k)));
+    }
+  } catch { /* ignore */ }
+  window.location.replace(`${window.location.pathname}?v=${Date.now()}`);
+}
+
 function hardReload() {
-  window.location.href = `${window.location.pathname}?_cb=${Date.now()}`;
+  void bulletproofReload();
 }
 
 export function useUpdateChecker(pollIntervalMs = 60_000) {

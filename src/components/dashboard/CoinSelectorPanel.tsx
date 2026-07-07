@@ -164,13 +164,20 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
     fetchValidSymbols().then(setValidSymbols);
   }, []);
 
-  // All coins merged and filtered to only those Binance actually trades
+  // All coins merged and filtered to only those Binance actually trades.
+  // EXCEPTION: never filter out a coin the user has in their watchlist
+  // (selectedCoins) or one the backend flagged delisted/renamed — those must
+  // still render so their "delisted/renamed" badge is visible and pruneable.
   const allCoins = useMemo(() => {
     const set = new Set([...ALL_USDT_COINS, ...selectedCoins]);
     const all = [...set];
     if (!validSymbols || validSymbols.size === 0) return all; // unknown — show all
-    return all.filter(c => validSymbols.has(c));
-  }, [selectedCoins, validSymbols]);
+    const keep = new Set(selectedCoins.map(c => c.toUpperCase()));
+    return all.filter(c => {
+      const u = c.toUpperCase();
+      return validSymbols.has(c) || keep.has(u) || Boolean(invalid[u]);
+    });
+  }, [selectedCoins, validSymbols, invalid]);
 
   // Fetch 24hr ticker once when allCoins list is ready (not on every price tick).
   // WebSocket prices override these values via getPrice() — this is just seed data

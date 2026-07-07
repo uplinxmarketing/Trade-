@@ -1830,6 +1830,117 @@ _ghost_check_fails: Dict[str, int] = {}  # consecutive -2010 check_failed count 
 _SELL_RETRY_COOLDOWN_PROFIT = 0.5   # take-profit: 0.5s breaks retry loop without delaying exit
 _SELL_RETRY_COOLDOWN_LOSS   = 0.0   # stop-loss / force-sell: retry immediately
 
+# ── H1 fix 3: cached live account snapshot ───────────────────────────────────
+# The pre-sell balance clamp used to call _acct() (a signed REST GET) on EVERY
+# sell attempt. When a sell is stuck retrying every ~0.75s that hammered the
+# signed-API budget. _cached_acct() serves a snapshot at most _ACCT_CACHE_TTL
+# old; a cancel/fill event forces a refresh via _invalidate_acct_cache().
+_acct_cache_lock = threading.Lock()
+_acct_cache: dict = {"ts": 0.0, "acct": None}
+_ACCT_CACHE_TTL = 5.0   # seconds
+
+
+def _cached_acct(force: bool = False) -> dict:
+    """Live account snapshot, cached for _ACCT_CACHE_TTL to stop the stuck-sell
+    loop from calling the signed account endpoint every retry. force=True (used
+    right after a cancel that releases locked balance) fetches fresh."""
+    now = time.time()
+    with _acct_cache_lock:
+        ent = _acct_cache
+        if (not force and ent["acct"] is not None
+                and (now - ent["ts"]) < _ACCT_CACHE_TTL):
+            return ent["acct"]
+    acct = _acct()
+    with _acct_cache_lock:
+        _acct_cache["ts"] = time.time()
+        _acct_cache["acct"] = acct
+    return acct
+
+
+def _invalidate_acct_cache() -> None:
+    """Drop the cached account snapshot so the next _cached_acct() refetches
+    (call after any cancel/fill that changes free/locked balances)."""
+    with _acct_cache_lock:
+        _acct_cache["ts"] = 0.0
+        _acct_cache["acct"] = None
+
+
+def _asset_free_locked(acct: dict, asset: str):
+    """(free, locked) floats for `asset` from an account payload, or (None,None)."""
+    for b in acct.get("balances", []):
+        if b.get("asset") == asset:
+            try:
+                return float(b.get("free") or 0.0), float(b.get("locked") or 0.0)
+            except (TypeError, ValueError):
+                return None, None
+    return None, None
+
+
+# ── H1 fix 3: stuck-position escalation ──────────────────────────────────────
+# A sell that keeps skipping (e.g. below_min_qty from our own locked maker-TP,
+# or a repeated -2010) leaves the position UNPROTECTED while the loop spins.
+# Track consecutive skips per symbol; >10 within 60s escalates to a CRITICAL
+# log + diag issue and is surfaced via get_stuck_positions() so the UI can show
+# a persistent "position stuck — manual action may be required" banner.
+_stuck_lock = threading.Lock()
+_sell_skip_track: Dict[str, dict] = {}   # sym -> {count, first_ts, last_ts, reason}
+_stuck_positions: Dict[str, dict] = {}   # sym -> {skips, since_ts, reason}
+_STUCK_SKIP_THRESHOLD = 10               # skips within the window before escalation
+_STUCK_SKIP_WINDOW_SEC = 60.0
+
+
+def _note_sell_skip(sym: str, reason: str) -> None:
+    """Record one consecutive sell skip for `sym`. Escalates to the stuck
+    registry + a CRITICAL log once >_STUCK_SKIP_THRESHOLD skips land inside a
+    rolling _STUCK_SKIP_WINDOW_SEC window."""
+    now = time.time()
+    with _stuck_lock:
+        ent = _sell_skip_track.get(sym)
+        if ent is None or (now - ent["first_ts"]) > _STUCK_SKIP_WINDOW_SEC:
+            ent = {"count": 0, "first_ts": now, "last_ts": now, "reason": reason}
+            _sell_skip_track[sym] = ent
+        ent["count"] += 1
+        ent["last_ts"] = now
+        ent["reason"] = reason
+        escalate = ent["count"] > _STUCK_SKIP_THRESHOLD
+        if escalate:
+            first_stuck = sym not in _stuck_positions
+            _stuck_positions[sym] = {
+                "skips": ent["count"],
+                "since_ts": ent["first_ts"],
+                "reason": reason,
+            }
+    if escalate:
+        try:
+            database.log_activity(
+                f"[SELL_STUCK] CRITICAL {sym}: sell skipped {ent['count']}x in "
+                f"<{_STUCK_SKIP_WINDOW_SEC:.0f}s (reason={reason}) — position may be "
+                f"UNPROTECTED; manual action may be required", "error")
+        except Exception:
+            pass
+        if first_stuck:
+            log_diag_issue("sell_stuck", "error",
+                           f"{sym}: sell stuck ({ent['count']} skips, reason={reason})",
+                           detail=f"consecutive sell skips within {_STUCK_SKIP_WINDOW_SEC:.0f}s")
+
+
+def _clear_sell_skip(sym: str) -> None:
+    """Reset the stuck-skip counter for `sym` — call on any sell progress
+    (cancel released balance, order placed, position finalized/closed)."""
+    with _stuck_lock:
+        _sell_skip_track.pop(sym, None)
+        _stuck_positions.pop(sym, None)
+
+
+def get_stuck_positions() -> Dict[str, dict]:
+    """Symbols whose local sell is stuck (repeated skips) — for control_api/UI.
+
+    Returns {sym: {'skips': int, 'since_ts': float, 'reason': str}} (a copy).
+    A symbol appears once it has skipped >10 times inside a 60s window and is
+    removed on the first successful sell progress (_clear_sell_skip)."""
+    with _stuck_lock:
+        return {s: dict(e) for s, e in _stuck_positions.items()}
+
 # ── Sell executor — parallel sells so 10 simultaneous exits never queue up ───
 # Each position gets its own worker thread; _selling guard prevents duplicates.
 _sell_executor = ThreadPoolExecutor(max_workers=12, thread_name_prefix="sell-worker")
@@ -4688,6 +4799,149 @@ def start_entry_heartbeat() -> None:
 
 # ── Shared sell execution (used by both realtime_monitor and signal_scanner) ──
 
+def _min_lot_qty(symbol: str) -> float:
+    """Symbol's LOT_SIZE minQty (0.0 when unknown). Lets the cancel-first
+    release check tell a released balance from genuine dust."""
+    try:
+        from exchange_info import get_symbol_filters
+        f = get_symbol_filters(symbol) or {}
+        return float(f.get("min_qty") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _cancel_resting_before_sell(pos: dict, sym: str, reason: str, mode: str) -> str:
+    """H1 fix 1: UNIVERSAL cancel-first for EVERY local sell path (sl, hard-stop,
+    breakeven-stop, trail, take-profit, force-sell, recycler, manual, delist/
+    ghost). Runs at the TOP of _execute_sell — inside the _selling critical
+    section held by the caller — BEFORE the balance clamp, so a resting maker-TP
+    / OCO leg that has LOCKED the base asset is cancelled and the locked balance
+    released before we clamp to FREE balance. Without this, free≈0 rounds the
+    sell qty to 0 → 'below_min_qty' skip → the loop spins forever and the
+    position is UNPROTECTED on the downside.
+
+    Returns:
+      'released' — nothing rests, or the resting order was cancelled and the
+                   locked balance is released → proceed to clamp + market sell.
+      'filled'   — a resting order FILLED during cancel (-2011) and the base
+                   balance is now ~0 → the position was closed by that fill
+                   (finalized here for managed orders, else left for the manager
+                   poll) → caller ABORTS the market sell (no double sell).
+      'retry'    — cancel failed / balance not released / balance re-fetch
+                   failed → abort this attempt, next tick retries.
+
+    Paper mode / paper fallback: no managed/exchange orders exist → fast no-op
+    'released' (guarded on live mode and not paper fallback).
+    """
+    if exit_orders is None or mode != "live" or connection.is_using_paper_fallback():
+        return "released"
+
+    asset = sym[:-4] if sym.endswith("USDT") else sym
+    pos_qty = float(pos.get("quantity") or 0.0)
+
+    # 1a. Managed tracking (local dict — cheap) AND live open orders (source of
+    #     truth: a maker-TP / OCO leg may rest even if get_managed lost it across
+    #     a restart). get_open_orders is per-symbol (weight 6).
+    managed = None
+    try:
+        managed = exit_orders.get_managed(sym)
+    except Exception:
+        managed = None
+    open_orders = []
+    try:
+        open_orders = binance_direct.get_open_orders(sym) or []
+    except Exception as _oe:
+        database.log_activity(
+            f"[ManagedExit] {sym}: get_open_orders failed before sell "
+            f"({type(_oe).__name__}: {_oe})", "warn")
+        # Managed tracking (if any) still drives the cancel below; if there is no
+        # managed tracking either we cannot confirm a resting order — proceed and
+        # let the clamp's locked-aware guard route back here if coins are locked.
+        if not managed:
+            return "released"
+
+    if not managed and not open_orders:
+        return "released"   # nothing rests — normal clamp/sell
+
+    # 1b. Cancel the managed exit first (handles the -2011 finalize-from-fill via
+    #     the existing NO-DOUBLE-SELL helper).
+    if managed:
+        proceed = _clear_managed_exit_before_sell(pos, sym, reason)
+        _invalidate_acct_cache()
+        if not proceed:
+            with _positions_lock:
+                still_open = any(p.get("id") == pos.get("id") for p in _positions)
+            if still_open:
+                return "retry"       # cancel failed — retry next tick
+            _clear_sell_skip(sym)
+            return "filled"          # finalized from the fill — nothing to sell
+
+    # 1c. Sweep any RAW open orders (restart: managed tracking lost but the
+    #     maker-TP still rests and locks the qty). Tolerate -2011 (already gone).
+    try:
+        raw_orders = binance_direct.get_open_orders(sym) or []
+    except Exception:
+        raw_orders = open_orders
+    for o in raw_orders:
+        oid = o.get("orderId")
+        if oid is None:
+            continue
+        try:
+            binance_direct.cancel_order(sym, oid)
+            _invalidate_acct_cache()
+            database.log_activity(
+                f"[ManagedExit] {sym}: cancelled orphan open order {oid} before "
+                f"local sell ({reason})", "warn")
+        except binance_direct.BinanceDirectError as _ce:
+            if _ce.code == -2011:
+                _invalidate_acct_cache()   # already filled/cancelled — release check below decides
+                continue
+            database.log_activity(
+                f"[ManagedExit] {sym}: cancel of open order {oid} failed "
+                f"({_ce.code}: {_ce.msg}) — sell aborted, will retry", "warn")
+            _sell_last_failed_ts[sym] = time.time()
+            _sell_last_failed_reason[sym] = reason
+            return "retry"
+
+    # 1c/step 2. Confirm the release: poll up to ~2s until free ≈ position qty
+    #            (locked coins released). If a -2011 fill collapsed free+locked to
+    #            ~0 the position already exited → 'filled' (let the manager poll
+    #            finalize when it wasn't a managed order we could book here).
+    min_lot = _min_lot_qty(sym)
+    dust = max(min_lot, 1e-12)
+    deadline = time.time() + 2.0
+    while True:
+        try:
+            acct = _cached_acct(force=True)
+        except Exception as _ae:
+            database.log_activity(
+                f"[ManagedExit] {sym}: balance re-fetch after cancel failed "
+                f"({type(_ae).__name__}: {_ae}) — will retry", "warn")
+            return "retry"
+        free, locked = _asset_free_locked(acct, asset)
+        if free is None:
+            free, locked = 0.0, 0.0
+        total = free + locked
+        if total < dust and pos_qty > 0:
+            database.log_activity(
+                f"[ManagedExit] {sym}: base balance ~0 after cancel — resting order "
+                f"already filled/closed the position; aborting market sell ({reason})",
+                "warn")
+            _clear_sell_skip(sym)
+            return "filled"
+        if locked < dust or free >= min(pos_qty, total) * 0.999:
+            _clear_sell_skip(sym)   # release confirmed — sell can proceed
+            return "released"
+        if time.time() >= deadline:
+            database.log_activity(
+                f"[ManagedExit] {sym}: locked balance not released after cancel "
+                f"(free={free}, locked={locked}) — will retry ({reason})", "warn")
+            _sell_last_failed_ts[sym] = time.time()
+            _sell_last_failed_reason[sym] = reason
+            return "retry"
+        time.sleep(0.2)
+
+
 def _execute_sell(pos: dict, price: float, reason: str):
     """Execute a market sell for pos at price. Logs trade, cleans up state.
     Caller MUST have already added pos['symbol'] to _selling before submitting
@@ -4716,6 +4970,24 @@ def _execute_sell(pos: dict, price: float, reason: str):
             _selling_ts.pop(sym, None)
         return
 
+    # ── H1 fix 1: UNIVERSAL cancel-first ──────────────────────────────────────
+    # Release any resting maker-TP / OCO that LOCKED the base asset BEFORE the
+    # balance clamp, so a stop / breakeven-stop / hard-stop / trail / take-profit
+    # / force-sell / recycler / manual sell never spins 'below_min_qty' on our
+    # own locked coins. No-op in paper mode / paper fallback.
+    if mode == "live":
+        _rel = _cancel_resting_before_sell(pos, sym, reason, mode)
+        if _rel in ("filled", "retry"):
+            # 'filled' → a resting order already closed the position (finalized
+            # here, or the manager poll will); 'retry' → cancel failed / balance
+            # not released. Either way abort this attempt; the guard is released.
+            if _rel == "filled":
+                _clear_sell_skip(sym)
+            with _selling_lock:
+                _selling.discard(sym)
+                _selling_ts.pop(sym, None)
+            return
+
     # ── Lot-step rounding (toggleable via strategy.use_lot_step_rounding) ───
     _strategy_ls = _load_strategy()
     if _strategy_ls.get("use_lot_step_rounding", True):
@@ -4737,15 +5009,18 @@ def _execute_sell(pos: dict, price: float, reason: str):
         except Exception as _ls_exc:
             log.warning("%s: lot_step rounding failed (%s), using raw qty", sym, _ls_exc)
 
-    # ── Clamp to actual Binance free balance (prevents APIError -2010) ─────
-    if get_mode() == "live":
+    # ── Clamp to actual Binance free balance (prevents APIError -2010) ─────────
+    # H1 fix 2/3: read FREE and LOCKED and use the 5s-cached account snapshot so
+    # a stuck sell no longer hammers the signed account endpoint every ~0.75s.
+    # LOCKED-BALANCE-AWARE clamp: when the rounded free qty is below the min lot
+    # but the coins are merely LOCKED by our own resting order (free+locked still
+    # covers the lot), route BACK to the cancel-first path instead of skipping
+    # 'below_min_qty'. Only skip as dust when free+locked is genuinely below min.
+    if mode == "live":
         try:
             _asset = sym[:-4]  # e.g. "XRP" from "XRPUSDT"
-            _acc = _acct()  # geo-block-safe direct transport in live mode
-            _free = next(
-                (float(b["free"]) for b in _acc.get("balances", []) if b["asset"] == _asset),
-                None
-            )
+            _acc = _cached_acct()  # geo-block-safe direct transport, 5s cached
+            _free, _locked = _asset_free_locked(_acc, _asset)
             if _free is not None:
                 if abs(qty - _free) > qty * 0.001:  # > 0.1% mismatch — log it
                     log.warning(
@@ -4759,15 +5034,56 @@ def _execute_sell(pos: dict, price: float, reason: str):
                         from exchange_info import compute_sell_quantity
                         _clamped_qty, _, _cr = compute_sell_quantity(sym, qty)
                         if _clamped_qty <= 0:
-                            database.log_activity(
-                                f"[SELL_SKIPPED] {sym} ({reason}): after balance clamp — {_cr}",
-                                "warn"
-                            )
-                            with _selling_lock:
-                                _selling.discard(sym)
-                                _selling_ts.pop(sym, None)
-                            return
-                        qty = _clamped_qty
+                            _dust = max(_min_lot_qty(sym), 1e-12)
+                            _tot = (_free or 0.0) + (_locked or 0.0)
+                            if (_locked or 0.0) >= _dust and _tot >= _dust:
+                                # Coins are LOCKED by a resting bot order (not
+                                # dust) → cancel-first, do NOT skip.
+                                database.log_activity(
+                                    f"[SELL_LOCKED] {sym} ({reason}): free~{_free} "
+                                    f"locked={_locked} — {_cr}; coins locked by resting "
+                                    f"order, cancelling instead of skipping", "warn")
+                                _invalidate_acct_cache()
+                                _rel2 = _cancel_resting_before_sell(pos, sym, reason, mode)
+                                if _rel2 == "released":
+                                    _acc = _cached_acct(force=True)
+                                    _free2, _ = _asset_free_locked(_acc, _asset)
+                                    qty = min(_floor_qty(pos["quantity"], sym), _free2 or 0.0)
+                                    _clamped_qty, _, _cr = compute_sell_quantity(sym, qty)
+                                    if _clamped_qty > 0:
+                                        qty = _clamped_qty
+                                    else:
+                                        _note_sell_skip(sym, "below_min_qty")
+                                        _log_skip_dedup(
+                                            sym, "below_min_qty",
+                                            f"[SELL_SKIPPED] {sym} ({reason}): after "
+                                            f"balance clamp — {_cr}", "warn")
+                                        with _selling_lock:
+                                            _selling.discard(sym)
+                                            _selling_ts.pop(sym, None)
+                                        return
+                                else:
+                                    # filled → position closed; retry → try again.
+                                    if _rel2 == "filled":
+                                        _clear_sell_skip(sym)
+                                    with _selling_lock:
+                                        _selling.discard(sym)
+                                        _selling_ts.pop(sym, None)
+                                    return
+                            else:
+                                # Genuine dust (free+locked below min lot) — skip,
+                                # deduped, and track for stuck escalation.
+                                _note_sell_skip(sym, "below_min_qty")
+                                _log_skip_dedup(
+                                    sym, "below_min_qty",
+                                    f"[SELL_SKIPPED] {sym} ({reason}): after balance "
+                                    f"clamp — {_cr}", "warn")
+                                with _selling_lock:
+                                    _selling.discard(sym)
+                                    _selling_ts.pop(sym, None)
+                                return
+                        else:
+                            qty = _clamped_qty
                     except Exception:
                         pass
         except Exception as _bal_exc:
@@ -4961,6 +5277,8 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         _log_order_result("SELL", sym, qty, price, result)
         pos["_sell_binance_done_ts"] = time.time()
         _ghost_check_fails.pop(sym, None)  # reset -2010 backoff on success
+        _clear_sell_skip(sym)              # H1 fix 3: sell progressed — clear stuck state
+        _invalidate_acct_cache()           # balance changed — force a fresh snapshot next read
         # Local sell completed — drop any managed-exit tracking (defensive: the
         # pre-sell cancel above normally already forgot it).
         if exit_orders is not None:
@@ -6501,7 +6819,20 @@ def _evaluate_exit_decision(pos: dict, sym: str, price: float,
         be_r = cfg.get("breakeven_at_r")
         if be_r is not None and sl_dist and gain_pct >= float(sl_dist) * float(be_r):
             pos["be_moved"] = True
-            pos["be_stop_price"] = max(stop_price or 0.0, real_target)
+            _bep_stop = max(stop_price or 0.0, real_target)
+            pos["be_stop_price"] = _bep_stop
+            # H1 fix 4: the BE-move must UPDATE the STORED stop, not merely set a
+            # flag. Before this fix pos['stop_price'] stayed at the original ATR
+            # stop (below entry) while be_moved=True, so the /api/positions
+            # display — and the cancel-first sell's price reference — showed a
+            # stop that no longer reflected reality. Preserve the original ATR
+            # stop in orig_stop_price so the stop-loss vs breakeven-stop label
+            # split below can still distinguish a BEP scratch from a true
+            # stop-out, then promote stored stop_price to the BEP.
+            if pos.get("orig_stop_price") is None:
+                pos["orig_stop_price"] = stop_price
+            pos["stop_price"] = _bep_stop
+            stop_price = _bep_stop
 
     # Effective protective stop BELOW tp: original stop, escalated to BEP once
     # the BE-move armed. There is deliberately NO trailing exit below tp_price.
@@ -6548,8 +6879,15 @@ def _evaluate_exit_decision(pos: dict, sym: str, price: float,
             _stop_loss_confirmation.pop(sym, None)
             # BE-move stop hit (faded back to BEP after arming) vs a real loss
             # at the original stop — distinct labels so R stats separate them.
-            be_hit = (pos.get("be_moved") and stop_price
-                      and price > float(stop_price))
+            # H1 fix 4: stop_price is now promoted to the BEP once be_moved, so
+            # compare against the PRESERVED original ATR stop (orig_stop_price)
+            # to tell a BEP scratch (price above the original stop) from a true
+            # stop-out (price at/below it).
+            _ref_stop = pos.get("orig_stop_price")
+            if _ref_stop is None:
+                _ref_stop = stop_price
+            be_hit = (pos.get("be_moved") and _ref_stop
+                      and price > float(_ref_stop))
             return ("breakeven-stop" if be_hit else "stop-loss"), crossed
         return None, crossed
     _stop_loss_confirmation.pop(sym, None)

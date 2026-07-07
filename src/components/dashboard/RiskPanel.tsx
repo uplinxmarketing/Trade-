@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { Info } from 'lucide-react';
 import { toast } from 'sonner';
 
 // ── Types (tolerant — every section may arrive as {available:false} while the
@@ -97,9 +98,12 @@ const CHIP_CLASSES: Record<ChipTone, string> = {
   muted: 'bg-muted/20 text-muted-foreground border-border',
 };
 
-function Chip({ tone, children }: { tone: ChipTone; children: React.ReactNode }) {
+function Chip({ tone, children, title }: { tone: ChipTone; children: React.ReactNode; title?: string }) {
   return (
-    <span className={`inline-flex items-center gap-1.5 text-[9px] font-semibold px-2 py-1 rounded border ${CHIP_CLASSES[tone]}`}>
+    <span
+      title={title}
+      className={`inline-flex items-center gap-1.5 text-[9px] font-semibold px-2 py-1 rounded border ${CHIP_CLASSES[tone]}`}
+    >
       {children}
     </span>
   );
@@ -244,13 +248,17 @@ export function RiskPanel({ baseUrl = '' }: { baseUrl?: string }) {
           </Chip>
         )}
 
-        {/* Slots (A3 degradation) */}
+        {/* Slots — degraded here is the auto-degrade feature sizing positions to
+            the available balance, NOT a fault. Render it neutral/amber-info. */}
         {!sectionOk(slots) ? (
           <Chip tone="muted">Slots: n/a</Chip>
         ) : slots.degraded ? (
-          <Chip tone="amber">
-            running {num(slots.max_positions)} → {num(slots.effective_slots)} slots:
-            allocation {num(slots.effective_allocation).toFixed(2)}
+          <Chip
+            tone="amber"
+            title={`Auto-sized to balance: your allocation (${num(slots.effective_allocation).toFixed(2)}) only funds ${num(slots.effective_slots)} of ${num(slots.max_positions)} positions at the minimum ticket. This is the auto-degrade feature working normally, not a fault.`}
+          >
+            <Info className="w-2.5 h-2.5" />
+            slots: {num(slots.effective_slots)}/{num(slots.max_positions)} — sized to balance
           </Chip>
         ) : (
           <Chip tone="green">running {num(slots.effective_slots) || num(slots.max_positions)} slots</Chip>
