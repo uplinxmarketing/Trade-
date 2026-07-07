@@ -81,6 +81,16 @@ ws_candles_5m: Dict[str, list] = {}
 _WS_5M_CANDLE_MAX = 60   # 5 hours of 5m candles (§6.2)
 _MIN_CANDLES_5M   = 21   # enough for EMA21 to be meaningful
 
+# In-memory 15-minute candle buffer — filled via WebSocket @kline_15m + REST
+# backfill (I1.3). trade_engine's T2_ema50_15m_slope needs EMA50 over 15m
+# (>=50 candles); the engine reads this via fetch_15m_candles() (preferred) or
+# the raw ws_candles_15m buffer directly. Backfilling 15m klines (limit 60)
+# makes T2 usable within the startup backfill window instead of waiting hours
+# for the 5m buffer to grow enough 15m aggregate candles.
+ws_candles_15m: Dict[str, list] = {}
+_WS_15M_CANDLE_MAX = 60   # 15 hours of 15m candles — >=50 for EMA50 (§3.1/T2)
+_MIN_CANDLES_15M   = 50   # EMA50 over 15m needs >=50 candles to be meaningful
+
 # Guards ws_candles / ws_candles_5m mutation: WS event loop appends while
 # backfill/gap-repair executor threads merge. Merges REPLACE the per-symbol
 # list atomically so lock-free readers (trade_engine, futures_engine) never
@@ -300,16 +310,21 @@ def _filter_tradeable(coins: list) -> list:
         else:
             kept.append(c)
     to_warn: list = []
+    restored: list = []
     with _excluded_lock:
-        # A previously-excluded symbol that is tradeable again (relisted) is
-        # cleared so it can re-subscribe and WARN afresh if it re-delists.
-        # KNOWN_DELISTED entries are never "relisted" this way — they stay
-        # dropped until the hardcoded set is edited.
+        # I4.2 — a previously-excluded symbol that is TRADING again (e.g. TON
+        # coming back from a BREAK halt) is cleared so the next reconcile
+        # re-subscribes it, and the restore is logged. KNOWN_DELISTED entries
+        # never "relist" this way — they stay dropped until the hardcoded set
+        # is edited, so they are skipped here.
         for c in coins:
             if c in delisted:
                 continue
-            if tradeable and c in tradeable and _excluded_symbols.pop(c, None) is not None:
-                _excluded_warned.discard(c)
+            if tradeable and c in tradeable:
+                prev = _excluded_symbols.pop(c, None)
+                if prev is not None:
+                    _excluded_warned.discard(c)
+                    restored.append((c, prev))
         for c in dropped:
             if c not in _excluded_symbols:
                 _excluded_symbols[c] = _symbol_status(c)
@@ -324,6 +339,16 @@ def _filter_tradeable(coins: list) -> list:
             _te_ex.log_diag_issue(
                 "data", "warn",
                 f"{c} excluded from market streams (status={status})")
+        except Exception:
+            pass
+    for c, prev in restored:
+        print(f"[DataCollector] Restoring symbol {c} — status flipped "
+              f"{prev}→TRADING; re-added to stream universe")
+        try:
+            import trade_engine as _te_rs
+            _te_rs.log_diag_issue(
+                "data", "info",
+                f"{c} restored to market streams (was {prev}, now TRADING)")
         except Exception:
             pass
     return kept
@@ -575,6 +600,61 @@ def fetch_5m_candles(symbol: str, limit: int = 30) -> list:
         return []
 
 
+def fetch_15m_candles(symbol: str, limit: int = 60) -> list:
+    """I1.3 — 15-minute candles for T2_ema50_15m_slope (EMA50 needs >=50).
+    Prefers the WebSocket/backfill buffer (ws_candles_15m) to avoid REST calls;
+    falls back to REST only when the buffer has fewer than _MIN_CANDLES_15M
+    candles. Returns a list of dicts with open/high/low/close/volume keys —
+    same shape as fetch_5m_candles so trade_engine can read either uniformly.
+
+    trade_engine's T2 should read this (or the raw ws_candles_15m buffer)
+    instead of aggregating the 60×5m buffer (which only yields ~20 15m candles,
+    below the 50 EMA50 needs)."""
+    buf = ws_candles_15m.get(symbol, [])
+    if len(buf) >= _MIN_CANDLES_15M:
+        return [
+            {
+                "open_time": int(k[0]),
+                "open":      float(k[1]),
+                "high":      float(k[2]),
+                "low":       float(k[3]),
+                "close":     float(k[4]),
+                "volume":    float(k[5]),
+            }
+            for k in buf[-limit:]
+        ]
+
+    try:
+        raw = _fetch_klines_rest(symbol, "15m", limit=limit, defer_sec=2.0)
+        return [
+            {
+                "open_time": int(k[0]),
+                "open":      float(k[1]),
+                "high":      float(k[2]),
+                "low":       float(k[3]),
+                "close":     float(k[4]),
+                "volume":    float(k[5]),
+            }
+            for k in raw
+        ]
+    except Exception:
+        return []
+
+
+def backfill_ready(symbol: str) -> bool:
+    """I1.4 — True once `symbol` has enough buffered history for the HARD entry
+    readiness gate: >=_MIN_CANDLES (16) 1m candles for RSI AND >=_MIN_CANDLES_5M
+    (21) 5m candles for the 5m veto. trade_engine should EXCLUDE not-ready
+    symbols from ENTRY evaluation (not score them zero).
+
+    15m is deliberately NOT part of this gate: T2_ema50_15m_slope is only
+    SCORED, so a symbol missing 15m history means "T2 can't contribute", not
+    "symbol unready". Use fetch_15m_candles()/ws_candles_15m separately to know
+    whether T2 has data."""
+    return (len(ws_candles.get(symbol, [])) >= _MIN_CANDLES
+            and len(ws_candles_5m.get(symbol, [])) >= _MIN_CANDLES_5M)
+
+
 def _compute_and_save(symbol: str, raw_klines: list, save_all: bool = False):
     """Compute indicators and persist candles.
 
@@ -751,6 +831,8 @@ def _buffer_meta(interval: str) -> Tuple[Dict[str, list], int, int]:
     """(buffer dict, interval ms, max length) for an interval string."""
     if interval == "5m":
         return ws_candles_5m, 300_000, _WS_5M_CANDLE_MAX
+    if interval == "15m":
+        return ws_candles_15m, 900_000, _WS_15M_CANDLE_MAX
     return ws_candles, 60_000, _WS_CANDLE_MAX
 
 
@@ -898,6 +980,16 @@ _last_reconnect_alarm_ts = 0.0
 _backfill_last_duration = 0.0
 _manager_started_ts = 0.0
 
+# I1.1 — startup-backfill completion telemetry (exposed via get_data_health()).
+# _backfill_complete flips True after the first full startup sweep reaches its
+# targets (or exhausts retries); _backfill_pct is the last sweep's
+# symbols-filled ratio ×100. Read by the health panel so the UI can show the
+# bot is "fully seeing" instead of guessing from buffer-fill percentages.
+_backfill_complete = False
+_backfill_pct = 0.0
+_backfill_phase = "pending"   # pending → held → universe → complete
+_backfill_last_stats: Dict = {}
+
 _RECONNECT_ALARM_THRESHOLD = 30      # attempts per 5 min → ALARM (§6.4 item g)
 
 
@@ -978,7 +1070,7 @@ def _gap_repair_tail(symbols: list, reason: str):
     whose buffer tail is ≥2 intervals old, fetch just the missing tail range.
     Blocking — runs on an executor thread."""
     for sym in symbols:
-        for interval in (config.CANDLE_TIMEFRAME, "5m"):
+        for interval in (config.CANDLE_TIMEFRAME, "5m", "15m"):
             try:
                 buf_map, step, _maxlen = _buffer_meta(interval)
                 buf = buf_map.get(sym)
@@ -1008,7 +1100,8 @@ _bg_tasks: set = set()   # keep task refs so they aren't GC'd
 
 def _backfill_symbol(sym: str) -> int:
     """Blocking single-symbol backfill through the rate-limited path.
-    Fills the 1m buffer to 120 and the 5m buffer to 60 closed candles."""
+    Fills the 1m buffer to 120, the 5m buffer to 60, and the 15m buffer to 60
+    closed candles (I1.3 — 15m feeds T2_ema50_15m_slope)."""
     merged = 0
     try:
         if len(ws_candles.get(sym, [])) < _WS_CANDLE_MAX:
@@ -1020,6 +1113,10 @@ def _backfill_symbol(sym: str) -> int:
             raw = _fetch_klines_rest(sym, "5m", limit=_WS_5M_CANDLE_MAX, defer_sec=20.0)
             merged += _merge_candles(sym, "5m", raw)
             _kline_store_save(sym, "5m", raw)                     # Phase 1 store
+        if len(ws_candles_15m.get(sym, [])) < _WS_15M_CANDLE_MAX:
+            raw = _fetch_klines_rest(sym, "15m", limit=_WS_15M_CANDLE_MAX, defer_sec=20.0)
+            merged += _merge_candles(sym, "15m", raw)
+            _kline_store_save(sym, "15m", raw)                    # Phase 1 store
     except _RestDeferred:
         pass  # budget closed — the next backfill trigger will finish the job
     except Exception as e:
@@ -1027,11 +1124,32 @@ def _backfill_symbol(sym: str) -> int:
     return merged
 
 
-async def _backfill_buffers(coins: list, reason: str):
-    """Startup / new-coin REST backfill (§6.2 b): fill 1m buffers to 120 and
-    5m buffers to 60 closed candles, ≤10 symbols in flight, all through the
-    binance_limits gate. Logs total duration + symbols filled."""
-    global _backfill_last_duration
+def _avg_buffer_len(coins: list, buf_map: Dict[str, list]) -> float:
+    """Mean candle count across `coins` for one buffer map (0.0 when empty)."""
+    if not coins:
+        return 0.0
+    return round(sum(len(buf_map.get(c, [])) for c in coins) / len(coins), 1)
+
+
+def _backfill_targets_met(coins: list) -> bool:
+    """True once every symbol has reached the backfill_ready hard gate
+    (1m>=16 AND 5m>=21). 15m is scored-only, so it isn't part of completion."""
+    return all(backfill_ready(c) for c in coins)
+
+
+async def _backfill_buffers(coins: list, reason: str, is_startup: bool = False):
+    """Startup / new-coin REST backfill (§6.2 b + I1): fill 1m buffers to 120,
+    5m buffers to 60, and 15m buffers to 60 closed candles, ≤10 symbols in
+    flight, all through the binance_limits gate.
+
+    I1.1 — HELD-position symbols are backfilled FIRST (priority ahead of the
+    rest of the universe) so their sell monitors and exits see history within
+    seconds of boot. The startup sweep RETRIES symbols that missed their target
+    (rate-limit gate closed / transient fetch error) with backoff, and only
+    then declares completion — flipping _backfill_complete and recording a
+    clear completion line + get_data_health() telemetry."""
+    global _backfill_last_duration, _backfill_complete, _backfill_pct
+    global _backfill_phase, _backfill_last_stats
     coins = [c for c in coins if c]
     if not coins:
         return
@@ -1039,34 +1157,203 @@ async def _backfill_buffers(coins: list, reason: str):
         print("[DataCollector] Backfill already running — skipping duplicate sweep")
         return
     _backfill_running.set()
+    if is_startup:
+        _backfill_complete = False
+        _backfill_phase = "universe"
     t0 = time.time()
-    filled: list = []
-    sem = asyncio.Semaphore(_BACKFILL_CONCURRENCY)
 
-    async def one(sym: str):
-        async with sem:
-            n = await asyncio.to_thread(_backfill_symbol, sym)
-            if n:
-                filled.append(sym)
+    # I1.2 — held symbols first, then the rest of the universe (de-duped,
+    # order-preserving). A held symbol always gets priority in the sweep queue.
+    held = set(_held_symbols())
+    ordered = [c for c in coins if c in held] + [c for c in coins if c not in held]
 
+    async def sweep(pending: list) -> list:
+        """One concurrent pass over `pending`; returns symbols still short of
+        their 1m/5m targets afterward (retry candidates)."""
+        sem = asyncio.Semaphore(_BACKFILL_CONCURRENCY)
+
+        async def one(sym: str):
+            async with sem:
+                await asyncio.to_thread(_backfill_symbol, sym)
+
+        await asyncio.gather(*(one(c) for c in pending), return_exceptions=True)
+        return [c for c in pending if not backfill_ready(c)]
+
+    # I1.1 — retry with backoff so a closed rate-limit gate / transient
+    # exchange failure doesn't leave the bot half-blind (the bundle showed the
+    # sweep never finishing). Startup gets more attempts than incremental adds.
+    max_attempts = 4 if is_startup else 1
+    pending = list(ordered)
     try:
-        await asyncio.gather(*(one(c) for c in coins), return_exceptions=True)
+        for attempt in range(1, max_attempts + 1):
+            still = await sweep(pending)
+            if not still or attempt == max_attempts:
+                pending = still
+                break
+            delay = min(2.0 * attempt, 8.0)
+            print(f"[DataCollector] Backfill ({reason}) attempt {attempt}: "
+                  f"{len(still)} symbol(s) short of target — retrying in {delay:.0f}s")
+            await asyncio.sleep(delay)
+            pending = still
     finally:
         _backfill_running.clear()
+
     dur = time.time() - t0
     _backfill_last_duration = dur
-    print(f"[DataCollector] Backfill ({reason}): filled {len(filled)}/{len(coins)} "
-          f"symbols in {dur:.1f}s")
+    ready = [c for c in ordered if backfill_ready(c)]
+    pct = round(100.0 * len(ready) / len(ordered), 1) if ordered else 0.0
+    avg1 = _avg_buffer_len(ordered, ws_candles)
+    avg5 = _avg_buffer_len(ordered, ws_candles_5m)
+    avg15 = _avg_buffer_len(ordered, ws_candles_15m)
+    _backfill_last_stats = {
+        "reason": reason, "symbols": len(ordered), "ready": len(ready),
+        "avg_1m": avg1, "avg_5m": avg5, "avg_15m": avg15,
+        "duration_sec": round(dur, 1), "ts": time.time(),
+    }
+    if is_startup:
+        _backfill_pct = pct
+        _backfill_complete = True
+        _backfill_phase = "complete"
+    print(f"[DataCollector] backfill complete ({reason}): {len(ready)}/{len(ordered)} "
+          f"symbols ready, 1m avg {avg1} candles, 5m avg {avg5}, 15m avg {avg15}, "
+          f"took {dur:.1f}s ({pct:.0f}% ready)")
+    if pending:
+        print(f"[DataCollector] Backfill ({reason}): {len(pending)} symbol(s) still "
+              f"short after {max_attempts} attempt(s): {', '.join(sorted(pending)[:20])}")
 
 
-def _spawn_backfill(coins: list, reason: str):
+def _spawn_backfill(coins: list, reason: str, is_startup: bool = False):
     """Fire-and-forget backfill task on the running WS event loop."""
     try:
-        task = asyncio.get_running_loop().create_task(_backfill_buffers(list(coins), reason))
+        task = asyncio.get_running_loop().create_task(
+            _backfill_buffers(list(coins), reason, is_startup=is_startup))
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
     except Exception as e:
         print(f"[DataCollector] Could not schedule backfill: {e}")
+
+
+def _batch_ticker_prices(symbols: list) -> Dict[str, float]:
+    """Blocking batched /ticker/price fetch through the limits gate. Returns
+    {symbol: price}. Used to seed held-position prices instantly at boot."""
+    import urllib.parse as _up
+    out: Dict[str, float] = {}
+    syms = [s for s in symbols if s]
+    if not syms:
+        return out
+    try:
+        _limits_acquire(_W_KLINES * 2, critical=True, defer_sec=5.0)
+    except _RestDeferred:
+        pass  # spend anyway — held-symbol pricing is exit-critical
+    if len(syms) == 1:
+        qs = f"symbol={syms[0]}"
+    else:
+        qs = "symbols=" + _up.quote(json.dumps(syms, separators=(',', ':')), safe='')
+    for base in _BINANCE_BASES:
+        try:
+            data = _urlopen_json(f"{base}/api/v3/ticker/price?{qs}", timeout=8)
+            rows = data if isinstance(data, list) else [data]
+            for r in rows:
+                try:
+                    px = float(r.get("price", 0) or 0)
+                    s = r.get("symbol", "")
+                    if s and px > 0:
+                        out[s] = px
+                except Exception:
+                    continue
+            if out:
+                return out
+        except _RestLimited:
+            break
+        except Exception:
+            continue
+    return out
+
+
+def _batch_book_tickers(symbols: list) -> Dict[str, dict]:
+    """Blocking batched /ticker/bookTicker fetch through the limits gate.
+    Returns {symbol: {bid, bid_qty, ask, ask_qty}} — seeds book_ticker for
+    held symbols so the sell path has best bid/ask within seconds of boot."""
+    import urllib.parse as _up
+    out: Dict[str, dict] = {}
+    syms = [s for s in symbols if s]
+    if not syms:
+        return out
+    try:
+        _limits_acquire(_W_KLINES * 2, critical=True, defer_sec=5.0)
+    except _RestDeferred:
+        pass
+    if len(syms) == 1:
+        qs = f"symbol={syms[0]}"
+    else:
+        qs = "symbols=" + _up.quote(json.dumps(syms, separators=(',', ':')), safe='')
+    for base in _BINANCE_BASES:
+        try:
+            data = _urlopen_json(f"{base}/api/v3/ticker/bookTicker?{qs}", timeout=8)
+            rows = data if isinstance(data, list) else [data]
+            for r in rows:
+                try:
+                    s = r.get("symbol", "")
+                    if not s:
+                        continue
+                    out[s] = {
+                        "bid":     float(r.get("bidPrice", 0) or 0),
+                        "bid_qty": float(r.get("bidQty", 0) or 0),
+                        "ask":     float(r.get("askPrice", 0) or 0),
+                        "ask_qty": float(r.get("askQty", 0) or 0),
+                    }
+                except Exception:
+                    continue
+            if out:
+                return out
+        except _RestLimited:
+            break
+        except Exception:
+            continue
+    return out
+
+
+def _seed_held_prices() -> int:
+    """I1.2 — immediately seed prices/book_ticker/last_price_ts for every
+    HELD-position symbol at boot (before the WS feed warms up) so their sell
+    monitors have data within seconds instead of being briefly unprotected.
+    Blocking — call via asyncio.to_thread from the WS loop. Returns the number
+    of held symbols seeded."""
+    held = _held_symbols()
+    if not held:
+        return 0
+    now = time.time()
+    px_map = _batch_ticker_prices(held)
+    bt_map = _batch_book_tickers(held)
+    seeded = 0
+    for sym in held:
+        px = px_map.get(sym)
+        bt = bt_map.get(sym)
+        # Fall back to bookTicker mid when /ticker/price missed the symbol.
+        if (not px or px <= 0) and bt and bt.get("bid") and bt.get("ask"):
+            px = (bt["bid"] + bt["ask"]) / 2.0
+        if px and px > 0:
+            prices[sym] = px
+            last_price_ts[sym] = now
+            try:
+                client.update_price(sym, px)
+            except Exception:
+                pass
+            try:
+                import trade_engine as _te_seed
+                _te_seed._last_ws_price_ts[sym] = now
+            except Exception:
+                pass
+            seeded += 1
+        if bt:
+            bt2 = dict(bt)
+            bt2["ts"] = now
+            book_ticker[sym] = bt2
+            last_price_ts[sym] = now
+    if seeded:
+        print(f"[DataCollector] Seeded fresh boot prices for {seeded}/{len(held)} "
+              f"held symbol(s): {', '.join(sorted(held))}")
+    return seeded
 
 
 # ── Live WebSocket ────────────────────────────────────────────────────────────
@@ -1080,7 +1367,10 @@ _WS_BASE = "wss://data-stream.binance.vision"
 _MAX_STREAMS_PER_CONN = 300
 
 # Streams every watched coin gets on the sharded market connections.
-_MARKET_SUFFIXES = (f"kline_{config.CANDLE_TIMEFRAME}", "kline_5m", "miniTicker")
+# I1.3 — @kline_15m added so T2_ema50_15m_slope stays fresh after the startup
+# 15m backfill (adds 1 stream/symbol → 4 suffixes → 75 coins/shard under the
+# 300-stream cap; the shard splitter absorbs any overflow into a 2nd conn).
+_MARKET_SUFFIXES = (f"kline_{config.CANDLE_TIMEFRAME}", "kline_5m", "kline_15m", "miniTicker")
 
 # §6.4 control-message pacing: live SUBSCRIBE/UNSUBSCRIBE frames are used for
 # small diffs; larger diffs fall back to the proven close-and-reconnect path.
@@ -1247,10 +1537,13 @@ def _handle_ws_message(raw: str):
                 # §6.2 c: fetch ONLY the missing range for ONLY this symbol.
                 asyncio.get_running_loop().run_in_executor(
                     None, _gap_repair_range, sym, interval, gap[0], gap[1], "kline-gap")
-            if interval != "5m" and appended:
+            if interval == config.CANDLE_TIMEFRAME and appended:
                 # ── Persist + signal on a worker thread so the blocking
                 # SQLite work never stalls this loop. (Duplicates from
                 # reconnect overlap are skipped — already persisted.)
+                # Only the 1m stream drives the signal recompute; 5m has its
+                # own path below and 15m only feeds the ws_candles_15m buffer
+                # (buffered above) for T2 — no per-close callback needed.
                 asyncio.get_running_loop().run_in_executor(
                     None, _persist_and_signal, sym, closed, snapshot)
             elif interval == "5m" and appended:
@@ -1796,13 +2089,24 @@ async def _start_websocket_loop():
         print(f"[DataCollector] 5m bootstrap failed: {e}")
 
     _reconnect_requested.clear()
+
+    # I1.2 — seed fresh prices/book quotes for HELD symbols BEFORE anything
+    # else so their sell monitors are never left unprotected at boot (the
+    # H1-era gap). Blocking REST, but only for the (few) held symbols.
+    try:
+        await asyncio.to_thread(_seed_held_prices)
+    except Exception as e:
+        print(f"[DataCollector] Held-price boot seed error: {e}")
+
     try:
         desired = await asyncio.to_thread(_load_persisted_watchlist)
     except Exception:
         desired = list(config.WATCHED_COINS)
     active = await _verify_symbols(desired)
     await _rebuild_market_connections(active)
-    _spawn_backfill(list(active), "startup")   # §6.2 b — fill 1m→120 / 5m→60
+    # §6.2 b + I1 — fill 1m→120 / 5m→60 / 15m→60, held symbols first, retried
+    # until the readiness targets are met; flips _backfill_complete when done.
+    _spawn_backfill(list(active), "startup", is_startup=True)
     try:
         await _sync_held_connection()
     except Exception as e:
@@ -1946,6 +2250,13 @@ def get_data_health() -> dict:
     _uncovered = sorted(_universe_set - _covered)
     with _excluded_lock:
         _excluded_snapshot = dict(_excluded_symbols)
+    # I4.3 — split excluded symbols by reason so the UI can badge "delisted →
+    # successor" (permanent, KNOWN_DELISTED) vs "halted (BREAK)" (temporary,
+    # auto-restored when it returns to TRADING) differently.
+    _excluded_delisted = sorted(s for s, st in _excluded_snapshot.items()
+                                if str(st).upper() == "DELISTED")
+    _excluded_break = sorted(s for s, st in _excluded_snapshot.items()
+                             if str(st).upper() != "DELISTED")
     _total_streams = sum(len(c.streams) for c in _connections)
     ages = []
     for sym in subscribed:
@@ -1977,6 +2288,15 @@ def get_data_health() -> dict:
         "buffer_fill_pct_1m":         round(100.0 * sum(fill1) / len(fill1), 1) if fill1 else 0.0,
         "buffer_fill_pct_5m":         round(100.0 * sum(fill5) / len(fill5), 1) if fill5 else 0.0,
         "backfill_last_duration_sec": round(_backfill_last_duration, 2),
+        # I1.1 — startup-backfill completion signal for the health panel.
+        "backfill_complete":          _backfill_complete,
+        "backfill_pct":               _backfill_pct,
+        "backfill_phase":             _backfill_phase,
+        "backfill_stats":             dict(_backfill_last_stats),
+        # I1.3 — mean 15m buffer depth (T2_ema50_15m_slope needs >=50).
+        "buffer_fill_pct_15m":        round(
+            100.0 * sum(min(1.0, len(ws_candles_15m.get(s, [])) / _WS_15M_CANDLE_MAX)
+                        for s in subscribed) / len(subscribed), 1) if subscribed else 0.0,
         "gap_repairs_24h":            gap_24h,
         "reconnect_attempts_5min":    recon_5m,
         "resubscribe_count":          _ws_health.get("resubscribe_count", 0),
@@ -1994,6 +2314,11 @@ def get_data_health() -> dict:
         # G2 — {sym: non-TRADING status} dropped from the stream universe.
         "excluded_symbols":           _excluded_snapshot,
         "excluded_count":             len(_excluded_snapshot),
+        # I4.3 — split by reason: permanent delisted (KNOWN_DELISTED, badge as
+        # "delisted → successor") vs temporary halted (BREAK/other, auto-restored
+        # when the symbol returns to TRADING).
+        "excluded_delisted":          _excluded_delisted,
+        "excluded_break":             _excluded_break,
     }
 
 

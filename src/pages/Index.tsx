@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { API_BASE } from '@/config';
 import TopBar from '@/components/dashboard/TopBar';
+import VersionFooter from '@/components/dashboard/VersionFooter';
 import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import AITradingAgent from '@/components/dashboard/AITradingAgent';
 import CoinSelector from '@/components/dashboard/CoinSelector';
@@ -262,6 +263,9 @@ const Index = () => {
           <AiChatPanel />
         </div>
       </div>
+
+      {/* Persistent self-diagnosing version footer (I2) */}
+      <VersionFooter />
     </div>
   );
 };

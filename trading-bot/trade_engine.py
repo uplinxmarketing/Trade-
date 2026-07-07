@@ -1554,15 +1554,28 @@ def _record_exit_r(sym: str, entry: float, exit_px: float,
         pass
 
 
-def get_exit_r_stats() -> dict:
+def get_exit_r_stats(since_ts: "float | None" = None) -> dict:
     """F1 analytics accessor: rolling stats over the last (≤100) closed trades'
     realized_r vs planned_rr. Shape:
       {n, avg_realized_r, median_realized_r, avg_planned_rr, win_rate,
        by_label:{label:{n, avg_realized_r}}, samples:[last 20 records]}.
-    win_rate here = fraction with realized_r > 0. Empty-safe."""
+    win_rate here = fraction with realized_r > 0. Empty-safe.
+
+    I3 — range-scoping: when `since_ts` (a UNIX timestamp) is provided, the ring
+    is filtered to entries with ts >= since_ts BEFORE computing every field
+    (n/avgs/median/win_rate/by_label/samples), so control_api can pass
+    process_start for a since-deploy view. Each ring entry carries a `ts`
+    (set in _record_exit_r). The no-arg call is unchanged (engine-lifetime)."""
     with _exit_r_stats_lock:
-        rows = [r for r in _exit_r_stats if r.get("realized_r") is not None]
-        all_rows = list(_exit_r_stats)
+        _snap = list(_exit_r_stats)
+    if since_ts is not None:
+        try:
+            _cut = float(since_ts)
+            _snap = [r for r in _snap if float(r.get("ts", 0) or 0) >= _cut]
+        except (TypeError, ValueError):
+            pass
+    rows = [r for r in _snap if r.get("realized_r") is not None]
+    all_rows = _snap
     if not rows:
         return {"n": 0, "avg_realized_r": None, "median_realized_r": None,
                 "avg_planned_rr": None, "win_rate": None, "by_label": {},
@@ -4607,20 +4620,61 @@ def bb_position_5m_from_closes(closes: list) -> Optional[str]:
 _EMA50_15M_MIN_CANDLES = 55   # EMA50 over 15m needs >=55 candles to be meaningful
 
 
+def _fetch_real_15m(symbol: str, limit: int = 60) -> list:
+    """I1.3 — real 15m candles from the data layer for T2's EMA50-15m slope.
+    Prefers data_collector.fetch_15m_candles(sym, limit); falls back to the
+    data_collector.ws_candles_15m buffer. Returns normalized candle dicts
+    ({open,high,low,close,volume}) or [] when neither source is available
+    (older data_collector) — callers then use the 5m→15m aggregate."""
+    try:
+        import data_collector as _dc_15
+    except Exception:
+        return []
+    rows = None
+    fn = getattr(_dc_15, "fetch_15m_candles", None)
+    if callable(fn):
+        try:
+            rows = fn(symbol, limit)
+        except Exception:
+            rows = None
+    if not rows:
+        buf = getattr(_dc_15, "ws_candles_15m", None)
+        if buf is not None:
+            try:
+                rows = list(buf.get(symbol) or [])
+            except Exception:
+                rows = None
+    if not rows:
+        return []
+    return [c for c in (_row_to_candle(r) for r in rows) if c is not None]
+
+
 def _ema50_15m_slope_for(symbol: str, candles_5m: list) -> Optional[float]:
     """§3.1 ema50_15m_slope: EMA50 over the 15m series, slope as the % change
     of EMA50 across the last two 15m candles (>0 = rising, feeds T2).
 
-    15m series = 5m buffer aggregated 3→1; when that yields <55 candles (the
-    60×5m buffer only covers 5h = 20 15m candles) bootstrap from stored 1m DB
-    history via indicators.aggregate_candles(group=15). Returns None when no
-    source reaches 55 15m candles (T2 then reports no_data and doesn't fire)."""
+    Source order (I1.3): REAL 15m candles from the data layer
+    (data_collector.fetch_15m_candles / ws_candles_15m) when available; else
+    the 5m buffer aggregated 3→1; else stored 1m DB history aggregated
+    group=15. Returns None when no source reaches the min 15m candle count —
+    T2 is SCORED, so a None simply means T2 can't contribute (it does NOT
+    block the symbol)."""
     series_15m: list = []
+    # I1.3 — prefer the real 15m source when the data layer exposes it.
     try:
-        if candles_5m:
-            series_15m = indicators.aggregate_candles(list(candles_5m), group=3)
+        real_15m = _fetch_real_15m(symbol, 60)
+        if len(real_15m) >= _EMA50_15M_MIN_CANDLES:
+            series_15m = real_15m
     except Exception:
         series_15m = []
+    if len(series_15m) < _EMA50_15M_MIN_CANDLES:
+        try:
+            if candles_5m:
+                _agg = indicators.aggregate_candles(list(candles_5m), group=3)
+                if len(_agg) > len(series_15m):
+                    series_15m = _agg
+        except Exception:
+            pass
     if len(series_15m) < _EMA50_15M_MIN_CANDLES:
         try:
             rows = database.get_candles(symbol, config.CANDLE_TIMEFRAME,
@@ -4795,6 +4849,105 @@ def start_entry_heartbeat() -> None:
     _entry_heartbeat_thread = threading.Thread(
         target=_entry_heartbeat_loop, name="entry-heartbeat", daemon=True)
     _entry_heartbeat_thread.start()
+
+
+# ── I1 — no scoring/entry on partial buffers; arm entries last ────────────────
+# A symbol whose 1m/5m buffers aren't backfilled yet is EXCLUDED from entry
+# evaluation (reason backfill_warmup) — NOT scored 0, NOT a rejection/veto — so
+# T2/P2/M4 never read empty buffers and silently zero the score post-restart.
+# Separately, the whole buy path stays disarmed until the data layer reports
+# backfill_complete (or a ~2min grace elapses). EXITS are independent of both.
+
+def _entry_backfill_ready(sym: str) -> bool:
+    """I1.1 — per-symbol entry gate. Prefers data_collector.backfill_ready(sym)
+    (True once 1m≥16 AND 5m≥21 for that symbol). When that function is absent
+    (older data_collector) returns True so the existing MIN-candle checks in the
+    data layer remain the only gate — no behavior change."""
+    try:
+        import data_collector as _dc_br
+        fn = getattr(_dc_br, "backfill_ready", None)
+        if callable(fn):
+            return bool(fn(sym))
+    except Exception:
+        pass
+    return True   # function absent → fall back to existing checks (fail-open)
+
+
+_backfill_warmup_log: Dict[str, float] = {}
+_backfill_warmup_lock = threading.Lock()
+
+
+def _note_backfill_warmup(sym: str) -> None:
+    """I1.1 — record that `sym` was excluded from entry as backfill_warmup.
+    Deduped to one activity log per symbol per 5 min so the warmup window never
+    spams the log; NOT routed through _record_rejection (this is not a
+    rejection/veto and must not inflate rejection diagnostics or score the
+    symbol 0)."""
+    now = time.time()
+    with _backfill_warmup_lock:
+        last = _backfill_warmup_log.get(sym, 0.0)
+        if now - last < 300.0:
+            return
+        _backfill_warmup_log[sym] = now
+    try:
+        database.log_activity(
+            f"{sym}: entry skipped — backfill_warmup (buffers not ready)", "info")
+    except Exception:
+        pass
+
+
+_entries_armed_flag: bool = False
+_entries_arm_deadline: Optional[float] = None
+_ENTRY_ARM_GRACE_SEC: float = 120.0   # ~2min fallback so a stuck backfill
+_entries_arm_lock = threading.Lock()  # can't permanently disable trading
+
+
+def _entries_armed() -> bool:
+    """I1.2 — arm entries LAST. The buy path stays disarmed until the data layer
+    reports get_data_health()['backfill_complete'] is True, or a ~2min grace
+    elapses (fallback). Logs the transition once. Held-symbol EXIT monitoring is
+    a separate path and is unaffected by this gate. Once armed, stays armed."""
+    global _entries_armed_flag, _entries_arm_deadline
+    with _entries_arm_lock:
+        if _entries_armed_flag:
+            return True
+        now = time.time()
+        if _entries_arm_deadline is None:
+            _entries_arm_deadline = now + _ENTRY_ARM_GRACE_SEC
+        complete = False
+        pct = None
+        try:
+            import data_collector as _dc_arm
+            fn = getattr(_dc_arm, "get_data_health", None)
+            if callable(fn):
+                h = fn() or {}
+                complete = bool(h.get("backfill_complete"))
+                for _k in ("backfill_pct", "backfill_percent", "backfill_progress"):
+                    if h.get(_k) is not None:
+                        try:
+                            pct = float(h.get(_k))
+                        except (TypeError, ValueError):
+                            pct = None
+                        break
+        except Exception:
+            complete = False
+        if complete:
+            _entries_armed_flag = True
+            try:
+                database.log_activity("entries armed — backfill complete", "info")
+            except Exception:
+                pass
+            return True
+        if now >= _entries_arm_deadline:
+            _entries_armed_flag = True
+            _pct_s = f"{pct:.0f}%" if pct is not None else "unknown"
+            try:
+                database.log_activity(
+                    f"entries armed — grace timeout, backfill {_pct_s}", "warn")
+            except Exception:
+                pass
+            return True
+        return False
 
 
 # ── Shared sell execution (used by both realtime_monitor and signal_scanner) ──
@@ -5725,6 +5878,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     global _last_buy_check, _buys_this_scan, _last_buy_ts
     _buys_this_scan = 0  # reset per-scan counter each invocation
 
+    # ── I1.2 — arm entries LAST: withhold ALL buy-check evaluation until the
+    # data layer reports backfill_complete (or a ~2min grace elapses). This is
+    # the single choke point every buy path flows through (5m-close, veto
+    # heartbeat, signal_scanner, legacy tick). Held-symbol EXIT monitoring runs
+    # on a separate path (sell monitor / held watchdog) and is NOT gated here.
+    if not _entries_armed():
+        return
+
     # Load strategy once up front (_load_strategy is mtime-cached — cheap).
     strategy = _load_strategy()
     _pre_min_sigs = int(strategy.get("min_signals", config.MIN_SIGNALS_TO_BUY))
@@ -5993,6 +6154,16 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         if already_held:
             _record_rejection(sym, cached["score"], "already_held")
+            continue
+
+        # ── I1.1 — exclude not-ready symbols from ENTRY evaluation ────────────
+        # A symbol whose 1m/5m buffers aren't backfilled yet is SKIPPED for
+        # entry (reason backfill_warmup) — NOT scored 0, NOT counted as a
+        # rejection/veto — so T2/P2/M4 never read empty buffers and silently
+        # zero the score post-restart. EXITS are unaffected (held symbols hit
+        # the already_held continue above and are monitored on the sell path).
+        if not _entry_backfill_ready(sym):
+            _note_backfill_warmup(sym)
             continue
 
         # ── Extract signal snapshot for this symbol ────────────────────────────

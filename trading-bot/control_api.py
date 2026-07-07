@@ -25,6 +25,14 @@ _DEPLOY_ID = str(uuid.uuid4())
 # "since_deploy" always means "since the currently-running build started".
 _PROCESS_START_TS = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
+# I2 — git short hash of the running code, resolved once and cached (None = not
+# yet resolved). Distinct from version.json's committed frontend hash.
+_RUNNING_GIT_COMMIT_CACHE = None
+
+# I3 — denominator below which a computed rate/percentage is statistically
+# meaningless and must be shown as "N/A (n=k)" rather than a confident number.
+_LOW_SAMPLE_N = 20
+
 # GitHub raw version URL — bot polls this to detect available updates.
 _GITHUB_VERSION_URL = (
     "https://raw.githubusercontent.com/uplinxmarketing/Trade-/main/public/version.json"
@@ -892,9 +900,12 @@ def _validate_universe() -> dict:
         tradeable = set()
     if not tradeable:  # fail open — cannot validate without exchangeInfo
         return {"valid": approved, "invalid": [], "covered": len(approved),
-                "expected_valid": len(approved), "exchange_info_available": False}
+                "expected_valid": len(approved), "exchange_info_available": False,
+                "break_count": 0, "delisted_count": 0}
     valid: list = []
     invalid: list = []
+    break_count = 0
+    delisted_count = 0
     for sym in approved:
         if sym in tradeable:
             valid.append(sym)
@@ -903,13 +914,28 @@ def _validate_universe() -> dict:
             st = _ei.symbol_status(sym)
         except Exception:
             st = ""
+        # I4.3 — distinguish a TRADING HALT (status BREAK, auto-restores) from a
+        # genuine delisting/rename. BREAK symbols are temporarily untradeable but
+        # come back on their own when the exchange resumes the market.
+        _is_break = "BREAK" in str(st).upper()
+        if _is_break:
+            break_count += 1
+            kind = "break"
+            note = "halted — auto-restores when TRADING resumes"
+        else:
+            delisted_count += 1
+            kind = "delisted"
+            note = None
         invalid.append({
             "symbol":           sym,
             "status":           st,
+            "excluded_kind":    kind,
+            "note":             note,
             "suggested_rename": _ei.RENAMED_SYMBOLS.get(sym),
         })
     return {"valid": valid, "invalid": invalid, "covered": len(valid),
-            "expected_valid": len(approved), "exchange_info_available": True}
+            "expected_valid": len(approved), "exchange_info_available": True,
+            "break_count": break_count, "delisted_count": delisted_count}
 
 
 def _flush_db_state():
@@ -1947,6 +1973,10 @@ def api_status():
         "open_positions":      len(_get_positions()),
         "trades_today":        stats["trades_today"],
         "win_rate":            round(wins / total, 3) if total else 0.0,
+        # I3.2 — denominator + low-sample flag so a win_rate off <20 trades is
+        # rendered as "N/A (n=k)" rather than a confident percentage.
+        "win_rate_low_sample": total < _LOW_SAMPLE_N,
+        "win_rate_n":          total,
         "wins":                wins,
         "losses":              stats["losses"],
         "total_trades":        total,
@@ -2917,10 +2947,53 @@ def api_signals_telemetry():
         # Defensive copy: the scanner thread mutates this dict live.
         scanner = dict(getattr(_te, "_signal_scanner_health", {}) or {})
         tel = _sr.get_signal_telemetry()  # {"window_hours": N, "signals": {...}}
+        signals = tel.get("signals", tel) or {}
+
+        # I3.2 — attach the denominator-aware low_sample flag to every signal so
+        # the UI never renders a confident fire_rate from a handful of evals.
+        if isinstance(signals, dict):
+            for _v in signals.values():
+                if isinstance(_v, dict):
+                    _ev = _v.get("evaluated", 0) or 0
+                    _v["low_sample"] = _ev < _LOW_SAMPLE_N
+
+        # I3.1 — telemetry buckets are IN-MEMORY and reset on restart, so the
+        # advertised "rolling 24h" collapses to process uptime after a deploy.
+        # Report the true data-start (earliest bucket present, floored at the
+        # process start) and a note whenever the window is uptime-truncated so
+        # the denominators can be read honestly.
+        data_start_ts = _PROCESS_START_TS
+        note = None
+        try:
+            buckets = getattr(_sr, "_signal_telemetry_buckets", None)
+            if isinstance(buckets, dict) and buckets:
+                earliest_hour = min(buckets.keys())
+                _bucket_ts = datetime.fromtimestamp(
+                    earliest_hour * 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                # The earliest bucket can't predate the process (buckets reset on
+                # restart); take the later of the two as the honest data-start.
+                data_start_ts = max(_PROCESS_START_TS, _bucket_ts)
+        except Exception:
+            pass
+        window_hours = tel.get("window_hours", 24)
+        try:
+            _uptime_h = ((datetime.now(timezone.utc)
+                          - datetime.strptime(_PROCESS_START_TS, "%Y-%m-%dT%H:%M:%S")
+                            .replace(tzinfo=timezone.utc)).total_seconds() / 3600.0)
+            if _uptime_h < window_hours:
+                note = (f"telemetry since {data_start_ts} — resets on restart "
+                        f"(process uptime {_uptime_h:.1f}h < {window_hours}h window)")
+        except Exception:
+            pass
+
         return {
-            "signals":      tel.get("signals", tel),
-            "scanner":      scanner,
-            "window_hours": tel.get("window_hours", 24),
+            "signals":       signals,
+            "scanner":       scanner,
+            "window_hours":  window_hours,
+            "data_start_ts": data_start_ts,
+            "process_start_ts": _PROCESS_START_TS,
+            "note":          note,
+            "low_sample_n":  _LOW_SAMPLE_N,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -3752,6 +3825,17 @@ def api_diagnostics_bundle(
             return False
         return True
 
+    # I3.2 — never print a confident percentage off a thin denominator. Below
+    # _LOW_SAMPLE_N samples the rate is rendered "N/A (n=k)".
+    def _rate_str(numer, denom, suffix="%"):
+        try:
+            d = int(denom or 0)
+        except Exception:
+            d = 0
+        if d < _LOW_SAMPLE_N:
+            return f"N/A (n={d})"
+        return f"{(100.0 * (numer or 0) / d):.1f}{suffix}"
+
     def section(title):
         out.write(f"\n===== {title} =====\n")
 
@@ -3795,6 +3879,39 @@ def api_diagnostics_bundle(
                       f"buffer_5m={d.get('buffer_fill_pct_5m')}% "
                       f"gap_repairs_24h={d.get('gap_repairs_24h')} "
                       f"reconnects_5min={d.get('reconnect_attempts_5min')}\n")
+            # I4.1 — universe = VALID (tradeable) symbols only. expected_symbols
+            # is already valid-only; print the excluded split (delisted vs BREAK)
+            # so "61 valid (8 excluded: 7 delisted, 1 BREAK)" reads truthfully
+            # instead of the old inflated 69-including-dead-tickers count.
+            _valid = d.get("expected_symbols")
+
+            def _count(v):
+                # Data agent exposes excluded_delisted/_break as symbol LISTS;
+                # tolerate a plain count too.
+                if v is None:
+                    return None
+                if isinstance(v, (list, tuple, set, dict)):
+                    return len(v)
+                try:
+                    return int(v)
+                except Exception:
+                    return None
+
+            _exc_delisted = _count(d.get("excluded_delisted"))
+            _exc_break = _count(d.get("excluded_break"))
+            if _exc_delisted is None or _exc_break is None:
+                # Split not exposed — derive from excluded_symbols {sym: status}:
+                # anything containing BREAK is a trading halt, rest are delisted.
+                _exc = d.get("excluded_symbols") or {}
+                _br = [s for s, st in _exc.items() if "BREAK" in str(st).upper()]
+                _exc_break = len(_br)
+                _exc_delisted = len(_exc) - _exc_break
+            _exc_total = (_exc_delisted or 0) + (_exc_break or 0)
+            out.write(f"  universe: {_valid} valid ({_exc_total} excluded: "
+                      f"{_exc_delisted or 0} delisted, {_exc_break or 0} BREAK)\n")
+            if d.get("backfill_complete") is not None or d.get("backfill_pct") is not None:
+                out.write(f"  backfill: complete={d.get('backfill_complete')} "
+                          f"pct={d.get('backfill_pct')}\n")
             wca = d.get("worst_candle_ages") or []
             if wca:
                 out.write("  worst candle ages: "
@@ -3823,6 +3940,9 @@ def api_diagnostics_bundle(
             v = st.get(k)
             if isinstance(v, list):
                 v = f"{len(v)} coins"
+            # I3.2 — win_rate off <20 trades is not a confident number.
+            if k == "win_rate":
+                v = _rate_str(st.get("wins", 0), st.get("total_trades", 0))
             out.write(f"  {k}={v}\n")
     safe(_stat, "status")
 
@@ -3870,16 +3990,23 @@ def api_diagnostics_bundle(
     # -- Signal telemetry -----------------------------------------------------
     section("SIGNAL TELEMETRY (24h fire rates)")
     def _tel():
-        import signal_registry as _sr
         if _cache_key != "24h":
             out.write("  NOTE: telemetry fire rates are a fixed rolling 24h window "
                       f"(not scoped to RANGE {_cache_key})\n")
-        tel = _sr.get_signal_telemetry()
-        sigs = tel.get("signals", tel) or {}
+        # I3.1 — go through the endpoint so we get data_start_ts + the resets-on-
+        # restart note (buckets are in-memory; the "24h" collapses to uptime).
+        tel = api_signals_telemetry()
+        if tel.get("error"):
+            out.write(f"  unavailable: {tel.get('error')}\n")
+            return
+        out.write(f"  data_start={tel.get('data_start_ts')}\n")
+        if tel.get("note"):
+            out.write(f"  NOTE: {tel.get('note')}\n")
+        sigs = tel.get("signals", {}) or {}
         for sid, v in sorted(sigs.items()):
             ev, fi = v.get("evaluated", 0), v.get("fired", 0)
-            rate = (fi / ev * 100) if ev else 0.0
-            out.write(f"  {sid:<28} fired {fi}/{ev} ({rate:.1f}%)\n")
+            # I3.2 — <20 evals → "N/A (n=k)", never a confident fire rate.
+            out.write(f"  {sid:<28} fired {fi}/{ev} ({_rate_str(fi, ev)})\n")
         if not sigs:
             out.write("  (no evaluations yet)\n")
     safe(_tel, "telemetry")
@@ -3896,7 +4023,11 @@ def api_diagnostics_bundle(
         out.write(f"  config_hash={ex.get('config_hash')} "
                   f"process_start={ex.get('process_start')} "
                   f"since_deploy={ex.get('since_deploy')}\n")
-        out.write(f"  trades={ex.get('trades')} win_rate={ex.get('win_rate')}% "
+        # I3.2 — guard win_rate on the trade count (already a percent value).
+        _an_tr = ex.get("trades") or 0
+        _an_wr = (f"{ex.get('win_rate')}%" if _an_tr >= _LOW_SAMPLE_N
+                  else f"N/A (n={_an_tr})")
+        out.write(f"  trades={ex.get('trades')} win_rate={_an_wr} "
                   f"avg_win={ex.get('avg_win')} avg_loss={ex.get('avg_loss')} "
                   f"expectancy={ex.get('expectancy_per_trade')} "
                   f"profit_factor={ex.get('profit_factor')}\n")
@@ -3919,24 +4050,45 @@ def api_diagnostics_bundle(
     safe(_an, "analytics")
 
     # -- Exit-R distribution (F1/F9) -------------------------------------------
-    section("EXIT-R (planned vs realized)")
+    section(f"EXIT-R (planned vs realized, RANGE {_cache_key})")
     def _exitr():
-        out.write("  NOTE: exit-R stats are engine-lifetime (not scoped to RANGE)\n")
-        er = api_diagnostics_exit_r()
+        # I3.3 — scope EXIT-R to the bundle's range (default since_deploy) so
+        # "since deploy" is the one-click default instead of engine-lifetime.
+        er = api_diagnostics_exit_r(
+            range=range,
+            since_deploy=1 if _cache_key == "since_deploy" else 0,
+            from_iso=from_iso, to_iso=to_iso)
         if not er.get("available"):
             out.write(f"  unavailable: {er.get('reason') or er.get('error')}\n")
             return
+        if not er.get("range_applied") and _cache_key != "all":
+            out.write("  NOTE: engine helper does not accept since_ts yet — "
+                      "stats are engine-lifetime, NOT scoped to RANGE\n")
+        n = er.get("n", er.get("count"))
+        # I3.2 — win_rate here is fraction realized_r>0; guard on n.
+        _wr = er.get("win_rate")
+        _wr_str = (f"{_wr*100:.1f}%" if isinstance(_wr, (int, float))
+                   and (n or 0) >= _LOW_SAMPLE_N else f"N/A (n={n or 0})")
+        out.write(f"  n={n} avg_planned_rr={er.get('avg_planned_rr')} "
+                  f"avg_realized_r={er.get('avg_realized_r')} "
+                  f"median_realized_r={er.get('median_realized_r')} "
+                  f"win_rate={_wr_str}\n")
         dist = er.get("distribution") or er.get("buckets") or er.get("r_distribution")
         if isinstance(dist, dict):
             out.write("  distribution: " + ", ".join(
                 f"{k}={v}" for k, v in dist.items()) + "\n")
         elif isinstance(dist, list):
             out.write("  distribution: " + ", ".join(str(x) for x in dist) + "\n")
-        for k in ("planned_r_avg", "realized_r_avg", "planned_r_median",
-                  "realized_r_median", "count", "n", "unlabeled_exits",
-                  "unlabeled_count"):
-            if k in er:
-                out.write(f"  {k}={er.get(k)}\n")
+        # I3.3 — planned-vs-realized R per exit label.
+        by_label = er.get("by_label") or {}
+        if isinstance(by_label, dict) and by_label:
+            out.write("  by_label (planned→realized R):\n")
+            for lbl, lv in sorted(by_label.items()):
+                if not isinstance(lv, dict):
+                    continue
+                _pl = lv.get("avg_planned_rr", lv.get("planned_rr", "—"))
+                out.write(f"    {str(lbl):<20} n={lv.get('n')} "
+                          f"planned={_pl} realized={lv.get('avg_realized_r')}\n")
     safe(_exitr, "exit_r")
 
     # -- Chronic spread (E1) vetoes (F10) --------------------------------------
@@ -3952,13 +4104,17 @@ def api_diagnostics_bundle(
         prune = vs.get("prune_candidates") or []
         out.write(f"  symbols_tracked={len(syms)} prune_candidates={len(prune)}\n")
         if prune:
+            # prune_candidates already require evals >= min_evals (20), so their
+            # percentage is trustworthy.
             out.write("  PRUNE (E1>70%): " + ", ".join(
                 f"{s}({syms[s]['e1_veto_pct']}% of {syms[s]['evals']})"
                 for s in prune[:20]) + "\n")
         worst = sorted(syms.items(),
                        key=lambda kv: kv[1].get("e1_veto_pct", 0), reverse=True)[:8]
         for s, d in worst:
-            out.write(f"    {s:<12} e1={d.get('e1_veto_pct')}% "
+            # I3.2 — the bundle showed "e1=100%" from ONE eval; guard on evals.
+            _e1 = _rate_str(d.get("e1_vetoes"), d.get("evals"))
+            out.write(f"    {s:<12} e1={_e1} "
                       f"evals={d.get('evals')} vetoes={d.get('e1_vetoes')}\n")
     safe(_veto, "veto_stats")
 
@@ -5614,9 +5770,29 @@ def api_universe_validate():
                 "exchange_info_available": False, "error": f"{type(e).__name__}: {e}"}
 
 
-@app.get("/api/version")
-def api_version():
-    return _read_frontend_version()
+def _running_git_commit() -> str:
+    """I2 — git short hash of the CODE THIS PROCESS IS RUNNING (not the frontend
+    build's committed hash from version.json, which can drift when dist/ is
+    stale). Best-effort: returns '' when git is unavailable. Cached for the life
+    of the process (the running commit only changes across a restart)."""
+    global _RUNNING_GIT_COMMIT_CACHE
+    if _RUNNING_GIT_COMMIT_CACHE is not None:
+        return _RUNNING_GIT_COMMIT_CACHE
+    val = ""
+    try:
+        import subprocess, pathlib as _pl, shutil as _sh
+        app_dir = _pl.Path(__file__).parent.parent
+        env = dict(os.environ)
+        env["PATH"] = env.get("PATH", "") + ":/usr/local/bin:/usr/bin:/bin"
+        git = _sh.which("git", path=env["PATH"]) or "git"
+        r = subprocess.run(
+            [git, "-c", f"safe.directory={app_dir}", "rev-parse", "--short", "HEAD"],
+            cwd=str(app_dir), env=env, capture_output=True, text=True, timeout=10)
+        val = (r.stdout or "").strip()
+    except Exception:
+        val = ""
+    _RUNNING_GIT_COMMIT_CACHE = val
+    return val
 
 
 def _served_dist_index():
@@ -5631,36 +5807,84 @@ def _served_dist_index():
     return None, None
 
 
-@app.get("/api/version/served")
-def api_version_served(response: Response):
-    """H2.3 — report the SERVED frontend bundle so the operator/frontend can
-    verify the browser loaded the same asset hash the server is serving. Reads
-    the on-disk index.html the SPA route serves and extracts the main entry
-    bundle filename (assets/index-*.js). Never cached."""
+def _served_asset_info() -> dict:
+    """I2 — one place that reads the SERVED on-disk index.html and returns the
+    main entry bundle filename (assets/index-*.js), every referenced asset, the
+    index.html mtime and dist_path. Shared by /api/version and
+    /api/version/served so the footer can render both build ids consistently."""
     import re as _re
-    response.headers["Cache-Control"] = "no-store"
-    v = _read_frontend_version()
     dist_path, index_path = _served_dist_index()
     index_asset = None
     all_assets: list = []
+    index_mtime = None
+    err = None
     try:
         if index_path and index_path.exists():
             _html = index_path.read_text()
             all_assets = sorted(set(_re.findall(r"/assets/[A-Za-z0-9_\-.]+", _html)))
             _main = [a for a in all_assets if _re.search(r"/assets/index-.*\.js$", a)]
             index_asset = (_main[0] if _main else (all_assets[0] if all_assets else None))
+            try:
+                index_mtime = datetime.fromtimestamp(
+                    index_path.stat().st_mtime, timezone.utc).isoformat()
+            except Exception:
+                index_mtime = None
     except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    return {
+        "index_asset": index_asset,
+        "assets": all_assets,
+        "index_mtime": index_mtime,
+        "dist_path": str(dist_path) if dist_path else None,
+        "error": err,
+    }
+
+
+@app.get("/api/version")
+def api_version(response: Response):
+    """I2 — the ONE endpoint the UI footer reads so every future build mismatch
+    is self-diagnosing. Extends version.json (version/buildTime/commit) with:
+      git_commit  — git short hash of the code THIS process is running,
+      ui_asset / served_asset — the served main assets/index-*.js filename.
+    Footer can render "UI <ui_asset or commit> / API <git_commit>". Never cached
+    so a stale CDN copy can't mask a skew."""
+    response.headers["Cache-Control"] = "no-store"
+    v = dict(_read_frontend_version())
+    info = _served_asset_info()
+    v["git_commit"] = _running_git_commit()
+    v["ui_asset"] = info.get("index_asset")
+    v["served_asset"] = info.get("index_asset")
+    v["deployId"] = _DEPLOY_ID
+    return v
+
+
+@app.get("/api/version/served")
+def api_version_served(response: Response):
+    """H2.3 / I2.3 — report the SERVED frontend bundle so the operator/frontend
+    can verify the browser loaded the same asset hash the server is serving.
+    Reads the on-disk index.html the SPA route serves and extracts the main
+    entry bundle filename (assets/index-*.js). Also returns the index.html mtime
+    and the git commit of the running process so served-vs-disk-vs-git can be
+    compared in one call. Never cached."""
+    response.headers["Cache-Control"] = "no-store"
+    v = _read_frontend_version()
+    info = _served_asset_info()
+    if info.get("error"):
         return {"version": v.get("version"), "commit": v.get("commit"),
-                "deployId": _DEPLOY_ID, "dist_path": str(dist_path) if dist_path else None,
-                "index_asset": None, "error": f"{type(e).__name__}: {e}"}
+                "git_commit": _running_git_commit(),
+                "deployId": _DEPLOY_ID, "dist_path": info.get("dist_path"),
+                "index_asset": None, "index_mtime": info.get("index_mtime"),
+                "error": info.get("error")}
     return {
         "version": v.get("version"),
         "buildTime": v.get("buildTime"),
         "commit": v.get("commit"),
+        "git_commit": _running_git_commit(),
         "deployId": _DEPLOY_ID,
-        "index_asset": index_asset,
-        "assets": all_assets,
-        "dist_path": str(dist_path) if dist_path else None,
+        "index_asset": info.get("index_asset"),
+        "index_mtime": info.get("index_mtime"),
+        "assets": info.get("assets"),
+        "dist_path": info.get("dist_path"),
     }
 
 
@@ -5871,15 +6095,29 @@ def api_update():
             _post_main = _index_main_js()
             print(f"[Update] served main asset AFTER pull:  {_post_main} "
                   f"(frontend_changed={_frontend_changed})", flush=True)
-            if _frontend_changed and _pre_sig and _post_sig and _pre_sig == _post_sig:
-                _msg = ("SERVED BUNDLE UNCHANGED AFTER UPDATE — dist may be stale, run "
-                        "npm build. The pull changed frontend files (dist/ or src/) but "
-                        f"the served index.html main asset ({_post_main}) did NOT change — "
-                        "the build may have failed or served a stale dist/. Users may see "
-                        f"old UI. assets={list(_post_sig)[:4]}")
-                print(f"[Update] ERROR: {_msg}", flush=True)
+            # I2.2 — the load-bearing signal is the MAIN entry bundle filename
+            # (assets/index-*.js): its hash MUST change when the frontend
+            # changes. Keying the alarm on that filename (not just the full
+            # asset-set tuple) catches the exact stale-UI recurrence — a build
+            # that shipped an old index-*.js while other chunk names shifted.
+            _main_unchanged = (_pre_main == _post_main and _post_main != "(none)")
+            _sig_unchanged = bool(_pre_sig and _post_sig and _pre_sig == _post_sig)
+            if _frontend_changed and (_main_unchanged or _sig_unchanged):
+                _msg = ("DEPLOY BUNDLE STALE — served asset unchanged despite frontend "
+                        "changes; run npm build or check dist commit. "
+                        f"before={_pre_main} after={_post_main} "
+                        f"(git {_running_git_commit() or '?'}); the pull changed dist/ or "
+                        "src/ files but the served index.html main asset did NOT change — "
+                        "users may see old UI. "
+                        f"assets_before={list(_pre_sig)[:4]} assets_after={list(_post_sig)[:4]}")
+                print(f"[Update] CRITICAL: {_msg}", flush=True)
                 try:
                     database.log_activity(_msg, "error")
+                except Exception:
+                    pass
+                try:
+                    import logging as _lg_stale
+                    _lg_stale.getLogger(__name__).critical(_msg)
                 except Exception:
                     pass
         except Exception as _sig_exc:
@@ -6401,7 +6639,10 @@ def api_diagnostics_veto_stats(hours: float = 24.0, min_evals: int = 20):
             if evals <= 0:
                 continue
             pct = round(100.0 * e1 / evals, 1)
-            symbols[r["coin"]] = {"e1_veto_pct": pct, "evals": evals, "e1_vetoes": e1}
+            # I3.2 — flag rates computed from a thin denominator so the UI can
+            # grey them out / show "N/A (n=k)" instead of a confident percent.
+            symbols[r["coin"]] = {"e1_veto_pct": pct, "evals": evals,
+                                  "e1_vetoes": e1, "low_sample": evals < _LOW_SAMPLE_N}
             if pct > 70.0 and evals >= min_evals:
                 prune.append(r["coin"])
         prune.sort(key=lambda s: symbols[s]["e1_veto_pct"], reverse=True)
@@ -6418,22 +6659,74 @@ def api_diagnostics_veto_stats(hours: float = 24.0, min_evals: int = 20):
                 "symbols": {}, "prune_candidates": []}
 
 
+def _iso_to_epoch(iso: Optional[str]) -> Optional[float]:
+    """Naive-UTC 'YYYY-MM-DDTHH:MM:SS' → epoch seconds. None-safe."""
+    if not iso:
+        return None
+    try:
+        return datetime.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
 @app.get("/api/diagnostics/exit-r")
-def api_diagnostics_exit_r():
-    """F1/F9 — planned vs realized R distribution from
+def api_diagnostics_exit_r(
+    range: str = Query("since_deploy"),
+    since_deploy: int = Query(0),
+    from_iso: Optional[str] = Query(None, alias="from"),
+    to_iso: Optional[str] = Query(None, alias="to"),
+):
+    """F1/F9/I3.3 — planned vs realized R distribution from
     trade_engine.get_exit_r_stats(). Defensive: returns {available: false} when
-    the engine helper isn't present yet (parallel rollout)."""
+    the engine helper isn't present yet (parallel rollout).
+
+    I3.3 — a `range` (1h|6h|24h|since_deploy|all) or `since_deploy=1` scopes the
+    stats to a window by passing since_ts to get_exit_r_stats(). since_deploy
+    uses _PROCESS_START_TS. The engine helper may not yet accept since_ts
+    (parallel rollout): we detect that and fall back to the unscoped call,
+    flagging range_applied=false so the caller knows the scope was ignored."""
     try:
         import trade_engine as _te
         fn = getattr(_te, "get_exit_r_stats", None)
         if not callable(fn):
             return {"available": False,
                     "reason": "trade_engine.get_exit_r_stats not available"}
-        data = fn()
+
+        # Resolve the requested window → since_ts epoch. since_deploy wins.
+        _rf, _rt, _rlabel, _rkey = _resolve_range(
+            "since_deploy" if since_deploy else range, from_iso, to_iso)
+        since_ts = _iso_to_epoch(_rf)  # None for range=all
+
+        range_applied = False
+        data = None
+        if since_ts is not None:
+            try:
+                import inspect as _insp
+                if "since_ts" in _insp.signature(fn).parameters:
+                    data = fn(since_ts=since_ts)
+                    range_applied = True
+            except (TypeError, ValueError):
+                data = None
+            if data is None:
+                # Signature probe failed or helper rejected the kwarg — try it
+                # optimistically, then fall back to the unscoped call.
+                try:
+                    data = fn(since_ts=since_ts)
+                    range_applied = True
+                except TypeError:
+                    data = fn()
+                    range_applied = False
+        else:
+            data = fn()
         if not isinstance(data, dict):
             return {"available": False, "reason": "unexpected return type"}
         out = dict(data)
         out["available"] = True
+        out["range"] = _rkey
+        out["range_label"] = _rlabel
+        out["since_ts"] = since_ts
+        out["range_applied"] = range_applied
         return out
     except Exception as e:
         return {"available": False, "error": f"{type(e).__name__}: {e}"}
