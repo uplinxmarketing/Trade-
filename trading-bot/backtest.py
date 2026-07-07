@@ -18,8 +18,13 @@ DETERMINISM CONTRACT
     hour) — both are meaningless when replaying history.
 
 FILL SIMULATION RULES (spec, encoded exactly)
-    * Entries are evaluated on candle CLOSE; the fill happens at the NEXT
-      candle's open ± slippage.
+    * Phase 3 §3.1: entries are evaluated on each 5m candle CLOSE (the 1m
+      candle whose close lands on a 5-minute boundary); the fill happens at
+      the NEXT 1m candle's open ± slippage. When 1m candles are missing at
+      that point (data gap), the pending fill lands on the next available
+      candle's open — which is the next 5m open when a whole 5m block is
+      absent. Legacy escape hatch entries.tick_entries=true restores
+      per-1m-close evaluation (old behavior).
     * Taker fills cross half the modeled spread (backtest.spread_bps, default
       2 bps) plus tiered slippage.
     * Maker fills only occur if the candle's range crosses the limit price.
@@ -103,6 +108,133 @@ def taker_fill_price(px: float, side: str, slip_bps: float, spread_bps_: float) 
     side='buy' pays up; side='sell' gives up."""
     adj = (slip_bps + spread_bps_ / 2.0) / 10_000.0
     return px * (1.0 + adj) if side == "buy" else px * (1.0 - adj)
+
+
+# ── Phase 3 §3.1/§3.3/§3.4 — entries / regime config (live-engine parity) ────
+# Keep defaults in sync with trade_engine._ENTRIES_DEFAULTS /
+# trade_engine._neutral_size_mult.
+
+ENTRIES_DEFAULTS: Dict[str, Any] = {
+    "eval_heartbeat_sec":     15.0,   # live-only (tick cadence); unused in replay
+    "tick_entries":           False,  # true → legacy per-1m-close evaluation
+    "falling_knife_atr_mult": 1.0,    # knife threshold = mult × atr_pct (5m)
+    "cooldown_after_sl_min":  15.0,   # per-symbol re-entry cooldown after SL
+}
+
+# §3.4c global correlated-dump pause (same constants as trade_engine)
+STOP_PAUSE_COUNT        = 3
+STOP_PAUSE_WINDOW_MS    = 600_000
+STOP_PAUSE_DURATION_MS  = 300_000
+
+
+def entries_config(strategy: dict) -> dict:
+    raw = strategy.get("entries") if isinstance(strategy, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    cfg: Dict[str, Any] = {}
+    for key, default in ENTRIES_DEFAULTS.items():
+        val = raw.get(key, default)
+        try:
+            cfg[key] = bool(val) if isinstance(default, bool) else float(val)
+        except (TypeError, ValueError):
+            cfg[key] = default
+    return cfg
+
+
+def neutral_size_mult(strategy: dict) -> float:
+    """§3.3 strategy.regime.neutral_size_mult (default 0.5) — budget
+    multiplier applied when the BTC regime is 'neutral'."""
+    try:
+        raw = strategy.get("regime", {}) if isinstance(strategy, dict) else {}
+        return max(0.0, min(1.0, float(raw.get("neutral_size_mult", 0.5))))
+    except Exception:
+        return 0.5
+
+
+def _ema_last(values: List[float], period: int) -> float:
+    """Seed-at-first-value EMA (same as trade_engine._ema_calc) — returns the
+    final EMA value."""
+    if not values or period <= 0:
+        return 0.0
+    k = 2.0 / (period + 1.0)
+    ema_val = values[0]
+    for v in values[1:]:
+        ema_val = v * k + ema_val * (1 - k)
+    return ema_val
+
+
+def btc_regime_from_closes(closes: List[float]) -> str:
+    """§3.3 3-state BTC regime classifier over 1h closes (oldest→newest).
+    MUST stay in sync with trade_engine.compute_btc_regime_from_closes
+    (backtest cannot import trade_engine — trade_engine imports this module):
+      risk_off : price < EMA50 OR pct_4h < -2.0
+      risk_on  : price > EMA20 > EMA50 AND pct_4h > -0.5
+      neutral  : everything else (also when <55 closes are available)."""
+    if not closes or len(closes) < 55:
+        return "neutral"
+    price  = closes[-1]
+    ema_20 = _ema_last(closes, 20)
+    ema_50 = _ema_last(closes, 50)
+    pct_4h = (closes[-1] - closes[-5]) / closes[-5] * 100 if closes[-5] > 0 else 0.0
+    if price < ema_50 or pct_4h < -2.0:
+        return "risk_off"
+    if price > ema_20 > ema_50 and pct_4h > -0.5:
+        return "risk_on"
+    return "neutral"
+
+
+def _bb_position_5m(closes5: List[float]) -> Optional[str]:
+    """'above_upper' | 'at_upper' | 'inside' from 5m closes (P2 veto input).
+    None when the 20-period band can't be computed (P2 fails open)."""
+    if not closes5 or len(closes5) < 20:
+        return None
+    bb_u, _, bb_l = indicators.calc_bollinger(closes5)
+    upper, lower = bb_u[-1], bb_l[-1]
+    if upper is None or lower is None:
+        return None
+    px = closes5[-1]
+    if px > upper:
+        return "above_upper"
+    band = upper - lower
+    if band > 0 and px >= upper - 0.01 * band:
+        return "at_upper"
+    return "inside"
+
+
+def _ema50_15m_slope_from_5m(window5: List[dict]) -> Optional[float]:
+    """EMA50 slope (% change across the last two 15m candles) from closed 5m
+    candles aggregated 3→1. Needs >=55 15m candles (i.e. >=165 5m candles),
+    else None — same rule as the live engine."""
+    if not window5 or len(window5) < 55 * 3:
+        return None
+    series_15m = indicators.aggregate_candles(list(window5), group=3)
+    if len(series_15m) < 55:
+        return None
+    closes = [c["close"] for c in series_15m]
+    ema50 = indicators.calc_ema(closes, 50)
+    if len(ema50) < 2 or ema50[-1] is None or ema50[-2] is None or ema50[-2] == 0:
+        return None
+    return round((ema50[-1] - ema50[-2]) / ema50[-2] * 100.0, 6)
+
+
+def _load_btc_1h(start_ms: int, end_ms: int) -> List[dict]:
+    """BTCUSDT 1h candles for §3.3 regime replay, derived from the stored
+    kline history: prefer stored 1m aggregated to 1h, else stored 5m
+    aggregated 12→1. Empty list → regime stays 'neutral' for the whole run
+    (documented fallback)."""
+    warmup = 80 * 60 * MINUTE_MS   # 80h of history so EMA50 has warmup
+    for interval, group in (("1m", 60), ("5m", 12)):
+        try:
+            rows = database.get_klines("BTCUSDT", interval,
+                                       start_ms=start_ms - warmup,
+                                       end_ms=end_ms)
+        except Exception:
+            rows = []
+        candles = [c for c in (_row_to_candle(r) for r in rows) if c is not None]
+        if candles:
+            hourly = indicators.aggregate_candles(candles, group=group)
+            if hourly:
+                return hourly
+    return []
 
 
 # ── Phase 2 §2.6 — exits config (SINGLE SOURCE for live + replay) ─────────────
@@ -408,6 +540,32 @@ def _build_signal_data(window: List[dict], low_24h: Optional[float]) -> dict:
     }
 
 
+def _build_signal_data_5m(window5: List[dict], window1m: List[dict],
+                          low_24h: Optional[float],
+                          atr_pct: Optional[float],
+                          btc_regime: str) -> dict:
+    """Phase 3 §3.1 signal_data: booleans + rsi/stoch evaluated on CLOSED 5m
+    candles (parity with trade_engine.on_kline5m_close, which evaluates the
+    5m buffer at [-1]), plus the Phase 3 registry fields:
+    klines_5m / ema50_15m_slope / bb_position_5m / atr_pct / btc_regime.
+    klines_1m stays 1m-sourced (freshest execution context).
+
+    `window5` may be longer than INDICATOR_WINDOW (the 15m EMA50 slope needs
+    ~165 5m candles); the boolean/RSI stack runs on the last INDICATOR_WINDOW
+    candles like the 1m path."""
+    base = _build_signal_data(window5[-INDICATOR_WINDOW:], low_24h)  # [-1] closed convention
+    closes5 = [c["close"] for c in window5[-INDICATOR_WINDOW:]]
+    base.update({
+        "klines_1m":       [dict(c) for c in window1m[-15:]],
+        "klines_5m":       [dict(c) for c in window5[-30:]],
+        "ema50_15m_slope": _ema50_15m_slope_from_5m(window5),
+        "bb_position_5m":  _bb_position_5m(closes5),
+        "atr_pct":         atr_pct,
+        "btc_regime":      btc_regime,
+    })
+    return base
+
+
 def _entry_atr_pct(fm_series: List[dict], ptr: int, candles_1m: List[dict],
                    i: int, fill_px: float) -> Optional[float]:
     """ATR(14) as % of fill price at entry time (§2.1) — replay mirror of the
@@ -484,6 +642,12 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
 
     tiers = slippage_tiers(strategy)
     spr_bps = spread_bps(strategy)
+    # ── Phase 3 §3.1/§3.3/§3.4 (live-engine parity) ──────────────────────────
+    ent_cfg = entries_config(strategy)
+    tick_entries = bool(ent_cfg["tick_entries"])        # legacy per-1m eval
+    knife_mult = float(ent_cfg["falling_knife_atr_mult"])
+    cooldown_ms = int(float(ent_cfg["cooldown_after_sl_min"]) * 60_000)
+    neutral_mult = neutral_size_mult(strategy)
     entry_is_maker = bool(bt_cfg.get("entry_is_maker", False))
     exit_is_maker = bool(bt_cfg.get("exit_is_maker", False))
     bb_gate_enabled = bool(bt_cfg.get("bb_gate_enabled", True))
@@ -519,6 +683,37 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
 
     _seed_spread_cache(list(data.keys()))
 
+    # ── §3.3 BTC regime replay ───────────────────────────────────────────────
+    # Regime is computed from STORED BTCUSDT klines (1m→1h aggregate, else
+    # 5m→1h) with the same classifier thresholds as the live engine. When no
+    # BTCUSDT history exists the regime stays 'neutral' for the whole run
+    # (documented fallback) — entries then size at neutral_size_mult, and the
+    # REGIME_risk_off veto never fires.
+    btc_1h = _load_btc_1h(start_ms, end_ms)
+    _btc_state = {"ptr": 0, "ts": -1, "regime": "neutral"}
+
+    def _regime_at(t_ms: int) -> str:
+        """3-state regime using 1h candles CLOSED at t_ms. Query times are
+        nondecreasing across the replay loop, so a single forward pointer
+        keeps this O(total) and deterministic."""
+        if not btc_1h:
+            return "neutral"
+        if t_ms == _btc_state["ts"]:
+            return _btc_state["regime"]
+        p = _btc_state["ptr"]
+        while p < len(btc_1h) and btc_1h[p]["open_time"] + 3_600_000 <= t_ms:
+            p += 1
+        # Fill queries (at ts) interleave with eval queries (at ts+1m) within
+        # one timeline step — backtrack the (at most one-candle) overshoot so
+        # every query sees exactly the candles closed at ITS timestamp.
+        while p > 0 and btc_1h[p - 1]["open_time"] + 3_600_000 > t_ms:
+            p -= 1
+        _btc_state["ptr"] = p
+        closes = [c["close"] for c in btc_1h[max(0, p - 72): p]]
+        _btc_state["ts"] = t_ms
+        _btc_state["regime"] = btc_regime_from_closes(closes)
+        return _btc_state["regime"]
+
     # ── Timeline ─────────────────────────────────────────────────────────────
     ts_events: Dict[int, List[Tuple[str, int]]] = {}
     for sym, candles in data.items():
@@ -536,6 +731,10 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
     qv_sums: Dict[str, float] = {s: 0.0 for s in data}       # trailing 24h quote vol
     fivem_ptr: Dict[str, int] = {s: 0 for s in data}
     atr5_ptr: Dict[str, int] = {s: 0 for s in data}          # closed-5m ptr for entry ATR
+    # §3.4b/§3.4c protections state (live parity)
+    cooldown_until: Dict[str, int] = {}   # sym -> ms until which entries are blocked
+    stop_out_ts: List[int] = []           # rolling stop-out timestamps (ms)
+    pause_until_ms = 0                    # global correlated-dump pause
     trades: List[dict] = []
     equity_curve: List[List[float]] = []
     exposed_ts = 0
@@ -557,7 +756,7 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
 
     def _close_position(sym: str, ts: int, raw_px: float, label: str,
                         maker: bool) -> None:
-        nonlocal cash
+        nonlocal cash, pause_until_ms
         pos = positions.pop(sym)
         fm = fee_models[sym]
         if maker:
@@ -585,6 +784,18 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
             "exit_label": label,
             "hold_sec": (ts - pos["entry_ts"]) / 1000.0,
         })
+        # ── §3.4b/§3.4c — stop-out protections (live parity) ─────────────────
+        # Stop-loss family exits set the per-symbol cooldown and count toward
+        # the global correlated-dump pause (>=3 stop-outs in 10 min → 5 min
+        # pause of ALL entries). TP/trail/end-of-run exits do not.
+        if label in ("backtest_sl", "backtest_hard_sl"):
+            cooldown_until[sym] = max(cooldown_until.get(sym, 0),
+                                      ts + cooldown_ms)
+            stop_out_ts.append(ts)
+            stop_out_ts[:] = [t for t in stop_out_ts
+                              if t >= ts - STOP_PAUSE_WINDOW_MS]
+            if len(stop_out_ts) >= STOP_PAUSE_COUNT and ts >= pause_until_ms:
+                pause_until_ms = ts + STOP_PAUSE_DURATION_MS
         _mark(ts)
 
     # ── Replay ───────────────────────────────────────────────────────────────
@@ -610,9 +821,23 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
             # 1) Pending entry scheduled for this candle → fill at its open.
             if pending.get(sym) == i:
                 del pending[sym]
-                if in_replay and sym not in positions and len(positions) < max_positions:
+                # §3.3/§3.4 fill-time guards (live parity — the live buy loop
+                # re-checks these right before executing):
+                #   * risk_off regime → entry vetoed, NEVER sized
+                #   * neutral regime  → budget × neutral_size_mult
+                #   * per-symbol SL cooldown / global stop pause → skip
+                _fill_regime = _regime_at(ts)
+                if (in_replay and sym not in positions
+                        and len(positions) < max_positions
+                        and _fill_regime != "risk_off"
+                        and ts >= cooldown_until.get(sym, 0)
+                        and ts >= pause_until_ms):
                     deployed = sum(p["cost"] for p in positions.values())
                     budget = _budget_for(strategy, cash, deployed)
+                    if budget is not None and _fill_regime == "neutral":
+                        budget = round(budget * neutral_mult, 8)
+                        if budget <= 0:
+                            budget = None
                     if budget is not None:
                         fm = fee_models[sym]
                         filled = True
@@ -739,31 +964,88 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
                         _close_position(sym, ts, tp, "backtest_tp",
                                         exit_is_maker)
 
-            # 3) Entry evaluation on candle close → schedule next-open fill.
+            # 3) Entry evaluation → schedule next-open fill.
+            #    Phase 3 §3.1: entries are evaluated on 5m candle CLOSES only
+            #    (the 1m close landing on a 5-minute boundary) and filled at
+            #    the next 1m candle's open per the fill rules; when 1m data
+            #    has a gap there, the fill lands on the next available candle
+            #    (the next 5m open when a whole block is missing). Legacy
+            #    escape hatch entries.tick_entries=true evaluates every 1m
+            #    close (old behavior).
+            close_ts = ts + MINUTE_MS
+            is_5m_close = (close_ts % (5 * MINUTE_MS) == 0)
             if (in_replay and sym not in positions and sym not in pending
-                    and i + 1 < len(candles) and i + 1 >= MIN_EVAL_CANDLES):
+                    and i + 1 < len(candles) and i + 1 >= MIN_EVAL_CANDLES
+                    and (tick_entries or is_5m_close)
+                    and close_ts >= cooldown_until.get(sym, 0)   # §3.4b SL cooldown
+                    and close_ts >= pause_until_ms):             # §3.4c global pause
                 window = candles[max(0, i - INDICATOR_WINDOW + 1): i + 1]
+                # Advance the closed-5m pointer ALWAYS (signal data + ATR need
+                # it, not just the 5m veto).
+                fm_series = fivem[sym]
+                ptr = fivem_ptr[sym]
+                while (ptr < len(fm_series)
+                       and fm_series[ptr]["open_time"] + 5 * MINUTE_MS <= close_ts):
+                    ptr += 1
+                fivem_ptr[sym] = ptr
+                regime = _regime_at(close_ts)
                 gates_ok = True
-                if bb_gate_enabled and not _bb_gate_ok(window):
+                # §3.3 macro-gate parity: risk_off vetoes ALL entries (the
+                # REGIME_risk_off registry veto would also fire — this keeps
+                # the gate active even when that veto is configured off).
+                if regime == "risk_off":
+                    gates_ok = False
+                if gates_ok and bb_gate_enabled and not _bb_gate_ok(window):
                     gates_ok = False
                 if gates_ok and use_5m_veto:
-                    fm_series = fivem[sym]
-                    ptr = fivem_ptr[sym]
-                    close_ts = ts + MINUTE_MS
-                    while (ptr < len(fm_series)
-                           and fm_series[ptr]["open_time"] + 5 * MINUTE_MS <= close_ts):
-                        ptr += 1
-                    fivem_ptr[sym] = ptr
                     if not indicators.is_5m_bullish(fm_series[max(0, ptr - 60): ptr]):
                         gates_ok = False
+                # §3.4a falling-knife (ATR-scaled): drop over the last 3
+                # closed 1m candles vs falling_knife_atr_mult × atr_pct
+                # (5m ATR% ladder); fixed 0.4% when ATR is unavailable.
+                atr_pct_eval = None
+                if gates_ok:
+                    atr_pct_eval = _entry_atr_pct(fm_series, ptr, candles,
+                                                  i + 1, candle["close"])
+                    if i >= 3 and candles[i - 3]["close"] > 0:
+                        pct_3min = ((candle["close"] - candles[i - 3]["close"])
+                                    / candles[i - 3]["close"] * 100.0)
+                        knife_thr = (knife_mult * atr_pct_eval
+                                     if atr_pct_eval and atr_pct_eval > 0 else 0.4)
+                        if pct_3min < -knife_thr:
+                            gates_ok = False
                 if gates_ok:
                     low_24h = min(v for _, v in dq) if dq else None
-                    sig_data = _build_signal_data(window, low_24h)
-                    _clear_registry_caches(sym)
-                    decision = signal_registry.evaluate_buy_decision(
-                        sym, sig_data, eval_strategy)
-                    if decision.get("allowed"):
-                        pending[sym] = i + 1
+                    if tick_entries:
+                        # Legacy 1m evaluation + Phase 3 registry fields.
+                        sig_data = _build_signal_data(window, low_24h)
+                        window5 = fm_series[max(0, ptr - 200): ptr]
+                        sig_data.update({
+                            "klines_5m":       [dict(c) for c in window5[-30:]],
+                            "ema50_15m_slope": _ema50_15m_slope_from_5m(window5),
+                            "bb_position_5m":  _bb_position_5m(
+                                [c["close"] for c in window5[-INDICATOR_WINDOW:]]),
+                            "atr_pct":         atr_pct_eval,
+                            "btc_regime":      regime,
+                        })
+                    else:
+                        # §3.1 default: signals evaluated on closed 5m candles
+                        # (200-candle slice so the 15m EMA50 slope has its
+                        # 165-candle requirement).
+                        window5 = fm_series[max(0, ptr - 200): ptr]
+                        if len(window5) < 3:
+                            window5 = []
+                        if not window5:
+                            sig_data = None
+                        else:
+                            sig_data = _build_signal_data_5m(
+                                window5, window, low_24h, atr_pct_eval, regime)
+                    if sig_data is not None:
+                        _clear_registry_caches(sym)
+                        decision = signal_registry.evaluate_buy_decision(
+                            sym, sig_data, eval_strategy)
+                        if decision.get("allowed"):
+                            pending[sym] = i + 1
 
             last_close[sym] = candle["close"]
 

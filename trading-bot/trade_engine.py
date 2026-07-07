@@ -228,6 +228,288 @@ def _log_order_result(action: str, symbol: str, intended_qty: float, intended_pr
         pass
 
 
+# ── §3.5 Maker-first entries (live mode) ─────────────────────────────────────
+
+def _parse_entry_order(sym: str, order: dict, fallback_price: float,
+                       is_maker: bool) -> dict:
+    """Normalize a BUY order payload into position-entry numbers.
+
+    Mirrors the market-buy fill parsing exactly: VWAP entry price
+    (cummulativeQuoteQty / executedQty — fills[0] alone understates multi-fill
+    cost), commission-adjusted qty, and the USDT fee across all fills.
+
+    LIMIT_MAKER caveat: GET /api/v3/order and DELETE /api/v3/order payloads
+    carry executedQty/cummulativeQuoteQty but NO fills[] array. Without fills
+    the commission is estimated from the FeeModel: fee = quote_spent × maker
+    fraction, and (unless bnb_discount is on — then the fee comes out of the
+    BNB balance) the base-asset commission is deducted from qty so the
+    recorded position matches the wallet credit (prevents -2010 on the sell).
+    """
+    fills = order.get("fills") or []
+    exec_qty  = float(order.get("executedQty", 0) or 0)
+    cum_quote = float(order.get("cummulativeQuoteQty", 0) or 0)
+    if exec_qty > 0 and cum_quote > 0:
+        fill_price = cum_quote / exec_qty
+    elif fills:
+        fill_price = float(fills[0].get("price", fallback_price))
+    else:
+        fill_price = fallback_price
+    try:
+        fm = fees.get_fee_model(sym)
+        fee_frac = fm.maker() if is_maker else fm.taker()
+        bnb_fee = bool(fm.bnb_discount)
+    except Exception:
+        fee_frac = _fee_rate_for(sym)
+        bnb_fee = False
+    spent = cum_quote if cum_quote > 0 else exec_qty * fill_price
+    if fills:
+        # Same math as the market path: subtract base-asset commission from
+        # executedQty; convert all commissions to USDT (BNB via live price).
+        base_asset = sym[:-4] if sym.endswith("USDT") else sym
+        base_comm = sum(
+            float(f.get("commission") or 0) for f in fills
+            if f.get("commissionAsset") == base_asset
+        )
+        qty = max(0.0, exec_qty - base_comm)
+        fee_usdt, _ = _fills_fee_usdt(fills, spent * fee_frac)
+    else:
+        fee_usdt = spent * fee_frac
+        qty = exec_qty if bnb_fee else max(0.0, exec_qty * (1.0 - fee_frac))
+    return {
+        "fill_price":     fill_price,
+        "qty":            qty,
+        "buy_fee_usdt":   fee_usdt,
+        "spent_quote":    spent,
+        "entry_is_maker": is_maker,
+    }
+
+
+def _maker_best_bid(sym: str, max_age_sec: float = 5.0):
+    """Fresh best bid from the @bookTicker feed; None when absent/stale."""
+    try:
+        import data_collector as _dc
+        bt = _dc.book_ticker.get(sym)
+        if not bt:
+            return None
+        if (time.time() - float(bt.get("ts", 0) or 0)) > max_age_sec:
+            return None
+        bid = float(bt.get("bid") or 0)
+        return bid if bid > 0 else None
+    except Exception:
+        return None
+
+
+def _log_high_order_count(sym: str, context: str) -> None:
+    """§3.5e — each maker post+cancel spends per-account order-count budget.
+    Log the rolling 10s order count (from response-header telemetry) when it
+    climbs past 20 so an aggressive chase is visible before Binance 429s."""
+    try:
+        bl = _get_blimits()
+        if bl is None:
+            return
+        oc = int(bl.get_limits_health().get("order_count_10s", 0) or 0)
+        if oc > 20:
+            database.log_activity(
+                f"{sym}: {context} — rolling 10s order count is {oc} "
+                f"(maker chase posts+cancels count toward account order limits)",
+                "warn")
+    except Exception:
+        pass
+
+
+def _execute_maker_first_buy(sym: str, budget: float,
+                             signal_still_holds=None):
+    """§3.5 — maker-first live entry: LIMIT_MAKER at best bid, chase, fallback.
+
+    Lifecycle:
+      * best bid from data_collector.book_ticker (fresh <5 s). Unavailable →
+        ONE taker market buy iff entries.taker_fallback, else abandon.
+      * post binance_direct.order_limit_maker(BUY, floor_to_lot(budget/bid),
+        tick-floored bid). A -2010 'would immediately match' reject → re-read
+        the bid and repost (counts as a repost).
+      * poll get_order every ~0.5 s for entries.chase_seconds. FILLED → done.
+        PARTIALLY_FILLED at timeout → cancel remainder, keep the filled part.
+        Unfilled → cancel + repost, up to entries.max_reposts reposts after
+        the initial post.
+      * chase exhausted → one taker market buy iff entries.taker_fallback AND
+        `signal_still_holds()` (quick re-check of the cached engine decision);
+        otherwise abandon (return None — the CALLER releases the _buying claim
+        and records the 'maker_chase_abandoned' rejection).
+
+    Paper mode never reaches this function — the existing simulated market-buy
+    path is unchanged (paper maker simulation is out of scope).
+
+    Returns the _parse_entry_order dict (fill_price / qty / buy_fee_usdt /
+    spent_quote / entry_is_maker) or None on abandonment.
+    """
+    cfg = _entries_cfg()
+    chase_sec  = max(0.5, float(cfg["chase_seconds"]))
+    max_reposts = max(0, int(cfg["max_reposts"]))
+    taker_fb   = bool(cfg["taker_fallback"])
+
+    def _taker_fallback_buy(why: str):
+        if not taker_fb:
+            database.log_activity(
+                f"{sym}: maker-first entry abandoned — {why} "
+                f"(entries.taker_fallback=false)", "warn")
+            return None
+        if signal_still_holds is not None:
+            try:
+                if not signal_still_holds():
+                    database.log_activity(
+                        f"{sym}: maker-first entry abandoned — {why}, and the "
+                        f"signal no longer holds (taker fallback skipped)", "warn")
+                    return None
+            except Exception:
+                pass
+        database.log_activity(
+            f"{sym}: maker chase → taker fallback market buy ({why})", "info")
+        result = _market_buy(sym, budget)
+        _log_order_result("BUY", sym, 0.0, 0.0, result)
+        return _parse_entry_order(sym, result, 0.0, is_maker=False)
+
+    reposts = 0            # reposts AFTER the initial post (-2010 counts too)
+    while True:
+        bid = _maker_best_bid(sym)
+        if bid is None:
+            return _taker_fallback_buy("best bid unavailable/stale (>5s)")
+        price = _floor_price_tick(bid, sym)
+        qty = _floor_qty(budget / bid, sym)
+        if qty <= 0 or price <= 0:
+            database.log_activity(
+                f"{sym}: maker-first entry abandoned — qty floors to 0 "
+                f"(budget=${budget:.2f} bid=${bid:.6f})", "warn")
+            return None
+
+        try:
+            _log_order_intent("BUY_MAKER", sym, qty, price)
+            order = binance_direct.order_limit_maker(sym, "BUY", qty, price)
+        except binance_direct.BinanceDirectError as e:
+            if e.code == -2010:
+                # Would immediately match and take — bid moved through our
+                # price between the book-ticker read and the post. Re-read
+                # and repost; this consumes a repost.
+                reposts += 1
+                _log_high_order_count(sym, "maker post rejected -2010")
+                if reposts > max_reposts:
+                    return _taker_fallback_buy(
+                        f"chase exhausted ({reposts - 1} reposts + -2010 reject)")
+                continue
+            raise
+        _log_high_order_count(sym, "maker order posted")
+
+        order_id = int(order.get("orderId", 0) or 0)
+        status = order.get("status", "NEW")
+        deadline = time.time() + chase_sec
+        while status not in ("FILLED", "CANCELED", "EXPIRED", "REJECTED") \
+                and time.time() < deadline:
+            time.sleep(0.5)
+            try:
+                order = binance_direct.get_order(sym, order_id)
+                status = order.get("status", status)
+            except Exception as _poll_e:
+                database.log_activity(
+                    f"{sym}: maker chase poll error ({_poll_e}) — retrying", "warn")
+
+        if status == "FILLED":
+            _log_order_result("BUY_MAKER", sym, qty, price, order)
+            return _parse_entry_order(sym, order, price, is_maker=True)
+
+        if status in ("CANCELED", "EXPIRED", "REJECTED"):
+            # Cancelled/expired externally — treat like an unfilled timeout.
+            filled = float(order.get("executedQty", 0) or 0)
+            if filled > 0:
+                _log_order_result("BUY_MAKER", sym, qty, price, order)
+                return _parse_entry_order(sym, order, price, is_maker=True)
+        else:
+            # Timeout with the order still resting — cancel the remainder.
+            try:
+                cancelled = binance_direct.cancel_order(sym, order_id)
+                if isinstance(cancelled, dict) and cancelled.get("executedQty") is not None:
+                    order = cancelled
+            except binance_direct.BinanceDirectError as e:
+                if e.code == -2011:
+                    # Raced a fill: the order completed before the cancel.
+                    try:
+                        order = binance_direct.get_order(sym, order_id)
+                    except Exception:
+                        pass
+                else:
+                    database.log_activity(
+                        f"{sym}: maker chase cancel failed ({e}) — abandoning "
+                        f"(order {order_id} may still rest)", "error")
+                    return None
+            _log_high_order_count(sym, "maker order cancelled")
+            filled = float(order.get("executedQty", 0) or 0)
+            if filled > 0:
+                # PARTIALLY_FILLED at timeout: keep the filled part as the
+                # position; qty/fees recomputed from the actual fill numbers.
+                _log_order_result("BUY_MAKER", sym, qty, price, order)
+                database.log_activity(
+                    f"{sym}: maker chase partial fill kept — "
+                    f"{filled:.8f}/{qty:.8f} filled, remainder cancelled", "info")
+                return _parse_entry_order(sym, order, price, is_maker=True)
+
+        reposts += 1
+        if reposts > max_reposts:
+            return _taker_fallback_buy(f"chase exhausted ({max_reposts} reposts)")
+
+
+# ── §3.6 zero-maker-fee promo-pair advisory ──────────────────────────────────
+# The watchlist owns symbol choice: auto-switching BTCUSDT→BTCFDUSD would
+# change the traded universe (quote balance, data feeds, exit orders), so this
+# stays advisory-only — an INFO log at buy-decision time (throttled 30 min per
+# symbol) plus a promo_pair_available flag in /api/signals-summary entries.
+_promo_advice_ts: Dict[str, float] = {}
+_PROMO_ADVICE_THROTTLE_SEC = 1800.0
+
+
+def promo_pair_available(sym: str) -> bool:
+    """True when entries.prefer_fee_promo_pairs is on, `sym` quotes in USDT,
+    and a matching <BASE>FDUSD entry with maker_pct==0 is configured in
+    strategy fees.per_symbol_overrides (e.g. BTCUSDT → BTCFDUSD)."""
+    try:
+        if not _entries_cfg()["prefer_fee_promo_pairs"]:
+            return False
+        sym_u = str(sym).strip().upper()
+        if not sym_u.endswith("USDT"):
+            return False
+        target = sym_u[:-4] + "FDUSD"
+        fees_blk = _load_strategy().get("fees")
+        overrides = fees_blk.get("per_symbol_overrides") if isinstance(fees_blk, dict) else None
+        if not isinstance(overrides, dict):
+            return False
+        for k, v in overrides.items():
+            if str(k).strip().upper() == target and isinstance(v, dict):
+                try:
+                    if float(v.get("maker_pct")) == 0.0:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+        return False
+    except Exception:
+        return False
+
+
+def _maybe_log_promo_pair(sym: str) -> None:
+    """§3.6 advisory log (throttled) — suggests the zero-maker-fee pair but
+    never switches symbols."""
+    if not promo_pair_available(sym):
+        return
+    now = time.time()
+    if now - _promo_advice_ts.get(sym, 0.0) < _PROMO_ADVICE_THROTTLE_SEC:
+        return
+    _promo_advice_ts[sym] = now
+    try:
+        database.log_activity(
+            f"{sym}: zero-maker-fee promo pair {sym[:-4].upper()}FDUSD is "
+            f"configured (fees.per_symbol_overrides maker_pct=0) — consider "
+            f"trading it instead for free maker entries. Advisory only: the "
+            f"watchlist owns symbol choice, no auto-switch.", "info")
+    except Exception:
+        pass
+
+
 # Phase 1: Signal registry — shadow mode only (use_new_signal_engine=False by default).
 # Falls back gracefully if the file is absent so a partial deploy can't break the bot.
 try:
@@ -402,6 +684,130 @@ _STOP_LOSS_CONFIRMATION_TICKS = 2
 # Post-loss cooldown: after a confirmed slippage-loss fill, skip re-buying that coin for 30 min
 _loss_cooldown: Dict[str, float] = {}
 _LOSS_COOLDOWN_SEC = 1800  # 30 minutes
+
+# ── Phase 3 §3.1/§3.4 — entries config + protections state ────────────────────
+# strategy.json "entries" block (all hot-reloadable via _load_strategy):
+#   eval_heartbeat_sec      (15)   veto-only re-check cadence between 5m closes
+#   tick_entries            (False) legacy escape hatch: restore per-tick buy
+#                                   dispatch from realtime_monitor
+#   falling_knife_atr_mult  (1.0)  falling-knife threshold = mult × atr_pct
+#                                   (5m ATR%, Phase 2 ladder); fallback 0.4%
+#   cooldown_after_sl_min   (15)   per-symbol re-entry cooldown after a
+#                                   stop-loss / hard-stop-loss exit
+# §3.5 maker-first entry keys (live mode only):
+#   maker_first             (True)  post LIMIT_MAKER at best bid instead of a
+#                                   taker market buy for automatic live entries
+#   chase_seconds           (3)     poll window per post before cancel+repost
+#   max_reposts             (3)     reposts allowed after the initial post
+#                                   (-2010 'would match' rejections count too)
+#   taker_fallback          (False) after the chase is exhausted, fall back to
+#                                   ONE taker market buy if the signal holds
+# §3.6:
+#   prefer_fee_promo_pairs  (False) advisory-only: log + flag when a matching
+#                                   zero-maker-fee FDUSD pair is configured
+_ENTRIES_DEFAULTS = {
+    "eval_heartbeat_sec":     15.0,
+    "tick_entries":           False,
+    "falling_knife_atr_mult": 1.0,
+    "cooldown_after_sl_min":  15.0,
+    "maker_first":            True,
+    "chase_seconds":          3.0,
+    "max_reposts":            3,
+    "taker_fallback":         False,
+    "prefer_fee_promo_pairs": False,
+}
+
+
+def _entries_cfg() -> dict:
+    """Effective strategy.entries config (§3.1/§3.4/§3.5/§3.6) — defaults
+    merged over strategy.json, mtime-cached via _load_strategy so edits
+    hot-reload."""
+    raw = _load_strategy().get("entries")
+    raw = raw if isinstance(raw, dict) else {}
+    cfg = {}
+    for key, default in _ENTRIES_DEFAULTS.items():
+        val = raw.get(key, default)
+        try:
+            if isinstance(default, bool):
+                cfg[key] = bool(val)
+            elif isinstance(default, int):
+                cfg[key] = int(float(val))
+            else:
+                cfg[key] = float(val)
+        except (TypeError, ValueError):
+            cfg[key] = default
+    return cfg
+
+
+def _neutral_size_mult() -> float:
+    """§3.3 strategy.regime.neutral_size_mult (default 0.5): budget multiplier
+    applied when the BTC regime is 'neutral' (live + paper)."""
+    try:
+        raw = _load_strategy().get("regime", {})
+        return max(0.0, min(1.0, float(raw.get("neutral_size_mult", 0.5))))
+    except Exception:
+        return 0.5
+
+
+# §3.4c — global correlated-dump pause: >=3 stop-outs within 10 minutes pause
+# ALL entries for 5 minutes (module state; surfaced as gate blocker
+# 'global_stop_pause' and in the activity log).
+_STOP_PAUSE_COUNT      = 3
+_STOP_PAUSE_WINDOW_SEC = 600.0
+_STOP_PAUSE_DURATION_SEC = 300.0
+_stop_out_ts: List[float] = []          # rolling stop-out timestamps
+_stop_out_lock = threading.Lock()
+_global_stop_pause_until: float = 0.0
+_last_stop_pause_log_ts: float = 0.0    # throttle the "paused" log to 1/min
+
+
+def _global_stop_pause_active(now: Optional[float] = None) -> bool:
+    return (now if now is not None else time.time()) < _global_stop_pause_until
+
+
+def _record_stop_out(sym: str, reason: str) -> None:
+    """§3.4b/§3.4c — called when a position exits via stop-loss/hard-stop-loss.
+
+    1. Per-symbol cooldown: entries.cooldown_after_sl_min minutes (replaces
+       the 30 s COOLDOWN_AFTER_LOSS for stop-outs specifically; other losing
+       exits keep their existing behavior — e.g. the slippage-loss cooldown).
+    2. Global pause: 3 stop-outs in 10 min → pause ALL entries for 5 min
+       (correlated-dump protection).
+    """
+    global _global_stop_pause_until
+    now = time.time()
+    try:
+        cd_min = _entries_cfg()["cooldown_after_sl_min"]
+    except Exception:
+        cd_min = _ENTRIES_DEFAULTS["cooldown_after_sl_min"]
+    _cooldowns[sym] = now + cd_min * 60.0
+    try:
+        database.log_activity(
+            f"{sym}: stop-out ({reason}) — re-entry cooldown {cd_min:.0f} min", "info")
+    except Exception:
+        pass
+    triggered = False
+    with _stop_out_lock:
+        _stop_out_ts.append(now)
+        _stop_out_ts[:] = [t for t in _stop_out_ts if t >= now - _STOP_PAUSE_WINDOW_SEC]
+        n_recent = len(_stop_out_ts)
+        if n_recent >= _STOP_PAUSE_COUNT and now >= _global_stop_pause_until:
+            _global_stop_pause_until = now + _STOP_PAUSE_DURATION_SEC
+            triggered = True
+    if triggered:
+        try:
+            database.log_activity(
+                f"GLOBAL STOP PAUSE: {n_recent} stop-outs within "
+                f"{int(_STOP_PAUSE_WINDOW_SEC // 60)} min — ALL entries paused for "
+                f"{int(_STOP_PAUSE_DURATION_SEC // 60)} min (correlated dump protection)",
+                "warn")
+        except Exception:
+            pass
+        try:
+            log_diag_issue("entries", "warn",
+                           f"global_stop_pause armed after {n_recent} stop-outs")
+        except Exception:
+            pass
 
 # Abort-log throttle — SELL ABORTED fires every 250ms per stuck position; cap to 1/min per symbol
 _last_abort_log_ts: Dict[str, float] = {}
@@ -1210,6 +1616,23 @@ def can_execute_buy(coin_cfg: dict, client) -> tuple[bool, str]:
 
 
 def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
+    """Trade size in USDT (see _get_budget_for_coin_base) with §3.3 regime
+    sizing applied: when the BTC regime is 'neutral' the computed budget is
+    multiplied by strategy.regime.neutral_size_mult (default 0.5) — identical
+    in live and paper mode. risk_off never reaches sizing (entries are vetoed
+    upstream by the macro gate / REGIME_risk_off veto); risk_on is unscaled."""
+    base = _get_budget_for_coin_base(symbol, free_usdt)
+    try:
+        if base > 0 and get_btc_regime() == "neutral":
+            mult = _neutral_size_mult()
+            if mult < 1.0:
+                return round(base * mult, 2)
+    except Exception:
+        pass  # sizing must never fail a buy because regime data is missing
+    return base
+
+
+def _get_budget_for_coin_base(symbol: str, free_usdt: float) -> float:
     """Return trade size in USDT based on BUDGET_MODE (config defaults or strategy.json overrides).
 
     If bot_allocation_usdt > 0, the bot is restricted to that USDT cap across all
@@ -1963,6 +2386,8 @@ def evaluate_buy_gates(sym: str) -> dict:
         blockers.append("cooldown_after_loss")
     if _loss_cooldown.get(sym, 0) > time.time():
         blockers.append("slippage_loss_cooldown")
+    if _global_stop_pause_active():
+        blockers.append("global_stop_pause")
 
     if bool(strategy.get("macro_gate_enabled", True)):
         _btc = get_btc_state()
@@ -1992,6 +2417,12 @@ def evaluate_buy_gates(sym: str) -> dict:
                 "low_24h":         cached.get("low_24h"),
                 "klines_1m":       cached.get("klines_1m", []),
                 "stoch_rsi_value": cached.get("stoch_rsi_val"),
+                # Phase 3 §3.1/§3.3 fields (populated on 5m closes)
+                "klines_5m":       cached.get("klines_5m", []),
+                "ema50_15m_slope": cached.get("ema50_15m_slope"),
+                "bb_position_5m":  cached.get("bb_position_5m"),
+                "atr_pct":         cached.get("atr_pct"),
+                "btc_regime":      get_btc_regime(),
             }
             _dec = _sr_evaluate_buy_decision(sym, _sig_data, strategy)
             if not _dec.get("allowed"):
@@ -2031,7 +2462,9 @@ _MARKET_REGIME_TTL_SEC = 120.0
 def _fetch_btc_1h_klines() -> Optional[List[dict]]:
     # C §6.4 — non-critical background fetch: when can_spend refuses, callers
     # (get_market_regime / get_btc_state) fall back to their cached values.
-    url = "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=24"
+    # limit=72: EMA50 on 1h needs >=50 closed candles (§3.3 3-state regime);
+    # 72 gives EMA warmup headroom while staying a single weight-2 request.
+    url = "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=72"
     ok, data, _, _ = _binance_request(url, timeout=4.0, source="btc_klines",
                                       weight=2, critical=False)
     if not ok or not isinstance(data, list):
@@ -2078,15 +2511,54 @@ def get_market_regime() -> dict:
     return _market_regime_cache
 
 
-# ── BTC macro gate state — simpler thresholds, 5-min TTL ─────────────────────
-# Used by the pre-loop macro gate in _check_buys_from_cache.
-# Bearish = pct_24h < -3% OR pct_4h < -2% (clear dump, not just chop).
-# Called from _buy_check_executor thread — NEVER from event loop.
+# ── §3.3 BTC regime — 3-state (risk_on / neutral / risk_off), 60 s cache ─────
+# Computed from BTCUSDT 1h klines (single existing fetch): EMA structure
+# (price vs EMA20 vs EMA50 on 1h) + 4h momentum. Thresholds (documented):
+#   risk_off : price < EMA50  OR  pct_4h < -2.0   — clear downtrend / dump;
+#              -2% in 4h matches the old binary "bearish" dump trigger.
+#   risk_on  : price > EMA20 > EMA50  AND  pct_4h > -0.5 — intact uptrend
+#              structure with at most mild short-term give-back.
+#   neutral  : everything else (chop / transition) → entries allowed at
+#              reduced size (strategy.regime.neutral_size_mult, default 0.5).
+# risk_off is checked FIRST so a dump inside an uptrend still de-risks.
+# Refreshed every 60 s (was 120 s for the old binary gate). Called from
+# buy-check / executor threads — NEVER from the event loop.
 _btc_state_cache: dict = {"ts": 0.0, "data": None}
-_BTC_STATE_TTL_SEC = 300.0
+_BTC_STATE_TTL_SEC = 60.0
+
+
+def compute_btc_regime_from_closes(closes: List[float]) -> Tuple[str, dict]:
+    """Pure §3.3 classifier over 1h closes (oldest→newest). Returns
+    (regime, details). Shared shape with backtest._btc_regime_from_closes —
+    keep the thresholds in sync. <55 closes → neutral (EMA50 not meaningful)."""
+    if not closes or len(closes) < 55:
+        return "neutral", {"error": "insufficient_1h_data", "n": len(closes or [])}
+    price   = closes[-1]
+    ema_20  = _ema_calc(closes, 20)
+    ema_50  = _ema_calc(closes, 50)
+    pct_4h  = (closes[-1] - closes[-5]) / closes[-5] * 100 if closes[-5] > 0 else 0.0
+    if price < ema_50 or pct_4h < -2.0:
+        regime = "risk_off"
+    elif price > ema_20 > ema_50 and pct_4h > -0.5:
+        regime = "risk_on"
+    else:
+        regime = "neutral"
+    return regime, {
+        "price":  price,
+        "ema_20": round(ema_20, 2),
+        "ema_50": round(ema_50, 2),
+        "pct_4h": round(pct_4h, 3),
+    }
+
 
 def get_btc_state() -> Optional[dict]:
-    """BTC macro state for macro gate. 5-min cache. Must run on buy-check thread."""
+    """BTC macro state (legacy dict shape) for the macro gate + UI. 60 s cache.
+    Must run on a buy-check/worker thread (REST fetch).
+
+    §3.3: the legacy binary "regime" key now maps from the 3-state classifier
+    so macro_gate_enabled semantics are preserved: bearish ⇔ risk_off (gate
+    blocks), bullish ⇔ risk_on, choppy ⇔ neutral. The 3-state value is carried
+    alongside as "regime3"."""
     now = time.time()
     if _btc_state_cache["data"] and (now - _btc_state_cache["ts"]) < _BTC_STATE_TTL_SEC:
         return _btc_state_cache["data"]
@@ -2096,25 +2568,40 @@ def get_btc_state() -> Optional[dict]:
     closes = [k["close"] for k in klines]
     ema_8  = _ema_calc(closes, 8)
     ema_24 = _ema_calc(closes, 24)
-    pct_24h = (closes[-1] - closes[0]) / closes[0] * 100 if closes[0] > 0 else 0
-    pct_4h  = (closes[-1] - closes[-4]) / closes[-4] * 100 if closes[-4] > 0 else 0
-    if pct_24h < -3.0 or pct_4h < -2.0:
-        regime = "bearish"
-    elif ema_8 > ema_24 and pct_24h > 1.0:
-        regime = "bullish"
-    else:
-        regime = "choppy"
+    pct_24h = ((closes[-1] - closes[-25]) / closes[-25] * 100
+               if len(closes) >= 25 and closes[-25] > 0
+               else ((closes[-1] - closes[0]) / closes[0] * 100 if closes[0] > 0 else 0))
+    pct_4h  = (closes[-1] - closes[-5]) / closes[-5] * 100 if closes[-5] > 0 else 0
+    regime3, det = compute_btc_regime_from_closes(closes)
+    legacy = {"risk_off": "bearish", "risk_on": "bullish"}.get(regime3, "choppy")
     data = {
         "price":   closes[-1],
         "ema_8":   round(ema_8, 2),
         "ema_24":  round(ema_24, 2),
+        "ema_20":  det.get("ema_20"),
+        "ema_50":  det.get("ema_50"),
         "pct_4h":  round(pct_4h, 3),
         "pct_24h": round(pct_24h, 3),
-        "regime":  regime,
+        "regime":  legacy,     # legacy binary-gate key: bearish ⇔ risk_off
+        "regime3": regime3,    # §3.3 3-state key
     }
     _btc_state_cache["ts"]   = now
     _btc_state_cache["data"] = data
     return data
+
+
+def get_btc_regime(detailed: bool = False):
+    """§3.3 public accessor: 'risk_on' | 'neutral' | 'risk_off' (60 s cache).
+    detailed=True returns the full state dict instead. Unknown/unfetchable →
+    'neutral' (fail-open for sizing; the REGIME veto fails open separately)."""
+    state = None
+    try:
+        state = get_btc_state()
+    except Exception:
+        state = None
+    if detailed:
+        return state
+    return (state or {}).get("regime3") or "neutral"
 
 
 # ── Reversal confirmation ──────────────────────────────────────────────────────
@@ -2691,9 +3178,20 @@ def _rebuild_full_entry(symbol: str, candles: list) -> bool:
         five_m_ok, five_m_ts = _five_m_state(symbol, prev)
         low_24h = _low_24h_for(symbol, candles)
 
+        # §3.1d — when entries are evaluated on 5m closes (default), the ENTRY
+        # signal fields (signals/score/rsi_val/stoch_rsi_val) are OWNED by the
+        # 5m path (on_kline5m_close) and this 1m rebuild must not overwrite
+        # them; it keeps refreshing price/ts/bb_ok/5m_ok/low_24h/klines_1m for
+        # exits and diagnostics. Before the first 5m close (no entry_ts_5m in
+        # the cache yet) the 1m values still seed the entry so the bot isn't
+        # blind during warmup. All 5m-derived keys (klines_5m, ema50_15m_slope,
+        # bb_position_5m, atr_pct, btc_regime) are merge-preserved by design —
+        # entry.update() below never touches them.
+        preserve_5m = (not _entries_cfg()["tick_entries"]) and bool(prev.get("entry_ts_5m"))
+
         with _signal_cache_lock:
             entry = dict(_signal_cache.get(symbol, {}))  # re-read under write lock
-            entry.update({
+            updates = {
                 "signals":       signals,
                 "score":         score,
                 "price":         closes[-1],
@@ -2705,7 +3203,11 @@ def _rebuild_full_entry(symbol: str, candles: list) -> bool:
                 "low_24h":       low_24h,
                 "klines_1m":     [dict(c) for c in candles[-15:]],
                 "stoch_rsi_val": stoch_rsi_val,
-            })
+            }
+            if preserve_5m and entry.get("entry_ts_5m"):
+                for _k in ("signals", "score", "rsi_val", "stoch_rsi_val"):
+                    updates.pop(_k, None)
+            entry.update(updates)
             _signal_cache[symbol] = entry
         _signal_scanner_health["last_event_refresh_ts"] = time.time()
         return True
@@ -2758,7 +3260,7 @@ def update_coin_signals(symbol: str, closes: list, volumes: list):
             # 5m-veto cache (5m_ts loss forced a REST refetch every scan).
             prev  = _signal_cache.get(symbol, {})  # re-read under the write lock
             entry = dict(prev)
-            entry.update({
+            _upd = {
                 "signals":  signals,
                 "score":    score,
                 "price":    closes[-1],
@@ -2766,7 +3268,15 @@ def update_coin_signals(symbol: str, closes: list, volumes: list):
                 "bb_ok":    prev.get("bb_ok",  False),  # preserved from last REST scan
                 "5m_ok":    prev.get("5m_ok",  False),  # preserved from last REST scan
                 "ts":       time.time(),
-            })
+            }
+            # §3.1d — entry signals are owned by the 5m path (see
+            # _rebuild_full_entry); this thin-buffer fallback also only
+            # refreshes price/ts once a 5m evaluation exists.
+            if (not _entries_cfg()["tick_entries"]) and prev.get("entry_ts_5m"):
+                _upd.pop("signals", None)
+                _upd.pop("score",   None)
+                _upd.pop("rsi_val", None)
+            entry.update(_upd)
             # Append the newly closed candle to klines_1m so R1/M4 keep seeing
             # fresh data between REST scans (cap at 60 — more than the engine
             # needs). Skip the append when the REST scan already recorded it.
@@ -2795,6 +3305,260 @@ def update_coin_signals(symbol: str, closes: list, volumes: list):
             _signal_cache[symbol] = entry
     except Exception as e:
         print(f"[TradeEngine] Signal cache error {symbol}: {e}")
+
+
+# ── Phase 3 §3.1 — entry evaluation on 5m closes ─────────────────────────────
+# Entries no longer arm/fire per tick: on each symbol's 5m kline CLOSE the
+# ENTRY signal fields are rebuilt from the 5m buffer and a buy check runs for
+# that moment; between closes a small heartbeat only re-checks VETO conditions
+# (spread, regime, cooldowns…) so an armed setup can enter when a veto clears.
+# Expected trade rate drops to ~3-15/day BY DESIGN (was: tick-driven).
+
+def _evaluate_signals_at_close(candles: list) -> dict:
+    """Six signal booleans evaluated on the LAST candle of `candles`, which
+    must all be CLOSED candles (the ws_candles_5m buffer only holds closed
+    ones). This is the [-1] twin of evaluate_signals (which assumes an
+    in-progress candle on top and evaluates [-2]) and matches
+    backtest._build_signal_data's closed-candle convention."""
+    if not candles or len(candles) < 3:
+        return {"trend": False, "rsi": False, "macd": False,
+                "volume": False, "obv": False, "atr": False}
+    closes  = [c["close"]  for c in candles]
+    volumes = [c["volume"] for c in candles]
+    ema9        = indicators.calc_ema(closes, 9)
+    ema21       = indicators.calc_ema(closes, 21)
+    rsi_vals    = indicators.calc_rsi(closes, 14)
+    _, _, histo = indicators.calc_macd(closes)
+    vol_ma      = indicators.calc_volume_ma(volumes, 20)
+    trend = bool(ema9[-1] is not None and ema21[-1] is not None
+                 and ema9[-1] > ema21[-1])
+    rsi = bool(rsi_vals[-1] is not None
+               and config.RSI_BUY_MIN <= rsi_vals[-1] <= config.RSI_BUY_MAX)
+    macd = bool(len(histo) >= 2 and histo[-1] is not None and histo[-2] is not None
+                and histo[-1] > 0 and histo[-1] > histo[-2])
+    volume = bool(vol_ma[-1] is not None and vol_ma[-1] > 0
+                  and volumes[-1] >= vol_ma[-1] * config.VOLUME_RATIO_MIN)
+    obv = indicators.obv_is_bullish(candles)
+    atr = indicators.atr_is_tradeable(
+        indicators.calc_atr(candles, config.ATR_PERIOD),
+        closes[-1], config.ATR_MIN_PCT, config.ATR_MAX_PCT)
+    return {"trend": trend, "rsi": rsi, "macd": macd,
+            "volume": volume, "obv": obv, "atr": atr}
+
+
+def bb_position_5m_from_closes(closes: list) -> Optional[str]:
+    """§3.1 bb_position_5m for the P2 veto: 'above_upper' | 'at_upper' |
+    'inside' from 5m closes (BB 20/2 on the last closed candle). None when
+    the band can't be computed (P2 fails open on None)."""
+    try:
+        if not closes or len(closes) < 20:
+            return None
+        bb_u, bb_m, bb_l = indicators.calc_bollinger(closes)
+        upper, lower = bb_u[-1], bb_l[-1]
+        if upper is None or lower is None:
+            return None
+        px = closes[-1]
+        if px > upper:
+            return "above_upper"
+        band = upper - lower
+        if band > 0 and px >= upper - 0.01 * band:
+            return "at_upper"
+        return "inside"
+    except Exception:
+        return None
+
+
+_EMA50_15M_MIN_CANDLES = 55   # EMA50 over 15m needs >=55 candles to be meaningful
+
+
+def _ema50_15m_slope_for(symbol: str, candles_5m: list) -> Optional[float]:
+    """§3.1 ema50_15m_slope: EMA50 over the 15m series, slope as the % change
+    of EMA50 across the last two 15m candles (>0 = rising, feeds T2).
+
+    15m series = 5m buffer aggregated 3→1; when that yields <55 candles (the
+    60×5m buffer only covers 5h = 20 15m candles) bootstrap from stored 1m DB
+    history via indicators.aggregate_candles(group=15). Returns None when no
+    source reaches 55 15m candles (T2 then reports no_data and doesn't fire)."""
+    series_15m: list = []
+    try:
+        if candles_5m:
+            series_15m = indicators.aggregate_candles(list(candles_5m), group=3)
+    except Exception:
+        series_15m = []
+    if len(series_15m) < _EMA50_15M_MIN_CANDLES:
+        try:
+            rows = database.get_candles(symbol, config.CANDLE_TIMEFRAME,
+                                        limit=15 * (_EMA50_15M_MIN_CANDLES + 5))
+            c1 = [c for c in (_row_to_candle(r) for r in (rows or [])) if c is not None]
+            if c1:
+                derived = indicators.aggregate_candles(c1, group=15)
+                if len(derived) > len(series_15m):
+                    series_15m = derived
+        except Exception:
+            pass
+    if len(series_15m) < _EMA50_15M_MIN_CANDLES:
+        return None
+    try:
+        closes_15m = [c["close"] for c in series_15m]
+        ema50 = indicators.calc_ema(closes_15m, 50)
+        if len(ema50) < 2 or ema50[-1] is None or ema50[-2] is None or ema50[-2] == 0:
+            return None
+        return round((ema50[-1] - ema50[-2]) / ema50[-2] * 100.0, 6)
+    except Exception:
+        return None
+
+
+_entry_mode_logged: str = ""      # last logged entry-timing mode ("" = never)
+
+
+def _log_entry_timing_mode_once() -> None:
+    """Log the §3.1 entry-timing mode once at startup (and again only if the
+    tick_entries escape hatch is flipped at runtime)."""
+    global _entry_mode_logged
+    try:
+        mode = "tick (legacy)" if _entries_cfg()["tick_entries"] else "5m-close"
+    except Exception:
+        mode = "5m-close"
+    if mode == _entry_mode_logged:
+        return
+    _entry_mode_logged = mode
+    hb = _entries_cfg().get("eval_heartbeat_sec", 15)
+    msg = (f"Entry timing mode: {mode} — entry signals refresh on 5m kline closes; "
+           f"{hb:.0f}s heartbeat re-checks vetoes only. Expected trade rate "
+           f"~3-15/day by design."
+           if mode == "5m-close" else
+           "Entry timing mode: tick (legacy escape hatch entries.tick_entries=true) "
+           "— per-tick buy dispatch restored.")
+    print(f"[TradeEngine] {msg}")
+    try:
+        database.log_activity(msg, "info")
+    except Exception:
+        pass
+
+
+def _dispatch_buy_check(prices_snapshot: Dict[str, float]) -> None:
+    """Single-flight dispatch of _check_buys_from_cache to the buy-check
+    executor (same guard realtime_monitor used per tick). Shared by the 5m
+    close path, the veto heartbeat, and the legacy tick path."""
+    global _buy_check_in_flight
+    with _buy_check_lock:
+        if _buy_check_in_flight:
+            return
+        _buy_check_in_flight = True
+
+    def _run_buy_check():
+        global _buy_check_in_flight
+        try:
+            _check_buys_from_cache(prices_snapshot)
+        finally:
+            with _buy_check_lock:
+                _buy_check_in_flight = False
+
+    _buy_check_executor.submit(_run_buy_check)
+
+
+def on_kline5m_close(symbol: str, closed_row: list, buf_snapshot: list) -> None:
+    """§3.1b — per-symbol 5m kline-close handler (worker thread; wired via
+    data_collector.register_kline5m_callback).
+
+    Rebuilds the symbol's ENTRY signal fields from the 5m buffer:
+      * six signal booleans (trend/macd/volume/obv/atr + rsi bool) on 5m closes
+      * rsi_val + stoch_rsi_val on 5m closes
+      * klines_5m (last ~30 candles)                      → R1/M4 prefer these
+      * ema50_15m_slope (5m→15m aggregate, EMA50, §3.1)   → T2
+      * bb_position_5m (above_upper/at_upper/inside)      → P2 veto
+      * atr_pct (Phase 2 §2.1 ATR ladder)                 → sizing/knife/registry
+      * btc_regime (§3.3 3-state, 60 s cache)             → REGIME veto
+    Everything is merged into the existing _signal_cache entry (keys owned by
+    other paths — bb_ok, 5m_ok, low_24h, klines_1m — are preserved), then a
+    buy check is triggered for this moment (single-flight)."""
+    try:
+        _log_entry_timing_mode_once()
+        candles_5m = [c for c in (_row_to_candle(r) for r in (buf_snapshot or []))
+                      if c is not None]
+        if len(candles_5m) < 3:
+            return
+        closes_5m = [c["close"] for c in candles_5m]
+        signals = _evaluate_signals_at_close(candles_5m)
+        score = sum(signals.values())
+        rsi_list = indicators.calc_rsi(closes_5m, 14)
+        rsi_display = rsi_list[-1] if rsi_list and rsi_list[-1] is not None else 0.0
+        try:
+            stoch_rsi_val = indicators.calc_stoch_rsi(closes_5m)
+        except Exception:
+            stoch_rsi_val = None
+        bb_pos_5m = bb_position_5m_from_closes(closes_5m)
+        ema_slope = _ema50_15m_slope_for(symbol, candles_5m)
+        px = closes_5m[-1]
+        atr_pct, _atr_src = _atr_pct_5m_at_entry(symbol, px)
+        try:
+            btc_regime = get_btc_regime()
+        except Exception:
+            btc_regime = None
+
+        with _signal_cache_lock:
+            entry = dict(_signal_cache.get(symbol, {}))
+            entry.update({
+                "signals":         signals,
+                "score":           score,
+                "price":           px,
+                "rsi_val":         rsi_display,
+                "stoch_rsi_val":   stoch_rsi_val,
+                "klines_5m":       [dict(c) for c in candles_5m[-30:]],
+                "ema50_15m_slope": ema_slope,
+                "bb_position_5m":  bb_pos_5m,
+                "atr_pct":         round(atr_pct, 6) if atr_pct else None,
+                "btc_regime":      btc_regime,
+                "entry_ts_5m":     time.time(),
+                "ts":              time.time(),
+            })
+            _signal_cache[symbol] = entry
+        _signal_scanner_health["last_event_refresh_ts"] = time.time()
+
+        # §3.1c(i) — the 5m close IS the entry moment: trigger a buy check now.
+        if not _entries_cfg()["tick_entries"]:
+            try:
+                import data_collector as _dc_5c
+                _dispatch_buy_check(dict(_dc_5c.prices))
+            except Exception:
+                _dispatch_buy_check({})
+    except Exception as e:
+        print(f"[TradeEngine] 5m entry rebuild error {symbol}: {e}")
+
+
+# §3.1c(ii) — veto-only heartbeat: every entries.eval_heartbeat_sec (default
+# 15 s) re-run the buy check so an armed setup (5m signals already passing)
+# can enter the moment a VETO clears (spread narrows, regime flips back,
+# cooldown expires). Entry SIGNALS themselves refresh ONLY on 5m closes —
+# _check_buys_from_cache reads the cache, it never recomputes signals.
+_entry_heartbeat_thread: Optional[threading.Thread] = None
+
+
+def _entry_heartbeat_loop() -> None:
+    _log_entry_timing_mode_once()
+    while True:
+        try:
+            cfg = _entries_cfg()
+            interval = max(1.0, float(cfg.get("eval_heartbeat_sec", 15.0)))
+            if not cfg["tick_entries"]:   # tick mode has its own dispatch path
+                try:
+                    import data_collector as _dc_hb
+                    _dispatch_buy_check(dict(_dc_hb.prices))
+                except Exception:
+                    pass
+        except Exception:
+            interval = 15.0
+        time.sleep(interval)
+
+
+def start_entry_heartbeat() -> None:
+    """Start (or restart) the §3.1 veto-recheck heartbeat thread."""
+    global _entry_heartbeat_thread
+    if _entry_heartbeat_thread is not None and _entry_heartbeat_thread.is_alive():
+        return
+    _entry_heartbeat_thread = threading.Thread(
+        target=_entry_heartbeat_loop, name="entry-heartbeat", daemon=True)
+    _entry_heartbeat_thread.start()
 
 
 # ── Shared sell execution (used by both realtime_monitor and signal_scanner) ──
@@ -3442,6 +4206,17 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     _rebuild_pos_index()
     _pos_peaks.pop(sym, None)
 
+    # ── §3.4b/§3.4c — stop-out protections ───────────────────────────────────
+    # Stop-loss family exits (stop-loss / hard-stop-loss / oco-sl, i.e. exit
+    # label sl|hard_sl) set the per-symbol cooldown_after_sl_min re-entry
+    # cooldown AND count toward the global correlated-dump pause. Other losing
+    # exits keep their existing behavior (e.g. slippage-loss 30-min cooldown).
+    try:
+        if _exit_label_for(reason) in ("sl", "hard_sl"):
+            _record_stop_out(sym, reason)
+    except Exception:
+        pass
+
     try:
         import supabase_sync
         # Paper mode: read balance from memory (instant, no network call).
@@ -3512,6 +4287,20 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         if _now_p - _last_paused_log >= 60.0:
             _last_paused_log = _now_p
             database.log_activity("Buy check: trading_active=False — bot is paused", "warn")
+        return
+
+    # ── §3.4c global correlated-dump pause: >=3 stop-outs in 10 min → ALL
+    # entries paused for 5 min. Exits are unaffected.
+    if _global_stop_pause_active():
+        global _last_stop_pause_log_ts
+        _now_gp = time.time()
+        if _now_gp - _last_stop_pause_log_ts >= 60.0:
+            _last_stop_pause_log_ts = _now_gp
+            _rem_gp = int(_global_stop_pause_until - _now_gp)
+            database.log_activity(
+                f"Buy check: global_stop_pause active ({_rem_gp}s remaining) — "
+                f"all entries paused after correlated stop-outs", "warn")
+            _record_rejection("(all)", 0, "global_stop_pause", f"{_rem_gp}s remaining")
         return
 
     # Fast pre-check: any coin signalling BUY? (no lock needed for scalar read)
@@ -3721,6 +4510,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 "low_24h":        cached.get("low_24h"),
                 "klines_1m":      cached.get("klines_1m", []),
                 "stoch_rsi_value": cached.get("stoch_rsi_val"),
+                # Phase 3 §3.1/§3.3 fields (populated on 5m closes; the
+                # regime is read live — 60 s cache — so the REGIME veto
+                # reacts within a minute of BTC flipping risk_off)
+                "klines_5m":       cached.get("klines_5m", []),
+                "ema50_15m_slope": cached.get("ema50_15m_slope"),
+                "bb_position_5m":  cached.get("bb_position_5m"),
+                "atr_pct":         cached.get("atr_pct"),
+                "btc_regime":      get_btc_regime(),
             }
             _dec = _sr_evaluate_buy_decision(sym, _sig_data, strategy)
             _buy_decision = _dec
@@ -3788,10 +4585,12 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         if time.time() - _last_buy_ts < _BUY_STAGGER_SEC:
             continue  # this slot too soon — try next coin in case it's been longer
 
-        # ── Falling knife filter ───────────────────────────────────────────────
-        # Block buys when price has dropped >0.4% in the last 3 minutes of samples.
-        # Prevents buying mid-crash where "RSI oversold" triggers but momentum is
-        # still strongly negative.
+        # ── Falling knife filter (§3.4a — volatility-scaled) ──────────────────
+        # Block buys when price has dropped more than
+        # entries.falling_knife_atr_mult × atr_pct (5m ATR%, Phase 2 ladder)
+        # over the last ~3 minutes of samples — a fixed 0.4% was too tight for
+        # volatile coins and too loose for quiet ones. When ATR is unavailable
+        # fall back to the old fixed 0.4% threshold.
         try:
             import data_collector as _dc_fk
             recent_closes = list(_dc_fk.price_samples.get(sym, []))
@@ -3799,10 +4598,21 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 price_now     = recent_closes[-1]
                 price_3min    = recent_closes[-180]
                 pct_3min      = (price_now - price_3min) / price_3min * 100 if price_3min > 0 else 0
-                if pct_3min < -0.4:
-                    _record_rejection(sym, score, "falling_knife", f"{pct_3min:.2f}% in 3min")
+                _fk_atr = cached.get("atr_pct")
+                if _fk_atr is None:
+                    _fk_atr, _ = _atr_pct_5m_at_entry(sym, price_now)
+                if _fk_atr and _fk_atr > 0:
+                    _knife_thr = _entries_cfg()["falling_knife_atr_mult"] * float(_fk_atr)
+                    _knife_src = f"atr_mult({_fk_atr:.3f}%×{_entries_cfg()['falling_knife_atr_mult']})"
+                else:
+                    _knife_thr = 0.4   # ATR unavailable → legacy fixed threshold
+                    _knife_src = "fixed_0.4"
+                if pct_3min < -_knife_thr:
+                    _record_rejection(sym, score, "falling_knife",
+                                      f"{pct_3min:.2f}% in 3min (thr={_knife_thr:.2f}% {_knife_src})")
                     database.log_activity(
-                        f"[SKIP] {sym}: falling knife — down {pct_3min:.2f}% in 3min | "
+                        f"[SKIP] {sym}: falling knife — down {pct_3min:.2f}% in 3min "
+                        f"(threshold {_knife_thr:.2f}%, {_knife_src}) | "
                         f"{sig_str} | SKIP(downward momentum)", "info"
                     )
                     continue
@@ -3856,6 +4666,11 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     sym, f"shadow_eval_failed:{type(_shadow_exc).__name__}",
                     f"Shadow eval failed for {sym}: {_shadow_exc}",
                 )
+
+        # §3.6 — advisory only: gates/blockers are unaffected; the watchlist
+        # owns symbol choice (full auto-switching would change the traded
+        # universe — out of scope, documented on _maybe_log_promo_pair).
+        _maybe_log_promo_pair(sym)
 
         budget = get_budget_for_coin(sym, usdt_balance)
         if budget <= 0:
@@ -3995,6 +4810,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         "low_24h":         cached.get("low_24h"),
                         "klines_1m":       _fresh_candles[-15:],
                         "stoch_rsi_value": _fresh_stoch,
+                        # Phase 3 fields — carried from the 5m-close cache
+                        # (their cadence IS 5m; a 1m fresh re-check cannot
+                        # produce fresher values for them)
+                        "klines_5m":       cached.get("klines_5m", []),
+                        "ema50_15m_slope": cached.get("ema50_15m_slope"),
+                        "bb_position_5m":  cached.get("bb_position_5m"),
+                        "atr_pct":         cached.get("atr_pct"),
+                        "btc_regime":      get_btc_regime(),
                     }
                     _fresh_dec = _sr_evaluate_buy_decision(sym, _fresh_data, strategy)
                     if not _fresh_dec["allowed"]:
@@ -4045,11 +4868,48 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 _release_buy_claim()
                 continue
 
+        # §3.5 — maker-first live entries. Paper mode (and live-on-paper-
+        # fallback, which _market_buy blocks anyway) keeps the existing
+        # simulated market-buy path unchanged — paper maker simulation is
+        # out of scope.
+        _entry_is_maker = False
+        _use_maker_first = (
+            mode == "live"
+            and _entries_cfg()["maker_first"]
+            and not connection.is_using_paper_fallback()
+        )
         try:
-            _log_order_intent("BUY", sym, budget / max(price, 1e-12), price)
-            # Live mode: geo-block-safe direct transport; raises in paper fallback.
-            result = _market_buy(sym, budget)
-            _log_order_result("BUY", sym, budget / max(price, 1e-12), price, result)
+            if _use_maker_first:
+                _mfr = _execute_maker_first_buy(
+                    sym, budget,
+                    # Quick re-check of the cached engine decision: the chase
+                    # can run (chase_seconds × posts) seconds — only take the
+                    # taker fallback when the approval that got us here still
+                    # stands and the cache isn't ancient.
+                    signal_still_holds=lambda: (
+                        bool(_buy_decision.get("allowed", True))
+                        and (time.time() - cached.get("ts", 0)) < 300.0
+                    ),
+                )
+                if _mfr is None:
+                    _record_rejection(sym, score, "maker_chase_abandoned",
+                                      f"chase={_entries_cfg()['chase_seconds']}s "
+                                      f"reposts={_entries_cfg()['max_reposts']}")
+                    _release_buy_claim()
+                    continue
+                fill_price      = _mfr["fill_price"]
+                qty             = _mfr["qty"]
+                buy_fee_usdt    = _mfr["buy_fee_usdt"]
+                _entry_is_maker = bool(_mfr["entry_is_maker"])
+                # Partial fills spend less than the requested budget — account
+                # for what was actually deployed, not what was asked for.
+                if _mfr.get("spent_quote", 0) > 0:
+                    budget = float(_mfr["spent_quote"])
+            else:
+                _log_order_intent("BUY", sym, budget / max(price, 1e-12), price)
+                # Live mode: geo-block-safe direct transport; raises in paper fallback.
+                result = _market_buy(sym, budget)
+                _log_order_result("BUY", sym, budget / max(price, 1e-12), price, result)
         except Exception as e:
             _release_buy_claim()
             err_str = str(e)
@@ -4060,39 +4920,42 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 database.log_activity(f"{sym}: blacklisted — market closed/delisted on Binance", "warn")
             continue
 
-        buy_fills  = result.get("fills", [])
-        _exec_qty  = float(result.get("executedQty", 0) or 0)
-        _cum_quote = float(result.get("cummulativeQuoteQty", 0) or 0)
-        # Entry price = VWAP across ALL fills (cummulativeQuoteQty / executedQty).
-        # fills[0] is only the best-priced tranche — using it understates the true
-        # average cost on multi-fill market buys and corrupts breakeven math.
-        if _exec_qty > 0 and _cum_quote > 0:
-            fill_price = _cum_quote / _exec_qty
-        elif buy_fills:
-            fill_price = float(buy_fills[0].get("price", price))
-        else:
-            fill_price = price
-        # Subtract base-asset commission from executedQty: without the BNB fee
-        # discount Binance takes the fee in the bought coin, so the wallet is
-        # credited executedQty − Σcommission. Recording the gross qty causes
-        # -2010 "insufficient balance" on the eventual sell.
-        _base_asset = sym[:-4] if sym.endswith("USDT") else sym
-        _base_commission = sum(
-            float(f.get("commission") or 0) for f in buy_fills
-            if f.get("commissionAsset") == _base_asset
-        )
-        qty = max(0.0, _exec_qty - _base_commission)
+        if not _use_maker_first:
+            buy_fills  = result.get("fills", [])
+            _exec_qty  = float(result.get("executedQty", 0) or 0)
+            _cum_quote = float(result.get("cummulativeQuoteQty", 0) or 0)
+            # Entry price = VWAP across ALL fills (cummulativeQuoteQty / executedQty).
+            # fills[0] is only the best-priced tranche — using it understates the true
+            # average cost on multi-fill market buys and corrupts breakeven math.
+            if _exec_qty > 0 and _cum_quote > 0:
+                fill_price = _cum_quote / _exec_qty
+            elif buy_fills:
+                fill_price = float(buy_fills[0].get("price", price))
+            else:
+                fill_price = price
+            # Subtract base-asset commission from executedQty: without the BNB fee
+            # discount Binance takes the fee in the bought coin, so the wallet is
+            # credited executedQty − Σcommission. Recording the gross qty causes
+            # -2010 "insufficient balance" on the eventual sell.
+            _base_asset = sym[:-4] if sym.endswith("USDT") else sym
+            _base_commission = sum(
+                float(f.get("commission") or 0) for f in buy_fills
+                if f.get("commissionAsset") == _base_asset
+            )
+            qty = max(0.0, _exec_qty - _base_commission)
+
         if qty <= 0:
             _release_buy_claim()
             continue
 
-        # Compute actual buy fee in USDT across all fills.
-        # In live BNB-fee mode, commission is in BNB — convert using live price.
-        # Stored on the position so _do_execute_sell can use the real value.
-        if mode == "live":
-            buy_fee_usdt, _ = _fills_fee_usdt(buy_fills, budget * _fee_rate_for(sym))
-        else:
-            buy_fee_usdt = budget * _fee_rate_for(sym)
+        if not _use_maker_first:
+            # Compute actual buy fee in USDT across all fills.
+            # In live BNB-fee mode, commission is in BNB — convert using live price.
+            # Stored on the position so _do_execute_sell can use the real value.
+            if mode == "live":
+                buy_fee_usdt, _ = _fills_fee_usdt(buy_fills, budget * _fee_rate_for(sym))
+            else:
+                buy_fee_usdt = budget * _fee_rate_for(sym)
 
         # Gather entry indicators from latest DB candle
         entry_rsi = entry_ma = entry_bb = entry_vol = None
@@ -4125,6 +4988,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             # database.log_trade), so persisting it would need a schema
             # migration. save_position ignores unknown keys — safe to carry.
             "origin":             "auto",
+            # §3.5 — True when the entry filled as a LIMIT_MAKER (maker fee);
+            # False for taker market buys and paper fills. Snapshots / fee
+            # analytics can use it later (FeeModel.round_trip entry leg).
+            "entry_is_maker":     _entry_is_maker,
             "exit_target":        exit_target,
             "breakeven_mult_at_buy": round(_bep_mult_buy, 8),
             "quantity":           qty,
@@ -4520,24 +5387,15 @@ def realtime_monitor(prices: Dict[str, float]):
             _tick_signal_ts[sym] = now
             _inline_refresh_from_ticks(sym, price)
 
-    # ── Real-time buy check — dispatched to background thread, never blocks event loop ──
-    # _check_buys_from_cache calls _get_usdt_balance() (blocking Binance REST in live
-    # mode). Running it inline here would stall sell-trigger detection during WS reconnect
-    # bursts. If a check is already in flight we skip — the in-flight check covers the same
-    # coins, and during reconnect storms we'd otherwise queue 50 redundant REST calls.
-    global _buy_check_in_flight
-    with _buy_check_lock:
-        if not _buy_check_in_flight:
-            _buy_check_in_flight = True
-            _prices_snap = dict(prices)
-            def _run_buy_check():
-                global _buy_check_in_flight
-                try:
-                    _check_buys_from_cache(_prices_snap)
-                finally:
-                    with _buy_check_lock:
-                        _buy_check_in_flight = False
-            _buy_check_executor.submit(_run_buy_check)
+    # ── Buy check dispatch — §3.1c: ticks NO LONGER trigger buy checks. ──────
+    # Entry evaluation moved to 5m kline closes (on_kline5m_close) plus the
+    # veto-recheck heartbeat (entries.eval_heartbeat_sec). Exits above keep
+    # running on every tick (plus the 0.25 s sell-monitor loop) — untouched.
+    # Legacy escape hatch: entries.tick_entries=true restores the old
+    # per-tick dispatch (single-flight, background thread, same as before).
+    _log_entry_timing_mode_once()
+    if _entries_cfg()["tick_entries"]:
+        _dispatch_buy_check(dict(prices))
 
 
 # ── Sell monitor — daemon thread, independent of asyncio ─────────────────────
@@ -5835,6 +6693,11 @@ async def position_guardian():
     """
     global _sell_monitor_thread, _price_refresher_thread, _held_refresher_thread
     while True:
+        # §3.1c(ii) — veto-recheck heartbeat (restarted here if it ever dies).
+        try:
+            start_entry_heartbeat()
+        except Exception:
+            pass
         if not (_sell_monitor_thread and _sell_monitor_thread.is_alive()):
             _sell_monitor_thread = threading.Thread(
                 target=_sell_monitor_loop, name="sell-monitor", daemon=True
@@ -6359,3 +7222,15 @@ async def _refresh_signal_cache_locked():
         f"{ready} at score≥{config.MIN_SIGNALS_TO_BUY}{_abort_note}",
         "info",
     )
+
+# ── Phase 3 §3.1 — wire the 5m kline-close callback ──────────────────────────
+# Registered at import time (control_api imports this module during startup,
+# before the WebSocket feed launches) so no control_api change is needed.
+# data_collector also falls back to on_kline5m_close via a guarded import if
+# this registration never ran (e.g. direct data_collector usage in tests).
+try:
+    import data_collector as _dc_reg5m
+    if hasattr(_dc_reg5m, "register_kline5m_callback"):
+        _dc_reg5m.register_kline5m_callback(on_kline5m_close)
+except Exception:
+    pass
