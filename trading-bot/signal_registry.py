@@ -216,9 +216,36 @@ def _signal_obv(symbol: str, data: dict, strategy: dict) -> Tuple[bool, Any]:
 
 
 def _signal_atr(symbol: str, data: dict, strategy: dict) -> Tuple[bool, Any]:
-    """X1: ATR within tradeable range."""
+    """X1: ATR within tradeable range.
+
+    NOTE (v0.4 F3): This raw signal is TRUE when ATR is tradeable and fires
+    ~99.9% of the time, so it discriminates nothing as a scored signal — it was
+    a "free point" inflating scores on trendless tape. Per spec §3.2 it is no
+    longer in the scored default set (DEFAULT role → 'off'). Its useful
+    information (is volatility outside the tradeable band?) is captured instead
+    by the X1_atr_untradeable VETO below, which BLOCKS when ATR is not tradeable
+    (too low = dead tape, too high = chaos). The raw signal stays registered so
+    persisted roles maps that still reference 'X1_atr_sufficient' resolve.
+    """
     fired = bool(data.get("atr", False))
     return fired, fired
+
+
+def _signal_atr_untradeable(symbol: str, data: dict, strategy: dict) -> Tuple[bool, Any]:
+    """X1 VETO: fires (BLOCKS) when ATR is OUTSIDE the tradeable range.
+
+    Inverted semantics vs the raw X1 signal: X1's compute returns True when ATR
+    IS tradeable, so this veto fires when NOT tradeable — i.e. volatility is too
+    low (dead) or too high (chaotic) to trade. FAIL-OPEN: if the tradeability
+    flag is missing/None the veto cannot evaluate and must NOT fire, so a missing
+    'atr' key never blocks an entry.
+    """
+    atr_tradeable = data.get("atr")
+    if atr_tradeable is None:
+        return False, "no_data"
+    tradeable = bool(atr_tradeable)
+    # Veto fires (block) when NOT tradeable.
+    return (not tradeable), ("tradeable" if tradeable else "untradeable")
 
 
 register_signal(SignalDef("T1_ema_short_long",      "trend",       "EMA9 > EMA21 on 1h (short-term uptrend)",           _signal_ema_trend))
@@ -227,6 +254,12 @@ register_signal(SignalDef("M3_macd_rising",          "momentum",    "MACD histog
 register_signal(SignalDef("V1_volume_above_average", "volume",      "Current volume > recent average",                    _signal_volume))
 register_signal(SignalDef("V2_obv_rising",           "volume",      "OBV rising (accumulation pressure)",                 _signal_obv))
 register_signal(SignalDef("X1_atr_sufficient",       "volatility",  "ATR within tradeable range",                         _signal_atr))
+register_signal(SignalDef(
+    "X1_atr_untradeable",
+    "volatility",
+    "VETO: ATR outside tradeable range (too low = dead, too high = chaos)",
+    _signal_atr_untradeable,
+))
 
 
 # ── Phase 2: 5 new signals ────────────────────────────────────────────────────
@@ -545,10 +578,20 @@ register_signal(SignalDef(
 
 # ── Default signal_engine config (used when block absent in strategy.json) ───
 
-# v0.4 §3.2 starting set: T1 remains the single mandatory trend gate; T2 joins
-# the scored pool as higher-timeframe context; P2 (5m BB upper touch) and
-# REGIME (BTC risk_off) join E1 as vetoes; min_scored raised 2 → 3.
-# M1/M2/M5/P1/TM1 stay registered but default-off (measure first).
+# v0.4 §3.2 / F3 starting set:
+#   • T1_ema_short_long is the single MANDATORY trend gate (restored — F3 found
+#     it had drifted to 'scored' and fired only ~5.8%, so entries needed no
+#     trend and the bot bought trendless tape). It is now a hard gate again.
+#   • SCORED = the 5 "real" discriminating signals {M3, V1, V2, M4, R1} plus
+#     T2_ema50_15m_slope (15m EMA50 slope) as a genuine higher-timeframe
+#     trend-confirm that helps offset X1 leaving the scored pool. min_scored 3.
+#   • X1_atr_sufficient is REMOVED from scored (F3: fired ~99.9% → discriminated
+#     nothing, a free point). Its information is now a VETO (X1_atr_untradeable)
+#     that BLOCKS when ATR is outside the tradeable band. The raw X1 signal keeps
+#     DEFAULT role 'off'.
+#   • VETOES = E1 (spread), P2 (5m BB upper touch), REGIME (BTC risk_off),
+#     X1_atr_untradeable (ATR untradeable).
+#   • M1/M2/M5/P1/TM1 stay registered but default-off (measure first).
 DEFAULT_SIGNAL_ENGINE: Dict[str, Any] = {
     "enabled": True,
     "mandatory_signals": ["T1_ema_short_long"],
@@ -558,7 +601,6 @@ DEFAULT_SIGNAL_ENGINE: Dict[str, Any] = {
         "V2_obv_rising",
         "M4_micro_pullback",
         "R1_reversal_confirmed",
-        "X1_atr_sufficient",
         "T2_ema50_15m_slope",
     ],
     "min_scored": 3,
@@ -566,6 +608,7 @@ DEFAULT_SIGNAL_ENGINE: Dict[str, Any] = {
         "E1_spread_too_wide",
         "P2_bb_upper_touch_5m",
         "REGIME_risk_off",
+        "X1_atr_untradeable",
     ],
 }
 
