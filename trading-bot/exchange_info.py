@@ -13,7 +13,7 @@ _exchange_info_cache = {
     "symbol_filters": {},
 }
 _exchange_info_lock = Lock()
-_EXCHANGE_INFO_TTL_SEC = 3600
+_EXCHANGE_INFO_TTL_SEC = 86400  # 24h — exchangeInfo is weight 20 (addendum 6.4); the -1013 error path already forces a refresh on symbol errors
 
 
 def _fetch_exchange_info():

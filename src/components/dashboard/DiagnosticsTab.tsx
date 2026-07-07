@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { toast } from 'sonner';
+import { DataHealthPanel } from './DataHealthPanel';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -946,7 +947,10 @@ function PhantomAlerts({ baseUrl }: { baseUrl: string }) {
 export function DiagnosticsTab({ baseUrl = '' }: { baseUrl?: string }) {
   return (
     <div className="space-y-4">
-      <ThreadHealth baseUrl={baseUrl} />
+      <DataHealthPanel baseUrl={baseUrl} />
+      <div className="border-t border-border/50 pt-3">
+        <ThreadHealth baseUrl={baseUrl} />
+      </div>
       <div className="border-t border-border/50 pt-3">
         <AlertsBanner baseUrl={baseUrl} />
       </div>

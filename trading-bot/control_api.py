@@ -2587,6 +2587,264 @@ async def api_proxy_binance(path: str, request: Request):
         return Response(content=json.dumps({"error": str(e)}), status_code=502, media_type="application/json")
 
 
+# ── Part C §6.5: Data-health panel (GET /api/health/data) ───────────────────
+# All three sources are wired DEFENSIVELY: the getter functions are being added
+# by parallel work (data_collector.get_data_health, binance_limits.get_limits_health,
+# trade_engine.get_engine_health). Until they land — or if any of them ever
+# raises — the corresponding section degrades to {"available": false} and the
+# endpoint keeps serving 200s.
+
+# Module state for the "scan_skipped_overlap grew in the last 10 min" red rule.
+_scan_skip_track = {
+    "value": None,      # last observed scan_skipped_overlap counter
+    "ts": 0.0,          # when it was observed
+    "grew_ts": 0.0,     # last time we saw the counter increase
+    "grew_from": None,
+    "grew_to": None,
+}
+_scan_skip_lock = threading.Lock()
+_SCAN_SKIP_RED_WINDOW_SEC = 600.0  # 10 minutes
+
+
+def _health_num(v):
+    """Best-effort float conversion; returns None instead of raising."""
+    try:
+        if v is None or isinstance(v, bool):
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _health_data_section() -> dict:
+    """data_collector.get_data_health() → dict, or {"available": False}."""
+    try:
+        import data_collector as _dc
+        fn = getattr(_dc, "get_data_health", None)
+        if not callable(fn):
+            return {"available": False}
+        raw = fn()
+        if not isinstance(raw, dict):
+            return {"available": False}
+        out = dict(raw)
+        out["available"] = True
+        return out
+    except Exception:
+        return {"available": False}
+
+
+def _health_limits_section() -> dict:
+    """binance_limits.get_limits_health() → dict, or {"available": False}."""
+    try:
+        import binance_limits as _bl
+        fn = getattr(_bl, "get_limits_health", None)
+        if not callable(fn):
+            return {"available": False}
+        raw = fn()
+        if not isinstance(raw, dict):
+            return {"available": False}
+        out = dict(raw)
+        out["available"] = True
+        return out
+    except Exception:
+        return {"available": False}
+
+
+def _health_engine_section() -> dict:
+    """trade_engine.get_engine_health() → dict, or {"available": False}."""
+    try:
+        import trade_engine as _te
+        fn = getattr(_te, "get_engine_health", None)
+        if not callable(fn):
+            return {"available": False}
+        raw = fn()
+        if not isinstance(raw, dict):
+            return {"available": False}
+        out = dict(raw)
+        out["available"] = True
+        return out
+    except Exception:
+        return {"available": False}
+
+
+def _current_scan_skipped_overlap(engine: dict):
+    """scan_skipped_overlap from engine health scanner section, falling back to
+    trade_engine._signal_scanner_health on older engine versions."""
+    try:
+        sc = engine.get("scanner")
+        if isinstance(sc, dict) and "scan_skipped_overlap" in sc:
+            v = _health_num(sc.get("scan_skipped_overlap"))
+            if v is not None:
+                return v
+    except Exception:
+        pass
+    try:
+        import trade_engine as _te
+        ssh = getattr(_te, "_signal_scanner_health", None)
+        if isinstance(ssh, dict):
+            return _health_num(ssh.get("scan_skipped_overlap"))
+    except Exception:
+        pass
+    return None
+
+
+def _compute_health_snapshot() -> dict:
+    """Shared health computation for /api/health/data and /api/diagnostics.
+
+    Returns {"status", "causes", "data", "limits", "engine", "ts"}.
+    causes is EMPTY when green; each tripped red rule contributes one sentence.
+    """
+    now = time.time()
+    data = _health_data_section()
+    limits = _health_limits_section()
+    engine = _health_engine_section()
+
+    causes: list = []
+
+    # RED RULE 1: any active symbol's 1m candle age > 90s
+    try:
+        stale = []
+        for item in (data.get("worst_candle_ages") or []):
+            try:
+                sym, age = item[0], float(item[1])
+            except Exception:
+                continue
+            if age > 90:
+                stale.append((str(sym), age))
+        if stale:
+            worst = ", ".join(f"{s} ({a:.0f}s)" for s, a in stale)
+            causes.append(f"1m candle data is stale (>90s) for: {worst}.")
+    except Exception:
+        pass
+
+    # RED RULE 2: used_weight > 4800
+    try:
+        uw = _health_num(limits.get("used_weight"))
+        if uw is not None and uw > 4800:
+            causes.append(
+                f"Binance REST used weight is {uw:.0f}, above the 4800 red line (limit 6000)."
+            )
+    except Exception:
+        pass
+
+    # RED RULE 3: any held symbol's price age > 5s
+    try:
+        hpa = _health_num(engine.get("held_max_price_age_sec"))
+        if hpa is not None and hpa > 5:
+            held = engine.get("held_symbols") or []
+            held_note = f" across {len(held)} held symbol(s)" if isinstance(held, (list, tuple)) and held else ""
+            causes.append(
+                f"Price feed for held positions is stale: max price age {hpa:.1f}s (>5s){held_note}."
+            )
+    except Exception:
+        pass
+
+    # RED RULE 4: scan_skipped_overlap grew within the last 10 minutes
+    try:
+        skip = _current_scan_skipped_overlap(engine)
+        grew_ts = 0.0
+        grew_from = grew_to = None
+        with _scan_skip_lock:
+            if skip is not None:
+                prev = _scan_skip_track["value"]
+                if prev is not None and skip > prev:
+                    _scan_skip_track["grew_ts"] = now
+                    _scan_skip_track["grew_from"] = prev
+                    _scan_skip_track["grew_to"] = skip
+                _scan_skip_track["value"] = skip
+                _scan_skip_track["ts"] = now
+            grew_ts = _scan_skip_track["grew_ts"]
+            grew_from = _scan_skip_track["grew_from"]
+            grew_to = _scan_skip_track["grew_to"]
+        if grew_ts and (now - grew_ts) <= _SCAN_SKIP_RED_WINDOW_SEC:
+            causes.append(
+                f"Signal scans are overlapping: scan_skipped_overlap grew from "
+                f"{grew_from:.0f} to {grew_to:.0f} within the last 10 minutes."
+            )
+    except Exception:
+        pass
+
+    # RED RULE 5: reconnect_attempts_5min > 30
+    try:
+        rc = _health_num(data.get("reconnect_attempts_5min"))
+        if rc is not None and rc > 30:
+            causes.append(
+                f"WebSocket reconnect storm: {rc:.0f} reconnect attempts in the last 5 minutes (>30)."
+            )
+    except Exception:
+        pass
+
+    # RED RULE 6: banned_until / rest_paused_until in the future
+    try:
+        banned = _health_num(limits.get("banned_until"))
+        if banned and banned > now:
+            causes.append(
+                f"Binance IP ban is active (HTTP 418): {banned - now:.0f}s remaining."
+            )
+        paused = _health_num(limits.get("rest_paused_until"))
+        if paused and paused > now:
+            causes.append(
+                f"REST traffic is paused after rate limiting (HTTP 429): {paused - now:.0f}s remaining."
+            )
+    except Exception:
+        pass
+
+    return {
+        "status": "red" if causes else "green",
+        "causes": causes,
+        "data": data,
+        "limits": limits,
+        "engine": engine,
+        "ts": now,
+    }
+
+
+def _limits_report_line() -> str:
+    """One-line rate-limit state for the plain-text diagnostic report.
+    Covers used weight plus any active 429 pause / 418 ban with remaining seconds."""
+    lim = _health_limits_section()
+    if not lim.get("available"):
+        return "Rate limits: n/a (binance_limits not available)"
+    now = time.time()
+    parts = [f"Rate limits: used_weight={lim.get('used_weight')}"]
+    oc = lim.get("order_count_10s")
+    if oc is not None:
+        parts.append(f"orders_10s={oc}")
+    banned = _health_num(lim.get("banned_until"))
+    if banned and banned > now:
+        parts.append(f"BANNED (418) for {banned - now:.0f}s more")
+    paused = _health_num(lim.get("rest_paused_until"))
+    if paused and paused > now:
+        parts.append(f"REST PAUSED (429) for {paused - now:.0f}s more")
+    half = _health_num(lim.get("half_rate_until"))
+    if half and half > now:
+        parts.append(f"half-rate for {half - now:.0f}s more")
+    last_429 = _health_num(lim.get("last_429_ts"))
+    if last_429:
+        parts.append(f"last 429 {now - last_429:.0f}s ago")
+    last_418 = _health_num(lim.get("last_418_ts"))
+    if last_418:
+        parts.append(f"last 418 {now - last_418:.0f}s ago")
+    return "  ".join(parts)
+
+
+@app.get("/api/health/data")
+def api_health_data():
+    """Part C §6.5 health panel: data feed + rate limits + engine health with RED rules."""
+    try:
+        return _compute_health_snapshot()
+    except Exception as e:
+        # Last-resort backstop — this endpoint must never 500.
+        return {
+            "status": "red",
+            "causes": [f"Health computation failed: {type(e).__name__}: {e}."],
+            "data": {"available": False},
+            "limits": {"available": False},
+            "engine": {"available": False},
+            "ts": time.time(),
+        }
+
+
 @app.get("/api/diagnostics")
 def api_diagnostics():
     """Comprehensive bot health snapshot. Zero extra Binance calls — all data is in-memory."""
@@ -2623,8 +2881,16 @@ def api_diagnostics():
 
     active_threads = [t.name for t in _thr.enumerate() if t.is_alive()]
 
+    # Part C §6.5: compact health verdict (shared computation with /api/health/data)
+    try:
+        _hs = _compute_health_snapshot()
+        _health_compact = {"status": _hs.get("status", "green"), "causes": _hs.get("causes", [])}
+    except Exception:
+        _health_compact = {"status": "green", "causes": []}
+
     return {
         "server_time": now,
+        "health": _health_compact,
         "binance": {
             "rest_ok":            last_rest_age is not None and last_rest_age < 30,
             "last_rest_age_sec":  last_rest_age,
@@ -2855,6 +3121,18 @@ def api_diagnostics_log_text(limit: int = 50, severity: str = ""):
         ]
     except Exception:
         header = ["=== WolfBot Diagnostic Report ==="]
+
+    # Part C §6.5: 429/418 visibility — rate-limit state line (used weight,
+    # active pause/ban with remaining seconds). Defensive: skipped entirely if
+    # binance_limits isn't wired yet.
+    try:
+        _lim_line = _limits_report_line()
+        if header and header[-1].startswith("---"):
+            header.insert(len(header) - 1, _lim_line)
+        else:
+            header.append(_lim_line)
+    except Exception:
+        pass
 
     body = []
     for e in entries:

@@ -6,12 +6,17 @@ realtime_monitor:  Called on every WebSocket trade tick (~100 ms).
                    Buys read from an in-memory signal cache (no I/O per tick).
 
 signal_scanner:    Async coroutine, runs every SCAN_INTERVAL_SEC (60 s).
-                   Only refreshes the signal cache from REST / DB.
+                   ws-first mode (default): poll-based buy backup + DB refresh
+                   for thin-WS-buffer symbols + health stats — NO REST.
+                   legacy mode (strategy data.legacy_rest_scan=true): the old
+                   full REST refresh pass (emergency fallback).
                    Does NOT execute trades — buy execution is in realtime_monitor.
 
 update_coin_signals: Called by data_collector on every 1-minute kline close
-                   (WebSocket-driven). Keeps the signal cache fresh between
-                   REST refreshes.
+                   (WebSocket-driven, runs on a worker thread). C §6.2: rebuilds
+                   the FULL signal-cache entry from the ws_candles buffers —
+                   real-ATR signals, bb_ok, 5m_ok, low_24h, klines_1m,
+                   stoch_rsi_val — merge-preserving keys set by other paths.
 """
 
 import asyncio
@@ -40,6 +45,101 @@ except Exception:
     _thread_health = None
 
 log = logging.getLogger(__name__)
+
+
+# ── C §6.4 — Binance rate-limit accounting (binance_limits module) ────────────
+# Wired DEFENSIVELY: the module may land after this file (parallel delivery),
+# so import lazily and degrade to no-ops when unavailable. can_spend defaults
+# to True (never block trading because accounting is missing).
+_blimits = None
+_blimits_import_failed = False
+
+
+def _get_blimits():
+    global _blimits, _blimits_import_failed
+    if _blimits is None and not _blimits_import_failed:
+        try:
+            import binance_limits as _bl
+            _blimits = _bl
+        except Exception:
+            _blimits_import_failed = True
+    return _blimits
+
+
+def _limits_can_spend(weight: int, critical: bool) -> bool:
+    """Gate a REST call through binance_limits right before issuing it.
+    Prefers spend() (gate + charge the background budget, per that module's
+    contract) and falls back to can_spend(); allows on any failure."""
+    bl = _get_blimits()
+    fn = (getattr(bl, "spend", None) or getattr(bl, "can_spend", None)) if bl else None
+    if fn is None:
+        return True
+    try:
+        return bool(fn(weight, critical=critical))
+    except TypeError:
+        try:
+            return bool(fn(weight, critical))
+        except Exception:
+            return True
+    except Exception:
+        return True
+
+
+def _limits_record_headers(headers: dict) -> None:
+    bl = _get_blimits()
+    fn = getattr(bl, "record_response_headers", None) if bl else None
+    if fn is None or not headers:
+        return
+    try:
+        fn(headers)
+    except Exception:
+        pass
+
+
+def _retry_after_sec(headers: Optional[dict], default: float) -> float:
+    try:
+        for k, v in (headers or {}).items():
+            if str(k).lower() == "retry-after":
+                return max(1.0, float(v))
+    except Exception:
+        pass
+    return default
+
+
+def _limits_on_429(headers: Optional[dict] = None) -> None:
+    """Forward a 429 to binance_limits.on_429(retry_after_sec)."""
+    bl = _get_blimits()
+    fn = getattr(bl, "on_429", None) if bl else None
+    if fn is None:
+        return
+    ra = _retry_after_sec(headers, 0.0)
+    try:
+        fn(ra if ra > 0 else None)
+    except TypeError:
+        try:
+            fn()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _limits_on_418(headers: Optional[dict] = None) -> None:
+    """Forward a 418 to binance_limits.on_418(retry_after_sec)."""
+    bl = _get_blimits()
+    fn = getattr(bl, "on_418", None) if bl else None
+    if fn is None:
+        return
+    ra = _retry_after_sec(headers, 0.0)
+    try:
+        fn(ra if ra > 0 else None)
+    except TypeError:
+        try:
+            fn()
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 # ── Client transport helpers ─────────────────────────────────────────────────
@@ -384,20 +484,31 @@ def _reset_circuit_breaker() -> None:
     _consecutive_400_count = 0
 
 
-def _binance_request(url: str, timeout: float = 3.0, source: str = "unknown"):
+def _binance_request(url: str, timeout: float = 3.0, source: str = "unknown",
+                     weight: int = 1, critical: bool = False):
     """Unified Binance REST caller that captures FULL error context.
 
     Returns (success, data, headers, latency_ms).
     On failure records the exact URL + Binance JSON body in the diag log so we
     can see which call site fails and what Binance is actually complaining about.
+
+    C §6.4: every call is gated by binance_limits.can_spend(weight, critical)
+    (no-op allow when the module is absent), response headers are routed into
+    binance_limits.record_response_headers, 429 → on_429 + existing per-source
+    backoff, 418 → on_418 + immediate circuit-break (IP ban — stop everything).
     """
     import urllib.request as _ur_b
     import urllib.error as _ue_b
     import traceback as _tb_b
+    global _circuit_breaker_until
 
     if _check_circuit_breaker():
         return (False, None, {}, 0.0)
     if _backoff_should_skip(source):
+        return (False, None, {}, 0.0)
+    if not _limits_can_spend(weight, critical):
+        # Budget refused for a non-critical background call — skip gracefully;
+        # callers already handle (False, ...) via their cache/WS/DB fallbacks.
         return (False, None, {}, 0.0)
 
     t0 = time.time()
@@ -411,6 +522,7 @@ def _binance_request(url: str, timeout: float = 3.0, source: str = "unknown"):
             _record_rest_health(hdrs, latency_ms)
         except Exception:
             pass
+        _limits_record_headers(hdrs)
         _reset_circuit_breaker()
         _backoff_record_success(source)
         return (True, json.loads(body), hdrs, latency_ms)
@@ -424,9 +536,30 @@ def _binance_request(url: str, timeout: float = 3.0, source: str = "unknown"):
             err_hdrs = dict(he.headers) if he.headers else {}
             _record_rest_health(err_hdrs, latency_ms)
         except Exception:
-            pass
+            err_hdrs = {}
+        _limits_record_headers(err_hdrs)
         if he.code == 400:
             _trip_circuit_breaker()
+        elif he.code == 429:
+            # Rate-limited: inform the limits module + existing per-source backoff.
+            _limits_on_429(err_hdrs)
+            _backoff_record_failure(source)
+        elif he.code == 418:
+            # IP auto-ban: inform limits module and circuit-break ALL REST for
+            # the Retry-After window (min 120s) — continuing would extend the ban.
+            _limits_on_418(err_hdrs)
+            _circuit_breaker_until = max(
+                _circuit_breaker_until,
+                time.time() + _retry_after_sec(err_hdrs, 120.0),
+            )
+            try:
+                log_diag_issue(
+                    "binance", "error",
+                    "HTTP 418 (IP ban) — circuit-breaking all REST calls",
+                    detail=f"source={source} retry_after={_retry_after_sec(err_hdrs, 120.0):.0f}s",
+                )
+            except Exception:
+                pass
         try:
             _record_rest_error(
                 f"[{source}] HTTP {he.code}: {he.reason}",
@@ -621,7 +754,30 @@ _signal_scanner_health: Dict = {
     "scan_skipped_overlap":   0,      # refreshes skipped because one was already in flight
     "effective_interval_sec": float(30),  # adaptive sleep (>= SCAN_INTERVAL_SEC, <= 600)
     "universe_size":          0,      # symbols in the last scan pass
+    # C §6.2/§6.5 — WS-first signal engine
+    "mode":                  "ws-first",  # "ws-first" | "legacy" (strategy data.legacy_rest_scan)
+    "stale_signal_count":    0,           # symbols whose cache entry is older than 180s
+    "last_event_refresh_ts": 0.0,         # last kline-close (event-driven) full cache rebuild
+    "db_fallback_refreshes": 0,           # thin-WS-buffer symbols refreshed from DB (no REST)
 }
+
+# C §6.2d — cache freshness: entries older than this are "stale" (~1 candle + margin)
+_STALE_SIGNAL_SEC = 180.0
+
+# Active symbol universe (approved coins) — set by both scanner modes; used by
+# stale_signal_syms() so freshness is judged against symbols we SHOULD track.
+_active_universe: set = set()
+
+# One-per-change mode logging ("ws-first" vs "legacy")
+_last_logged_scan_mode: str = ""
+
+# C §6.3 — held-position exit watchdog state
+_held_max_price_age_sec: float = 0.0          # freshest-price age of the worst held symbol
+_watchdog_fire_ts: "_deque[float]" = _deque(maxlen=50000)  # REST-fire timestamps (24h window)
+_watchdog_lock = threading.Lock()
+_WATCHDOG_STALE_SEC = 3.0                     # any held age above this → ONE batched REST fetch
+_WATCHDOG_ALERT_SEC = 5.0                     # any held age above this → price_feed diag error
+_watchdog_alert_log_ts: float = 0.0           # 60s throttle for the price_feed alert
 
 # C §6.1a — single-flight guard: only ONE _refresh_signal_cache may run at a
 # time. Overlapping invocations are SKIPPED (never queued) via
@@ -1539,8 +1695,11 @@ _market_regime_cache: dict = {"ts": 0.0, "regime": "unknown", "details": {}}
 _MARKET_REGIME_TTL_SEC = 120.0
 
 def _fetch_btc_1h_klines() -> Optional[List[dict]]:
+    # C §6.4 — non-critical background fetch: when can_spend refuses, callers
+    # (get_market_regime / get_btc_state) fall back to their cached values.
     url = "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=24"
-    ok, data, _, _ = _binance_request(url, timeout=4.0, source="btc_klines")
+    ok, data, _, _ = _binance_request(url, timeout=4.0, source="btc_klines",
+                                      weight=2, critical=False)
     if not ok or not isinstance(data, list):
         return None
     try:
@@ -1634,7 +1793,9 @@ def _fetch_1m_klines_rc(symbol: str, limit: int = 6) -> Optional[List[dict]]:
     for _base in _KLINE_BASES:
         url = f"{_base}/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
         _src = f"reversal_klines_{_base.split('//', 1)[-1].split('.', 1)[0]}"
-        ok, data, _, _ = _binance_request(url, timeout=3.0, source=_src)
+        # C §6.4 — non-critical: WS closed-candle buffer is the fallback
+        ok, data, _, _ = _binance_request(url, timeout=3.0, source=_src,
+                                          weight=2, critical=False)
         if not ok or not isinstance(data, list) or len(data) < limit:
             continue
         try:
@@ -1731,8 +1892,10 @@ def _fetch_fresh_1m_candles(sym: str, limit: int = 50, min_candles: int = 36) ->
     qs = _up_fr.urlencode({"symbol": sym, "interval": "1m", "limit": limit})
     for _base in _KLINE_BASES:
         _src = f"klines_pre_buy_{_base.split('//', 1)[-1].split('.', 1)[0]}"
+        # C §6.4 — non-critical: WS buffer + DB candles are the fallbacks
         ok, raw, _, _ = _binance_request(f"{_base}/api/v3/klines?{qs}",
-                                         timeout=2.0, source=_src)
+                                         timeout=2.0, source=_src,
+                                         weight=2, critical=False)
         if not ok or not isinstance(raw, list) or len(raw) < min_candles:
             continue
         try:
@@ -1879,16 +2042,196 @@ def evaluate_signals(candles: list) -> dict:
     return {"trend": trend, "rsi": rsi, "macd": macd, "volume": volume, "obv": obv, "atr": atr}
 
 
+# ── C §6.2 — WS-first full cache rebuild helpers ─────────────────────────────
+
+def _row_to_candle(r) -> Optional[dict]:
+    """Normalize one buffer row (raw kline list OR dict) into a candle dict.
+    Defensive against the data_collector buffer format changing shape."""
+    try:
+        if isinstance(r, dict):
+            c = float(r["close"])
+            out = {
+                "open":   float(r.get("open",  c) or c),
+                "high":   float(r.get("high",  c) or c),
+                "low":    float(r.get("low",   c) or c),
+                "close":  c,
+                "volume": float(r.get("volume", 0) or 0.0),
+            }
+            if r.get("open_time") is not None:
+                out["open_time"] = int(r["open_time"])
+            return out
+        # Raw kline row: [open_time, open, high, low, close, volume, ...]
+        return {
+            "open_time": int(r[0]),
+            "open":      float(r[1]),
+            "high":      float(r[2]),
+            "low":       float(r[3]),
+            "close":     float(r[4]),
+            "volume":    float(r[5]),
+        }
+    except Exception:
+        return None
+
+
+def _ws_buffer_candles(symbol: str, min_candles: int = 16) -> list:
+    """Real-OHLCV candle dicts from data_collector.ws_candles (120×1m buffer).
+    Returns [] when the buffer is missing/thin/malformed — callers fall back."""
+    try:
+        import data_collector as _dc_wb
+        buf = list((getattr(_dc_wb, "ws_candles", None) or {}).get(symbol) or [])
+    except Exception:
+        return []
+    if len(buf) < min_candles:
+        return []
+    out = [c for c in (_row_to_candle(r) for r in buf) if c is not None]
+    return out if len(out) >= min_candles else []
+
+
+def _five_m_state(symbol: str, prev: dict) -> tuple:
+    """(5m_ok, 5m_ts) for the WS-first rebuild.
+
+    Source order: ws_candles_5m (≥21 candles, reuse is_5m_bullish) → 5m derived
+    from the deep 1m WS buffer (120×1m → 24×5m) → warmup-neutral rule: preserve
+    a previously computed value if one exists, else neutral (True) so data
+    availability alone never vetoes buys after a restart."""
+    global _warned_5m_warmup
+    candles_5m: list = []
+    try:
+        import data_collector as _dc_5m
+        buf5 = list((getattr(_dc_5m, "ws_candles_5m", None) or {}).get(symbol) or [])
+        candles_5m = [c for c in (_row_to_candle(r) for r in buf5) if c is not None]
+    except Exception:
+        candles_5m = []
+    if len(candles_5m) < 21:
+        try:
+            one_m = _ws_buffer_candles(symbol, min_candles=105)
+            if one_m:
+                derived = indicators.aggregate_candles(one_m, group=5)
+                if len(derived) >= 21:
+                    candles_5m = derived
+        except Exception:
+            pass
+    if len(candles_5m) >= 21:
+        try:
+            return bool(indicators.is_5m_bullish(candles_5m)), time.time()
+        except Exception:
+            pass
+    # Warmup-neutral (kept from the REST scan): not enough 5m data anywhere.
+    prev_ts = prev.get("5m_ts", 0) or 0
+    if prev_ts:
+        return prev.get("5m_ok", True), prev_ts
+    if not _warned_5m_warmup:
+        _warned_5m_warmup = True
+        try:
+            database.log_activity(
+                "5m veto warmup: <21 five-minute candles available "
+                "(WS buffer refilling) — treating 5m trend as neutral "
+                "until data accumulates", "warn"
+            )
+        except Exception:
+            pass
+    return True, 0
+
+
+def _low_24h_for(symbol: str, candles: list) -> Optional[float]:
+    """24h low: existing 10-min cache → min(DB 1440-row low, WS-buffer low).
+    The WS buffer covers the freshest ~2h (rows may not be persisted yet);
+    the DB read supplies the true 24h span."""
+    _l24 = _low24h_cache.get(symbol)
+    if _l24 is not None and (time.time() - _l24[1]) < _LOW24H_CACHE_TTL_SEC:
+        return _l24[0]
+    lows: list = []
+    try:
+        _db_rows_24h = database.get_candles(symbol, config.CANDLE_TIMEFRAME, limit=1440)
+        if len(_db_rows_24h) >= 60:
+            lows.append(min(float(r.get("low") or r["close"]) for r in _db_rows_24h))
+    except Exception:
+        pass
+    try:
+        if candles:
+            lows.append(min(c["low"] for c in candles))
+    except Exception:
+        pass
+    low_24h = min(lows) if lows else None
+    if low_24h is not None:
+        _low24h_cache[symbol] = (low_24h, time.time())
+    return low_24h
+
+
+def _rebuild_full_entry(symbol: str, candles: list) -> bool:
+    """C §6.2a — rebuild the FULL signal-cache entry from real-OHLCV candles:
+    6 signals with REAL high/low (accurate ATR), RSI display value, bb_ok,
+    stoch_rsi_val, klines_1m (last 15 real OHLCV), low_24h, 5m_ok.
+
+    Merge-preserve semantics: keys set by other paths are never dropped.
+    Runs on a worker thread (kline handler dispatches via run_in_executor).
+    Returns True when the entry was stored."""
+    if not candles or len(candles) < 16:
+        return False
+    try:
+        closes  = [c["close"]  for c in candles]
+        volumes = [c["volume"] for c in candles]
+        signals = evaluate_signals(candles)   # real high/low → ATR accurate
+        score   = sum(signals.values())
+        rsi_list    = indicators.calc_rsi(closes, 14)
+        rsi_display = rsi_list[-2] if rsi_list[-2] is not None else 0.0
+        # BB veto on the last completed candle (same semantics as the REST scan)
+        bb_u, bb_m, _ = indicators.calc_bollinger(closes)
+        bb_ok = indicators.bb_buy_allowed(closes[-2], bb_u[-2], bb_m[-2])
+        try:
+            stoch_rsi_val = indicators.calc_stoch_rsi(closes)
+        except Exception:
+            stoch_rsi_val = None
+
+        with _signal_cache_lock:
+            prev = dict(_signal_cache.get(symbol, {}))
+        five_m_ok, five_m_ts = _five_m_state(symbol, prev)
+        low_24h = _low_24h_for(symbol, candles)
+
+        with _signal_cache_lock:
+            entry = dict(_signal_cache.get(symbol, {}))  # re-read under write lock
+            entry.update({
+                "signals":       signals,
+                "score":         score,
+                "price":         closes[-1],
+                "rsi_val":       rsi_display,
+                "bb_ok":         bb_ok,
+                "5m_ok":         five_m_ok,
+                "5m_ts":         five_m_ts,
+                "ts":            time.time(),
+                "low_24h":       low_24h,
+                "klines_1m":     [dict(c) for c in candles[-15:]],
+                "stoch_rsi_val": stoch_rsi_val,
+            })
+            _signal_cache[symbol] = entry
+        _signal_scanner_health["last_event_refresh_ts"] = time.time()
+        return True
+    except Exception as e:
+        print(f"[TradeEngine] Full entry rebuild error {symbol}: {e}")
+        return False
+
+
 def update_coin_signals(symbol: str, closes: list, volumes: list):
     """Update the signal cache on every kline close (WebSocket-driven).
 
-    Builds minimal candle dicts (high=low=close) so OBV works correctly.
-    ATR signal will be False (atr_is_tradeable returns False when ATR=0) —
-    that is safe: the REST scan (_refresh_one) sets accurate ATR/BB/5m values
-    every 60 s and they are preserved here via the prev cache entry.
+    C §6.2a — WS-first: when the data_collector ws_candles buffer has real
+    OHLCV depth, rebuild the FULL cache entry from it (accurate ATR, bb_ok,
+    5m_ok, low_24h, klines_1m, stoch_rsi_val) — no REST needed. Called on a
+    worker thread (data_collector's kline handler runs _persist_and_signal
+    via run_in_executor), so the DB reads here never touch the event loop.
+
+    Fallback (thin WS buffer, e.g. right after restart): the legacy minimal
+    path below — fake candles (high=low=close) so OBV works; ATR/BB/5m values
+    from the last full refresh are preserved via the prev cache entry.
     """
     if len(closes) < 16:  # minimum for RSI-14 to produce a valid value at [-2]
         return
+    try:
+        _full = _ws_buffer_candles(symbol)
+        if _full and _rebuild_full_entry(symbol, _full):
+            return
+    except Exception as e:
+        print(f"[TradeEngine] WS-first rebuild error {symbol}: {e}")
     try:
         candles = [
             {"high": c, "low": c, "close": c, "volume": v}
@@ -3474,18 +3817,25 @@ _REST_PX_TTL = 5.0   # refetch REST prices every 5 s when WebSocket is down
 _sell_monitor_last_rest_ts: float = 0.0   # rate-limits sell-monitor REST refresh to 2s
 
 
-def _fetch_batch_prices(symbols: list, source: str = "batch_prices") -> Dict[str, float]:
+def _fetch_batch_prices(symbols: list, source: str = "batch_prices",
+                        critical: bool = True) -> Dict[str, float]:
     """Batch ticker price fetch via _binance_request (source-tagged, circuit-broken).
     Uses single-symbol endpoint (weight=1) when only one symbol requested,
-    batch endpoint (weight=2) otherwise."""
+    batch endpoint (weight=4) otherwise. critical=True by default: nearly all
+    callers are on the exit path (held watchdog, pre-sell fresh quote,
+    position restore) and must not be shed by the rate-limit budget."""
     import urllib.parse as _up2
     if not symbols:
         return {}
     symbols = list(symbols)
+    _bl = _get_blimits()
+    _w_single = int(getattr(_bl, "WEIGHT_TICKER_PRICE", 2) or 2) if _bl else 2
+    _w_batch  = int(getattr(_bl, "WEIGHT_TICKER_PRICE_BATCH", 4) or 4) if _bl else 4
     if len(symbols) == 1:
-        # Single-symbol endpoint: weight=1 vs batch weight=2
+        # Single-symbol endpoint (weight 2) vs batch endpoint (weight 4)
         url = f"https://data-api.binance.vision/api/v3/ticker/price?symbol={symbols[0]}"
-        ok, data, _, _ = _binance_request(url, timeout=3.0, source=source)
+        ok, data, _, _ = _binance_request(url, timeout=3.0, source=source,
+                                          weight=_w_single, critical=critical)
         if not ok or not isinstance(data, dict):
             return {}
         try:
@@ -3496,7 +3846,8 @@ def _fetch_batch_prices(symbols: list, source: str = "batch_prices") -> Dict[str
     _syms_json = json.dumps(symbols, separators=(',', ':'))
     _encoded   = _up2.quote(_syms_json, safe='')
     url = f"https://data-api.binance.vision/api/v3/ticker/price?symbols={_encoded}"
-    ok, data, _, _ = _binance_request(url, timeout=3.0, source=source)
+    ok, data, _, _ = _binance_request(url, timeout=3.0, source=source,
+                                      weight=_w_batch, critical=critical)
     if not ok or not isinstance(data, list):
         return {}
     result: Dict[str, float] = {}
@@ -3675,16 +4026,138 @@ _held_refresher_thread: Optional[threading.Thread] = None
 _held_refresher_hb_log_ts: float = 0.0
 
 
+def _held_price_ages(held_syms: list) -> Dict[str, float]:
+    """Freshest WS price age per held symbol — best of data_collector's
+    last_price_ts (wired defensively; the map may not exist yet) and the
+    engine's own _last_ws_price_ts. Symbols with no timestamp map to inf."""
+    now_ts = time.time()
+    dc_ts: dict = {}
+    try:
+        import data_collector as _dc_ag
+        dc_ts = getattr(_dc_ag, "last_price_ts", None) or {}
+    except Exception:
+        dc_ts = {}
+    ages: Dict[str, float] = {}
+    for s in held_syms:
+        try:
+            t1 = float(dc_ts.get(s, 0) or 0)
+        except Exception:
+            t1 = 0.0
+        t2 = float(_last_ws_price_ts.get(s, 0) or 0)
+        freshest = max(t1, t2)
+        ages[s] = (now_ts - freshest) if freshest > 0 else float("inf")
+    return ages
+
+
+def _watchdog_fires_24h() -> int:
+    """Rolling count of watchdog REST fires in the last 24h (prunes in place)."""
+    cutoff = time.time() - 86400.0
+    with _watchdog_lock:
+        while _watchdog_fire_ts and _watchdog_fire_ts[0] < cutoff:
+            _watchdog_fire_ts.popleft()
+        return len(_watchdog_fire_ts)
+
+
+def _watchdog_cycle() -> dict:
+    """One held-position watchdog evaluation (C §6.3). Testable single pass.
+
+    Returns {"held": [...], "stale": [...], "fired": bool, "fetched": int}.
+    fired=True means ONE batched REST call was made for ALL held symbols
+    (never per-symbol loops); fired=False means every held symbol's freshest
+    WS price age was within _WATCHDOG_STALE_SEC — no REST at all."""
+    global _held_max_price_age_sec, _watchdog_alert_log_ts, _held_refresher_hb_log_ts
+
+    with _positions_lock:
+        held_syms = list({p.get("symbol") for p in _positions if p.get("symbol")})
+    if not held_syms:
+        _held_max_price_age_sec = 0.0
+        return {"held": [], "stale": [], "fired": False, "fetched": 0}
+
+    ages = _held_price_ages(held_syms)
+    stale = [s for s, a in ages.items() if a > _WATCHDOG_STALE_SEC]
+    fired = False
+    fetched_n = 0
+
+    if stale:
+        # ONE batched call for ALL held symbols (weight 4, critical=True) —
+        # routed through _binance_request → binance_limits header recording.
+        fetched = _fetch_batch_prices(held_syms, source="held_watchdog")
+        fired = True
+        with _watchdog_lock:
+            _watchdog_fire_ts.append(time.time())
+        now_ts = time.time()
+        if fetched:
+            fetched_n = len(fetched)
+            try:
+                import data_collector as _dc_hr
+                dc_prices = getattr(_dc_hr, "prices", None)
+            except Exception:
+                dc_prices = None
+            for s, px in fetched.items():
+                if dc_prices is not None:
+                    try:
+                        dc_prices[s] = px
+                    except Exception:
+                        pass
+                _last_ws_price_ts[s] = now_ts
+                _rest_px[s] = px
+                _rest_px_sym_ts[s] = now_ts
+
+            # 60s heartbeat log
+            if now_ts - _held_refresher_hb_log_ts >= 60.0:
+                _held_refresher_hb_log_ts = now_ts
+                try:
+                    database.log_activity(
+                        f"[HeldWatchdog] fired (stale: {stale[:5]}) — "
+                        f"{fetched_n}/{len(held_syms)} symbols refreshed: "
+                        + ", ".join(f"{s}={v:.6f}" for s, v in list(fetched.items())[:5]),
+                        "info"
+                    )
+                except Exception:
+                    pass
+        # Re-measure after the refresh attempt for health + alerting
+        ages = _held_price_ages(held_syms)
+
+    worst = max(ages.values()) if ages else 0.0
+    _held_max_price_age_sec = 9999.0 if worst == float("inf") else round(worst, 2)
+
+    # Health alert: a held symbol's price is >5s stale even after the
+    # watchdog's refresh attempt — the exit path is flying blind.
+    if _held_max_price_age_sec > _WATCHDOG_ALERT_SEC:
+        _now_al = time.time()
+        if _now_al - _watchdog_alert_log_ts >= 60.0:
+            _watchdog_alert_log_ts = _now_al
+            _worst_syms = sorted(
+                (s for s, a in ages.items() if a > _WATCHDOG_ALERT_SEC),
+                key=lambda s: -ages[s],
+            )[:5]
+            log_diag_issue(
+                "price_feed", "error",
+                f"Held-position price age > {_WATCHDOG_ALERT_SEC:.0f}s "
+                f"(max {min(_held_max_price_age_sec, 9999):.1f}s) — exits may be delayed",
+                detail=f"symbols: {_worst_syms}",
+            )
+
+    return {"held": held_syms, "stale": stale, "fired": fired, "fetched": fetched_n}
+
+
 def _held_position_price_refresher():
-    """Dedicated REST refresher for held (open) positions every 2 s.
-    Critically important for low-WS-volume coins (ENJ, SUSHI, PENDLE, etc.)
-    that rarely generate @trade events — without this they go minutes stale."""
-    import data_collector as _dc_hr
-    global _held_refresher_hb_log_ts
+    """C §6.3 — held-position exit WATCHDOG (was: unconditional 2s REST poll).
+
+    Every 2s cycle: check each held symbol's freshest WS price age
+    (data_collector.last_price_ts, fallback _last_ws_price_ts). ONLY if any
+    held symbol's age exceeds _WATCHDOG_STALE_SEC (3s) does it fetch ALL held
+    symbols in ONE batched /api/v3/ticker/price?symbols=[...] call
+    (critical=True — exits depend on it). Never per-symbol loops.
+
+    Unchanged guarantee: stale prices never trigger stop-loss — the sell
+    monitor's _stale_px_syms skip rule is untouched."""
     consecutive_errors = 0
 
     try:
-        database.log_activity("Held-position price refresher started (2s interval)", "info")
+        database.log_activity(
+            "Held-position exit watchdog started (2s cycle; REST only when a "
+            "held symbol's WS price age exceeds 3s)", "info")
     except Exception:
         pass
 
@@ -3695,60 +4168,39 @@ def _held_position_price_refresher():
         except Exception:
             pass
         try:
-            with _positions_lock:
-                held_syms = list({p.get("symbol") for p in _positions if p.get("symbol")})
-            if not held_syms:
+            result = _watchdog_cycle()
+            if not result["held"]:
                 time.sleep(5.0)
                 continue
-
-            fetched = _fetch_batch_prices(held_syms)
-            now_ts = time.time()
-            if fetched:
-                for s, px in fetched.items():
-                    _dc_hr.prices[s] = px
-                    _last_ws_price_ts[s] = now_ts
-                    _rest_px[s] = px
-                    _rest_px_sym_ts[s] = now_ts
-                consecutive_errors = 0
-
-                # 60s heartbeat log
-                if now_ts - _held_refresher_hb_log_ts >= 60.0:
-                    _held_refresher_hb_log_ts = now_ts
-                    try:
-                        database.log_activity(
-                            f"[HeldRefresher] OK — {len(fetched)}/{len(held_syms)} symbols refreshed: "
-                            + ", ".join(f"{s}={v:.6f}" for s, v in list(fetched.items())[:5]),
-                            "info"
-                        )
-                    except Exception:
-                        pass
-            else:
-                consecutive_errors += 1
-                if consecutive_errors <= 3 or consecutive_errors % 30 == 0:
-                    try:
-                        database.log_activity(
-                            f"[HeldRefresher] REST fetch returned empty for {held_syms} "
-                            f"(attempt {consecutive_errors})", "warn"
-                        )
-                    except Exception:
-                        pass
+            if result["fired"]:
+                if result["fetched"] > 0:
+                    consecutive_errors = 0
+                else:
+                    consecutive_errors += 1
+                    if consecutive_errors <= 3 or consecutive_errors % 30 == 0:
+                        try:
+                            database.log_activity(
+                                f"[HeldWatchdog] REST fetch returned empty for {result['held']} "
+                                f"(attempt {consecutive_errors})", "warn"
+                            )
+                        except Exception:
+                            pass
         except Exception as _e:
             consecutive_errors += 1
             if consecutive_errors <= 3 or consecutive_errors % 30 == 0:
                 try:
                     database.log_activity(
-                        f"[HeldRefresher] {type(_e).__name__}: {_e} ({consecutive_errors} consecutive errors)",
+                        f"[HeldWatchdog] {type(_e).__name__}: {_e} ({consecutive_errors} consecutive errors)",
                         "warn"
                     )
                 except Exception:
                     pass
                 log_diag_issue(
                     "price_refresher", "error",
-                    f"Held refresher failed ({consecutive_errors} consecutive)",
+                    f"Held watchdog failed ({consecutive_errors} consecutive)",
                     detail=f"{type(_e).__name__}: {_e}",
                 )
-        # 2s base cadence — this thread is the sole REST price source for the
-        # sell monitor's trigger evaluation (backs off to 30s under errors).
+        # 2s base cadence (backs off to 30s under consecutive REST errors).
         time.sleep(max(2.0, min(30.0, 2.0 + consecutive_errors * 1.0)))
 
 
@@ -4183,15 +4635,130 @@ async def position_guardian():
         await asyncio.sleep(5.0)
 
 
+# ── C §6.2d/§6.5 — cache freshness + engine health contract ──────────────────
+
+def stale_signal_syms(max_age_sec: float = _STALE_SIGNAL_SEC) -> list:
+    """Symbols whose signal-cache entry is older than max_age_sec (default 180s
+    ≈ every active symbol should be at most ~1 candle old in ws-first mode).
+    Judged against the active universe when known (a symbol with NO entry is
+    stale too); falls back to cache keys before the first scan pass."""
+    now = time.time()
+    with _signal_cache_lock:
+        cache_ts = {s: float((e or {}).get("ts", 0) or 0) for s, e in _signal_cache.items()}
+    universe = _active_universe or set(cache_ts)
+    return sorted(s for s in universe if now - cache_ts.get(s, 0.0) > max_age_sec)
+
+
+def get_engine_health() -> dict:
+    """C §6.5 contract — engine health snapshot for control_api/thread_health."""
+    stale = stale_signal_syms()
+    _signal_scanner_health["stale_signal_count"] = len(stale)
+    with _positions_lock:
+        held_n = len(_positions)
+    return {
+        "scanner":                dict(_signal_scanner_health),
+        "held_max_price_age_sec": _held_max_price_age_sec,
+        "stale_signal_syms":      stale[:10],
+        "watchdog_fires_24h":     _watchdog_fires_24h(),
+        "held_symbols":           held_n,
+    }
+
+
+# ── C §6.2c — ws-first scanner maintenance (no REST) ─────────────────────────
+
+def _refresh_symbol_from_db(sym: str) -> bool:
+    """Rebuild a full cache entry for one symbol from DB candles (no REST).
+    Used by the ws-first maintenance pass while the WS buffer is still thin."""
+    try:
+        db_rows = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=120)
+        if len(db_rows) < 16:
+            return False
+        candles = [
+            {"high":   float(r.get("high") or r["close"]),
+             "low":    float(r.get("low")  or r["close"]),
+             "close":  float(r["close"]),
+             "volume": float(r.get("volume") or 0.0)}
+            for r in db_rows
+        ]
+        return _rebuild_full_entry(sym, candles)
+    except Exception:
+        return False
+
+
+def _ws_first_maintenance():
+    """C §6.2c — the scanner-loop pass when legacy_rest_scan is OFF (default).
+    Makes NO REST calls. Responsibilities:
+      1. universe telemetry (approved coins),
+      2. DB-fallback cache refresh for symbols whose WS buffers are still thin
+         AND whose cache entry has gone stale,
+      3. _signal_scanner_health freshness stats (mode/stale counts).
+    Runs on an executor thread — the DB reads must stay off the event loop."""
+    global _active_universe, _last_empty_universe_warn_ts
+    strategy = _load_strategy()
+    approved = [
+        c["symbol"] for c in (strategy or {}).get("approved_coins", [])
+        if c.get("approved")
+    ]
+    _active_universe = set(approved)
+    _signal_scanner_health["universe_size"] = len(approved)
+    if not approved:
+        if time.time() - _last_empty_universe_warn_ts >= 600.0:
+            _last_empty_universe_warn_ts = time.time()
+            log.warning("[SignalScanner] ws-first pass: approved-coin universe is EMPTY, no buys possible")
+            try:
+                database.log_activity(
+                    "Signal scan: 0 approved symbols — universe is empty, the bot cannot buy anything",
+                    "warn",
+                )
+            except Exception:
+                pass
+        _signal_scanner_health["stale_signal_count"] = 0
+        return
+
+    try:
+        import data_collector as _dc_mt
+        ws_bufs = getattr(_dc_mt, "ws_candles", None) or {}
+    except Exception:
+        ws_bufs = {}
+
+    now = time.time()
+    refreshed_db = 0
+    for sym in approved:
+        try:
+            buf_len = len(ws_bufs.get(sym) or [])
+        except Exception:
+            buf_len = 0
+        if buf_len >= 16:
+            continue  # kline-close path owns this symbol's freshness
+        with _signal_cache_lock:
+            entry_ts = float((_signal_cache.get(sym) or {}).get("ts", 0) or 0)
+        if now - entry_ts <= _STALE_SIGNAL_SEC:
+            continue
+        if _refresh_symbol_from_db(sym):
+            refreshed_db += 1
+
+    if refreshed_db:
+        _signal_scanner_health["db_fallback_refreshes"] = (
+            _signal_scanner_health.get("db_fallback_refreshes", 0) + refreshed_db
+        )
+    _signal_scanner_health["stale_signal_count"] = len(stale_signal_syms())
+
+
 # ── Process 2: signal scanner (async, refreshes cache every SCAN_INTERVAL_SEC) ─
 
 async def signal_scanner(prices: dict):
     """
     Async coroutine — runs every SCAN_INTERVAL_SEC (60 s).
-    Refreshes the signal cache from REST, then immediately attempts buys.
-    This is the primary buy trigger — WebSocket callbacks are a fast-path
-    supplement, but buys MUST fire even when WebSocket is slow or disconnected.
+
+    C §6.2c — two modes (strategy.json data.legacy_rest_scan, default OFF):
+      ws-first (default): kline-close events own signal freshness; this loop
+        only (1) triggers _check_buys_from_cache periodically (poll-based buy
+        backup), (2) DB-refreshes symbols whose WS buffers are thin (no REST),
+        (3) updates _signal_scanner_health freshness stats.
+      legacy: the old full REST refresh pass (emergency fallback, one release).
+    The buy trigger stays: buys MUST fire even when WebSocket is slow.
     """
+    global _last_logged_scan_mode
     _signal_scanner_health["interval_sec"] = float(config.SCAN_INTERVAL_SEC)
     # C §6.1b — adaptive interval: starts at the configured value; stretched
     # when a pass runs long, decayed back when passes get fast again.
@@ -4201,9 +4768,24 @@ async def signal_scanner(prices: dict):
     while True:
         _t0_scan = time.time()
         try:
-            await _refresh_signal_cache()
-            # Trigger buy checks right after refreshing — don't wait for WebSocket
+            _strategy_sc = _load_strategy()
+            _legacy = bool(((_strategy_sc or {}).get("data") or {}).get("legacy_rest_scan", False))
+            _mode = "legacy" if _legacy else "ws-first"
+            _signal_scanner_health["mode"] = _mode
+            if _mode != _last_logged_scan_mode:
+                _last_logged_scan_mode = _mode
+                log.info("[SignalScanner] Signal engine mode: %s (data.legacy_rest_scan=%s)",
+                         _mode, _legacy)
+                try:
+                    database.log_activity(f"Signal engine mode: {_mode}", "info")
+                except Exception:
+                    pass
             loop = asyncio.get_running_loop()
+            if _legacy:
+                await _refresh_signal_cache()
+            else:
+                await loop.run_in_executor(None, _ws_first_maintenance)
+            # Trigger buy checks right after refreshing — don't wait for WebSocket
             await loop.run_in_executor(None, _check_buys_from_cache, dict(prices))
         except Exception as e:
             print(f"[SignalScanner] Unexpected error: {e}")
@@ -4264,6 +4846,10 @@ async def _fetch_klines(session, sym: str) -> list:
         url = f"{base}/api/v3/klines?symbol={sym}&interval=1m&limit=50"
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                try:
+                    _limits_record_headers(dict(resp.headers))  # C §6.4 weight accounting
+                except Exception:
+                    pass
                 resp.raise_for_status()
                 return await resp.json()
         except Exception as e:
@@ -4299,7 +4885,7 @@ async def _refresh_signal_cache_locked():
     """Body of the signal-cache refresh. Only ever runs under the single-flight
     guard in _refresh_signal_cache — do not call directly."""
     import aiohttp
-    global _last_empty_universe_warn_ts
+    global _last_empty_universe_warn_ts, _active_universe
     _pass_t0 = time.time()
     strategy = _load_strategy()
     if not strategy:
@@ -4311,6 +4897,7 @@ async def _refresh_signal_cache_locked():
         if c.get("approved")
     ]
     # C §6.1e — universe telemetry + logging (warn when empty, throttled 10 min)
+    _active_universe = set(approved_coins)
     _signal_scanner_health["universe_size"] = len(approved_coins)
     if not approved_coins:
         if time.time() - _last_empty_universe_warn_ts >= 600.0:
