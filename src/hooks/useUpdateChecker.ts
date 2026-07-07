@@ -42,29 +42,44 @@ export function useUpdateChecker(pollIntervalMs = 60_000) {
   const checkForUpdates = useCallback(async (): Promise<boolean> => {
     setChecking(true);
     try {
-      // Primary: check GitHub directly — works regardless of bot version.
+      // PRIMARY: server-side git check. The bot compares its own checkout
+      // against origin/main using git — no CORS, no raw.githubusercontent
+      // dependency, and it measures the real thing (is the SERVER behind?)
+      // rather than browser-bundle-vs-server. This is authoritative.
+      try {
+        const gr = await fetch(`/api/update/check?t=${Date.now()}`, { cache: 'no-store' });
+        if (gr.ok) {
+          const gd = await gr.json();
+          if (gd.ok) {
+            if (gd.update_available) {
+              latestVersionRef.current = gd.latest_subject || gd.remote_commit || 'new version';
+              setUpdateAvailable(true);
+              return true;
+            }
+            // Server is at origin/main HEAD. If the BROWSER bundle is older
+            // than what the server now serves, a reload (not a pull) is needed.
+            setUpdateAvailable(false);
+            return false;
+          }
+        }
+      } catch { /* fall through to version.json comparison */ }
+
+      // FALLBACK (git check unavailable — pre-0.4.6 bots): compare versions.
       let data: VersionInfo | null = null;
       try {
-        const ghResp = await fetch(`${GITHUB_VERSION_URL}?t=${Date.now()}`, {
-          cache: 'no-store',
-        });
+        const ghResp = await fetch(`${GITHUB_VERSION_URL}?t=${Date.now()}`, { cache: 'no-store' });
         if (ghResp.ok) data = await ghResp.json();
-      } catch { /* GitHub unreachable — fall back to bot */ }
-
-      // Fallback: ask the bot's /version.json endpoint.
+      } catch { /* GitHub unreachable */ }
       if (!data) {
         const resp = await fetch(`/version.json?t=${Date.now()}`, { cache: 'no-store' });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         data = await resp.json();
       }
-
-      const versionChanged = data.version !== LOCAL_VERSION;
-      if (versionChanged) {
+      if (data.version !== LOCAL_VERSION) {
         latestVersionRef.current = data.version;
         setUpdateAvailable(true);
         return true;
       }
-
       return false;
     } catch {
       throw new Error('Could not reach server');
@@ -110,11 +125,12 @@ export function useUpdateChecker(pollIntervalMs = 60_000) {
         const start = Date.now();
         const poll = setInterval(async () => {
           try {
-            const vr = await fetch(`${GITHUB_VERSION_URL}?t=${Date.now()}`, { cache: 'no-store' });
-            const vd = await vr.json();
-            const botVer = await fetch(`/version.json?t=${Date.now()}`, { cache: 'no-store' })
-              .then(r => r.json()).catch(() => ({}));
-            if (botVer.version === vd.version || Date.now() - start > 60_000) {
+            // The bot restarts mid-update; once /api/update/check reports 0
+            // commits behind (server pulled + came back up), reload the page.
+            const gr = await fetch(`/api/update/check?t=${Date.now()}`, { cache: 'no-store' })
+              .then(r => r.json()).catch(() => null);
+            const caughtUp = gr && gr.ok && gr.update_available === false;
+            if (caughtUp || Date.now() - start > 90_000) {
               clearInterval(poll);
               hardReload();
             }

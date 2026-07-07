@@ -5118,6 +5118,45 @@ def serve_version_json(response: Response):
     return data
 
 
+@app.get("/api/update/check")
+def api_update_check():
+    """Server-side update check via pure git — the reliable signal.
+
+    Compares the local checkout against origin/main using git itself (the same
+    channel /api/update already uses to pull), so it works even when neither
+    the browser nor the bot can reach raw.githubusercontent.com. Returns
+    behind_count>0 when origin/main has commits the running code doesn't.
+    """
+    import subprocess, pathlib, shutil as _sh
+    app_dir = pathlib.Path(__file__).parent.parent
+    env = dict(os.environ)
+    env["PATH"] = env.get("PATH", "") + ":/usr/local/bin:/usr/bin:/bin"
+    git = _sh.which("git", path=env["PATH"]) or "git"
+    def _git(*args, timeout=30):
+        return subprocess.run([git, "-c", f"safe.directory={app_dir}", *args],
+                              cwd=str(app_dir), env=env, capture_output=True,
+                              text=True, timeout=timeout)
+    try:
+        _git("fetch", "origin", "main", timeout=45)
+        behind = _git("rev-list", "--count", "HEAD..origin/main")
+        local  = _git("rev-parse", "--short", "HEAD")
+        remote = _git("rev-parse", "--short", "origin/main")
+        subj   = _git("log", "-1", "--format=%s", "origin/main")
+        n = int((behind.stdout or "0").strip() or "0")
+        return {
+            "ok": True,
+            "update_available": n > 0,
+            "behind_count": n,
+            "local_commit": (local.stdout or "").strip(),
+            "remote_commit": (remote.stdout or "").strip(),
+            "latest_subject": (subj.stdout or "").strip(),
+            "running_version": _read_frontend_version().get("version"),
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}",
+                "update_available": False}
+
+
 @app.post("/api/update")
 def api_update():
     """Pull latest code from GitHub, rebuild the frontend, and restart the bot."""
