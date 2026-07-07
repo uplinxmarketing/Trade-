@@ -184,6 +184,15 @@ function numPrice(prices: LivePrices, sym: string): number | undefined {
   return Number.isFinite(v) && v > 0 ? v : undefined;
 }
 
+// J1 — humane short age formatting for the per-symbol decision trace (Ns / Nm / Nh).
+function humanizeAgeSec(sec: number | null | undefined): string {
+  if (sec == null || !Number.isFinite(sec)) return '—';
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  return `${Math.round(s / 3600)}h`;
+}
+
 const INSTRUCTIONS_KEY  = 'ai_agent_instructions';
 const AGENT_CYCLE_MS    = 30_000;
 const MAX_LOG_LINES     = 200;
@@ -1899,6 +1908,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             signalsData.signals.map((s: any) => String(s.symbol ?? '').toUpperCase())
           );
           const missing = selectedCoins.filter(c => !present.has(c.toUpperCase()));
+          // J1 — only surface the decision-trace legend when the backend actually
+          // ships the new per-symbol fields (graceful degradation on older bots).
+          const anyTrace = signalsData.signals.some((s: any) =>
+            s.cached_green !== undefined || s.engine_ready !== undefined ||
+            s.last_evaluated_age_sec !== undefined || s.last_attempt_age_sec !== undefined ||
+            s.last_block_reason !== undefined || s.last_block_age_sec !== undefined);
           return (
             <div className="space-y-0 overflow-x-auto">
               {/* Header */}
@@ -1912,6 +1927,14 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 <span className="text-[8px] text-muted-foreground text-center">BUY</span>
                 <span className="text-[8px] text-muted-foreground text-right">PRICE</span>
               </div>
+              {/* J1 — cached-vs-fresh legend. Explains the two-state badge so the
+                  #1 source of operator confusion (green cache, no buy) is labelled. */}
+              {anyTrace && (
+                <p className="text-[7px] text-muted-foreground/80 leading-tight pt-0.5 pb-1 break-words">
+                  <span className="text-gain font-semibold">ready</span> = cached green + fresh re-check passed ·{' '}
+                  <span className="text-amber-400 font-semibold">cached green · fresh re-check pending</span> = cache is green but the fresh re-check hasn't confirmed yet (no buy until it does)
+                </p>
+              )}
               {signalsLoading && signalsData.signals.length === 0 && (
                 <div className="space-y-1">
                   {[1,2,3,4,5].map(i => (
@@ -1946,12 +1969,49 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                   label = 'HOLD'; labelColor = 'bg-muted/30 text-muted-foreground';
                 }
 
+                // J1 — per-symbol decision trace + two-state cached/fresh badge.
+                // Guard: all fields may be undefined on older backends.
+                const evalAge     = sig.last_evaluated_age_sec ?? null;
+                const attemptAge  = sig.last_attempt_age_sec ?? null;
+                const blockReason = sig.last_block_reason ?? null;
+                const blockAge    = sig.last_block_age_sec ?? null;
+                const cachedGreen = sig.cached_green === true;
+                const engineReady = sig.engine_ready === true;
+                const traceAvailable =
+                  sig.cached_green !== undefined || sig.engine_ready !== undefined ||
+                  sig.last_evaluated_age_sec !== undefined || sig.last_attempt_age_sec !== undefined ||
+                  sig.last_block_reason !== undefined || sig.last_block_age_sec !== undefined;
+
+                // Two-state badge — the key fix. Distinguish solid-green "ready"
+                // from the amber "cached green · fresh re-check pending" flicker,
+                // and surface the "no decision recorded" gap so it isn't invisible.
+                let readyBadge: { text: string; cls: string; title: string } | null = null;
+                if (traceAvailable) {
+                  if (cachedGreen && engineReady) {
+                    readyBadge = { text: 'ready', cls: 'bg-gain/20 text-gain',
+                      title: 'Cached green AND fresh re-check passed — the engine will act on this symbol.' };
+                  } else if (cachedGreen && attemptAge == null && blockReason == null) {
+                    readyBadge = { text: 'no decision recorded', cls: 'bg-muted/30 text-muted-foreground border border-dashed border-border',
+                      title: 'Buy-ready but no attempt and no block reason were recorded — a genuine gap, surfaced here so it is visible rather than hidden.' };
+                  } else if (cachedGreen && !engineReady) {
+                    readyBadge = { text: 'cached green · fresh re-check pending', cls: 'bg-amber-500/20 text-amber-400',
+                      title: 'Signal cache is green but the fresh re-check has not confirmed yet (pending or failed). This flicker is expected — no buy fires until the fresh re-check passes.' };
+                  }
+                }
+
+                // Compact decision trace sub-line (evaluated / attempt / block reason + ages).
+                const traceParts: string[] = [];
+                if (evalAge != null) traceParts.push(`evaluated ${humanizeAgeSec(evalAge)} ago`);
+                traceParts.push(attemptAge != null ? `attempt ${humanizeAgeSec(attemptAge)} ago` : 'no attempt');
+                if (blockReason) traceParts.push(blockAge != null ? `${blockReason} · ${humanizeAgeSec(blockAge)} ago` : blockReason);
+                const traceText = traceParts.join(' · ');
+
                 return (
                   <motion.div key={sig.symbol} layout layoutId={sig.symbol}
                     initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
                     transition={{ layout: { duration: 0.5, ease: 'easeInOut' }, opacity: { duration: 0.2 } }}
-                    className="grid items-center py-0.5 border-b border-border/20 last:border-0"
-                    style={{gridTemplateColumns: cols}}>
+                    className="border-b border-border/20 last:border-0">
+                    <div className="grid items-center py-0.5" style={{gridTemplateColumns: cols}}>
                     <span className="text-[9px] font-mono font-semibold truncate">{sig.symbol?.replace('USDT','')}</span>
                     {signalRegistry.map(reg => {
                       const r = results[reg.id];
@@ -1976,6 +2036,23 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                         ? Number(sig.price).toLocaleString('en-US',{maximumFractionDigits:0})
                         : Number(sig.price).toFixed(4)) : ''}
                     </span>
+                    </div>
+                    {/* J1 — muted decision sub-line + labelled two-state badge. */}
+                    {traceAvailable && (readyBadge || traceText) && (
+                      <div className="flex items-center gap-1 pb-0.5 pl-0.5 overflow-hidden">
+                        {readyBadge && (
+                          <span className={`text-[7px] font-bold px-1 rounded shrink-0 ${readyBadge.cls}`}
+                            title={readyBadge.title}>
+                            {readyBadge.text}
+                          </span>
+                        )}
+                        {traceText && (
+                          <span className="text-[7px] text-muted-foreground truncate" title={traceText}>
+                            {traceText}
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </motion.div>
                 );
               })}
