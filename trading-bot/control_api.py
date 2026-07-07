@@ -323,6 +323,35 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("auto_resume_patch", exc)
 
+            # 4c. Phase 5 §5.1 — one-time v1→v2 strategy schema migration.
+            #     Purely additive (missing blocks + schema_version); idempotent,
+            #     so re-running on every deploy is a no-op after the first.
+            try:
+                import strategy_config as _scfg_mig
+                _raw_mig = _load_strategy()
+                _v2_mig, _warn_mig = _scfg_mig.migrate_to_v2(_raw_mig)
+                _added_mig = {k: v for k, v in _v2_mig.items()
+                              if _raw_mig.get(k) != v}
+                if _added_mig:
+                    _write_strategy_patch(_added_mig)
+                    for _w in _warn_mig:
+                        print(f"[ControlAPI] strategy v2 migration: {_w}")
+                    try:
+                        database.save_config_version(
+                            "migration-v2",
+                            _scfg_mig.diff_views(_raw_mig, _v2_mig),
+                            _load_strategy())
+                    except Exception:
+                        pass
+                    database.log_activity(
+                        f"strategy.json migrated to schema v2 "
+                        f"({len(_added_mig)} key(s) added)", "info")
+                    steps.append("v2_migration applied")
+                else:
+                    steps.append("v2_migration noop")
+            except Exception as exc:
+                _step_failed("v2_migration", exc)
+
             # 5. History download — daemon thread, never blocks
             try:
                 threading.Thread(target=data_collector.download_history, daemon=True).start()
@@ -423,7 +452,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT"],
     allow_headers=["*"],
 )
 
@@ -630,6 +659,67 @@ def _load_strategy() -> dict:
 _strategy_write_lock = threading.Lock()
 
 
+# Part E — two-way alias sync between the v2 blocks (what the schema-driven UI
+# writes) and the legacy root keys (what parts of the engine still read).
+# Without this, a v2 edit like sizing.bot_allocation_usdt is written to the
+# sizing block while get_budget_for_coin/effective_slots keep reading the stale
+# root key — the classic "saves but changes nothing" dead field. Symmetrically,
+# a legacy POST /api/settings max_positions write to the root key would be
+# shadowed by an existing sizing block (which _sizing_cfg prefers).
+#   v2 sizing.{max_positions,bot_allocation_usdt,mode,reinvest_profits}
+#       ⇄ root {max_positions,bot_allocation_usdt,budget_mode,reinvest_profits}
+#   v2 entries.min_score ⇄ root min_signals + signal_engine.min_scored
+_SIZING_ROOT_ALIASES = (
+    # (root key, sizing-block key)
+    ("max_positions",       "max_positions"),
+    ("bot_allocation_usdt", "bot_allocation_usdt"),
+    ("budget_mode",         "mode"),
+    ("reinvest_profits",    "reinvest_profits"),
+)
+
+
+def _apply_alias_sync(s: dict, patch: dict) -> None:
+    """Mutate the merged strategy dict `s` so v2-block values and legacy root
+    keys stay consistent after applying `patch`. Direction is decided by what
+    the PATCH touched (v2 block touched → root follows; root touched → block
+    follows when it exists). Never raises."""
+    try:
+        sizing_p = patch.get("sizing") if isinstance(patch.get("sizing"), dict) else None
+        entries_p = patch.get("entries") if isinstance(patch.get("entries"), dict) else None
+        # v2 → legacy root (engine reads these keys at the root)
+        if sizing_p:
+            for root_key, blk_key in _SIZING_ROOT_ALIASES:
+                if blk_key in sizing_p:
+                    s[root_key] = sizing_p[blk_key]
+        if entries_p and "min_score" in entries_p:
+            try:
+                ms = int(entries_p["min_score"])
+                s["min_signals"] = ms
+                se = s.get("signal_engine")
+                if isinstance(se, dict):
+                    se["min_scored"] = ms
+            except (TypeError, ValueError):
+                pass
+        # legacy root → v2 blocks (the resolved v2 view prefers stored blocks)
+        if isinstance(s.get("sizing"), dict):
+            for root_key, blk_key in _SIZING_ROOT_ALIASES:
+                if root_key in patch:
+                    s["sizing"][blk_key] = patch[root_key]
+        if "min_signals" in patch:
+            try:
+                ms = int(patch["min_signals"])
+                if isinstance(s.get("entries"), dict):
+                    s["entries"]["min_score"] = ms
+                se = s.get("signal_engine")
+                if isinstance(se, dict) and "min_scored" not in patch.get(
+                        "signal_engine", {}):
+                    se["min_scored"] = ms
+            except (TypeError, ValueError):
+                pass
+    except Exception:
+        pass  # alias sync must never block a settings write
+
+
 def _write_strategy_patch(patch: dict):
     """Atomic merge-and-write to strategy.json (lock-protected against concurrent saves).
 
@@ -640,6 +730,7 @@ def _write_strategy_patch(patch: dict):
     with _strategy_write_lock:
         s = _load_strategy()
         s.update(patch)
+        _apply_alias_sync(s, patch)   # keep v2 blocks ⇄ legacy root keys consistent
         tmp_path = config.STRATEGY_FILE + ".tmp"
         with open(tmp_path, "w") as f:
             json.dump(s, f, indent=2)
@@ -2426,6 +2517,34 @@ async def api_proxy_ticker_24hr(symbols: str = None, symbol: str = None):
     return all_results
 
 
+# Which signal_thresholds keys tune which registered signal (used to expose
+# per-signal editable thresholds to the SignalsEditorPanel; the engine itself
+# reads the flat strategy.signal_thresholds map at evaluation time).
+_SIGNAL_THRESHOLD_KEYS = {
+    "M1_rsi_below_threshold": ("rsi_buy_threshold",),
+    "M2_stoch_rsi_oversold":  ("stoch_rsi_threshold",),
+    "M4_micro_pullback":      ("dip_pct", "lookback_candles"),
+    "M5_rsi_zone":            ("rsi_zone_low", "rsi_zone_high"),
+    "P1_near_24h_low":        ("near_low_pct",),
+    "R1_reversal_confirmed":  ("reversal_volume_multiplier",),
+    "E1_spread_too_wide":     ("spread_max_pct",),
+    "TM1_bad_hour":           ("allowed_trading_hours_utc",),
+}
+
+
+def _effective_signal_thresholds(strategy: dict) -> dict:
+    """Flat thresholds map the engine actually resolves: defaults overlaid with
+    strategy.signal_thresholds, plus M1's rsi_buy_threshold (default 40.0,
+    legacy root key fallback — same resolution order as signal_registry)."""
+    import signal_registry as _sr
+    out = dict(getattr(_sr, "DEFAULT_SIGNAL_THRESHOLDS", {}))
+    out["rsi_buy_threshold"] = strategy.get("rsi_buy_threshold", 40.0)
+    stored = strategy.get("signal_thresholds")
+    if isinstance(stored, dict):
+        out.update(stored)
+    return out
+
+
 @app.get("/api/signal-registry")
 def api_signal_registry():
     """List all registered signals with their current role in the signal engine."""
@@ -2463,12 +2582,19 @@ def api_signal_registry():
                 role = "veto"
             else:
                 role = "disabled"
-            signals_info.append({
+            entry = {
                 "id":          sig_id,
                 "category":    sig_def.category,
                 "description": sig_def.description,
                 "role":        role,
-            })
+            }
+            # Per-signal editable thresholds (resolved values) — the
+            # SignalsEditorPanel renders threshold inputs from this.
+            _th_keys = _SIGNAL_THRESHOLD_KEYS.get(sig_id)
+            if _th_keys:
+                _eff_th = _effective_signal_thresholds(strategy)
+                entry["thresholds"] = {k: _eff_th.get(k) for k in _th_keys}
+            signals_info.append(entry)
 
         return {
             "available":      True,
@@ -2483,7 +2609,7 @@ def api_signal_registry():
             "total":          len(signals_info),
             "categories":     sorted({s["category"] for s in signals_info}),
             "min_scored":     int(engine_cfg.get("min_scored", _sr.DEFAULT_SIGNAL_ENGINE["min_scored"])),
-            "thresholds":     strategy.get("signal_thresholds", _sr.DEFAULT_SIGNAL_THRESHOLDS),
+            "thresholds":     _effective_signal_thresholds(strategy),
             "signals":        signals_info,
         }
     except Exception as e:
@@ -4452,6 +4578,117 @@ def api_debug_sell():
         return {"error": str(e)}
 
 
+# ── Part E — zero-restart effect-test probes ─────────────────────────────────
+# Tiny read-only endpoints that expose CONFIG-DERIVED engine values so the
+# effect-test harness (trading-bot/effect_tests.py) can prove a settings edit
+# hot-applied without waiting for a real trade. They call the SAME resolvers
+# the live engine uses (_exit_cfg via backtest.exit_levels parity,
+# get_budget_for_coin, signal_registry.evaluate_buy_decision).
+
+@app.get("/api/debug/exit-geometry")
+def api_debug_exit_geometry(symbol: str = "BTCUSDT", entry: float = 100.0,
+                            budget: float = 50.0,
+                            atr_pct: Optional[float] = None):
+    """Exit geometry (sl/tp/hard_sl/bep + distances) for a HYPOTHETICAL entry
+    at `entry` with `budget` USDT deployed, resolved from the CURRENT
+    strategy.json through backtest.exit_levels — the same math
+    _apply_entry_exit_geometry freezes onto real positions at entry time."""
+    try:
+        import fees as _fees
+        from backtest import exit_levels as _exit_levels
+        entry = float(entry)
+        budget = float(budget)
+        if entry <= 0 or budget <= 0:
+            return JSONResponse(status_code=422,
+                                content={"error": "entry and budget must be > 0"})
+        fm = _fees.get_fee_model(symbol or None)
+        taker = fm.taker()
+        qty = budget / entry
+        cost = budget + budget * taker   # deployed capital incl. entry fee
+        lv = _exit_levels(entry, qty, cost, _load_strategy(), fm,
+                          atr_pct=float(atr_pct) if atr_pct is not None else None)
+        cfg = lv.pop("cfg", {}) or {}
+        out = {
+            "symbol": symbol, "entry": entry, "budget": budget,
+            "qty": qty, "taker_fee": taker,
+            **{k: lv[k] for k in ("tp", "sl", "hard_sl", "bep",
+                                  "sl_distance_pct", "tp_distance_pct",
+                                  "atr_pct", "atr_unavailable")},
+            "cfg": {k: cfg.get(k) for k in (
+                "k_sl", "sl_min_pct", "sl_max_pct", "hard_sl_pct", "rr_ratio",
+                "tp_buffer_pct", "min_profit_usdt", "breakeven_at_r", "k_trail",
+                "sl_confirm_ticks", "min_hold_sec", "legacy_mode")},
+        }
+        return out
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/debug/budget")
+def api_debug_budget(symbol: str = "BTCUSDT", free: float = 1000.0):
+    """Per-trade budget the engine would allocate for `symbol` given `free`
+    USDT — calls trade_engine.get_budget_for_coin (the REAL sizing path:
+    budget_mode / allocation cap / reinvest / neutral-regime multiplier) plus
+    the current effective_slots + sizing config."""
+    try:
+        import trade_engine as _te
+        budget = _te.get_budget_for_coin(symbol, float(free))
+        return {
+            "symbol":       symbol,
+            "free_usdt":    float(free),
+            "budget_usdt":  budget,
+            "sizing":       _te._sizing_cfg(),
+            "slots":        _te.effective_slots(),
+            "budget_mode":  _load_strategy().get("budget_mode", config.BUDGET_MODE),
+            "btc_regime":   (_te.get_btc_regime() if hasattr(_te, "get_btc_regime") else None),
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/debug/evaluate-gates")
+def api_debug_evaluate_gates(symbol: str = "BTCUSDT",
+                             rsi: float = 30.0,
+                             stoch_rsi: float = 20.0):
+    """Run signal_registry.evaluate_buy_decision on a SYNTHETIC all-bullish
+    snapshot under the CURRENT strategy.json — proves role/threshold edits
+    (PUT /api/signals/registry) change the engine's gate outcome with zero
+    restart. Synthetic data: every boolean signal true, price mid-range;
+    rsi/stoch_rsi injectable to exercise M1/M2 thresholds."""
+    try:
+        import signal_registry as _sr
+        strategy = _load_strategy()
+        signal_data = {
+            "trend": True, "rsi": True, "macd": True, "volume": True,
+            "obv": True, "atr": True,
+            "rsi_value": float(rsi), "stoch_rsi_value": float(stoch_rsi),
+            "low_24h": 99.0, "current_price": 100.0,
+            "klines_1m": [], "klines_5m": [],
+            "bb_position_5m": "inside", "btc_regime": "risk_on",
+            "ema50_15m_slope": 0.1,
+        }
+        # Synthetic evaluation must not poison the per-symbol result caches
+        # the live scanner uses (R1/M4 cache by symbol for 10-20 s).
+        probe_sym = f"__PROBE__{symbol}"
+        dec = _sr.evaluate_buy_decision(probe_sym, signal_data, strategy)
+        return {
+            "symbol": symbol,
+            "allowed": bool(dec.get("allowed")),
+            "reason": dec.get("reason"),
+            "score": dec.get("score"),
+            "fired_signals": sorted(dec.get("fired_signals") or []),
+            "veto_results": dec.get("veto_results"),
+            "mandatory_results": dec.get("mandatory_results"),
+            "min_scored_effective": int(
+                (strategy.get("signal_engine") or {}).get(
+                    "min_scored", _sr.DEFAULT_SIGNAL_ENGINE["min_scored"])
+                if (strategy.get("signal_engine") or {}).get("enabled", False)
+                else strategy.get("min_signals", 4)),
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 class ChatRequest(BaseModel):
     messages: list[dict]
     apiKey: str
@@ -5219,6 +5456,502 @@ def api_klines_coverage(symbols: str = "approved"):
         return {"symbols": out, "count": len(out), "ts": time.time()}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+# ── Phase 5 §5.1 + Phase 6 §6 — v2 strategy config API ───────────────────────
+#
+# Payload shapes (frontend contract):
+#   GET  /api/strategy          → {config, schema_version, last_modified, config_hash, raw_keys}
+#   PUT  /api/strategy          → body {config: <partial v2>, confirm?: "LIVE"}
+#                                 200 {ok, applied, diff, config_hash, version}
+#                                 422 {errors: {dotted.path: msg}} (file untouched)
+#                                 409 {error} when live+active without confirm
+#   GET  /api/strategy/schema   → {sections: [...], schema: {dotted: meta}, read_only: [...]}
+#   GET  /api/strategy/history  → {history: [{version, ts, actor, diff, config_hash}], count}
+#   POST /api/strategy/rollback → body {version, confirm?} → {ok, restored_version, version, config_hash}
+#   GET  /api/strategy/ack      → {config_hash, schema_version, ts}
+#   POST /api/strategy/preview  → body {config} → {n, reasons, totals} | {insufficient_data, n}
+#   PUT  /api/signals/registry  → body {roles?, thresholds?, confirm?} → {ok, signal_engine, signal_thresholds, version, config_hash}
+
+import strategy_config as _scfg
+
+
+def _strategy_raw_file() -> dict:
+    """Raw strategy.json without the hot-reload audit side effects."""
+    try:
+        with open(config.STRATEGY_FILE) as f:
+            s = json.load(f)
+        return s if isinstance(s, dict) else {}
+    except Exception:
+        return {}
+
+
+def _strategy_v2_mode() -> str:
+    return "live" if get_mode() == "live" else "paper"
+
+
+def _strategy_live_guard(confirm) -> Optional[JSONResponse]:
+    """409 guard: config writes while LIVE trading is actively running require
+    an explicit confirm:'LIVE'. Never raises (guard failure = no guard)."""
+    try:
+        if get_mode() == "live" and bool(
+                _strategy_raw_file().get("trading_active", False)):
+            if confirm != "LIVE":
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": "live trading active — resend with confirm:'LIVE'"})
+    except Exception:
+        pass
+    return None
+
+
+def _strategy_get_payload() -> dict:
+    raw = _strategy_raw_file()
+    last_modified = None
+    try:
+        last_modified = datetime.fromtimestamp(
+            os.path.getmtime(config.STRATEGY_FILE), tz=timezone.utc).isoformat()
+    except Exception:
+        pass
+    return {
+        "config":         _scfg.current_v2_view(raw, mode=_strategy_v2_mode()),
+        "schema_version": _scfg.SCHEMA_VERSION,
+        "last_modified":  last_modified,
+        "config_hash":    database.config_hash(raw),
+        "raw_keys":       sorted(str(k) for k in raw.keys()),
+    }
+
+
+@app.get("/api/strategy")
+def api_get_strategy():
+    """Resolved v2 view of strategy.json + file metadata."""
+    try:
+        return _strategy_get_payload()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/strategy/schema")
+def api_get_strategy_schema():
+    """Per-field UI metadata — the frontend auto-renders the form from this."""
+    try:
+        return {
+            "sections":  list(_scfg.SECTIONS),
+            "schema":    _scfg.SCHEMA,
+            "read_only": sorted(_scfg.READ_ONLY_PATHS),
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.put("/api/strategy")
+def api_put_strategy(body: dict = Body(...)):
+    """Validated partial update of the v2 blocks. All-or-nothing: any field
+    error → 422 and the file is untouched."""
+    try:
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=422,
+                                content={"errors": {"body": "must be an object"}})
+        patch = body.get("config")
+        if not isinstance(patch, dict) or not patch:
+            return JSONResponse(
+                status_code=422,
+                content={"errors": {"config": "must be a non-empty object"}})
+        guard = _strategy_live_guard(body.get("confirm"))
+        if guard is not None:
+            return guard
+
+        raw = _strategy_raw_file()
+        merged, errors = _scfg.validate_patch(raw, patch)
+        if errors:
+            return JSONResponse(status_code=422, content={"errors": errors})
+
+        old_view = _scfg.current_v2_view(raw, mode=_strategy_v2_mode())
+        merged["mode"] = old_view.get("mode", merged.get("mode"))
+        diff = _scfg.diff_views(old_view, merged)
+
+        # Only the blocks the caller actually touched are written — untouched
+        # blocks stay absent from the file so engine legacy fallbacks keep
+        # applying until the user opts in.
+        touched = [b for b in _scfg.V2_BLOCKS if isinstance(patch.get(b), dict)]
+        file_patch = {b: merged[b] for b in touched}
+        file_patch["schema_version"] = _scfg.SCHEMA_VERSION
+        _write_strategy_patch(file_patch)
+
+        new_raw = _strategy_raw_file()
+        version = database.save_config_version("api", diff, new_raw)
+        try:
+            database.log_activity(
+                "Strategy v2 updated via API: "
+                + (", ".join(sorted(diff.keys())[:12]) or "no-op"), "info")
+        except Exception:
+            pass
+        return {
+            "ok":          True,
+            "applied":     {b: merged[b] for b in touched},
+            "diff":        diff,
+            "config_hash": database.config_hash(new_raw),
+            "version":     version,
+        }
+    except Exception as e:
+        try:
+            database.log_activity(f"Strategy v2 save error: {e}", "error")
+        except Exception:
+            pass
+        return JSONResponse(status_code=422,
+                            content={"errors": {"config": f"{type(e).__name__}: {e}"}})
+
+
+@app.get("/api/strategy/history")
+def api_strategy_history(limit: int = 20):
+    """Config-change history (newest first, diffs only — full snapshots are
+    fetched per-version by rollback)."""
+    try:
+        limit = max(1, min(int(limit), 200))
+        history = database.get_config_history(limit=limit)
+        return {"history": history, "count": len(history)}
+    except Exception as e:
+        return {"history": [], "count": 0, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.post("/api/strategy/rollback")
+def api_strategy_rollback(body: dict = Body(...)):
+    """Restore the FULL strategy.json content of a stored history version
+    (atomic write under the shared strategy file lock)."""
+    try:
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=422,
+                                content={"errors": {"body": "must be an object"}})
+        try:
+            version = int(body.get("version"))
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=422,
+                                content={"errors": {"version": "must be an integer"}})
+        rec = database.get_config_version(version)
+        if rec is None or not isinstance(rec.get("full"), dict) or not rec["full"]:
+            return JSONResponse(status_code=404,
+                                content={"error": f"unknown config version {version}"})
+        guard = _strategy_live_guard(body.get("confirm"))
+        if guard is not None:
+            return guard
+
+        full = rec["full"]
+        old_raw = _strategy_raw_file()
+        import strategy_engine as _se_rb
+        # Both lock domains: control_api's writer lock (thread) AND the
+        # cross-process strategy file lock, then the shared atomic writer.
+        with _strategy_write_lock:
+            with _se_rb._strategy_file_lock():
+                _se_rb._atomic_write_strategy(full)
+        try:
+            _API_ALL_CACHE["data"] = None
+        except Exception:
+            pass
+
+        diff = _scfg.diff_views(_scfg.current_v2_view(old_raw),
+                                _scfg.current_v2_view(full))
+        new_version = database.save_config_version(f"rollback(v{version})", diff, full)
+        try:
+            database.log_activity(
+                f"strategy.json rolled back to config version {version}", "warn")
+        except Exception:
+            pass
+        return {
+            "ok":               True,
+            "restored_version": version,
+            "version":          new_version,
+            "diff":             diff,
+            "config_hash":      database.config_hash(full),
+        }
+    except Exception as e:
+        return JSONResponse(status_code=422,
+                            content={"errors": {"rollback": f"{type(e).__name__}: {e}"}})
+
+
+@app.get("/api/strategy/ack")
+def api_strategy_ack():
+    """Hash of the file as THIS process reads it right now — the UI polls
+    this after PUT to confirm the running bot sees the new config (all
+    readers are mtime-cached on the same file, so same hash = applied)."""
+    try:
+        raw = _strategy_raw_file()
+        return {
+            "config_hash":    database.config_hash(raw),
+            "schema_version": raw.get("schema_version"),
+            "ts":             datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return {"config_hash": None, "error": f"{type(e).__name__}: {e}"}
+
+
+# ── Preview: re-evaluate stored entry snapshots under a candidate config ─────
+
+_PREVIEW_SNAPSHOT_N = 200
+_PREVIEW_MIN_N = 10
+_PREVIEW_TIMEOUT_SEC = 30
+_preview_lock = threading.Lock()
+
+
+def _preview_signal_data(snap: dict) -> dict:
+    """Rebuild the signal_registry signal_data dict from one stored entry
+    snapshot (raw keys written by trade_engine._snapshot_raw_from_cache).
+    Shape-tolerant: missing keys degrade to None/False."""
+    raw = snap.get("raw") if isinstance(snap.get("raw"), dict) else {}
+    sigs = raw.get("signals") if isinstance(raw.get("signals"), dict) else {}
+    return {
+        "trend":           bool(sigs.get("trend")),
+        "rsi":             bool(sigs.get("rsi")),
+        "macd":            bool(sigs.get("macd")),
+        "volume":          bool(sigs.get("volume")),
+        "obv":             bool(sigs.get("obv")),
+        "atr":             bool(sigs.get("atr")),
+        "rsi_value":       raw.get("rsi_val", raw.get("rsi_value")),
+        "stoch_rsi_value": raw.get("stoch_rsi_val", raw.get("stoch_rsi_value")),
+        "low_24h":         raw.get("low_24h"),
+        "current_price":   raw.get("price", snap.get("price")),
+        "klines_1m":       raw.get("klines_1m") or [],
+    }
+
+
+def _preview_candidate_strategy(current_raw: dict, patch: dict, merged: dict) -> dict:
+    """Candidate raw strategy: current file + the patched v2 blocks, plus the
+    legacy/engine keys evaluate_buy_decision actually reads (min_signals /
+    signal_engine.min_scored mirror entries.min_score; signal_engine /
+    signal_thresholds passthrough keys apply verbatim)."""
+    import copy as _copy
+    cand = _copy.deepcopy(current_raw) if isinstance(current_raw, dict) else {}
+    for blk in _scfg.V2_BLOCKS:
+        if isinstance(patch.get(blk), dict):
+            cand[blk] = merged.get(blk, {})
+    entries_patch = patch.get("entries")
+    if isinstance(entries_patch, dict) and "min_score" in entries_patch:
+        try:
+            _ms = int(merged["entries"]["min_score"])
+            cand["min_signals"] = _ms
+            se = cand.get("signal_engine")
+            if isinstance(se, dict):
+                se = dict(se)
+                se["min_scored"] = _ms
+                cand["signal_engine"] = se
+        except Exception:
+            pass
+    # Direct signal-engine experimentation (not part of the typed v2 model).
+    for pk in ("signal_engine", "signal_thresholds"):
+        if isinstance(patch.get(pk), dict):
+            base = cand.get(pk) if isinstance(cand.get(pk), dict) else {}
+            cand[pk] = {**base, **patch[pk]}
+    return cand
+
+
+def _preview_worker(snapshots: list, current: dict, candidate: dict) -> dict:
+    import signal_registry as _sr
+    reasons: dict = {}
+    totals = {"current_allowed": 0, "candidate_allowed": 0,
+              "would_allow": 0, "would_block": 0}
+    evaluated = 0
+    for snap in snapshots:
+        sym = snap.get("symbol") or "?"
+        try:
+            sd = _preview_signal_data(snap)
+        except Exception:
+            continue
+        row = {}
+        for label, strat in (("current", current), ("candidate", candidate)):
+            try:
+                dec = _sr.evaluate_buy_decision(sym, sd, strat)
+                allowed = bool(dec.get("allowed"))
+                reason = "allowed" if allowed else str(dec.get("reason") or "blocked")
+            except Exception as exc:
+                allowed, reason = False, f"eval_error:{type(exc).__name__}"
+            row[label] = (allowed, reason)
+            bucket = reasons.setdefault(reason, {"current": 0, "candidate": 0})
+            bucket[label] += 1
+            if allowed:
+                totals[f"{label}_allowed"] += 1
+        evaluated += 1
+        cur_ok, cand_ok = row["current"][0], row["candidate"][0]
+        if not cur_ok and cand_ok:
+            totals["would_allow"] += 1
+        elif cur_ok and not cand_ok:
+            totals["would_block"] += 1
+    return {"n": evaluated, "reasons": reasons, "totals": totals}
+
+
+@app.post("/api/strategy/preview")
+def api_strategy_preview(body: dict = Body(...)):
+    """Dry-run a candidate config against the last stored entry snapshots:
+    per-reason counts under current vs candidate, plus would_allow /
+    would_block totals. Single-flight (409) with a 30 s timeout."""
+    try:
+        if not isinstance(body, dict) or not isinstance(body.get("config"), dict) \
+                or not body["config"]:
+            return JSONResponse(
+                status_code=422,
+                content={"errors": {"config": "must be a non-empty object"}})
+        patch = dict(body["config"])
+        # signal_engine / signal_thresholds are passthrough experiment keys —
+        # strip them before typed validation of the v2 blocks.
+        v2_patch = {k: v for k, v in patch.items()
+                    if k not in ("signal_engine", "signal_thresholds")}
+        raw = _strategy_raw_file()
+        merged: dict = {}
+        if v2_patch:
+            merged, errors = _scfg.validate_patch(raw, v2_patch)
+            if errors:
+                return JSONResponse(status_code=422, content={"errors": errors})
+
+        snapshots = []
+        try:
+            snapshots = database.get_entry_snapshots(limit=_PREVIEW_SNAPSHOT_N)
+        except Exception:
+            snapshots = []
+        if len(snapshots) < _PREVIEW_MIN_N:
+            return {"insufficient_data": True, "n": len(snapshots),
+                    "min_required": _PREVIEW_MIN_N}
+
+        candidate = _preview_candidate_strategy(raw, patch, merged or
+                                                _scfg.current_v2_view(raw))
+
+        if not _preview_lock.acquire(blocking=False):
+            return JSONResponse(status_code=409,
+                                content={"error": "a preview is already running"})
+        import concurrent.futures as _cf
+        ex = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="cfg-preview")
+        fut = ex.submit(_preview_worker, snapshots, raw, candidate)
+        fut.add_done_callback(lambda _f: _preview_lock.release())
+        ex.shutdown(wait=False)
+        try:
+            result = fut.result(timeout=_PREVIEW_TIMEOUT_SEC)
+        except _ConcurrentTimeoutError:
+            return {"error": f"preview timed out after {_PREVIEW_TIMEOUT_SEC}s "
+                             "(still finishing in the background)"}
+        except Exception as e:
+            return {"error": f"preview failed: {type(e).__name__}: {e}"}
+        result["snapshot_window"] = _PREVIEW_SNAPSHOT_N
+        return result
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+# ── PUT /api/signals/registry — roles + thresholds writer ────────────────────
+
+_REGISTRY_VALID_ROLES = {"scored", "mandatory", "veto", "off"}
+
+
+@app.put("/api/signals/registry")
+def api_put_signals_registry(body: dict = Body(...)):
+    """Write signal_engine.roles and/or signal_thresholds. Validated against
+    the live SIGNAL_REGISTRY; 422 field errors, LIVE guard, history entry."""
+    try:
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=422,
+                                content={"errors": {"body": "must be an object"}})
+        roles = body.get("roles")
+        thresholds = body.get("thresholds")
+        if not isinstance(roles, dict):
+            roles = None
+        if not isinstance(thresholds, dict):
+            thresholds = None
+        if not roles and not thresholds:
+            return JSONResponse(
+                status_code=422,
+                content={"errors": {"body": "provide roles and/or thresholds"}})
+
+        import signal_registry as _sr
+        errors: dict = {}
+        clean_roles: dict = {}
+        if roles:
+            for sig_id, role in roles.items():
+                if sig_id not in _sr.SIGNAL_REGISTRY:
+                    errors[f"roles.{sig_id}"] = (
+                        f"unknown signal id (known: {sorted(_sr.SIGNAL_REGISTRY)})")
+                    continue
+                norm = role.strip().lower() if isinstance(role, str) else None
+                if norm == "disabled":   # UI vocabulary → roles-map spelling
+                    norm = "off"
+                if norm not in _REGISTRY_VALID_ROLES:
+                    errors[f"roles.{sig_id}"] = "role must be scored|mandatory|veto|off"
+                    continue
+                clean_roles[sig_id] = norm
+        clean_thresholds: dict = {}
+        if thresholds:
+            # rsi_buy_threshold is read from signal_thresholds by M1 but has
+            # no entry in DEFAULT_SIGNAL_THRESHOLDS (legacy root default 40.0).
+            known_th = {"rsi_buy_threshold": 40.0,
+                        **getattr(_sr, "DEFAULT_SIGNAL_THRESHOLDS", {})}
+            # Accept the SignalsEditorPanel's nested shape too:
+            # {signal_id: {threshold_key: value}} — flatten to the flat map
+            # the engine reads (unknown inner keys still 422 below).
+            flat: dict = {}
+            for key, val in thresholds.items():
+                if key in _sr.SIGNAL_REGISTRY and isinstance(val, dict):
+                    flat.update(val)
+                else:
+                    flat[key] = val
+            thresholds = flat
+            for key, val in thresholds.items():
+                if key not in known_th:
+                    errors[f"thresholds.{key}"] = (
+                        f"unknown threshold (known: {sorted(known_th)})")
+                    continue
+                if isinstance(known_th.get(key), str):
+                    if not isinstance(val, str):
+                        errors[f"thresholds.{key}"] = "must be a string"
+                        continue
+                    clean_thresholds[key] = val
+                    continue
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    errors[f"thresholds.{key}"] = "must be a number"
+                    continue
+                clean_thresholds[key] = float(val)
+        if errors:
+            return JSONResponse(status_code=422, content={"errors": errors})
+
+        guard = _strategy_live_guard(body.get("confirm"))
+        if guard is not None:
+            return guard
+
+        s = _strategy_raw_file()
+        old_se = s.get("signal_engine") if isinstance(s.get("signal_engine"), dict) else {}
+        old_th = s.get("signal_thresholds") if isinstance(s.get("signal_thresholds"), dict) else {}
+        patch: dict = {}
+        new_se, new_th = dict(old_se), dict(old_th)
+        if clean_roles:
+            merged_roles = dict(old_se.get("roles") or {})
+            merged_roles.update(clean_roles)
+            new_se = {**old_se, "roles": merged_roles}
+            patch["signal_engine"] = new_se
+        if clean_thresholds:
+            new_th = {**old_th, **clean_thresholds}
+            patch["signal_thresholds"] = new_th
+        _write_strategy_patch(patch)
+
+        new_raw = _strategy_raw_file()
+        diff = _scfg.diff_views(
+            {"signal_engine": old_se, "signal_thresholds": old_th},
+            {"signal_engine": new_se, "signal_thresholds": new_th})
+        version = database.save_config_version("api", diff, new_raw)
+        try:
+            database.log_activity(
+                "Signal registry updated via API: "
+                + (", ".join(sorted(diff.keys())[:12]) or "no-op"), "info")
+        except Exception:
+            pass
+        return {
+            "ok":                True,
+            "signal_engine":     new_se,
+            "signal_thresholds": new_th,
+            "diff":              diff,
+            "version":           version,
+            "config_hash":       database.config_hash(new_raw),
+        }
+    except Exception as e:
+        try:
+            database.log_activity(f"Signal registry save error: {e}", "error")
+        except Exception:
+            pass
+        return JSONResponse(status_code=422,
+                            content={"errors": {"body": f"{type(e).__name__}: {e}"}})
 
 
 def start_control_api():

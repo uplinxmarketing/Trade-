@@ -359,6 +359,22 @@ def init_db():
             except Exception:
                 pass  # column already exists — SQLite has no IF NOT EXISTS for ALTER
 
+        # ── Phase 5 §5.1 — config history (versioned strategy.json audit) ────
+        try:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS config_history (
+                    version     INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts          REAL,
+                    actor       TEXT,
+                    diff_json   TEXT,
+                    full_json   TEXT,
+                    config_hash TEXT
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_config_history_ts ON config_history(ts)")
+        except Exception as e:
+            print(f"[Database] WARNING: config_history table not created: {e}")
+
         # ── Trade dedupe index ────────────────────────────────────────────────
         # import_trades relies on INSERT OR IGNORE, which is a no-op without a
         # UNIQUE constraint. Clean up existing exact-duplicate rows first
@@ -1344,6 +1360,91 @@ def get_recent_futures_trades(limit: int = 20) -> List[dict]:
         """, (limit,)).fetchall()
         conn.close()
     return [dict(r) for r in rows]
+
+
+# ── Config history (Phase 5 §5.1) ─────────────────────────────────────────────
+
+def save_config_version(actor: str, diff: dict, full: dict) -> Optional[int]:
+    """Record one strategy.json change. `diff` is a dotted-path change map,
+    `full` the complete post-change file content. Returns the new version
+    number (autoincrement) or None on failure — history must never break a
+    config write."""
+    import time as _t
+    try:
+        diff_json = json.dumps(diff if diff is not None else {}, default=str)
+    except Exception:
+        diff_json = "{}"
+    try:
+        full_json = json.dumps(full if full is not None else {}, default=str)
+    except Exception:
+        full_json = "{}"
+    try:
+        chash = config_hash(full if isinstance(full, dict) else {})
+    except Exception:
+        chash = None
+    try:
+        with _lock:
+            conn = _conn()
+            cur = conn.execute("""
+                INSERT INTO config_history (ts, actor, diff_json, full_json, config_hash)
+                VALUES (?,?,?,?,?)
+            """, (_t.time(), str(actor or "unknown"), diff_json, full_json, chash))
+            conn.commit()
+            version = cur.lastrowid
+            conn.close()
+        return version
+    except Exception:
+        return None
+
+
+def get_config_history(limit: int = 50) -> List[dict]:
+    """Newest-first config history (without full_json — fetch a single version
+    for that). diff_json is parsed back to a dict."""
+    try:
+        with _lock:
+            conn = _conn()
+            rows = conn.execute("""
+                SELECT version, ts, actor, diff_json, config_hash
+                FROM config_history ORDER BY version DESC LIMIT ?
+            """, (int(limit),)).fetchall()
+            conn.close()
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["diff"] = json.loads(d.pop("diff_json") or "{}")
+        except Exception:
+            d["diff"] = {}
+        out.append(d)
+    return out
+
+
+def get_config_version(version: int) -> Optional[dict]:
+    """One config-history row including the parsed full config, or None."""
+    try:
+        with _lock:
+            conn = _conn()
+            row = conn.execute("""
+                SELECT version, ts, actor, diff_json, full_json, config_hash
+                FROM config_history WHERE version = ?
+            """, (int(version),)).fetchone()
+            conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["diff"] = json.loads(d.pop("diff_json") or "{}")
+    except Exception:
+        d["diff"] = {}
+    try:
+        d["full"] = json.loads(d.pop("full_json") or "{}")
+    except Exception:
+        d["full"] = {}
+    return d
 
 
 def import_trades(trades: list) -> int:
