@@ -41,6 +41,12 @@ export interface HealthScannerInfo {
   effective_interval_sec?: number;
   scan_skipped_overlap?: number;
   universe_size?: number;
+  // J3 — authoritative universe breakdown so every panel agrees on the total.
+  // `universe_valid` is the count actually scanned; suspended/excluded are
+  // reported separately rather than folded into a single ambiguous number.
+  universe_valid?: number;
+  suspended?: number;
+  excluded?: number;
   stale_signal_count?: number;
 }
 
@@ -223,6 +229,16 @@ export function DataHealthPanelView({ health, error, stale = false }: {
 
   const worstAges = (d.worst_candle_ages ?? []).slice(0, 5);
 
+  // J3 — universe count consistency. Show the authoritative valid-universe total
+  // (falling back to universe_size on older backends) with suspended/excluded as
+  // SEPARATE counts, so this never disagrees with another panel's single number.
+  const validCount = scanner.universe_valid ?? scanner.universe_size;
+  const suspendedCount = scanner.suspended ?? 0;
+  const excludedCount = scanner.excluded ?? 0;
+  const universeStr = `universe ${fmtNum(validCount)} valid`
+    + (suspendedCount ? ` · ${suspendedCount} suspended` : '')
+    + (excludedCount ? ` · ${excludedCount} excluded` : '');
+
   // REST throttle countdowns — compare against the payload's own clock so
   // units always match, and only surface windows still in the future.
   const throttles: Array<{ label: string; until: number | undefined }> = [
@@ -351,7 +367,7 @@ export function DataHealthPanelView({ health, error, stale = false }: {
                 <span className="text-muted-foreground font-normal"> · skipped {fmtNum(scanner.scan_skipped_overlap)}</span>
               </>
             }
-            sub={`${fmtNum(scanner.last_duration_ms)}ms · every ${fmtNum(scanner.effective_interval_sec)}s · universe ${fmtNum(scanner.universe_size)}`}
+            sub={`${fmtNum(scanner.last_duration_ms)}ms · every ${fmtNum(scanner.effective_interval_sec)}s · ${universeStr}`}
           />
         </div>
         {(scanner.stale_signal_count ?? 0) > 0 && (

@@ -2361,7 +2361,17 @@ def get_data_health() -> dict:
                                 if str(st).upper() == "DELISTED")
     _excluded_break = sorted(s for s, st in _excluded_snapshot.items()
                              if str(st).upper() != "DELISTED")
-    _total_streams = sum(len(c.streams) for c in _connections)
+    # J3 — honest stream accounting. The universe-wide per-symbol stream set is
+    # exactly _market_suffixes(): {kline_1m, kline_5m, kline_15m, miniTicker} = 4
+    # when entries.bookticker_universe is OFF, +bookTicker = 5 when ON. NEVER
+    # hardcode the multiplier — derive it from the actual subscribed suffix set.
+    _streams_per_symbol = len(_market_suffixes())
+    _market_streams = sum(len(c.streams) for c in _connections)
+    # Held-only exit feed (@trade + @bookTicker per held symbol) lives on the
+    # dedicated _held_conn — counted SEPARATELY, never folded into the universe
+    # per-symbol figure.
+    _held_streams = len(_held_conn.streams) if _held_conn is not None else 0
+    _total_streams = _market_streams + _held_streams
     ages = []
     for sym in subscribed:
         buf = ws_candles.get(sym)
@@ -2412,6 +2422,17 @@ def get_data_health() -> dict:
         # covering every valid symbol reads as 100% (health green). Delisted/
         # renamed symbols are reported separately via excluded_symbols.
         "expected_symbols":           len(_universe_set),
+        # J3 — honest stream/symbol accounting (no hardcoded ×3 or ×4). The
+        # universe-wide per-symbol set is _market_suffixes(): 4 with the flag
+        # off, 5 with entries.bookticker_universe on. total_streams =
+        # symbols_covered × streams_per_symbol + the held-only exit feed.
+        "streams_per_symbol":         _streams_per_symbol,
+        "bookticker_universe":        _bookticker_universe_enabled(),
+        "market_streams":             _market_streams,
+        "held_streams":               _held_streams,
+        "total_streams":              _total_streams,
+        # Back-compat: "streams" now reflects the honest grand total (market +
+        # held-only), not just the market shards.
         "streams":                    _total_streams,
         "uncovered_symbols":          _uncovered[:50],
         "uncovered_count":            len(_uncovered),

@@ -287,6 +287,22 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("positions", exc)
 
+            # 3a. Part J (J2) — restore persisted risk latches EARLY, before any
+            #     entry evaluation is armed (signal_scanner / position_guardian
+            #     spawn at step 7). A latch that tripped before the restart must
+            #     be active again immediately, otherwise there is a window where
+            #     entries could fire un-latched. Guarded so an older trade_engine
+            #     without load_risk_latches() no-ops cleanly.
+            try:
+                _load_latches = getattr(trade_engine, "load_risk_latches", None)
+                if callable(_load_latches):
+                    _load_latches()
+                    steps.append("risk_latches_reloaded")
+                else:
+                    steps.append("risk_latches_reloaded (skip: fn absent)")
+            except Exception as exc:
+                _step_failed("risk_latches_reloaded", exc)
+
             # 3b. Start REST price refresher for held positions (2s interval —
             #     critical for low-WS-volume coins that can go minutes stale)
             try:
@@ -970,6 +986,35 @@ def _validate_universe() -> dict:
     except Exception:
         pass
     return result
+
+
+def _authoritative_universe() -> dict:
+    """Part J (J3) — the SINGLE authoritative universe count for every panel
+    this file emits (health payload, diagnostics bundle, status, scanner-
+    universe field/log). The VALID (TRADING) universe is authoritative;
+    suspended (halted/BREAK) and excluded (delisted) symbols are counted
+    SEPARATELY and are NEVER folded into the universe total. This kills the old
+    disagreement where health said "92 valid" while the scanner said
+    "universe=93" (the scanner had counted a suspended symbol in its total).
+
+    Returns {"universe_valid", "suspended", "excluded", "available"}. Fails open
+    (available False) so an exchangeInfo outage never zeros the panels."""
+    try:
+        uni = _validate_universe()
+    except Exception:
+        return {"universe_valid": None, "suspended": None,
+                "excluded": None, "available": False}
+    if not uni.get("exchange_info_available", False):
+        # Cannot split valid vs suspended without exchangeInfo — fail open:
+        # report the approved count as valid, zero suspended/excluded.
+        return {"universe_valid": uni.get("covered"), "suspended": 0,
+                "excluded": 0, "available": False}
+    return {
+        "universe_valid": uni.get("covered"),
+        "suspended":      int(uni.get("break_count", 0) or 0),
+        "excluded":       int(uni.get("delisted_count", 0) or 0),
+        "available":      True,
+    }
 
 
 # ── I4 — three-tier auto-management of the approved_coins watchlist ──────────
@@ -3019,9 +3064,34 @@ def api_signals_summary(limit: int = 30):
         strategy = _load_strategy()
         _SNAPSHOT_SKIP = {"E1_spread_too_wide"}
 
+        # J1 — decision-trace overlay. Pulled ONCE here inside the cached
+        # builder so it refreshes with the 3s summary cache. Guarded: an older
+        # trade_engine without get_decision_trace() leaves the map empty and the
+        # per-symbol fields fall through to null/False (shape unchanged).
+        _decision_trace: dict = {}
+        try:
+            import trade_engine as _te_trace
+            _dt_fn = getattr(_te_trace, "get_decision_trace", None)
+            if callable(_dt_fn):
+                _raw_trace = _dt_fn()
+                if isinstance(_raw_trace, dict):
+                    _decision_trace = _raw_trace
+        except Exception:
+            _decision_trace = {}
+
+        def _trace_age(_ts):
+            """now - raw ts (seconds, 1dp) or None. Same clock (time.time())
+            the rest of this file uses, so ages are consistent everywhere."""
+            try:
+                _ts = float(_ts)
+            except (TypeError, ValueError):
+                return None
+            return round(now - _ts, 1) if _ts > 0 else None
+
         signals_list = []
         for sym, entry in snap.items():
             try:
+                _tr = _decision_trace.get(sym) or {}
                 sig = entry.get("signals", {})
                 signal_data = {
                     "trend": sig.get("trend", False),
@@ -3072,6 +3142,15 @@ def api_signals_summary(limit: int = 30):
                     "promo_pair_available": bool(
                         getattr(_te_gates, "promo_pair_available", lambda _s: False)(sym)),
                     "ts": entry.get("ts", 0),
+                    # J1 — decision-trace fields (ages computed server-side from
+                    # the raw ts in trade_engine.get_decision_trace(); null when
+                    # the trace is unavailable or the symbol has no entry yet).
+                    "last_evaluated_age_sec": _trace_age(_tr.get("last_evaluated_ts")),
+                    "last_attempt_age_sec":   _trace_age(_tr.get("last_attempt_ts")),
+                    "last_block_reason":      _tr.get("last_block_reason"),
+                    "last_block_age_sec":     _trace_age(_tr.get("last_block_ts")),
+                    "cached_green":           bool(_tr.get("cached_green", False)),
+                    "engine_ready":           bool(_tr.get("engine_ready", False)),
                 })
             except Exception:
                 continue
@@ -3799,7 +3878,25 @@ def _limits_report_line() -> str:
 def api_health_data():
     """Part C §6.5 health panel: data feed + rate limits + engine health with RED rules."""
     try:
-        return _compute_health_snapshot()
+        snap = _compute_health_snapshot()
+        # J3 — make the scanner tile's universe count authoritative and consistent
+        # with every other panel: valid-universe is the single number, suspended /
+        # excluded are reported separately (never folded into the total). The
+        # frontend DataHealthPanel reads scanner.universe_valid / suspended /
+        # excluded; without this they were absent and it fell back to the scanner's
+        # own universe_size, which had folded a suspended symbol in (the "92 vs 93").
+        try:
+            eng = snap.get("engine")
+            sc = eng.get("scanner") if isinstance(eng, dict) else None
+            if isinstance(sc, dict):
+                _au = _authoritative_universe()
+                if _au.get("universe_valid") is not None:
+                    sc["universe_valid"] = _au.get("universe_valid")
+                    sc["suspended"] = _au.get("suspended")
+                    sc["excluded"] = _au.get("excluded")
+        except Exception:
+            pass
+        return snap
     except Exception as e:
         # Last-resort backstop — this endpoint must never 500.
         return {
@@ -3855,6 +3952,13 @@ def api_diagnostics():
     except Exception:
         _health_compact = {"status": "green", "causes": []}
 
+    # J3 — authoritative VALID universe count (shared with the health panel).
+    try:
+        _auth_uni = _authoritative_universe()
+    except Exception:
+        _auth_uni = {"universe_valid": None, "suspended": None,
+                     "excluded": None, "available": False}
+
     return {
         "server_time": now,
         "health": _health_compact,
@@ -3889,7 +3993,16 @@ def api_diagnostics():
             "last_duration_ms":      _last_scan_dur_ms,
             "scans_completed":       ssh.get("scans_completed", 0),
             "scan_skipped_overlap":  ssh.get("scan_skipped_overlap", 0),
-            "universe_size":         ssh.get("universe_size", 0),
+            # J3 — VALID universe is authoritative. universe_size now reports the
+            # valid (TRADING) count so it agrees with the health panel; suspended
+            # (halted/BREAK) is reported separately, never folded into the total.
+            # Falls back to the scanner's own count when exchangeInfo is missing.
+            "universe_size":         (_auth_uni.get("universe_valid")
+                                      if _auth_uni.get("universe_valid") is not None
+                                      else ssh.get("universe_size", 0)),
+            "universe_valid":        _auth_uni.get("universe_valid"),
+            "universe_suspended":    _auth_uni.get("suspended"),
+            "universe_excluded":     _auth_uni.get("excluded"),
             "cached_signals_count":  len(_te._signal_cache),          # signal-cache size
             "overloaded":            _scanner_overloaded,
         },
@@ -4166,12 +4279,21 @@ def api_diagnostics_bundle(
             out.write(f"  CAUSE: {c}\n")
         for w in snap.get("warns", []):
             out.write(f"  WARN: {w}\n")
+        # J3 — authoritative counts (default None so the scanner line below is
+        # safe even when the data section is unavailable).
+        _valid = None
+        _suspended_h = None
         d = snap.get("data") or {}
         if d.get("available"):
             out.write(f"  ws_connections={len(d.get('connections', []))} "
                       f"msgs/s={d.get('total_msgs_per_sec')} "
                       f"subscribed={d.get('subscribed_coins')} "
                       f"covered={d.get('symbols_covered')}/{d.get('expected_symbols')} "
+                      # J3.2 — streams/covered/subscribed are the LIVE values
+                      # from data_collector.get_data_health() (no hardcoded ×3/×4
+                      # multiplier here); data_collector owns the real stream
+                      # count incl. whether the 4th stream is @kline_15m vs a
+                      # bookTicker gated by entries.bookticker_universe.
                       f"streams={d.get('streams')} "
                       f"buffer_1m={d.get('buffer_fill_pct_1m')}% "
                       f"buffer_5m={d.get('buffer_fill_pct_5m')}% "
@@ -4181,7 +4303,14 @@ def api_diagnostics_bundle(
             # is already valid-only; print the excluded split (delisted vs BREAK)
             # so "61 valid (8 excluded: 7 delisted, 1 BREAK)" reads truthfully
             # instead of the old inflated 69-including-dead-tickers count.
-            _valid = d.get("expected_symbols")
+            # J3 — VALID universe is authoritative: prefer _authoritative_universe()
+            # (same number the scanner now reports) so no two panels disagree; fall
+            # back to expected_symbols when exchangeInfo is unavailable.
+            _auth_uni_h = _authoritative_universe()
+            _valid = (_auth_uni_h.get("universe_valid")
+                      if _auth_uni_h.get("universe_valid") is not None
+                      else d.get("expected_symbols"))
+            _suspended_h = _auth_uni_h.get("suspended")
 
             def _count(v):
                 # Data agent exposes excluded_delisted/_break as symbol LISTS;
@@ -4205,8 +4334,13 @@ def api_diagnostics_bundle(
                 _exc_break = len(_br)
                 _exc_delisted = len(_exc) - _exc_break
             _exc_total = (_exc_delisted or 0) + (_exc_break or 0)
+            # J3 — suspended (halted/BREAK) is reported separately, NEVER folded
+            # into the valid universe total.
+            _susp_note = (f", {_suspended_h} suspended"
+                          if _suspended_h else "")
             out.write(f"  universe: {_valid} valid ({_exc_total} excluded: "
-                      f"{_exc_delisted or 0} delisted, {_exc_break or 0} BREAK)\n")
+                      f"{_exc_delisted or 0} delisted, {_exc_break or 0} BREAK"
+                      f"{_susp_note})\n")
             if d.get("backfill_complete") is not None or d.get("backfill_pct") is not None:
                 out.write(f"  backfill: complete={d.get('backfill_complete')} "
                           f"pct={d.get('backfill_pct')}\n")
@@ -4222,7 +4356,14 @@ def api_diagnostics_bundle(
         eng = snap.get("engine") or {}
         if eng.get("available"):
             sc = eng.get("scanner") or {}
-            out.write(f"  scanner mode={sc.get('mode')} universe={sc.get('universe_size')} "
+            # J3 — report the authoritative VALID universe (agrees with the
+            # health line above) + suspended separately, instead of the scanner's
+            # own universe_size which used to include suspended symbols (the
+            # source of the "health 92 / scanner 93" disagreement).
+            _sc_valid = (_valid if _valid is not None
+                         else sc.get("universe_size"))
+            _sc_susp = (f" suspended={_suspended_h}" if _suspended_h else "")
+            out.write(f"  scanner mode={sc.get('mode')} universe={_sc_valid}{_sc_susp} "
                       f"stale_signals={sc.get('stale_signal_count')} "
                       f"overlap_skips={sc.get('scan_skipped_overlap')} "
                       f"held_max_price_age={eng.get('held_max_price_age_sec')}s\n")

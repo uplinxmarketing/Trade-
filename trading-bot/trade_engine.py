@@ -2786,6 +2786,134 @@ _rejection_examples: dict = {}
 _rejection_lock = threading.Lock()
 _rejection_reset_ts: float = time.time()
 
+
+# ── J1 — per-symbol decision trace ────────────────────────────────────────────
+# The operator repeatedly saw a coin show "green / buy_ready=1" but no purchase
+# and NO log lines for that symbol. This records, per symbol, WHY it did/didn't
+# act so control_api can surface it. All fields are raw (control_api computes
+# ages). Updated in-line on the buy/evaluation path; O(1) per eval.
+#   last_evaluated_ts — set every time the symbol is evaluated (fresh re-check).
+#   last_attempt_ts   — set when an actual entry attempt begins (order start).
+#   last_block_reason/last_block_ts — most recent reason it did NOT buy (reuses
+#                       the existing _record_rejection reason taxonomy).
+#   cached_green       — cached (last-candle) verdict says buy-ready.
+#   engine_ready       — the FRESH re-check verdict passed.
+_decision_trace: Dict[str, dict] = {}
+_decision_trace_lock = threading.Lock()
+_decision_heartbeat: int = 0            # +1 per _check_buys_from_cache pass
+_DECISION_GAP_HEARTBEATS = 2            # ready for >N cycles w/o attempt/block = bug
+# Transition-only dedupe for the DECISION-GAP warn: sym -> the _ready_since_hb
+# streak we last warned about (so one warn per stuck streak, no spam).
+_decision_gap_warned: Dict[str, int] = {}
+
+
+def _new_trace_entry() -> dict:
+    return {
+        "last_evaluated_ts": 0.0,
+        "last_attempt_ts":   0.0,
+        "last_block_reason": None,
+        "last_block_ts":     0.0,
+        "cached_green":      False,
+        "engine_ready":      False,
+        # internal (stripped from the public reader):
+        "_ready_since_hb":   0,     # heartbeat the current ready-streak began
+        "_was_ready":        False,
+    }
+
+
+def _trace_mark_evaluated(symbol: str, cached_green: bool) -> None:
+    """Set last_evaluated_ts + cached_green, and maintain the ready-streak used
+    by the DECISION-GAP detector. Called once per symbol per heartbeat."""
+    if not symbol or symbol == "(all)":
+        return
+    now = time.time()
+    with _decision_trace_lock:
+        ent = _decision_trace.get(symbol)
+        if ent is None:
+            ent = _new_trace_entry()
+            _decision_trace[symbol] = ent
+        ent["last_evaluated_ts"] = now
+        ent["cached_green"] = bool(cached_green)
+        ready = bool(cached_green) or bool(ent.get("engine_ready"))
+        if ready and not ent.get("_was_ready"):
+            ent["_ready_since_hb"] = _decision_heartbeat
+        ent["_was_ready"] = ready
+        if ready:
+            _maybe_warn_decision_gap_locked(symbol, ent)
+        else:
+            _decision_gap_warned.pop(symbol, None)
+
+
+def _trace_mark_engine_ready(symbol: str) -> None:
+    """FRESH re-check verdict passed (engine-ready, distinct from cached-green)."""
+    if not symbol or symbol == "(all)":
+        return
+    with _decision_trace_lock:
+        ent = _decision_trace.get(symbol) or _new_trace_entry()
+        _decision_trace[symbol] = ent
+        ent["engine_ready"] = True
+
+
+def _trace_mark_attempt(symbol: str) -> None:
+    """An actual entry attempt began — candidate passed gates, order placement
+    started. Resets the ready-streak (an action was taken this heartbeat)."""
+    if not symbol or symbol == "(all)":
+        return
+    with _decision_trace_lock:
+        ent = _decision_trace.get(symbol) or _new_trace_entry()
+        _decision_trace[symbol] = ent
+        ent["last_attempt_ts"] = time.time()
+        ent["_ready_since_hb"] = _decision_heartbeat
+        _decision_gap_warned.pop(symbol, None)
+
+
+def _trace_mark_block(symbol: str, reason: str) -> None:
+    """Most recent reason the symbol did NOT buy (reuses existing reason
+    strings). Resets the ready-streak (the cycle produced a block reason)."""
+    if not symbol or symbol == "(all)":
+        return
+    with _decision_trace_lock:
+        ent = _decision_trace.get(symbol)
+        if ent is None:
+            ent = _new_trace_entry()
+            _decision_trace[symbol] = ent
+        ent["last_block_reason"] = reason
+        ent["last_block_ts"] = time.time()
+        ent["engine_ready"] = False
+        ent["_ready_since_hb"] = _decision_heartbeat
+        _decision_gap_warned.pop(symbol, None)
+
+
+def _maybe_warn_decision_gap_locked(symbol: str, ent: dict) -> None:
+    """J1.3 — a symbol buy-ready for >2 heartbeats with NO attempt advance and
+    NO block reason is a bug (the operator's 'green but nothing happens'). Emit
+    ONE transition-only WARN. Caller holds _decision_trace_lock."""
+    since = ent.get("_ready_since_hb", _decision_heartbeat)
+    n = _decision_heartbeat - since
+    if n <= _DECISION_GAP_HEARTBEATS:
+        return
+    if _decision_gap_warned.get(symbol) == since:
+        return  # already warned for this stuck streak
+    _decision_gap_warned[symbol] = since
+    try:
+        database.log_activity(
+            f"DECISION-GAP: {symbol} buy-ready for {n} cycles with no attempt "
+            f"and no block reason", "warn")
+    except Exception:
+        pass
+
+
+def get_decision_trace() -> Dict[str, dict]:
+    """Public reader (control_api): shallow copy of the per-symbol decision
+    trace. Raw ts fields are returned as-is; control_api computes ages. Internal
+    bookkeeping fields (underscore-prefixed) are stripped."""
+    out: Dict[str, dict] = {}
+    with _decision_trace_lock:
+        for sym, ent in _decision_trace.items():
+            out[sym] = {k: v for k, v in ent.items() if not k.startswith("_")}
+    return out
+
+
 def _record_rejection(symbol: str, score, reason: str, detail: str = ""):
     # NOTE: no score filter here — engine-path rejections carry the ENGINE
     # score (often 0-2) and systematic gates (pre-gate, min-notional, vetoes)
@@ -2810,6 +2938,9 @@ def _record_rejection(symbol: str, score, reason: str, detail: str = ""):
         pass
     # Phase 1 §1.3: near-miss entry snapshot (throttled; never raises).
     _snapshot_near_miss(symbol, reason, detail, score)
+    # J1 — feed the per-symbol decision trace with the existing reason string
+    # (global "(all)" rejections are ignored — they aren't per-symbol blocks).
+    _trace_mark_block(symbol, reason)
 
 def get_rejection_stats() -> dict:
     with _rejection_lock:
@@ -3300,6 +3431,9 @@ _daily_stop_resumed_day: str = ""     # manual resume disarms re-trip for the da
 # once). The persistent "stopped" flag for the UI stays in get_risk_status();
 # the log stream only carries the two transition lines, not a 60 s heartbeat.
 _daily_stop_logged: bool = False
+# J2 — trip context captured when the daily stop trips (pnl/limit at trip),
+# persisted alongside the latch so a restart can show why it was armed.
+_daily_stop_trip_ctx: dict = {}
 
 
 def _utc_day_str() -> str:
@@ -3413,7 +3547,7 @@ def _check_daily_loss_stop() -> bool:
     """Lazy §4.2a breaker evaluation (30 s cached PnL). Returns True while
     buys must stay paused. Exits are unaffected — only buy paths call this."""
     global _daily_stop_until, _daily_stop_logged_day, _daily_stop_flattened_day
-    global _daily_stop_logged
+    global _daily_stop_logged, _daily_stop_trip_ctx
     now = time.time()
     if now < _daily_stop_until:
         return True
@@ -3433,6 +3567,15 @@ def _check_daily_loss_stop() -> bool:
         first_trip_today = _daily_stop_logged_day != day
         _daily_stop_logged_day = day
         _daily_stop_logged = True   # latched — release will log the INFO line
+        # J2 — capture the trip context and persist the latch so a restart
+        # before UTC midnight reloads (rather than silently clearing) it.
+        _daily_stop_trip_ctx = {
+            "day":        day,
+            "pnl_today":  st.get("pnl_today"),
+            "limit_usdt": st.get("limit_usdt"),
+            "limit_pct":  st.get("limit_pct"),
+        }
+    persist_risk_latches()
     if first_trip_today:
         try:
             database.log_activity(
@@ -3473,6 +3616,9 @@ def resume_daily_stop() -> dict:
                 "(breaker disarmed for the rest of today UTC)", "info")
         except Exception:
             pass
+    # J2 — persist the release (records resumed_day so a restart today does not
+    # re-arm) and clears the stored active latch.
+    persist_risk_latches()
     return {"resumed": was_stopped, "day": _daily_stop_resumed_day}
 
 
@@ -3536,6 +3682,145 @@ def _maybe_trigger_consec_pause_locked(count: int) -> None:
                 f"{int(_CONSEC_PAUSE_SEC // 60)} min", "error")
         except Exception:
             pass
+        # J2 — persist the pause expiry so a restart within the window reloads it.
+        persist_risk_latches()
+
+
+# ── J2 — persist risk latches across restarts ─────────────────────────────────
+# A process restart used to silently clear the daily-loss latch and the
+# consecutive-loss pause, so with several deploys/day the breaker was
+# decorative. We persist both latches to a small table OWNED by this file and
+# reload them at boot — but ONLY if each latch is still valid by its OWN rule
+# (daily stop: until_ts in the future AND same UTC day; consec pause: expiry in
+# the future). A latch whose rule already expired is NOT restored — it releases
+# by its rule, never by restart, and never wrongly re-arms.
+_RISK_LATCH_KEYS = ("daily_stop", "consec_pause")
+
+
+def _risk_latch_ensure_table_locked(conn) -> None:
+    """Create the risk_latches table idempotently. Caller holds database._lock."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS risk_latches("
+        "key TEXT PRIMARY KEY, active INTEGER, until_ts REAL, "
+        "context TEXT, updated_ts REAL)")
+
+
+def persist_risk_latches() -> None:
+    """Write the current daily-stop and consecutive-loss pause state to the DB.
+    Called on every latch trip/release. Never raises."""
+    try:
+        now = time.time()
+        daily_active = 1 if _daily_stop_until > now else 0
+        daily_ctx = _json.dumps({
+            "day":           _daily_stop_logged_day,
+            "resumed_day":   _daily_stop_resumed_day,
+            "flattened_day": _daily_stop_flattened_day,
+            "pnl_today":     (_daily_stop_trip_ctx or {}).get("pnl_today"),
+            "limit_usdt":    (_daily_stop_trip_ctx or {}).get("limit_usdt"),
+            "limit_pct":     (_daily_stop_trip_ctx or {}).get("limit_pct"),
+        })
+        consec_active = 1 if _consec_loss_pause_until > now else 0
+        consec_ctx = _json.dumps({"count": _consec_losses})
+        rows = [
+            ("daily_stop",   daily_active,  _daily_stop_until,        daily_ctx,  now),
+            ("consec_pause", consec_active, _consec_loss_pause_until, consec_ctx, now),
+        ]
+        with database._lock:
+            conn = database._conn()
+            try:
+                _risk_latch_ensure_table_locked(conn)
+                conn.executemany(
+                    "INSERT INTO risk_latches(key, active, until_ts, context, updated_ts) "
+                    "VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET active=excluded.active, "
+                    "until_ts=excluded.until_ts, context=excluded.context, "
+                    "updated_ts=excluded.updated_ts", rows)
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception:
+        pass
+
+
+def load_risk_latches() -> None:
+    """Boot-time restore (control_api calls this once before the engine loop).
+    Restores each latch ONLY if still valid by its own rule. Safe to call before
+    the engine starts and a clean no-op when the table/rows are missing."""
+    global _daily_stop_until, _daily_stop_logged_day, _daily_stop_logged
+    global _daily_stop_flattened_day, _daily_stop_resumed_day, _daily_stop_trip_ctx
+    global _consec_loss_pause_until, _consec_pause_logged, _consec_losses
+    try:
+        with database._lock:
+            conn = database._conn()
+            try:
+                _risk_latch_ensure_table_locked(conn)
+                rows = conn.execute(
+                    "SELECT key, active, until_ts, context FROM risk_latches").fetchall()
+            finally:
+                conn.close()
+    except Exception:
+        return
+    if not rows:
+        return
+    now = time.time()
+    today = _utc_day_str()
+    for r in rows:
+        try:
+            key = r["key"]
+            until = float(r["until_ts"] or 0.0)
+            try:
+                ctx = _json.loads(r["context"] or "{}") or {}
+            except Exception:
+                ctx = {}
+        except Exception:
+            continue
+        if key == "daily_stop":
+            resumed_day = ctx.get("resumed_day") or ""
+            # A manual resume today disarms re-tripping for the rest of the day —
+            # restore that fact even though the latch itself is not active.
+            if resumed_day == today:
+                _daily_stop_resumed_day = today
+                continue
+            trip_day = ctx.get("day") or ""
+            # Rule: restore only if the pause has not elapsed AND we are still on
+            # the same UTC day it was tripped (UTC midnight passing releases it).
+            if until > now and trip_day == today:
+                _daily_stop_until = until
+                _daily_stop_logged_day = trip_day
+                _daily_stop_flattened_day = ctx.get("flattened_day") or ""
+                # Re-arm without re-logging the trigger ERROR: set the latched
+                # flag True so the release transition still fires once later.
+                _daily_stop_logged = True
+                _daily_stop_trip_ctx = {
+                    "day":        trip_day,
+                    "pnl_today":  ctx.get("pnl_today"),
+                    "limit_usdt": ctx.get("limit_usdt"),
+                    "limit_pct":  ctx.get("limit_pct"),
+                }
+                try:
+                    _until_iso = datetime.fromtimestamp(
+                        until, timezone.utc).isoformat()
+                    database.log_activity(
+                        f"restored daily-stop latch, active until {_until_iso}",
+                        "info")
+                except Exception:
+                    pass
+        elif key == "consec_pause":
+            # Rule: restore only if the pause expiry is still in the future.
+            if until > now:
+                _consec_loss_pause_until = until
+                _consec_pause_logged = True
+                _cnt = ctx.get("count")
+                if isinstance(_cnt, int):
+                    _consec_losses = _cnt
+                try:
+                    _until_iso = datetime.fromtimestamp(
+                        until, timezone.utc).isoformat()
+                    database.log_activity(
+                        f"restored consecutive-loss pause latch, active until "
+                        f"{_until_iso}", "info")
+                except Exception:
+                    pass
 
 
 def _note_trade_closed(sym: str, net_profit: float) -> None:
@@ -4453,10 +4738,12 @@ def _five_m_state(symbol: str, prev: dict) -> tuple:
     if not _warned_5m_warmup:
         _warned_5m_warmup = True
         try:
+            # Estimate remaining backfill from how many 5m candles are still
+            # missing (need 21; each spans ~300 s). Cheap and approximate.
+            _rem_s = max(0, 21 - len(candles_5m)) * 300
             database.log_activity(
-                "5m veto warmup: <21 five-minute candles available "
-                "(WS buffer refilling) — treating 5m trend as neutral "
-                "until data accumulates", "warn"
+                f"5m trend backfilling (~{_rem_s}s remaining) — treated neutral "
+                f"until buffer ready", "warn"
             )
         except Exception:
             pass
@@ -6030,6 +6317,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         database.log_activity(
             "DAILY LOSS STOP: released — buys re-enabled "
             "(new UTC day or manual resume); exits were never paused", "info")
+        persist_risk_latches()   # J2 — record the release transition
 
     # ── §4.2b consecutive-loss pause: buys paused 60 min after N losses in a row.
     global _consec_pause_logged
@@ -6043,6 +6331,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         _consec_pause_logged = False
         database.log_activity(
             "CONSECUTIVE-LOSS PAUSE: expired — buys re-enabled", "info")
+        persist_risk_latches()   # J2 — record the release transition
 
     # Fast pre-check: any coin signalling BUY? (no lock needed for scalar read)
     # Use the runtime min_signals setting — the hardcoded config default would
@@ -6195,6 +6484,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         )
     )
 
+    # J1 — one evaluation heartbeat per pass that reaches the per-symbol loop.
+    global _decision_heartbeat
+    _decision_heartbeat += 1
+
     for sym, cached in cache_snapshot.items():
         # Re-check capacity before every individual buy — the pre-loop check only
         # guards the entry; without this, all ready coins buy in sequence and blow
@@ -6205,6 +6498,11 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
         if sym not in approved:
             continue
+        # J1 — record that this symbol was evaluated this heartbeat, with its
+        # cached (last-candle) buy-ready verdict. This drives the two-state
+        # cached-green vs engine-ready-fresh distinction and the DECISION-GAP
+        # detector. cached_green mirrors the pre-check's ready test.
+        _trace_mark_evaluated(sym, cached.get("score", 0) >= min_sigs)
         # F6: skip coins in the post-fail candidacy cooldown (prevents ~7s churn
         # of a coin the fresh engine re-check just rejected).
         if _in_candidacy_cooldown(sym):
@@ -6681,6 +6979,17 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 _record_rejection(sym, score, "no_reversal_confirmed", _rev_reason)
                 _release_buy_claim()
                 continue
+
+        # J1 — the candidate passed every gate + the fresh re-check; order
+        # placement is about to start. Record the fresh engine-ready verdict and
+        # the entry attempt, and emit ONE deduped INFO line so the operator sees
+        # the engine actually tried (the "green but no purchase, no logs" gap).
+        _trace_mark_engine_ready(sym)
+        _trace_mark_attempt(sym)
+        _log_skip_dedup(
+            sym, "entry_attempt",
+            f"{sym}: entry attempt — all gates passed, placing order "
+            f"(budget=${budget:.2f} @ ~${price:.4f})", "info")
 
         # §3.5 — maker-first live entries. Paper mode (and live-on-paper-
         # fallback, which _market_buy blocks anyway) keeps the existing
@@ -8966,10 +9275,10 @@ async def _refresh_signal_cache_locked():
                     global _warned_5m_warmup
                     if not _warned_5m_warmup:
                         _warned_5m_warmup = True
+                        _rem_s = max(0, 21 - len(candles_5m or [])) * 300
                         database.log_activity(
-                            "5m veto warmup: <21 five-minute candles available "
-                            "(WS buffer refilling, REST/DB thin) — treating 5m "
-                            "trend as neutral until data accumulates", "warn"
+                            f"5m trend backfilling (~{_rem_s}s remaining) — "
+                            f"treated neutral until buffer ready", "warn"
                         )
                 else:
                     five_m_ok = indicators.is_5m_bullish(candles_5m)
