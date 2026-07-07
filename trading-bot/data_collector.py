@@ -106,6 +106,12 @@ book_ticker: Dict[str, dict] = {}
 # Callbacks registered by main.py to avoid circular imports
 _price_callback: Optional[Callable[[Dict[str, float]], None]] = None
 _kline_callback: Optional[Callable[[str, list, list], None]]  = None
+# Phase 3 §3.1 — invoked whenever a 5m kline CLOSES for a symbol:
+# cb(symbol, closed_row, buf_snapshot) where closed_row is
+# [open_time, o, h, l, c, v] and buf_snapshot is a copy of the full
+# ws_candles_5m buffer after the append. Always called from an executor
+# thread (same offload pattern as the 1m _persist_and_signal path).
+_kline5m_callback: Optional[Callable[[str, list, list], None]] = None
 
 
 def register_price_callback(cb: Callable[[Dict[str, float]], None]):
@@ -117,6 +123,32 @@ def register_kline_callback(cb: Callable[[str, list, list], None]):
     """Wire kline-close events into trade_engine.update_coin_signals."""
     global _kline_callback
     _kline_callback = cb
+
+
+def register_kline5m_callback(cb: Callable[[str, list, list], None]):
+    """§3.1: wire 5m kline-CLOSE events into trade_engine's 5m entry
+    evaluation (on_kline5m_close). The 1m callback stays registered for
+    exits / cache freshness — this is entry-timing only."""
+    global _kline5m_callback
+    _kline5m_callback = cb
+
+
+def _dispatch_kline5m(sym: str, closed: list, buf_snapshot: list):
+    """Run the registered 5m-close callback on a worker thread (executor).
+    Falls back to trade_engine.on_kline5m_close when no callback was
+    registered (guarded — trade_engine may be absent in stripped deploys)."""
+    try:
+        cb = _kline5m_callback
+        if cb is None:
+            try:
+                import trade_engine as _te_5m
+                cb = getattr(_te_5m, "on_kline5m_close", None)
+            except Exception:
+                cb = None
+        if cb is not None:
+            cb(sym, closed, buf_snapshot)
+    except Exception as e:
+        print(f"[DataCollector] 5m close callback error ({sym}): {e}")
 
 
 # ── Dynamic watchlist ─────────────────────────────────────────────────────────
@@ -1026,6 +1058,13 @@ def _handle_ws_message(raw: str):
                 # reconnect overlap are skipped — already persisted.)
                 asyncio.get_running_loop().run_in_executor(
                     None, _persist_and_signal, sym, closed, snapshot)
+            elif interval == "5m" and appended:
+                # ── Phase 3 §3.1: entry-signal evaluation happens on 5m
+                # closes. Same executor-offload pattern as the 1m path —
+                # the callback does DB reads + indicator math and must
+                # never run on this event loop.
+                asyncio.get_running_loop().run_in_executor(
+                    None, _dispatch_kline5m, sym, closed, snapshot)
 
     elif evt == "24hrMiniTicker":
         symbol = data["s"]

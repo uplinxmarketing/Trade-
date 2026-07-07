@@ -257,20 +257,24 @@ _REVERSAL_SR_CACHE_TTL = 20.0
 
 
 def _signal_reversal_confirmed(symbol: str, data: dict, strategy: dict) -> Tuple[bool, Any]:
-    """R1: Last 1m candle green AND volume above prior 4-candle average."""
+    """R1: Last candle green AND volume above prior 4-candle average.
+
+    Prefers 5m candles (klines_5m) when the data layer provides them; falls
+    back to klines_1m so nothing breaks before the 5m data agent lands.
+    """
     now = time.time()
     cached = _reversal_sr_cache.get(symbol)
     if cached and (now - cached["ts"]) < _REVERSAL_SR_CACHE_TTL:
         return cached["result"]
 
-    klines_1m = data.get("klines_1m", [])
-    if len(klines_1m) < 5:
+    klines = data.get("klines_5m") or data.get("klines_1m") or []
+    if len(klines) < 5:
         result = (False, "no_data")
         _reversal_sr_cache[symbol] = {"ts": now, "result": result}
         return result
 
-    last   = klines_1m[-1]
-    prev_4 = klines_1m[-5:-1]
+    last   = klines[-1]
+    prev_4 = klines[-5:-1]
 
     last_close = float(last.get("close", 0))
     last_open  = float(last.get("open",  0))
@@ -297,7 +301,7 @@ def _signal_reversal_confirmed(symbol: str, data: dict, strategy: dict) -> Tuple
 register_signal(SignalDef(
     "R1_reversal_confirmed",
     "reversal",
-    "Last 1m candle green with volume above recent average",
+    "Last candle green with volume above recent average (5m preferred, 1m fallback)",
     _signal_reversal_confirmed,
 ))
 
@@ -309,7 +313,7 @@ _SPREAD_CACHE_TTL = 30.0
 def _signal_spread_too_wide(symbol: str, data: dict, strategy: dict) -> Tuple[bool, Any]:
     """E1 VETO: fired=True when bid-ask spread exceeds threshold (inverted: True = block)."""
     now = time.time()
-    threshold = float(strategy.get("signal_thresholds", {}).get("spread_max_pct", 0.10))
+    threshold = float(strategy.get("signal_thresholds", {}).get("spread_max_pct", 0.15))
     cached = _spread_sr_cache.get(symbol)
     if cached and (now - cached["ts"]) < _SPREAD_CACHE_TTL:
         return cached["spread_pct"] > threshold, cached["spread_pct"]
@@ -388,8 +392,9 @@ _PULLBACK_CACHE_TTL = 10.0
 
 def _signal_micro_pullback(symbol: str, data: dict, strategy: dict) -> Tuple[bool, Any]:
     """M4: Price is at least dip_pct% below the highest candle high over the last
-    lookback_candles 1m candles — a micro-pullback from a recent local top.
+    lookback_candles candles — a micro-pullback from a recent local top.
 
+    Prefers 5m candles (klines_5m) when present; falls back to klines_1m.
     Read dip_pct (default 0.3) and lookback_candles (default 5) from
     strategy['signal_thresholds']. Never blocks if candle data is unavailable.
     """
@@ -407,7 +412,7 @@ def _signal_micro_pullback(symbol: str, data: dict, strategy: dict) -> Tuple[boo
         _pullback_cache[symbol] = {"ts": now, "result": (False, None)}
         return False, None
 
-    klines = list(data.get("klines_1m", []))
+    klines = list(data.get("klines_5m") or data.get("klines_1m") or [])
 
     # Fall back to DB if the in-memory store is too thin
     if len(klines) < 2:
@@ -448,10 +453,102 @@ register_signal(SignalDef(
 ))
 
 
+# ── Phase 3 (§3.1/§3.2): 5m-native signals, regime + BB vetoes ────────────────
+
+def _signal_rsi_zone(symbol: str, data: dict, strategy: dict) -> Tuple[bool, Any]:
+    """M5: RSI(14, 5m) within the entry zone [rsi_zone_low, rsi_zone_high].
+
+    Replaces the RSI<40 blanket mandatory (§3.2). Defensive: missing rsi_value
+    → (False, "no_data").
+    """
+    rsi_value = data.get("rsi_value")
+    if rsi_value is None:
+        return False, "no_data"
+    thresholds = strategy.get("signal_thresholds", {})
+    zone_low  = float(thresholds.get("rsi_zone_low",  30.0))
+    zone_high = float(thresholds.get("rsi_zone_high", 55.0))
+    return zone_low <= float(rsi_value) <= zone_high, round(float(rsi_value), 2)
+
+
+register_signal(SignalDef(
+    "M5_rsi_zone",
+    "momentum",
+    "RSI(14, 5m) within [rsi_zone_low, rsi_zone_high] entry zone",
+    _signal_rsi_zone,
+))
+
+
+def _signal_bb_upper_touch_5m(symbol: str, data: dict, strategy: dict) -> Tuple[bool, Any]:
+    """P2 VETO: price at/above the 5m Bollinger upper band (fired=True = block).
+
+    Reads signal_data['bb_position_5m'] provided by the data layer. FAIL-OPEN:
+    if the key is missing/None the veto cannot evaluate and must NOT fire —
+    we return (False, "no_data") so an entry is never blocked on missing data.
+    """
+    bb_position = data.get("bb_position_5m")
+    if bb_position is None:
+        return False, "no_data"
+    return bb_position in ("above_upper", "at_upper"), bb_position
+
+
+register_signal(SignalDef(
+    "P2_bb_upper_touch_5m",
+    "price_level",
+    "VETO: price at/above 5m Bollinger upper band (chasing extension)",
+    _signal_bb_upper_touch_5m,
+))
+
+
+def _signal_btc_regime_risk_off(symbol: str, data: dict, strategy: dict) -> Tuple[bool, Any]:
+    """REGIME VETO: BTC regime is 'risk_off' (fired=True = block all entries).
+
+    Neutral-regime sizing is handled by the engine, not here. FAIL-OPEN:
+    missing/None regime → (False, "no_data") — a veto that can't evaluate
+    must not fire.
+    """
+    btc_regime = data.get("btc_regime")
+    if btc_regime is None:
+        return False, "no_data"
+    return btc_regime == "risk_off", btc_regime
+
+
+register_signal(SignalDef(
+    "REGIME_risk_off",
+    "trend",
+    "VETO: BTC market regime is risk_off (block all new entries)",
+    _signal_btc_regime_risk_off,
+))
+
+
+def _signal_ema50_15m_slope(symbol: str, data: dict, strategy: dict) -> Tuple[bool, Any]:
+    """T2: EMA50 slope on 15m-aggregated data is positive (context signal §3.1).
+
+    Defensive: missing/None slope → (False, "no_data").
+    """
+    slope = data.get("ema50_15m_slope")
+    if slope is None:
+        return False, "no_data"
+    try:
+        slope = float(slope)
+    except (TypeError, ValueError):
+        return False, "no_data"
+    return slope > 0.0, round(slope, 5)
+
+
+register_signal(SignalDef(
+    "T2_ema50_15m_slope",
+    "trend",
+    "EMA50 slope on 15m rising (higher-timeframe context uptrend)",
+    _signal_ema50_15m_slope,
+))
+
+
 # ── Default signal_engine config (used when block absent in strategy.json) ───
 
-# B Step 2.3 defaults: T1 is the single mandatory trend gate; M4 is DEMOTED
-# from mandatory to scored (the signal itself is kept — only its role changed).
+# v0.4 §3.2 starting set: T1 remains the single mandatory trend gate; T2 joins
+# the scored pool as higher-timeframe context; P2 (5m BB upper touch) and
+# REGIME (BTC risk_off) join E1 as vetoes; min_scored raised 2 → 3.
+# M1/M2/M5/P1/TM1 stay registered but default-off (measure first).
 DEFAULT_SIGNAL_ENGINE: Dict[str, Any] = {
     "enabled": True,
     "mandatory_signals": ["T1_ema_short_long"],
@@ -459,30 +556,39 @@ DEFAULT_SIGNAL_ENGINE: Dict[str, Any] = {
         "M3_macd_rising",
         "V1_volume_above_average",
         "V2_obv_rising",
-        "X1_atr_sufficient",
-        "R1_reversal_confirmed",
         "M4_micro_pullback",
+        "R1_reversal_confirmed",
+        "X1_atr_sufficient",
+        "T2_ema50_15m_slope",
     ],
-    "min_scored": 2,
-    "veto_signals": ["E1_spread_too_wide"],
+    "min_scored": 3,
+    "veto_signals": [
+        "E1_spread_too_wide",
+        "P2_bb_upper_touch_5m",
+        "REGIME_risk_off",
+    ],
 }
 
 DEFAULT_SIGNAL_THRESHOLDS: Dict[str, Any] = {
     "near_low_pct": 2.0,
     "reversal_volume_multiplier": 1.10,
-    "spread_max_pct": 0.10,
+    "spread_max_pct": 0.15,
     "allowed_trading_hours_utc": "13,14,15,16,17,18,19,20,21,22",
     "stoch_rsi_threshold": 25.0,
     "dip_pct": 0.3,
     "lookback_candles": 5,
+    "rsi_zone_low": 30.0,
+    "rsi_zone_high": 55.0,
 }
 
 
 # ── Config-driven roles (B Step 2.3) ──────────────────────────────────────────
 # strategy["signal_engine"]["roles"] = {signal_id: "scored"|"mandatory"|"veto"|"off"}
-# When present it fully derives the mandatory/scored/veto lists ("off" and
-# unlisted ids are excluded everywhere). Hot-reload comes for free: callers pass
-# the mtime-cached strategy dict on every evaluation.
+# When present it fully derives the mandatory/scored/veto lists ("off" ids are
+# excluded everywhere; ids absent from the map fall back to their DEFAULT role
+# so newly shipped signals activate for old persisted strategies). Hot-reload
+# comes for free: callers pass the mtime-cached strategy dict on every
+# evaluation.
 
 _VALID_SIGNAL_ROLES = {"scored", "mandatory", "veto", "off"}
 _roles_warned: set = set()          # one-time log keys (unknown id / invalid role)
@@ -513,11 +619,19 @@ def _derive_role_lists(roles: dict) -> Tuple[List[str], List[str], List[str]]:
 
     Unknown signal ids are ignored (one-time warning). Invalid role strings
     fall back to that signal's default role (one-time error).
+
+    Migration safety: registered signals ABSENT from the roles map get their
+    DEFAULT role (from DEFAULT_SIGNAL_ENGINE). This keeps persisted strategy
+    files working when new signals ship — a new default veto/scored signal
+    takes effect without the user re-saving their roles map. To disable a
+    signal, set it to "off" explicitly.
     """
     mandatory_ids: List[str] = []
     scored_ids:    List[str] = []
     veto_ids:      List[str] = []
-    for sig_id, role in roles.items():
+    merged = {sig_id: _default_role_for(sig_id) for sig_id in SIGNAL_REGISTRY}
+    merged.update(roles)
+    for sig_id, role in merged.items():
         if sig_id not in SIGNAL_REGISTRY:
             _warn_roles_once(
                 f"unknown::{sig_id}",
@@ -585,8 +699,9 @@ def evaluate_buy_decision(symbol: str, signal_data: dict, strategy: dict) -> Dic
     if isinstance(engine_cfg, dict) and engine_cfg.get("enabled", False):
         _roles = engine_cfg.get("roles")
         if isinstance(_roles, dict) and _roles:
-            # Roles map is authoritative when present: "off"/unlisted signals
-            # are excluded everywhere; list keys below are ignored.
+            # Roles map is authoritative when present: "off" signals are
+            # excluded everywhere; unlisted signals get their DEFAULT role
+            # (migration safety for new signals); list keys below are ignored.
             mandatory_ids, scored_ids, veto_ids = _derive_role_lists(_roles)
         else:
             mandatory_ids = engine_cfg.get("mandatory_signals", DEFAULT_SIGNAL_ENGINE["mandatory_signals"])

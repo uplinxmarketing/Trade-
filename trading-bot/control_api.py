@@ -536,6 +536,23 @@ async def _daily_maintenance_loop():
                 print("[Maintenance] nightly edge report rebuilt")
         except Exception as e:
             print(f"[Maintenance] nightly attribution failed: {e}")
+        # §3.6 — warn when any fees.per_symbol_overrides entry is >30 days
+        # unreviewed ('_reviewed_ts' absent or old): Binance fee promos change
+        # monthly, and a withdrawn promo silently left at maker_pct=0 corrupts
+        # every BEP/min-profit calculation for that pair.
+        try:
+            import fees as _fees
+            _pps = getattr(_fees, "promo_pairs_status", None)
+            if _pps is not None:
+                _stale_syms = sorted(s for s, e in _pps().items() if e.get("stale"))
+                if _stale_syms:
+                    database.log_activity(
+                        f"Fee override review overdue (>30 days): "
+                        f"{', '.join(_stale_syms)} — verify the Binance promo "
+                        f"still applies and refresh '_reviewed_ts' in "
+                        f"fees.per_symbol_overrides", "warn")
+        except Exception as e:
+            print(f"[Maintenance] fee-override staleness check failed: {e}")
         await _aio.sleep(24 * 3600)
 
 
@@ -2293,6 +2310,12 @@ def api_signals_summary(limit: int = 30):
                                    else ("; ".join(gates["blockers"]) if gates["blockers"] else "ready")),
                     "gate_blockers": gates["blockers"],
                     "signal_engine_allowed": sig_ok,
+                    # §3.6 — advisory flag: a zero-maker-fee FDUSD sibling of
+                    # this USDT pair is configured (entries.prefer_fee_promo_pairs
+                    # on + fees.per_symbol_overrides maker_pct=0). Never switches
+                    # the traded symbol — the watchlist owns symbol choice.
+                    "promo_pair_available": bool(
+                        getattr(_te_gates, "promo_pair_available", lambda _s: False)(sym)),
                     "ts": entry.get("ts", 0),
                 })
             except Exception:
@@ -3551,6 +3574,89 @@ def _resolved_exit_cfg():
         return None
 
 
+def _resolved_entries_cfg():
+    """RESOLVED entries config from the engine (defaults + strategy.json
+    merged) — §3.1/§3.4/§3.5/§3.6 keys. None if the engine is unavailable."""
+    try:
+        from trade_engine import _entries_cfg
+        cfg = _entries_cfg()
+        return dict(cfg) if isinstance(cfg, dict) else None
+    except Exception:
+        return None
+
+
+def _resolved_regime_cfg():
+    """RESOLVED §3.3 regime config: neutral_size_mult (engine default 0.5)
+    plus the fixed refresh cadence (the engine's 60 s regime cache TTL —
+    informational/read-only, not accepted on POST)."""
+    try:
+        from trade_engine import _neutral_size_mult
+        mult = float(_neutral_size_mult())
+    except Exception:
+        mult = None
+    return {"neutral_size_mult": mult, "refresh_sec": 60}
+
+
+# Phase 3 — validation spec for the POST "entries" block.
+# Each entry: (type, min, max). type 'bool' ignores min/max; none are nullable.
+_ENTRIES_VALIDATION = {
+    "maker_first":            ("bool",  None, None),
+    "chase_seconds":          ("float", 1.0,  30.0),
+    "max_reposts":            ("int",   0,    10),
+    "taker_fallback":         ("bool",  None, None),
+    "cooldown_after_sl_min":  ("float", 0.0,  240.0),
+    "falling_knife_atr_mult": ("float", 0.1,  5.0),
+    "eval_heartbeat_sec":     ("float", 5.0,  120.0),
+    "tick_entries":           ("bool",  None, None),
+    "prefer_fee_promo_pairs": ("bool",  None, None),
+}
+
+# Phase 3 — validation spec for the POST "regime" block. "refresh_sec" is
+# exposed on GET but read-only (fixed engine cache TTL) — it is silently
+# dropped on POST so a GET→edit→POST round-trip never errors.
+_REGIME_VALIDATION = {
+    "neutral_size_mult": ("float", 0.0, 1.0),
+}
+_REGIME_READONLY_KEYS = {"refresh_sec"}
+
+
+def _validate_typed_block(block: dict, spec: dict, block_name: str,
+                          ignore_keys: frozenset = frozenset()):
+    """Generic field-level validator for a POSTed settings sub-dict (same
+    contract as _validate_exits_patch): returns (validated, errors); only keys
+    that pass land in `validated`; keys in `ignore_keys` are dropped silently."""
+    validated: dict = {}
+    errors: dict = {}
+    if not isinstance(block, dict):
+        return {}, {block_name: "must be an object"}
+    for key, val in block.items():
+        if key in ignore_keys:
+            continue
+        spec_entry = spec.get(key)
+        if spec_entry is None:
+            errors[key] = f"unknown {block_name} key"
+            continue
+        typ, lo, hi = spec_entry
+        if val is None:
+            errors[key] = "must not be null"
+            continue
+        if typ == "bool":
+            if isinstance(val, bool):
+                validated[key] = val
+            else:
+                errors[key] = "must be a boolean"
+            continue
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            errors[key] = "must be a number"
+            continue
+        fv = float(val)
+        if not (lo <= fv <= hi):
+            errors[key] = f"must be between {lo} and {hi}"
+            continue
+        validated[key] = int(fv) if typ == "int" else fv
+    return validated, errors
+
+
 # Phase 2 §2.6 — validation spec for the POST "exits" block.
 # Each entry: (type, min, max, nullable). type 'bool' ignores min/max.
 _EXITS_VALIDATION = {
@@ -3632,6 +3738,10 @@ def api_get_settings():
         # Phase 2 §2.6 — RESOLVED exits config (engine defaults merged with
         # any strategy.json "exits" block); None if the engine is unavailable.
         "exits":               _resolved_exit_cfg(),
+        # Phase 3 — RESOLVED entries (§3.1/§3.4/§3.5/§3.6) and regime (§3.3)
+        # configs; None when the engine is unavailable.
+        "entries":             _resolved_entries_cfg(),
+        "regime":              _resolved_regime_cfg(),
         # Defaults below MUST mirror the engine's actual fallbacks:
         # trade_engine._refresh_risk_params (sl_on=True, sl_pct=0.4, tp_pct=0.1,
         # smart_hold=False, trailing=0.5) and _check_buys_from_cache (max_positions=10).
@@ -3668,6 +3778,11 @@ class SettingsRequest(BaseModel):
     # a plain dict so unknown keys reach validation and get field-level errors
     # instead of being silently dropped by pydantic).
     exits:               Optional[dict]  = None
+    # Phase 3 — optional entries (§3.5/§3.6 + §3.1/§3.4 knobs) and regime
+    # (§3.3) blocks, validated by _validate_typed_block (same plain-dict
+    # rationale as exits).
+    entries:             Optional[dict]  = None
+    regime:              Optional[dict]  = None
 
 
 class _SignalEngineConfig(BaseModel):
@@ -3719,6 +3834,27 @@ def api_save_settings(req: SettingsRequest):
                 return {"ok": False, "error": "invalid exits settings", "errors": _errors}
             if _validated:
                 patch["exits"] = {**_cur_exits, **_validated}
+        # ── Phase 3 — entries block (validated; field-level errors, no 500) ──
+        if req.entries is not None:
+            _validated, _errors = _validate_typed_block(
+                req.entries, _ENTRIES_VALIDATION, "entries")
+            if _errors:
+                return {"ok": False, "error": "invalid entries settings", "errors": _errors}
+            if _validated:
+                _s_cur = _load_strategy()
+                _cur = _s_cur.get("entries") if isinstance(_s_cur.get("entries"), dict) else {}
+                patch["entries"] = {**_cur, **_validated}
+        # ── Phase 3 — regime block (refresh_sec is read-only → dropped) ──
+        if req.regime is not None:
+            _validated, _errors = _validate_typed_block(
+                req.regime, _REGIME_VALIDATION, "regime",
+                ignore_keys=frozenset(_REGIME_READONLY_KEYS))
+            if _errors:
+                return {"ok": False, "error": "invalid regime settings", "errors": _errors}
+            if _validated:
+                _s_cur = _load_strategy()
+                _cur = _s_cur.get("regime") if isinstance(_s_cur.get("regime"), dict) else {}
+                patch["regime"] = {**_cur, **_validated}
         if not patch:
             return {"ok": False, "error": "No valid settings provided"}
         _write_strategy_patch(patch)

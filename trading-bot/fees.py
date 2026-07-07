@@ -59,6 +59,20 @@ MAX_FEE_PCT = 1.0                 # sanity ceiling: no sane spot fee exceeds 1%
 # Equals the default taker fee as a FRACTION (0.10% → 0.001).
 DEFAULT_TAKER_FRACTION = 0.001
 
+# §3.6 — Binance zero-maker-fee promo pairs, promo as of Jan 2026 — verify
+# monthly, promos change (mark each fees.per_symbol_overrides entry with
+# '_reviewed_ts' when re-verified; promo_pairs_status() flags stale entries).
+# Trade-offs of preferring these pairs: majors move less per hour (fewer
+# signals), and maker fills are not guaranteed — the chase can abandon.
+KNOWN_ZERO_MAKER_PAIRS = [
+    "BTCFDUSD", "ETHFDUSD", "BNBFDUSD", "SOLFDUSD",
+    "XRPFDUSD", "DOGEFDUSD", "LINKFDUSD",
+]
+
+# An override review is considered stale after 30 days without a '_reviewed_ts'
+# refresh — Binance fee promos are announced/withdrawn on ~monthly cadence.
+PROMO_REVIEW_MAX_AGE_SEC = 30 * 24 * 3600
+
 
 def _clamp_pct(value, default: float) -> float:
     """Coerce a config value to a sane fee percent in [0, MAX_FEE_PCT].
@@ -200,6 +214,55 @@ def for_symbol(symbol: Optional[str] = None, strategy: Optional[dict] = None) ->
                     bnb = bool(override.get("bnb_discount"))
 
     return FeeModel(maker_pct=maker, taker_pct=taker, bnb_discount=bnb)
+
+
+def promo_pairs_status(strategy: Optional[dict] = None) -> dict:
+    """§3.6 — review status of every fees.per_symbol_overrides entry.
+
+    Each override may carry an extra '_reviewed_ts' key (epoch seconds, set by
+    whoever last verified the promo is still live on Binance). An entry is
+    'stale' when '_reviewed_ts' is absent, unparseable, or older than 30 days
+    (PROMO_REVIEW_MAX_AGE_SEC) — the daily maintenance loop warns on stale
+    entries so a withdrawn promo can't silently keep maker_pct=0 in BEP math.
+
+    Returns {SYMBOL: {"maker_pct", "taker_pct", "zero_maker", "reviewed_ts",
+    "age_days", "stale"}} for every override (symbols upper-cased). Missing /
+    non-dict overrides block → {}.
+    """
+    if strategy is None:
+        strategy = _load_strategy()
+    fees_blk = strategy.get("fees") if isinstance(strategy, dict) else None
+    overrides = fees_blk.get("per_symbol_overrides") if isinstance(fees_blk, dict) else None
+    if not isinstance(overrides, dict):
+        return {}
+    now = time.time()
+    out: dict = {}
+    for sym, ov in overrides.items():
+        if not isinstance(ov, dict):
+            continue
+        reviewed_ts = None
+        try:
+            raw_ts = ov.get("_reviewed_ts")
+            if raw_ts is not None:
+                v = float(raw_ts)
+                if math.isfinite(v) and v > 0:
+                    reviewed_ts = v
+        except (TypeError, ValueError):
+            reviewed_ts = None
+        stale = reviewed_ts is None or (now - reviewed_ts) > PROMO_REVIEW_MAX_AGE_SEC
+        maker = _clamp_pct(ov.get("maker_pct", DEFAULT_MAKER_PCT), DEFAULT_MAKER_PCT) \
+            if "maker_pct" in ov else None
+        taker = _clamp_pct(ov.get("taker_pct", DEFAULT_TAKER_PCT), DEFAULT_TAKER_PCT) \
+            if "taker_pct" in ov else None
+        out[str(sym).strip().upper()] = {
+            "maker_pct":   maker,
+            "taker_pct":   taker,
+            "zero_maker":  maker == 0.0,
+            "reviewed_ts": reviewed_ts,
+            "age_days":    round((now - reviewed_ts) / 86400.0, 1) if reviewed_ts else None,
+            "stale":       stale,
+        }
+    return out
 
 
 def get_fee_model(symbol: Optional[str] = None) -> FeeModel:
