@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { toast } from 'sonner';
 
-// The version this browser bundle was BUILT with.
+// The version + git commit this browser bundle was BUILT with.
 const APP_VERSION = __APP_VERSION__;
+const APP_COMMIT  = __APP_COMMIT__;
 
 // One-shot auto-heal guard, keyed per backend version so we reload at most
 // once per distinct mismatch (no infinite reload loop if the reload doesn't
@@ -51,9 +52,9 @@ function currentAssetFilename(): string | null {
   }
 }
 
-interface ServedInfo { version: string | null; indexAsset: string | null; }
+interface ServedInfo { version: string | null; commit: string | null; indexAsset: string | null; }
 
-// Best-effort GET /api/version/served -> {version, index_asset, dist_path}.
+// Best-effort GET /api/version/served -> {version, commit, index_asset, mtime, dist_path}.
 async function fetchServed(): Promise<ServedInfo | null> {
   try {
     const res = await fetch(`/api/version/served?t=${Date.now()}`, { cache: 'no-store' });
@@ -64,6 +65,7 @@ async function fetchServed(): Promise<ServedInfo | null> {
     const idx = o.index_asset;
     return {
       version: parseVersion(data),
+      commit: parseCommit(data),
       indexAsset: typeof idx === 'string' && idx.trim()
         ? (idx.split('/').pop() || idx).trim()
         : null,
@@ -71,6 +73,16 @@ async function fetchServed(): Promise<ServedInfo | null> {
   } catch {
     return null;
   }
+}
+
+// Tolerantly extract a git commit (short or full sha) from a version payload.
+function parseCommit(data: unknown): string | null {
+  if (data && typeof data === 'object') {
+    const o = data as Record<string, unknown>;
+    const c = o.commit ?? o.git_commit ?? o.sha ?? o.commit_sha ?? o.rev;
+    if (typeof c === 'string' && c.trim()) return c.trim();
+  }
+  return null;
 }
 
 // Tolerantly extract a version string from whatever /api/version returns:
@@ -87,8 +99,14 @@ function parseVersion(data: unknown): string | null {
 
 export interface BackendVersionState {
   appVersion: string;
+  /** Git commit this browser bundle was compiled from (compile-time __APP_COMMIT__). */
+  appCommit: string;
   backendVersion: string | null;
+  /** Git commit the running backend reports (from /api/version, else /api/version/served). */
+  backendCommit: string | null;
   mismatch: boolean;
+  /** True when both commits are known and differ. */
+  commitMismatch: boolean;
   /** Asset filename the running server intends to serve (from /api/version/served). */
   servedAsset: string | null;
   /** Asset filename THIS browser bundle was actually served from. */
@@ -112,6 +130,7 @@ export interface BackendVersionState {
  */
 export function useBackendVersion(pollIntervalMs = 60_000): BackendVersionState {
   const [backendVersion, setBackendVersion] = useState<string | null>(null);
+  const [backendCommit, setBackendCommit] = useState<string | null>(null);
   const [servedAsset, setServedAsset] = useState<string | null>(null);
   const currentAsset = useRef<string | null>(currentAssetFilename()).current;
   const mismatchStreak = useRef(0);
@@ -129,13 +148,20 @@ export function useBackendVersion(pollIntervalMs = 60_000): BackendVersionState 
       if (!ver) return;
 
       setBackendVersion(ver);
+      // /api/version now includes the backend git commit — surface it for the footer.
+      const verCommit = parseCommit(data);
+      if (verCommit) setBackendCommit(verCommit);
 
       // Definitive stale-bundle check: ask the server which index asset it
       // serves and compare against the script this page actually loaded. A
       // difference proves the browser is running a cached bundle (vs. the
       // server merely being mid-deploy on a different version string).
       const served = await fetchServed();
-      if (served) setServedAsset(served.indexAsset);
+      if (served) {
+        setServedAsset(served.indexAsset);
+        // Fall back to the served-endpoint commit if /api/version lacked one.
+        if (!verCommit && served.commit) setBackendCommit(served.commit);
+      }
       const assetStale = Boolean(
         served?.indexAsset && currentAsset && served.indexAsset !== currentAsset,
       );
@@ -173,10 +199,19 @@ export function useBackendVersion(pollIntervalMs = 60_000): BackendVersionState 
     servedAsset && currentAsset && servedAsset !== currentAsset,
   );
 
+  const commitMismatch = Boolean(
+    backendCommit && APP_COMMIT && backendCommit !== APP_COMMIT
+    // Tolerate short-vs-full sha: treat as match when one is a prefix of the other.
+    && !backendCommit.startsWith(APP_COMMIT) && !APP_COMMIT.startsWith(backendCommit),
+  );
+
   return {
     appVersion: APP_VERSION,
+    appCommit: APP_COMMIT,
     backendVersion,
+    backendCommit,
     mismatch: (backendVersion != null && backendVersion !== APP_VERSION) || assetMismatch,
+    commitMismatch,
     servedAsset,
     currentAsset,
     assetMismatch,

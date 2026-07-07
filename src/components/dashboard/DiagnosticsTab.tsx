@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { toast } from 'sonner';
 import { DataHealthPanel } from './DataHealthPanel';
+import { isLowSample, LowSampleNA } from '@/lib/sampleGuard';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -19,6 +20,7 @@ interface SignalRate {
   fire_rate_pct: number;
   category?: string;
   description?: string;
+  low_sample?: boolean;
 }
 
 interface SignalWinStat {
@@ -28,6 +30,7 @@ interface SignalWinStat {
   win_rate_pct: number;
   avg_pnl_per_trade: number;
   total_pnl: number;
+  low_sample?: boolean;
 }
 
 interface CoinTrace {
@@ -255,13 +258,17 @@ function SignalFireRates({ baseUrl }: { baseUrl: string }) {
           {sorted.map(([sigId, stats]) => {
             const pct = Math.min(100, stats.fire_rate_pct);
             const barColor = pct > 60 ? 'bg-gain' : pct > 30 ? 'bg-yellow-500' : pct > 10 ? 'bg-orange-500' : 'bg-loss';
+            // Min-sample guard: too few evaluations ⇒ the % is noise, not signal.
+            const lowSample = isLowSample(stats.evaluations, stats.low_sample);
             return (
               <div key={sigId} className="flex items-center gap-2">
                 <p className="text-[8px] font-mono w-36 truncate shrink-0" title={stats.description}>{sigId}</p>
                 <div className="flex-1 h-3 bg-muted/30 rounded overflow-hidden relative">
-                  <div className={`h-full ${barColor} rounded`} style={{ width: `${pct}%` }} />
+                  {!lowSample && <div className={`h-full ${barColor} rounded`} style={{ width: `${pct}%` }} />}
                   <span className="absolute inset-0 flex items-center px-1 text-[7px] font-bold text-foreground">
-                    {stats.fire_rate_pct.toFixed(1)}%
+                    {lowSample
+                      ? <LowSampleNA count={stats.evaluations} className="text-muted-foreground/60 font-bold" />
+                      : `${stats.fire_rate_pct.toFixed(1)}%`}
                   </span>
                 </div>
                 <p className="text-[8px] text-muted-foreground w-14 text-right shrink-0">
@@ -326,12 +333,16 @@ function SignalWinRates({ baseUrl }: { baseUrl: string }) {
               </tr>
             </thead>
             <tbody>
-              {sorted.map(([sigId, s]) => (
+              {sorted.map(([sigId, s]) => {
+                const lowSample = isLowSample(s.total_trades_with_signal, s.low_sample);
+                return (
                 <tr key={sigId} className="border-b border-border/20 last:border-0">
                   <td className="text-[8px] font-mono py-0.5 pr-2 truncate max-w-[8rem]">{sigId}</td>
                   <td className="text-[8px] text-right text-muted-foreground">{s.total_trades_with_signal}</td>
-                  <td className={`text-[8px] text-right font-bold ${s.win_rate_pct >= 60 ? 'text-gain' : s.win_rate_pct >= 40 ? 'text-yellow-400' : 'text-loss'}`}>
-                    {s.win_rate_pct.toFixed(1)}%
+                  <td className={`text-[8px] text-right font-bold ${lowSample ? '' : s.win_rate_pct >= 60 ? 'text-gain' : s.win_rate_pct >= 40 ? 'text-yellow-400' : 'text-loss'}`}>
+                    {lowSample
+                      ? <LowSampleNA count={s.total_trades_with_signal} className="text-muted-foreground/50 font-normal" />
+                      : `${s.win_rate_pct.toFixed(1)}%`}
                   </td>
                   <td className={`text-[8px] text-right font-mono ${s.avg_pnl_per_trade >= 0 ? 'text-gain' : 'text-loss'}`}>
                     ${s.avg_pnl_per_trade.toFixed(3)}
@@ -340,7 +351,8 @@ function SignalWinRates({ baseUrl }: { baseUrl: string }) {
                     ${s.total_pnl.toFixed(2)}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

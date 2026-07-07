@@ -1,7 +1,19 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Star, Search, AlertCircle, Ban } from 'lucide-react';
+import { Star, Search, AlertCircle, Ban, PauseCircle } from 'lucide-react';
 import type { LivePrices } from '@/lib/trading-engine';
 import { useUniverseHealth, type InvalidInfo } from '@/hooks/useUniverseHealth';
+
+// I4 — distinguish the two dead-ticker statuses from /api/universe/validate:
+//  - BREAK   → symbol trading is halted; the backend auto-restores it, so this
+//              is NOT a remove prompt (e.g. TON during a maintenance break).
+//  - DELISTED→ pair is gone for good; user should remove/replace it.
+// 'renamed' remains a delisted-family case (pair replaced by suggested_rename).
+type DeadKind = 'break' | 'delisted';
+function classifyInvalid(info: InvalidInfo): DeadKind {
+  const s = (info.status ?? '').toUpperCase();
+  if (s === 'BREAK' || s.includes('HALT')) return 'break';
+  return 'delisted';
+}
 
 const COIN_COLORS: Record<string, string> = {
   BTC: '#F7931A', ETH: '#627EEA', SOL: '#9945FF', BNB: '#F3BA2F',
@@ -109,23 +121,31 @@ function CoinRow({
       <div className="flex-1 min-w-0">
         <div className={`text-xs font-semibold leading-none ${isActive ? 'text-gain' : 'text-foreground'}`}>{ticker}</div>
         {invalidInfo ? (
-          <div className="flex items-center gap-1 mt-0.5 flex-wrap">
-            <span
-              className="inline-flex items-center gap-0.5 px-1 py-px rounded bg-loss/15 text-loss text-[8px] font-semibold uppercase tracking-wide"
-              title="This pair is no longer tradable on Binance. Remove or replace it in your watchlist."
-            >
-              <Ban className="w-2 h-2" />
-              {invalidInfo.status === 'renamed' || invalidInfo.suggestedRename ? 'renamed' : 'delisted'}
-            </span>
-            {invalidInfo.suggestedRename && (
+          classifyInvalid(invalidInfo) === 'break' ? (
+            // BREAK — trading temporarily halted; auto-restores. Not a remove prompt.
+            <div className="flex items-center gap-1 mt-0.5 flex-wrap">
               <span
-                className="px-1 py-px rounded bg-warn/15 text-warn text-[8px] font-semibold"
-                title={`Suggested replacement: ${invalidInfo.suggestedRename}`}
+                className="inline-flex items-center gap-0.5 px-1 py-px rounded bg-warn/15 text-warn text-[8px] font-semibold uppercase tracking-wide"
+                title="Trading on this pair is halted (BREAK). The bot auto-restores it when it resumes — no action needed."
               >
-                → {invalidInfo.suggestedRename.replace('USDT', '')}
+                <PauseCircle className="w-2 h-2" />
+                halted (BREAK) — auto-restores
               </span>
-            )}
-          </div>
+            </div>
+          ) : (
+            // DELISTED (incl. renamed) — pair is gone; prompt to remove/replace.
+            <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+              <span
+                className="inline-flex items-center gap-0.5 px-1 py-px rounded bg-loss/15 text-loss text-[8px] font-semibold uppercase tracking-wide"
+                title="This pair is no longer tradable on Binance. Remove or replace it in your watchlist."
+              >
+                <Ban className="w-2 h-2" />
+                {invalidInfo.suggestedRename
+                  ? `delisted → ${invalidInfo.suggestedRename}`
+                  : 'delisted'}
+              </span>
+            </div>
+          )
         ) : ticketTooSmall ? (
           <span
             className="inline-flex items-center px-1 py-px mt-0.5 rounded bg-warn/15 text-warn text-[8px] font-semibold"
@@ -231,11 +251,18 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
     return list;
   }, [allCoins, tab, favorites, search]);
 
-  // Count how many of the coins actually in the watchlist are delisted/renamed.
-  const invalidInWatchlist = useMemo(
-    () => allCoins.filter(c => invalid[c.toUpperCase()]).length,
-    [allCoins, invalid],
-  );
+  // Count watchlist coins by dead-ticker kind: delisted (remove/replace) vs
+  // halted BREAK (auto-restores, informational only).
+  const { delistedCount, haltedCount } = useMemo(() => {
+    let delisted = 0, halted = 0;
+    for (const c of allCoins) {
+      const info = invalid[c.toUpperCase()];
+      if (!info) continue;
+      if (classifyInvalid(info) === 'break') halted++;
+      else delisted++;
+    }
+    return { delistedCount: delisted, haltedCount: halted };
+  }, [allCoins, invalid]);
 
   return (
     <div className="flex flex-col h-full bg-card border-r border-border">
@@ -277,11 +304,18 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
         </div>
       )}
 
-      {/* Delisted/renamed summary — prompt the user to prune */}
-      {invalidInWatchlist > 0 && (
-        <div className="px-3 py-1 text-[9px] text-loss flex items-center gap-1 border-b border-loss/20 bg-loss/5">
-          <Ban className="w-2.5 h-2.5 flex-shrink-0" />
-          {invalidInWatchlist} watchlist coin{invalidInWatchlist === 1 ? ' is' : 's are'} delisted/renamed — prune them
+      {/* Dead-ticker summary — count delisted (prune) vs halted (auto-restores) separately */}
+      {(delistedCount > 0 || haltedCount > 0) && (
+        <div className={`px-3 py-1 text-[9px] flex items-center gap-1 border-b ${
+          delistedCount > 0 ? 'text-loss border-loss/20 bg-loss/5' : 'text-warn border-warn/20 bg-warn/5'
+        }`}>
+          {delistedCount > 0
+            ? <Ban className="w-2.5 h-2.5 flex-shrink-0" />
+            : <PauseCircle className="w-2.5 h-2.5 flex-shrink-0" />}
+          <span>
+            {delistedCount} delisted, {haltedCount} halted
+            {delistedCount > 0 ? ' — prune delisted' : ' — auto-restores'}
+          </span>
         </div>
       )}
 

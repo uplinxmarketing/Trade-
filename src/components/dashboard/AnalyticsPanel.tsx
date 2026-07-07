@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { isLowSample, LowSampleNA } from '@/lib/sampleGuard';
 
 // ── Types (tolerant — backend may still be deploying) ──────────────────────
 interface SymbolRow {
@@ -6,6 +7,7 @@ interface SymbolRow {
   trades: number;
   net_pnl: number;
   win_rate: number;
+  low_sample?: boolean;
 }
 
 interface ExitLabelStats {
@@ -25,6 +27,7 @@ interface ExpectancyStats {
   avg_hold_time_sec: number;
   per_symbol: SymbolRow[];
   exit_labels: Record<string, ExitLabelStats>;
+  low_sample?: boolean;
 }
 
 interface SignalSide {
@@ -37,6 +40,7 @@ interface SignalAttribution {
   fired?: SignalSide;
   not_fired?: SignalSide;
   lift?: number;
+  low_sample?: boolean;
 }
 
 interface VetoAttribution {
@@ -245,7 +249,9 @@ export function AnalyticsPanel({ baseUrl = '' }: { baseUrl?: string }) {
       ) : stats ? (
         <>
           <div className="grid grid-cols-3 sm:grid-cols-6 gap-1.5">
-            <StatCard label="Win rate" value={fmtPct(stats.win_rate)}
+            <StatCard label="Win rate"
+              value={isLowSample(num(stats.trades), stats.low_sample) ? `N/A (n=${num(stats.trades)})` : fmtPct(stats.win_rate)}
+              valueClass={isLowSample(num(stats.trades), stats.low_sample) ? 'text-muted-foreground/50' : 'text-foreground'}
               sub={`${num(stats.trades)} trades`} />
             <StatCard label="Avg win" value={fmtUsd(stats.avg_win)} valueClass="text-gain" />
             <StatCard label="Avg loss" value={fmtUsd(stats.avg_loss)} valueClass="text-loss" />
@@ -321,7 +327,11 @@ export function AnalyticsPanel({ baseUrl = '' }: { baseUrl?: string }) {
                     <span className="text-[9px] font-mono text-foreground truncate">{row.symbol}</span>
                     <span className="text-[9px] font-mono text-muted-foreground text-right">{num(row.trades)}</span>
                     <span className={`text-[9px] font-mono text-right ${pnlClass(row.net_pnl)}`}>{fmtUsd(row.net_pnl)}</span>
-                    <span className="text-[9px] font-mono text-muted-foreground text-right">{fmtPct(row.win_rate, 0)}</span>
+                    <span className="text-[9px] font-mono text-muted-foreground text-right">
+                      {isLowSample(num(row.trades), row.low_sample)
+                        ? <LowSampleNA count={num(row.trades)} className="text-muted-foreground/50 font-mono" />
+                        : fmtPct(row.win_rate, 0)}
+                    </span>
                   </div>
                 ))}
               </div>
@@ -369,18 +379,21 @@ export function AnalyticsPanel({ baseUrl = '' }: { baseUrl?: string }) {
                 </div>
                 {signals.map(([id, s]) => {
                   const lift = num(s?.lift);
+                  const firedTrades = num(s?.fired?.trades);
+                  // Lift computed off a handful of fired trades is not meaningful.
+                  const lowSample = isLowSample(firedTrades, s?.low_sample);
                   return (
                     <div key={id} className="grid grid-cols-[minmax(6rem,1.4fr)_3rem_4rem_4rem_3.5rem] gap-x-2 py-0.5 border-b border-border/20 min-w-[22rem]">
                       <span className="text-[9px] font-mono text-foreground truncate" title={id}>{id}</span>
-                      <span className="text-[9px] font-mono text-muted-foreground text-right">{num(s?.fired?.trades)}</span>
+                      <span className="text-[9px] font-mono text-muted-foreground text-right">{firedTrades}</span>
                       <span className={`text-[9px] font-mono text-right ${pnlClass(s?.fired?.expectancy)}`}>
                         {fmtUsd(s?.fired?.expectancy)}
                       </span>
                       <span className={`text-[9px] font-mono text-right ${pnlClass(s?.not_fired?.expectancy)}`}>
                         {fmtUsd(s?.not_fired?.expectancy)}
                       </span>
-                      <span className={`text-[9px] font-mono font-semibold text-right ${lift > 0 ? 'text-gain' : lift < 0 ? 'text-loss' : 'text-muted-foreground'}`}>
-                        {fmtUsd(lift)}
+                      <span className={`text-[9px] font-mono font-semibold text-right ${lowSample ? 'text-muted-foreground/50' : lift > 0 ? 'text-gain' : lift < 0 ? 'text-loss' : 'text-muted-foreground'}`}>
+                        {lowSample ? <LowSampleNA count={firedTrades} className="text-muted-foreground/50 font-mono" /> : fmtUsd(lift)}
                       </span>
                     </div>
                   );

@@ -4,6 +4,7 @@ import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { LiveConfirmModal } from './LiveConfirmModal';
 import { isLiveRunning, fmtValue } from './strategy-shared';
+import { isLowSample, LowSampleNA, readLowSample, readDenominator } from '@/lib/sampleGuard';
 
 // ── Phase 5 §5.2.2 — signals editor ───────────────────────────────────────────
 // Table over GET /api/signal-registry with a role dropdown per signal
@@ -250,6 +251,14 @@ export function SignalsEditorPanel({ baseUrl = '' }: { baseUrl?: string }) {
                 ? (num(att.lift) ?? num((att as any).lift_pct) ?? num((att as any).value))
                 : null;
 
+              // Min-sample guard — a fire-rate / lift from a handful of
+              // evaluations is noise. Suppress the confident % when the
+              // backend flags low_sample or the denominator is < 20.
+              const fireCount = readDenominator(tel, ['evaluated', 'evaluations', 'fired']);
+              const fireLowSample = isLowSample(fireCount, readLowSample(tel));
+              const liftCount = readDenominator(att, ['trades', 'fired_trades', 'n_fired']);
+              const liftLowSample = isLowSample(liftCount, readLowSample(att));
+
               // Keep the current role selectable even when it isn't a canonical option
               const options: string[] = ROLE_OPTIONS.includes(role as any)
                 ? [...ROLE_OPTIONS]
@@ -296,13 +305,17 @@ export function SignalsEditorPanel({ baseUrl = '' }: { baseUrl?: string }) {
                     ) : (
                       <>
                         <span className="text-muted-foreground" title="Fire rate (fired / evaluated)">
-                          {fireRate !== null ? `${(fireRate <= 1 ? fireRate * 100 : fireRate).toFixed(0)}% fire` : '—'}
+                          {fireRate === null ? '—'
+                            : fireLowSample ? <LowSampleNA count={fireCount} />
+                            : `${(fireRate <= 1 ? fireRate * 100 : fireRate).toFixed(0)}% fire`}
                         </span>
                         {' · '}
                         <span
-                          className={lift === null ? 'text-muted-foreground/60' : lift >= 0 ? 'text-gain' : 'text-loss'}
+                          className={lift === null || liftLowSample ? 'text-muted-foreground/60' : lift >= 0 ? 'text-gain' : 'text-loss'}
                           title="Win-rate lift when this signal fired (attribution)">
-                          {lift !== null ? `${lift >= 0 ? '+' : ''}${lift.toFixed(2)} lift` : '—'}
+                          {lift === null ? '—'
+                            : liftLowSample ? <LowSampleNA count={liftCount} />
+                            : `${lift >= 0 ? '+' : ''}${lift.toFixed(2)} lift`}
                         </span>
                       </>
                     )}
