@@ -1,4 +1,4 @@
-import { Activity, Bot, Key, Wifi, WifiOff, RefreshCw, Download, ShieldCheck } from 'lucide-react';
+import { Activity, Bot, Key, Wifi, WifiOff, RefreshCw, Download, ShieldCheck, ClipboardCopy } from 'lucide-react';
 import { useUpdateChecker } from '@/hooks/useUpdateChecker';
 import { toast } from 'sonner';
 import { useState } from 'react';
@@ -14,6 +14,42 @@ const APP_VERSION = __APP_VERSION__;
 const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
   const { updateAvailable, checking, updating, checkForUpdates, applyUpdate } = useUpdateChecker();
   const [reconciling, setReconciling] = useState(false);
+  const [copyingDiag, setCopyingDiag] = useState(false);
+
+  const handleCopyDiagnostics = async () => {
+    setCopyingDiag(true);
+    const toastId = toast.loading('Collecting diagnostics…');
+    try {
+      const res = await fetch('/api/diagnostics/bundle', { cache: 'no-store' });
+      if (!res.ok) {
+        toast.error('Diagnostics fetch failed', { id: toastId, description: `HTTP ${res.status}` });
+        return;
+      }
+      const text = await res.text();
+      try {
+        await navigator.clipboard.writeText(text);
+        toast.success(`Diagnostics copied (${(text.length / 1024).toFixed(1)} KB)`, {
+          id: toastId,
+          description: 'Paste it into the chat for analysis.',
+          duration: 6000,
+        });
+      } catch {
+        // Clipboard API blocked (non-HTTPS or permissions) — offer a download instead
+        const blob = new Blob([text], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `wolfbot-diagnostics-${new Date().toISOString().slice(0, 19)}.txt`;
+        a.click();
+        URL.revokeObjectURL(url);
+        toast.success('Clipboard blocked — diagnostics downloaded as a file instead', { id: toastId });
+      }
+    } catch {
+      toast.error('Diagnostics request failed', { id: toastId });
+    } finally {
+      setCopyingDiag(false);
+    }
+  };
 
   const handleReconcile = async () => {
     setReconciling(true);
@@ -105,6 +141,17 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
               <span className="hidden sm:inline">Sync with Binance</span>
             </button>
           )}
+
+          {/* Copy diagnostics bundle — one click, paste into chat for remote diagnosis */}
+          <button
+            onClick={handleCopyDiagnostics}
+            disabled={copyingDiag}
+            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+            title="Copy the full diagnostic report (version, health, errors, gate blockers, telemetry, analytics, config) to the clipboard"
+          >
+            <ClipboardCopy className={`w-3.5 h-3.5 ${copyingDiag ? 'animate-spin' : ''}`} />
+            <span className="hidden sm:inline">Copy diagnostics</span>
+          </button>
 
           {/* Check for updates button */}
           {updateAvailable ? (
