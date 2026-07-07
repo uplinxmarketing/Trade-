@@ -2369,7 +2369,10 @@ def evaluate_buy_gates(sym: str) -> dict:
     if get_mode() == "live" and connection.is_using_paper_fallback():
         blockers.append("live_connection_down")
 
-    max_pos = int(strategy.get("max_positions", 10))
+    # §4.1/A3: capacity is the auto-degraded effective slot count, not the raw
+    # configured max_positions — the blocker shows open/EFFECTIVE.
+    _slots = effective_slots()
+    max_pos = _slots["effective_slots"]
     with _positions_lock:
         n_open = len(_positions)
         already_held = any(p["symbol"] == sym for p in _positions)
@@ -2388,6 +2391,17 @@ def evaluate_buy_gates(sym: str) -> dict:
         blockers.append("slippage_loss_cooldown")
     if _global_stop_pause_active():
         blockers.append("global_stop_pause")
+
+    # ── Phase 4 §4.2/§4.3/§4.5 circuit breakers (mirror of the buy loop) ────
+    if _check_daily_loss_stop():
+        blockers.append("daily_loss_stop")
+    if time.time() < _consec_loss_pause_until:
+        blockers.append("consecutive_loss_pause")
+    _slip_avg = _slippage_veto_active(sym)
+    if _slip_avg is not None:
+        blockers.append(f"slippage_veto (avg {_slip_avg:.0f}bps)")
+    if _corr_guard_state()["blocked"]:
+        blockers.append("btc_red_entry_limit")
 
     if bool(strategy.get("macro_gate_enabled", True)):
         _btc = get_btc_state()
@@ -2602,6 +2616,696 @@ def get_btc_regime(detailed: bool = False):
     if detailed:
         return state
     return (state or {}).get("regime3") or "neutral"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 4 §4.1-§4.5 — sizing + risk management (WolfBot v0.4)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# §4.2/§4.3/§4.5 config — strategy.risk block. Defaults per spec.
+_RISK_DEFAULTS: Dict[str, float] = {
+    "daily_loss_stop_pct":           2.0,    # §4.2a: daily stop at −2% of allocation
+    "flatten_on_stop":               False,  # §4.2a: force-sell everything on trip
+    "max_consecutive_losses":        4,      # §4.2b: pause buys 60 min at this count
+    "max_avg_slippage_bps":          15.0,   # §4.3: per-symbol rolling-avg veto
+    "max_new_entries_when_btc_red":  2,      # §4.5: entries per 5 min while BTC red
+}
+
+
+def _risk_cfg() -> dict:
+    """strategy.risk with defaults — hot-reloadable via _load_strategy."""
+    raw = _load_strategy().get("risk")
+    raw = raw if isinstance(raw, dict) else {}
+    cfg: dict = {}
+    for key, default in _RISK_DEFAULTS.items():
+        val = raw.get(key, default)
+        try:
+            cfg[key] = bool(val) if isinstance(default, bool) else float(val)
+        except (TypeError, ValueError):
+            cfg[key] = default
+    return cfg
+
+
+def _risk_db_rows(sql: str, params: tuple) -> list:
+    """Small read-only query helper against the trades DB (risk features only).
+    Uses database's own lock/connection factory; returns [] on any error —
+    risk checks must never crash the buy/sell paths."""
+    try:
+        with database._lock:
+            conn = database._conn()
+            try:
+                rows = conn.execute(sql, params).fetchall()
+            finally:
+                conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+# ── §4.1 + A3 — sizing: auto-degrade slots ────────────────────────────────────
+# NEW strategy block:
+#   strategy.sizing = {"max_positions": 9, "min_position_usdt": 10}   (A4 defaults)
+# LEGACY FALLBACK (documented): when the sizing block is ABSENT, the root
+# strategy.max_positions key (default 10, as before) still wins — existing
+# configs keep their exact behavior until the UI writes the new block.
+# A3: when the allocation can't fund max_positions slots of min_position_usdt
+# each, the SLOT COUNT degrades (min(max_positions, floor(alloc/min))) instead
+# of refusing to arm. Budget-mode formulas are untouched.
+
+_SIZING_DEFAULTS = {"max_positions": 9, "min_position_usdt": 10.0}
+_eff_balance_cache: dict = {"ts": 0.0, "free": 0.0}
+_EFF_BALANCE_TTL_SEC = 30.0
+_slots_last_logged: dict = {"slots": None, "ts": 0.0}
+_SLOTS_LOG_THROTTLE_SEC = 60.0
+
+
+def _sizing_cfg() -> dict:
+    strategy = _load_strategy()
+    sizing = strategy.get("sizing")
+    if isinstance(sizing, dict):
+        try:
+            max_pos = int(sizing.get("max_positions", _SIZING_DEFAULTS["max_positions"]))
+        except (TypeError, ValueError):
+            max_pos = _SIZING_DEFAULTS["max_positions"]
+        try:
+            min_pos = float(sizing.get("min_position_usdt", _SIZING_DEFAULTS["min_position_usdt"]))
+        except (TypeError, ValueError):
+            min_pos = _SIZING_DEFAULTS["min_position_usdt"]
+    else:
+        # Legacy fallback: root max_positions wins when the sizing block is absent.
+        try:
+            max_pos = int(strategy.get("max_positions", 10))
+        except (TypeError, ValueError):
+            max_pos = 10
+        min_pos = _SIZING_DEFAULTS["min_position_usdt"]
+    return {"max_positions": max(0, max_pos), "min_position_usdt": max(0.0, min_pos)}
+
+
+def _free_balance_snapshot() -> float:
+    """USDT free balance, cached 30 s (live mode = REST call)."""
+    now = time.time()
+    if now - _eff_balance_cache["ts"] < _EFF_BALANCE_TTL_SEC:
+        return float(_eff_balance_cache["free"])
+    try:
+        free = float(_get_usdt_balance())
+    except Exception:
+        return float(_eff_balance_cache["free"])
+    _eff_balance_cache["ts"] = now
+    _eff_balance_cache["free"] = free
+    return free
+
+
+def effective_slots() -> dict:
+    """§4.1/A3 — slot capacity from capital, degrading instead of refusing.
+
+    effective_allocation = bot_allocation_usdt when > 0 (same allocation the
+    budget math in get_budget_for_coin enforces), else the bot's total capital
+    snapshot (free USDT + USDT deployed in open positions — free alone would
+    shrink the slot count as capital deploys and block valid entries).
+    effective_slots = min(max_positions, floor(effective_allocation /
+    min_position_usdt)), floored at 0. Slot-count changes are logged (throttled).
+    """
+    cfg = _sizing_cfg()
+    max_pos, min_pos = cfg["max_positions"], cfg["min_position_usdt"]
+    strategy = _load_strategy()
+    try:
+        allocation = float(strategy.get("bot_allocation_usdt", config.BOT_ALLOCATION_USDT))
+    except (TypeError, ValueError):
+        allocation = 0.0
+    if allocation > 0:
+        eff_alloc = allocation
+    else:
+        with _positions_lock:
+            deployed = sum(float(p.get("budget_usdt") or 0.0) for p in _positions)
+        eff_alloc = _free_balance_snapshot() + deployed
+    if min_pos > 0:
+        eff = min(max_pos, int(math.floor(eff_alloc / min_pos)))
+    else:
+        eff = max_pos
+    eff = max(0, eff)
+    # Log slot degradation on CHANGE (throttled) — A3 audit trail.
+    now = time.time()
+    prev = _slots_last_logged["slots"]
+    if prev is not None and prev != eff and now - _slots_last_logged["ts"] >= _SLOTS_LOG_THROTTLE_SEC:
+        _slots_last_logged["ts"] = now
+        try:
+            database.log_activity(
+                f"SIZING: running {prev} → {eff} slots: allocation {eff_alloc:.2f} "
+                f"(min_position_usdt={min_pos:.2f}, max_positions={max_pos})",
+                "warn" if eff < prev else "info")
+        except Exception:
+            pass
+    _slots_last_logged["slots"] = eff
+    return {
+        "max_positions":        max_pos,
+        "min_position_usdt":    min_pos,
+        "effective_allocation": round(eff_alloc, 2),
+        "effective_slots":      eff,
+        "degraded":             eff < max_pos,
+    }
+
+
+# ── §4.2a — daily loss stop (circuit breaker that ACTS) ───────────────────────
+# Realized PnL for the current UTC day + fee-adjusted unrealized PnL of open
+# positions. When total <= −daily_loss_stop_pct% × effective_allocation, BUYS
+# pause until the next UTC midnight (module state _daily_stop_until). EXITS
+# KEEP RUNNING (only the buy path consults the breaker). flatten_on_stop=true
+# additionally force-sells every open position ONCE through the normal force
+# path. Evaluated lazily in the buy path with a 30 s cache — no new thread.
+# Manual resume: resume_daily_stop() (called by control_api) clears the pause
+# and suppresses re-tripping for the rest of the same UTC day.
+
+_daily_stop_until: float = 0.0
+_daily_stop_lock = threading.Lock()
+_daily_pnl_cache: dict = {"ts": 0.0, "data": None}
+_DAILY_PNL_TTL_SEC = 30.0
+_daily_stop_logged_day: str = ""      # ERROR log fired once per UTC day
+_daily_stop_flattened_day: str = ""   # flatten fired once per UTC day
+_daily_stop_resumed_day: str = ""     # manual resume disarms re-trip for the day
+_last_daily_stop_log_ts: float = 0.0  # buy-loop pause heartbeat throttle
+
+
+def _utc_day_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _next_utc_midnight_ts() -> float:
+    from datetime import timedelta as _td
+    now_dt = datetime.now(timezone.utc)
+    nxt = (now_dt + _td(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return nxt.timestamp()
+
+
+def _daily_pnl_state() -> dict:
+    """Realized (trades table, timestamp_sell in today UTC, current mode) +
+    unrealized (open positions, fee-adjusted estimate at freshest price) PnL.
+    Cached 30 s. Never raises."""
+    now = time.time()
+    cached = _daily_pnl_cache.get("data")
+    if cached and now - _daily_pnl_cache["ts"] < _DAILY_PNL_TTL_SEC:
+        return cached
+    day = _utc_day_str()
+    rows = _risk_db_rows(
+        "SELECT COALESCE(SUM(net_profit), 0.0) AS pnl FROM trades "
+        "WHERE mode = ? AND substr(timestamp_sell, 1, 10) = ?",
+        (get_mode(), day))
+    realized = float(rows[0]["pnl"]) if rows else 0.0
+    unrealized = 0.0
+    try:
+        import data_collector as _dc_pnl
+        with _positions_lock:
+            snap = [dict(p) for p in _positions]
+        for p in snap:
+            sym = p.get("symbol", "")
+            entry = float(p.get("entry_price") or 0)
+            qty = float(p.get("quantity") or 0)
+            buy_fee = float(p.get("buy_fee_usdt") or 0)
+            px = float(_dc_pnl.prices.get(sym) or _rest_px.get(sym, 0) or entry)
+            if entry <= 0 or qty <= 0 or px <= 0:
+                continue
+            # Fee-adjusted estimate: what selling at px would net vs cost.
+            proceeds = px * qty * (1.0 - _fee_rate_for(sym))
+            unrealized += proceeds - (qty * entry + buy_fee)
+    except Exception:
+        pass
+    slots = effective_slots()
+    try:
+        pct = float(_risk_cfg()["daily_loss_stop_pct"])
+    except Exception:
+        pct = _RISK_DEFAULTS["daily_loss_stop_pct"]
+    limit_usdt = max(0.0, pct / 100.0 * float(slots["effective_allocation"]))
+    data = {
+        "day":        day,
+        "realized":   round(realized, 6),
+        "unrealized": round(unrealized, 6),
+        "pnl_today":  round(realized + unrealized, 6),
+        "limit_pct":  pct,
+        "limit_usdt": round(limit_usdt, 6),
+    }
+    _daily_pnl_cache["ts"] = now
+    _daily_pnl_cache["data"] = data
+    return data
+
+
+def _flatten_all_positions(context: str) -> int:
+    """Force-sell every open position through the normal force path.
+    Returns the number of sells dispatched."""
+    try:
+        import data_collector as _dc_fl
+        px_map = _dc_fl.prices
+    except Exception:
+        px_map = {}
+    with _positions_lock:
+        snap = list(_positions)
+    dispatched = 0
+    for pos in snap:
+        sym = pos.get("symbol", "")
+        if not sym:
+            continue
+        with _selling_lock:
+            if sym in _selling:
+                continue
+            _selling.add(sym)
+            _selling_ts[sym] = time.time()
+        price = float(px_map.get(sym, 0) or _rest_px.get(sym, 0)
+                      or pos.get("entry_price", 0) or 0)
+        _sell_executor.submit(_execute_sell, pos, price, "force-sell")
+        dispatched += 1
+    try:
+        database.log_activity(
+            f"FLATTEN ({context}): dispatched force-sell for {dispatched} open position(s)",
+            "error")
+    except Exception:
+        pass
+    return dispatched
+
+
+def _check_daily_loss_stop() -> bool:
+    """Lazy §4.2a breaker evaluation (30 s cached PnL). Returns True while
+    buys must stay paused. Exits are unaffected — only buy paths call this."""
+    global _daily_stop_until, _daily_stop_logged_day, _daily_stop_flattened_day
+    now = time.time()
+    if now < _daily_stop_until:
+        return True
+    cfg = _risk_cfg()
+    if cfg["daily_loss_stop_pct"] <= 0:
+        return False
+    day = _utc_day_str()
+    if _daily_stop_resumed_day == day:
+        return False  # manually resumed — do not re-trip today
+    st = _daily_pnl_state()
+    if st["limit_usdt"] <= 0 or st["pnl_today"] > -st["limit_usdt"]:
+        return False
+    with _daily_stop_lock:
+        if now < _daily_stop_until:          # lost the race — already tripped
+            return True
+        _daily_stop_until = _next_utc_midnight_ts()
+        first_trip_today = _daily_stop_logged_day != day
+        _daily_stop_logged_day = day
+    if first_trip_today:
+        try:
+            database.log_activity(
+                f"DAILY LOSS STOP: today's PnL {st['pnl_today']:.2f} USDT "
+                f"(realized {st['realized']:.2f} + unrealized {st['unrealized']:.2f}) "
+                f"breached −{st['limit_pct']}% of allocation "
+                f"({st['limit_usdt']:.2f} USDT) — BUYS PAUSED until next UTC "
+                f"midnight. Exits keep running.", "error")
+        except Exception:
+            pass
+        try:
+            log_diag_issue("risk", "error",
+                           f"daily_loss_stop tripped: pnl_today={st['pnl_today']:.2f} "
+                           f"limit={st['limit_usdt']:.2f}")
+        except Exception:
+            pass
+    if cfg["flatten_on_stop"] and _daily_stop_flattened_day != day:
+        _daily_stop_flattened_day = day
+        _flatten_all_positions("daily_loss_stop")
+    return True
+
+
+def resume_daily_stop() -> dict:
+    """Manual resume (control_api): clears the daily-stop pause and disarms
+    re-tripping for the remainder of the current UTC day."""
+    global _daily_stop_until, _daily_stop_resumed_day
+    was_stopped = time.time() < _daily_stop_until
+    _daily_stop_until = 0.0
+    _daily_stop_resumed_day = _utc_day_str()
+    _daily_pnl_cache["ts"] = 0.0   # force fresh state on next check
+    try:
+        database.log_activity(
+            "DAILY LOSS STOP: manually resumed — buys re-enabled "
+            "(breaker disarmed for the rest of today UTC)", "warn")
+    except Exception:
+        pass
+    return {"resumed": was_stopped, "day": _daily_stop_resumed_day}
+
+
+# ── §4.2b — consecutive-loss pause ────────────────────────────────────────────
+# In-memory counter of consecutive losing closed trades (net_profit < 0),
+# lazily seeded from the DB (last trades of the current mode — equivalent to
+# startup seeding since the first access happens on the first buy check or
+# trade close). At >= risk.max_consecutive_losses → buys pause 60 min. Any
+# non-losing close resets the counter.
+
+_consec_lock = threading.Lock()
+_consec_losses: Optional[int] = None       # None → not yet seeded from DB
+_consec_loss_pause_until: float = 0.0
+_CONSEC_PAUSE_SEC = 3600.0                 # 60 min
+_last_consec_pause_log_ts: float = 0.0
+
+
+def _seed_consec_losses_locked() -> int:
+    """Seed from the DB: count leading losses in the last 50 closed trades of
+    the current mode. Caller holds _consec_lock."""
+    rows = _risk_db_rows(
+        "SELECT net_profit FROM trades WHERE mode = ? ORDER BY id DESC LIMIT 50",
+        (get_mode(),))
+    n = 0
+    for r in rows:
+        np_ = r.get("net_profit")
+        if np_ is not None and float(np_) < 0:
+            n += 1
+        else:
+            break
+    return n
+
+
+def _consec_loss_count() -> int:
+    global _consec_losses
+    with _consec_lock:
+        if _consec_losses is None:
+            _consec_losses = _seed_consec_losses_locked()
+        return _consec_losses
+
+
+def _maybe_trigger_consec_pause_locked(count: int) -> None:
+    """Arm the 60-min pause when the counter reaches the limit. Caller holds
+    _consec_lock."""
+    global _consec_loss_pause_until
+    try:
+        limit = int(_risk_cfg()["max_consecutive_losses"])
+    except Exception:
+        limit = int(_RISK_DEFAULTS["max_consecutive_losses"])
+    now = time.time()
+    if limit > 0 and count >= limit and now >= _consec_loss_pause_until:
+        _consec_loss_pause_until = now + _CONSEC_PAUSE_SEC
+        try:
+            database.log_activity(
+                f"CONSECUTIVE-LOSS PAUSE: {count} losing trades in a row "
+                f"(limit {limit}) — buys paused for "
+                f"{int(_CONSEC_PAUSE_SEC // 60)} min", "error")
+        except Exception:
+            pass
+
+
+def _note_trade_closed(sym: str, net_profit: float) -> None:
+    """Risk hook — called from every close path (_do_execute_sell and
+    _finalize_managed_exit) AFTER the trade row is written. Updates the
+    consecutive-loss counter (§4.2b) and refreshes the symbol's slippage
+    window (§4.3). Never raises."""
+    global _consec_losses
+    try:
+        _avg_slippage_bps(sym, force=True)
+    except Exception:
+        pass
+    try:
+        with _consec_lock:
+            if _consec_losses is None:
+                # First access: the just-closed trade is already in the DB —
+                # seeding includes it, so do NOT also increment.
+                _consec_losses = _seed_consec_losses_locked()
+            elif net_profit < 0:
+                _consec_losses += 1
+            else:
+                _consec_losses = 0
+            _maybe_trigger_consec_pause_locked(_consec_losses)
+    except Exception:
+        pass
+
+
+# ── §4.3 — slippage auto-veto ─────────────────────────────────────────────────
+# Rolling per-symbol mean of |slippage_bps| over the last 20 closed trades of
+# the current mode, restricted to trades younger than 7 days (vetoed symbols
+# can't trade, so old fills must decay out of the window for the veto to
+# expire). DB query cached 5 min per symbol; force-refreshed on that symbol's
+# trade close. avg > risk.max_avg_slippage_bps → veto; re-check <= threshold
+# → auto-clear.
+
+_slippage_lock = threading.Lock()
+_slippage_cache: Dict[str, dict] = {}    # sym -> {"avg_bps", "n", "ts"}
+_slippage_vetoed: Dict[str, dict] = {}   # sym -> {"avg_bps", "since_ts"}
+_SLIPPAGE_CACHE_TTL_SEC = 300.0
+_SLIPPAGE_WINDOW_TRADES = 20
+_SLIPPAGE_MAX_AGE_DAYS = 7.0
+
+
+def _avg_slippage_bps(sym: str, force: bool = False) -> Optional[float]:
+    """Rolling mean of |slippage_bps| for sym (see section comment). Updates
+    the veto set as a side effect. Returns None when no qualifying trades."""
+    now = time.time()
+    with _slippage_lock:
+        ent = _slippage_cache.get(sym)
+        if ent and not force and now - ent["ts"] < _SLIPPAGE_CACHE_TTL_SEC:
+            return ent["avg_bps"]
+    from datetime import timedelta as _td
+    since_iso = (datetime.now(timezone.utc)
+                 - _td(days=_SLIPPAGE_MAX_AGE_DAYS)).isoformat()
+    rows = _risk_db_rows(
+        "SELECT slippage_bps FROM trades "
+        "WHERE coin = ? AND mode = ? AND slippage_bps IS NOT NULL "
+        "AND timestamp_sell >= ? ORDER BY id DESC LIMIT ?",
+        (sym, get_mode(), since_iso, _SLIPPAGE_WINDOW_TRADES))
+    vals = [abs(float(r["slippage_bps"])) for r in rows
+            if r.get("slippage_bps") is not None]
+    avg = (sum(vals) / len(vals)) if vals else None
+    try:
+        threshold = float(_risk_cfg()["max_avg_slippage_bps"])
+    except Exception:
+        threshold = _RISK_DEFAULTS["max_avg_slippage_bps"]
+    with _slippage_lock:
+        _slippage_cache[sym] = {"avg_bps": avg, "n": len(vals), "ts": now}
+        vetoed = sym in _slippage_vetoed
+        if avg is not None and threshold > 0 and avg > threshold:
+            if not vetoed:
+                _slippage_vetoed[sym] = {"avg_bps": round(avg, 2), "since_ts": now}
+                log_it = ("added", avg)
+            else:
+                _slippage_vetoed[sym]["avg_bps"] = round(avg, 2)
+                log_it = None
+        elif vetoed:
+            _slippage_vetoed.pop(sym, None)
+            log_it = ("cleared", avg)
+        else:
+            log_it = None
+    if log_it:
+        action, a = log_it
+        try:
+            database.log_activity(
+                f"SLIPPAGE VETO {action.upper()}: {sym} avg "
+                f"{'n/a' if a is None else f'{a:.1f}bps'} vs limit "
+                f"{threshold:.1f}bps (last {_SLIPPAGE_WINDOW_TRADES} trades, "
+                f"<= {_SLIPPAGE_MAX_AGE_DAYS:.0f}d old)",
+                "warn" if action == "added" else "info")
+        except Exception:
+            pass
+    return avg
+
+
+def _slippage_veto_active(sym: str) -> Optional[float]:
+    """Returns the offending avg |slippage| in bps when sym is vetoed, else
+    None. Refreshes the 5-min cache (which also auto-clears expired vetoes)."""
+    _avg_slippage_bps(sym)
+    with _slippage_lock:
+        ent = _slippage_vetoed.get(sym)
+        return float(ent["avg_bps"]) if ent else None
+
+
+def get_slippage_vetoes() -> Dict[str, dict]:
+    """{symbol: {"avg_bps": float, "since_ts": float}} — current §4.3 vetoes."""
+    with _slippage_lock:
+        return {s: dict(v) for s, v in _slippage_vetoed.items()}
+
+
+# ── §4.5 — correlation guard ──────────────────────────────────────────────────
+# Rolling 5-min window of executed-entry timestamps. While the CURRENT BTCUSDT
+# 5m candle is red (close-so-far < open: open proxied by the last CLOSED 5m
+# candle's close from data_collector.ws_candles_5m, close-so-far = live price)
+# at most risk.max_new_entries_when_btc_red entries may fire per 5 minutes.
+# Fails open when BTC candle/price data is unavailable.
+
+_corr_lock = threading.Lock()
+_corr_entry_ts: "_deque[float]" = _deque(maxlen=500)
+_CORR_WINDOW_SEC = 300.0
+_btc_red_cache: dict = {"ts": 0.0, "red": False}
+_BTC_RED_TTL_SEC = 5.0
+
+
+def _record_corr_entry() -> None:
+    with _corr_lock:
+        _corr_entry_ts.append(time.time())
+
+
+def _entries_last_5min(now: Optional[float] = None) -> int:
+    now = now if now is not None else time.time()
+    with _corr_lock:
+        return sum(1 for t in _corr_entry_ts if t > now - _CORR_WINDOW_SEC)
+
+
+def _btc_5m_red() -> bool:
+    """True when the in-progress BTCUSDT 5m candle is red. Open is proxied by
+    the last closed 5m candle's close (ws_candles_5m holds closed candles
+    only); close-so-far is the live price. Stale buffer (>10 min) or missing
+    live price → False (fail-open). Cached 5 s."""
+    now = time.time()
+    if now - _btc_red_cache["ts"] < _BTC_RED_TTL_SEC:
+        return bool(_btc_red_cache["red"])
+    red = False
+    try:
+        import data_collector as _dc_cg
+        buf = list((getattr(_dc_cg, "ws_candles_5m", None) or {}).get("BTCUSDT") or [])
+        live = float(_dc_cg.prices.get("BTCUSDT", 0) or _rest_px.get("BTCUSDT", 0) or 0)
+        if buf and live > 0:
+            last = buf[-1]                      # [open_time_ms, o, h, l, c, v]
+            last_open_s = float(last[0]) / 1000.0
+            if now - last_open_s <= 600.0:      # closed within the last 10 min
+                open_proxy = float(last[4])     # close of last closed 5m candle
+                red = live < open_proxy
+    except Exception:
+        red = False
+    _btc_red_cache["ts"] = now
+    _btc_red_cache["red"] = red
+    return red
+
+
+def _corr_guard_state() -> dict:
+    """{"blocked", "entries_5min", "limit", "btc_5m_red"} — §4.5 snapshot."""
+    try:
+        limit = int(_risk_cfg()["max_new_entries_when_btc_red"])
+    except Exception:
+        limit = int(_RISK_DEFAULTS["max_new_entries_when_btc_red"])
+    entries = _entries_last_5min()
+    red = _btc_5m_red()
+    return {
+        "blocked":      bool(red and limit > 0 and entries >= limit),
+        "entries_5min": entries,
+        "limit":        limit,
+        "btc_5m_red":   red,
+    }
+
+
+# ── §4.4 — BNB fee balance (engine part) ──────────────────────────────────────
+
+_BNB_LOW_USDT = 2.0
+_bnb_topup_last_ts: float = 0.0
+_BNB_TOPUP_MIN_INTERVAL_SEC = 3600.0
+_BNB_TOPUP_USDT = 10.0
+
+
+def get_bnb_fee_status() -> dict:
+    """{"enabled", "bnb_free", "bnb_usdt_value", "low"} — §4.4 status.
+    bnb_free/bnb_usdt_value are live-only (account cache via _acct, guarded);
+    None in paper mode or when the lookup fails."""
+    try:
+        enabled = bool(fees.get_fee_model().bnb_discount)
+    except Exception:
+        enabled = bool(_load_strategy().get("fees", {}).get("bnb_discount", False))
+    bnb_free: Optional[float] = None
+    bnb_usdt: Optional[float] = None
+    if get_mode() == "live":
+        try:
+            acc = _acct()
+            for b in acc.get("balances", []):
+                if b.get("asset") == "BNB":
+                    bnb_free = float(b.get("free", 0) or 0)
+                    break
+            else:
+                bnb_free = 0.0
+        except Exception:
+            bnb_free = None
+        if bnb_free is not None:
+            try:
+                import data_collector as _dc_bnb
+                px = float(_dc_bnb.prices.get("BNBUSDT", 0)
+                           or _rest_px.get("BNBUSDT", 0) or 0)
+                if px > 0:
+                    bnb_usdt = round(bnb_free * px, 4)
+            except Exception:
+                bnb_usdt = None
+    if bnb_usdt is not None:
+        low = bnb_usdt < _BNB_LOW_USDT
+    elif bnb_free is not None:
+        low = bnb_free <= 0.0
+    else:
+        low = False
+    return {"enabled": enabled, "bnb_free": bnb_free,
+            "bnb_usdt_value": bnb_usdt, "low": low}
+
+
+def maybe_topup_bnb() -> dict:
+    """§4.4 — market-buy ~10 USDT of BNB when (and ONLY when) ALL of:
+    fees.auto_topup_bnb=true (default false), fees.bnb_discount enabled,
+    live mode, BNB balance low. NEVER auto-buys otherwise. Called from the
+    API layer's periodic check — the engine never calls this on its own.
+    Throttled to once per hour. Returns an action/status dict."""
+    global _bnb_topup_last_ts
+    status = get_bnb_fee_status()
+    auto = bool(_load_strategy().get("fees", {}).get("auto_topup_bnb", False))
+    out = {"acted": False, "status": status, "auto_topup_bnb": auto}
+    if not auto:
+        out["reason"] = "auto_topup_bnb disabled (default)"
+        return out
+    if get_mode() != "live":
+        out["reason"] = "not live mode"
+        return out
+    if not status["enabled"]:
+        out["reason"] = "fees.bnb_discount disabled"
+        return out
+    if not status["low"]:
+        out["reason"] = "BNB balance not low"
+        return out
+    now = time.time()
+    if now - _bnb_topup_last_ts < _BNB_TOPUP_MIN_INTERVAL_SEC:
+        out["reason"] = "throttled (max one top-up per hour)"
+        return out
+    _bnb_topup_last_ts = now
+    try:
+        database.log_activity(
+            f"BNB AUTO-TOPUP: fee balance low "
+            f"(free={status['bnb_free']}, ≈{status['bnb_usdt_value']} USDT) — "
+            f"market-buying {_BNB_TOPUP_USDT:.0f} USDT of BNB "
+            f"(fees.auto_topup_bnb=true)", "error")
+    except Exception:
+        pass
+    try:
+        result = _market_buy("BNBUSDT", _BNB_TOPUP_USDT)
+        qty = float(result.get("executedQty", 0) or 0)
+        out.update({"acted": True, "bought_qty": qty, "spent_usdt": _BNB_TOPUP_USDT})
+        try:
+            database.log_activity(
+                f"BNB AUTO-TOPUP: bought {qty:.6f} BNB for ~{_BNB_TOPUP_USDT:.0f} USDT",
+                "warn")
+        except Exception:
+            pass
+    except Exception as e:
+        out["reason"] = f"buy failed: {e}"
+        try:
+            database.log_activity(f"BNB AUTO-TOPUP FAILED: {e}", "error")
+        except Exception:
+            pass
+    return out
+
+
+# ── §4 — consolidated risk status (single payload for the API layer) ─────────
+
+def get_risk_status() -> dict:
+    """One dict covering every Phase 4 risk feature — consumed by control_api."""
+    daily = _daily_pnl_state()
+    now = time.time()
+    stopped = now < _daily_stop_until
+    return {
+        "daily": {
+            "pnl_today":       daily["pnl_today"],
+            "realized":        daily["realized"],
+            "unrealized":      daily["unrealized"],
+            "limit_usdt":      daily["limit_usdt"],
+            "limit_pct":       daily["limit_pct"],
+            "stopped":         stopped,
+            "stop_until":      _daily_stop_until if stopped else None,
+            "flatten_on_stop": bool(_risk_cfg()["flatten_on_stop"]),
+            "resumed_today":   _daily_stop_resumed_day == _utc_day_str(),
+        },
+        "consecutive": {
+            "count":        _consec_loss_count(),
+            "limit":        int(_risk_cfg()["max_consecutive_losses"]),
+            "paused_until": (_consec_loss_pause_until
+                             if now < _consec_loss_pause_until else None),
+        },
+        "slippage_vetoes": get_slippage_vetoes(),
+        "correlation": _corr_guard_state(),
+        "slots": effective_slots(),
+        "bnb":   get_bnb_fee_status(),
+    }
 
 
 # ── Reversal confirmation ──────────────────────────────────────────────────────
@@ -4193,6 +4897,10 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     except Exception as te:
         database.log_activity(f"log_trade error ({sym}): {te}", "warn")
 
+    # ── Phase 4 §4.2b/§4.3 risk hooks (after the trade row is written):
+    # consecutive-loss counter update + slippage-window refresh. Never raises.
+    _note_trade_closed(sym, net_profit)
+
     # Remove position from memory and DB — sell is confirmed on Binance and the
     # trade record is already written. Supabase sync and learning run after so
     # a slow network never delays cleanup.
@@ -4303,6 +5011,36 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _record_rejection("(all)", 0, "global_stop_pause", f"{_rem_gp}s remaining")
         return
 
+    # ── §4.2a daily loss stop: pause ALL buys until next UTC midnight (or
+    # manual resume). EXITS KEEP RUNNING — this only returns from the buy path.
+    if _check_daily_loss_stop():
+        global _last_daily_stop_log_ts
+        _now_ds = time.time()
+        if _now_ds - _last_daily_stop_log_ts >= 60.0:
+            _last_daily_stop_log_ts = _now_ds
+            _st_ds = _daily_pnl_state()
+            database.log_activity(
+                f"Buy check: daily_loss_stop active (pnl_today="
+                f"{_st_ds['pnl_today']:.2f} USDT, limit -{_st_ds['limit_usdt']:.2f}) "
+                f"— buys paused until next UTC midnight; exits keep running", "warn")
+            _record_rejection("(all)", 0, "daily_loss_stop",
+                              f"pnl_today={_st_ds['pnl_today']:.2f}")
+        return
+
+    # ── §4.2b consecutive-loss pause: buys paused 60 min after N losses in a row.
+    _now_cl = time.time()
+    if _now_cl < _consec_loss_pause_until:
+        global _last_consec_pause_log_ts
+        if _now_cl - _last_consec_pause_log_ts >= 60.0:
+            _last_consec_pause_log_ts = _now_cl
+            _rem_cl = int(_consec_loss_pause_until - _now_cl)
+            database.log_activity(
+                f"Buy check: consecutive_loss_pause active ({_rem_cl}s remaining) "
+                f"— {_consec_loss_count()} losses in a row", "warn")
+            _record_rejection("(all)", 0, "consecutive_loss_pause",
+                              f"{_rem_cl}s remaining")
+        return
+
     # Fast pre-check: any coin signalling BUY? (no lock needed for scalar read)
     # Use the runtime min_signals setting — the hardcoded config default would
     # silently defeat a user threshold set below it. Legacy path only: with the
@@ -4353,8 +5091,13 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # uses current TP/SL settings rather than stale cached values.
     _refresh_risk_params()
 
-    # Enforce max_positions (configurable via /api/settings, default 10)
-    max_pos = int(strategy.get("max_positions", 10))
+    # Enforce position capacity — §4.1/A3: the EFFECTIVE slot count (raw
+    # max_positions auto-degraded by floor(effective_allocation /
+    # min_position_usdt)). Budget-mode formulas are untouched; only the slot
+    # count degrades. Legacy configs (no strategy.sizing block) resolve
+    # max_positions from the root key as before.
+    _slots_info = effective_slots()
+    max_pos = _slots_info["effective_slots"]
     with _positions_lock:
         n_open = len(_positions)
     if n_open >= max_pos:
@@ -4365,8 +5108,11 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         _now_cap = time.time()
         if _now_cap - _last_at_capacity_log >= 60.0:
             _last_at_capacity_log = _now_cap
+            _degr_tag = (f" (degraded from {_slots_info['max_positions']}: "
+                         f"allocation {_slots_info['effective_allocation']:.2f})"
+                         if _slots_info["degraded"] else "")
             database.log_activity(
-                f"At max positions ({n_open}/{max_pos}) — bot active, "
+                f"At max positions ({n_open}/{max_pos}){_degr_tag} — bot active, "
                 f"waiting for an exit before opening new trades",
                 "info",
             )
@@ -4474,6 +5220,24 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             rem = int(_loss_cooldown[sym] - time.time())
             _record_rejection(sym, cached["score"], "loss_cooldown", f"{rem}s remaining")
             database.log_activity(f"{sym}: buy skipped — post-slippage-loss cooldown ({rem}s remaining)", "info")
+            continue
+
+        # ── §4.3 slippage auto-veto: avg |slippage| over the last 20 closed
+        # trades (<=7 days old) above risk.max_avg_slippage_bps blocks entries
+        # for this symbol until the rolling window decays back under.
+        _slip_avg = _slippage_veto_active(sym)
+        if _slip_avg is not None:
+            _record_rejection(sym, cached["score"], "slippage_veto",
+                              f"avg {_slip_avg:.1f}bps")
+            continue
+
+        # ── §4.5 correlation guard: while the current BTC 5m candle is red,
+        # at most risk.max_new_entries_when_btc_red entries per 5 minutes.
+        _corr = _corr_guard_state()
+        if _corr["blocked"]:
+            _record_rejection(sym, cached["score"], "btc_red_entry_limit",
+                              f"{_corr['entries_5min']} entries in 5min "
+                              f"(limit {_corr['limit']}, BTC 5m red)")
             continue
 
         with _positions_lock:
@@ -5040,6 +5804,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # Update stagger tracking
         _last_buy_ts = time.time()
         _buys_this_scan += 1
+        _record_corr_entry()   # §4.5 — executed buy enters the 5-min window
         pos_id = database.save_position(pos_record)
         pos_record["id"] = pos_id
 
@@ -6071,6 +6836,9 @@ def _finalize_managed_exit(pos: dict, sym: str, exit_price: float, reason: str,
                            origin=pos.get("origin", "auto"))
     except Exception as _te_err:
         database.log_activity(f"log_trade error ({sym}, {reason}): {_te_err}", "warn")
+
+    # Phase 4 §4.2b/§4.3 risk hooks — same as _do_execute_sell's close path.
+    _note_trade_closed(sym, net_profit)
 
     # Remove position from DB + memory (exchange fill is the confirmation).
     if pos.get("id"):

@@ -18,6 +18,7 @@ import { SignalEnginePanel } from './SignalEnginePanel';
 import { DiagnosticsTab } from './DiagnosticsTab';
 import { AnalyticsPanel } from './AnalyticsPanel';
 import { BacktestPanel } from './BacktestPanel';
+import { RiskPanel } from './RiskPanel';
 
 // ── Simple 4-signal analyser (no API key, Binance public data only) ────────────────────
 const BIN = '/api/proxy/binance';
@@ -422,6 +423,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [showAnalytics, setShowAnalytics] = useState(false);
   const [showBacktest, setShowBacktest] = useState(false);
+  const [showRisk, setShowRisk] = useState(false);
+  // Phase 4 §4.4 — compact breaker summary carried on the /api/all poll.
+  const [riskSummary, setRiskSummary] = useState<{
+    daily_stopped?: boolean; consec_paused?: boolean;
+    effective_slots?: number | null; degraded?: boolean;
+    slippage_veto_count?: number;
+  } | null>(null);
   const [signalRegistry, setSignalRegistry] = useState<{id: string; category: string; description: string; role: string}[]>([]);
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
@@ -769,6 +777,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     if (s.bot_allocation_usdt !== undefined) setSetupAllocation(Number(s.bot_allocation_usdt));
     // Server-authoritative stats — use these instead of summing individual trade rows
     // to avoid double-counting with Supabase.
+    // Phase 4 §4.4 — breaker-state summary for the "BUYS PAUSED" header badge.
+    if (data.risk && typeof data.risk === 'object') setRiskSummary(data.risk);
     if (s.realized_pnl  !== undefined) setServerRealizedPnl(Number(s.realized_pnl));
     if (s.wins          !== undefined) setServerWins(Number(s.wins));
     if (s.total_trades  !== undefined) setServerTotalTrades(Number(s.total_trades));
@@ -1286,6 +1296,16 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               {mode === 'live' ? (usingPaperFallback ? 'LIVE · PAPER FALLBACK' : 'LIVE') : 'PAPER'}
               <ChevronDown className={`w-2.5 h-2.5 transition-transform ${showModeToggle ? 'rotate-180' : ''}`} />
             </button>
+            {/* Phase 4 §4.4 — breaker badge next to the mode pill */}
+            {riskSummary?.daily_stopped ? (
+              <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-loss/20 text-loss border border-loss/30 whitespace-nowrap">
+                BUYS PAUSED: daily stop
+              </span>
+            ) : riskSummary?.consec_paused ? (
+              <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30 whitespace-nowrap">
+                BUYS PAUSED: loss streak
+              </span>
+            ) : null}
             {liveErrorMsg && !showModeToggle && (
               <span className="text-[9px] text-amber-400 truncate max-w-[140px]">{liveErrorMsg}</span>
             )}
@@ -1807,6 +1827,31 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           {showDiagnostics && (
             <div className="px-4 pb-4">
               <DiagnosticsTab baseUrl={botUrl} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Risk breakers — daily stop / loss streak / slots / BNB / correlation (server mode only) */}
+      {isServerMode && (
+        <div className="border-t border-border">
+          <button
+            onClick={() => setShowRisk(!showRisk)}
+            className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/20 transition-colors">
+            <div className="flex items-center gap-2">
+              <Shield className="w-3.5 h-3.5 text-muted-foreground" />
+              <span className="text-xs font-semibold">Risk</span>
+              {(riskSummary?.daily_stopped || riskSummary?.consec_paused) && (
+                <span className={`w-1.5 h-1.5 rounded-full ${riskSummary?.daily_stopped ? 'bg-loss' : 'bg-amber-400'} animate-pulse`} />
+              )}
+            </div>
+            {showRisk
+              ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
+              : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
+          </button>
+          {showRisk && (
+            <div className="px-4 pb-4">
+              <RiskPanel baseUrl={botUrl} />
             </div>
           )}
         </div>

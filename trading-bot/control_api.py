@@ -553,7 +553,66 @@ async def _daily_maintenance_loop():
                         f"fees.per_symbol_overrides", "warn")
         except Exception as e:
             print(f"[Maintenance] fee-override staleness check failed: {e}")
-        await _aio.sleep(24 * 3600)
+        # Phase 4 §4.5 — BNB fee-balance health check: run once now, then on a
+        # lighter hourly tick inside the 24 h maintenance window.
+        await _bnb_health_check()
+        for _hour_tick in range(23):
+            await _aio.sleep(3600)
+            await _bnb_health_check()
+        await _aio.sleep(3600)
+
+
+async def _bnb_health_check():
+    """Phase 4 §4.5 — hourly BNB fee-balance check.
+
+    Only acts when strategy.json fees.bnb_discount is true. Reads the engine's
+    get_risk_status()['bnb'] snapshot; when the balance is low it logs a
+    WARNING to the activity log, and when fees.auto_topup_bnb is enabled it
+    calls trade_engine.maybe_topup_bnb() (which re-checks conditions
+    internally) and logs the audit result. Fully defensive: no-ops when the
+    engine hasn't landed these APIs yet."""
+    import asyncio as _aio
+    try:
+        s = _load_strategy()
+        fees_cfg = s.get("fees") if isinstance(s.get("fees"), dict) else {}
+        if not fees_cfg.get("bnb_discount", False):
+            return
+        import trade_engine as _te
+        _grs = getattr(_te, "get_risk_status", None)
+        if not callable(_grs):
+            return
+        try:
+            status = await _aio.to_thread(_grs)
+        except Exception:
+            return
+        bnb = (status or {}).get("bnb") if isinstance(status, dict) else None
+        if not isinstance(bnb, dict):
+            return
+        if bnb.get("low"):
+            try:
+                _usdt_val = float(bnb.get("bnb_usdt_value") or 0.0)
+            except (TypeError, ValueError):
+                _usdt_val = 0.0
+            database.log_activity(
+                f"BNB balance low (~{_usdt_val:.2f} USDT) — fee discount at risk",
+                "warn")
+        if fees_cfg.get("auto_topup_bnb", False):
+            _topup = getattr(_te, "maybe_topup_bnb", None)
+            if callable(_topup):
+                try:
+                    result = await _aio.to_thread(_topup)
+                except Exception as exc:
+                    database.log_activity(f"BNB auto top-up failed: {exc}", "error")
+                    result = None
+                if result:
+                    try:
+                        database.log_activity(
+                            "BNB auto top-up: " + json.dumps(result, default=str),
+                            "info")
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"[Maintenance] BNB health check failed: {e}")
 
 
 # ── Internal helpers ─────────────────────────────────────────────
@@ -3597,6 +3656,183 @@ def _resolved_regime_cfg():
     return {"neutral_size_mult": mult, "refresh_sec": 60}
 
 
+# ── Phase 4 §4.1-§4.3 — risk breakers status / resume / settings blocks ──────
+
+# Engine defaults (mirrored here so GET /api/settings can resolve the blocks
+# even before the engine agent's _sizing_cfg/_risk_cfg helpers exist).
+_SIZING_DEFAULTS = {
+    "max_positions":     9,
+    "min_position_usdt": 10,
+}
+_RISK_DEFAULTS = {
+    "daily_loss_stop_pct":          2.0,
+    "flatten_on_stop":              False,
+    "max_consecutive_losses":       4,
+    "max_avg_slippage_bps":         15,
+    "max_new_entries_when_btc_red": 2,
+}
+
+
+def _resolved_block_cfg(block_name: str, defaults: dict, engine_fn_names: tuple):
+    """RESOLVED config block: engine resolver when available, otherwise
+    defaults merged with any strategy.json block of the same name."""
+    for fn_name in engine_fn_names:
+        try:
+            import trade_engine as _te
+            fn = getattr(_te, fn_name, None)
+            if callable(fn):
+                cfg = fn()
+                if isinstance(cfg, dict):
+                    return dict(cfg)
+        except Exception:
+            pass
+    try:
+        s = _load_strategy()
+        blk = s.get(block_name) if isinstance(s.get(block_name), dict) else {}
+        return {**defaults, **blk}
+    except Exception:
+        return dict(defaults)
+
+
+def _resolved_sizing_cfg():
+    return _resolved_block_cfg("sizing", _SIZING_DEFAULTS, ("_sizing_cfg", "sizing_cfg"))
+
+
+def _resolved_risk_cfg():
+    return _resolved_block_cfg("risk", _RISK_DEFAULTS, ("_risk_cfg", "risk_cfg"))
+
+
+# Phase 4 — validation specs for the POST "sizing" and "risk" blocks
+# (same (type, min, max) tuple contract as _ENTRIES_VALIDATION).
+_SIZING_VALIDATION = {
+    "max_positions":     ("int",   1, 50),
+    "min_position_usdt": ("float", 1, 1000),
+}
+_RISK_VALIDATION = {
+    "daily_loss_stop_pct":          ("float", 0.1, 50),
+    "flatten_on_stop":              ("bool",  None, None),
+    "max_consecutive_losses":       ("int",   1,   50),
+    "max_avg_slippage_bps":         ("float", 1,   500),
+    "max_new_entries_when_btc_red": ("int",   0,   50),
+}
+
+# Sections get_risk_status() is expected to return; each is surfaced as
+# {"available": false} when the engine (or that section) is absent.
+_RISK_STATUS_SECTIONS = ("daily", "consecutive", "slippage_vetoes",
+                         "correlation", "slots", "bnb")
+
+
+def _risk_status_payload() -> dict:
+    """Assemble the /api/risk/status body. NEVER raises — every failure mode
+    degrades to {"available": false} sections so the endpoint cannot 500."""
+    out: dict = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "available": False,
+    }
+    status = None
+    try:
+        import trade_engine as _te
+        _grs = getattr(_te, "get_risk_status", None)
+        if callable(_grs):
+            status = _grs()
+    except Exception:
+        status = None
+    if not isinstance(status, dict):
+        status = {}
+    else:
+        out["available"] = True
+    for section in _RISK_STATUS_SECTIONS:
+        val = status.get(section)
+        out[section] = val if isinstance(val, dict) else {"available": False}
+    return out
+
+
+def _risk_compact_summary() -> dict:
+    """Compact breaker-state summary carried on /api/all so the main poll can
+    drive header badges without an extra request. Never raises."""
+    out = {
+        "daily_stopped":       False,
+        "consec_paused":       False,
+        "effective_slots":     None,
+        "degraded":            False,
+        "slippage_veto_count": 0,
+    }
+    try:
+        import trade_engine as _te
+        _grs = getattr(_te, "get_risk_status", None)
+        status = _grs() if callable(_grs) else None
+        if isinstance(status, dict):
+            daily = status.get("daily") or {}
+            if isinstance(daily, dict):
+                out["daily_stopped"] = bool(daily.get("stopped"))
+            consec = status.get("consecutive") or {}
+            if isinstance(consec, dict):
+                pu = consec.get("paused_until")
+                try:
+                    out["consec_paused"] = bool(pu) and float(pu) > time.time()
+                except (TypeError, ValueError):
+                    out["consec_paused"] = bool(pu)
+            vetoes = status.get("slippage_vetoes")
+            if isinstance(vetoes, dict):
+                out["slippage_veto_count"] = len(vetoes)
+            slots = status.get("slots") or {}
+            if isinstance(slots, dict) and slots:
+                out["effective_slots"] = slots.get("effective_slots")
+                out["degraded"]        = bool(slots.get("degraded"))
+        if out["effective_slots"] is None:
+            _es = getattr(_te, "effective_slots", None)
+            if callable(_es):
+                slots = _es()
+                if isinstance(slots, dict):
+                    out["effective_slots"] = slots.get("effective_slots")
+                    out["degraded"]        = bool(slots.get("degraded"))
+    except Exception:
+        pass
+    return out
+
+
+@app.get("/api/risk/status")
+def api_risk_status():
+    """Phase 4 §4.1 — full risk-breaker status. Never 500s: absent engine
+    APIs degrade to {"available": false} sections."""
+    return _risk_status_payload()
+
+
+@app.post("/api/risk/resume")
+def api_risk_resume(body: dict = Body(default={})):
+    """Phase 4 §4.2 — clear an active daily loss stop. Requires an explicit
+    {"confirm": true} body; returns the refreshed risk status."""
+    if not isinstance(body, dict) or body.get("confirm") is not True:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False,
+                     "error": 'confirmation required — POST {"confirm": true}'})
+    resumed = False
+    err = None
+    try:
+        import trade_engine as _te
+        _fn = getattr(_te, "resume_daily_stop", None)
+        if callable(_fn):
+            resumed = bool(_fn())
+        else:
+            err = "engine does not support resume_daily_stop yet"
+    except Exception as exc:
+        err = str(exc)
+    if err:
+        try:
+            database.log_activity(f"Daily-stop resume failed: {err}", "error")
+        except Exception:
+            pass
+        return {"ok": False, "error": err, "status": _risk_status_payload()}
+    try:
+        database.log_activity(
+            "Daily loss stop manually resumed via API"
+            + ("" if resumed else " (engine reported no active stop)"), "warn")
+    except Exception:
+        pass
+    return {"ok": True, "resumed": resumed, "status": _risk_status_payload()}
+
+
 # Phase 3 — validation spec for the POST "entries" block.
 # Each entry: (type, min, max). type 'bool' ignores min/max; none are nullable.
 _ENTRIES_VALIDATION = {
@@ -3742,6 +3978,10 @@ def api_get_settings():
         # configs; None when the engine is unavailable.
         "entries":             _resolved_entries_cfg(),
         "regime":              _resolved_regime_cfg(),
+        # Phase 4 — RESOLVED sizing (§4/A3) and risk-breaker (§4.1-§4.3)
+        # configs (engine resolvers when present, defaults+strategy.json else).
+        "sizing":              _resolved_sizing_cfg(),
+        "risk":                _resolved_risk_cfg(),
         # Defaults below MUST mirror the engine's actual fallbacks:
         # trade_engine._refresh_risk_params (sl_on=True, sl_pct=0.4, tp_pct=0.1,
         # smart_hold=False, trailing=0.5) and _check_buys_from_cache (max_positions=10).
@@ -3783,6 +4023,10 @@ class SettingsRequest(BaseModel):
     # rationale as exits).
     entries:             Optional[dict]  = None
     regime:              Optional[dict]  = None
+    # Phase 4 — optional sizing and risk blocks, validated by
+    # _validate_typed_block (same plain-dict rationale as exits/entries).
+    sizing:              Optional[dict]  = None
+    risk:                Optional[dict]  = None
 
 
 class _SignalEngineConfig(BaseModel):
@@ -3844,6 +4088,26 @@ def api_save_settings(req: SettingsRequest):
                 _s_cur = _load_strategy()
                 _cur = _s_cur.get("entries") if isinstance(_s_cur.get("entries"), dict) else {}
                 patch["entries"] = {**_cur, **_validated}
+        # ── Phase 4 — sizing block (validated; field-level errors, no 500) ──
+        if req.sizing is not None:
+            _validated, _errors = _validate_typed_block(
+                req.sizing, _SIZING_VALIDATION, "sizing")
+            if _errors:
+                return {"ok": False, "error": "invalid sizing settings", "errors": _errors}
+            if _validated:
+                _s_cur = _load_strategy()
+                _cur = _s_cur.get("sizing") if isinstance(_s_cur.get("sizing"), dict) else {}
+                patch["sizing"] = {**_cur, **_validated}
+        # ── Phase 4 — risk block (validated; field-level errors, no 500) ──
+        if req.risk is not None:
+            _validated, _errors = _validate_typed_block(
+                req.risk, _RISK_VALIDATION, "risk")
+            if _errors:
+                return {"ok": False, "error": "invalid risk settings", "errors": _errors}
+            if _validated:
+                _s_cur = _load_strategy()
+                _cur = _s_cur.get("risk") if isinstance(_s_cur.get("risk"), dict) else {}
+                patch["risk"] = {**_cur, **_validated}
         # ── Phase 3 — regime block (refresh_sec is read-only → dropped) ──
         if req.regime is not None:
             _validated, _errors = _validate_typed_block(
@@ -4048,6 +4312,9 @@ def api_all():
         "activity":      database.get_activity_log(limit=100),
         "signals":       _get_signal_snapshot(),
         "market_health": _get_market_health(),
+        # Phase 4 §4.4 — compact breaker-state summary so the main poll can
+        # drive the "BUYS PAUSED" header badge without an extra request.
+        "risk":          _risk_compact_summary(),
     }
     _API_ALL_CACHE["ts"]   = now_ts
     _API_ALL_CACHE["data"] = payload

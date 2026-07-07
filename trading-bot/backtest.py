@@ -36,6 +36,28 @@ FILL SIMULATION RULES (spec, encoded exactly)
     * Fees come from fees.for_symbol(symbol, strategy) incl. per-symbol
       overrides.
 
+PHASE 4 RISK PARITY (§4.1-§4.5)
+    * §4.1/A3 effective slots: min(max_positions, floor(effective_allocation /
+      min_position_usdt)) — allocation is bot_allocation_usdt when > 0, else
+      the bot's current equity (cash + deployed). Slot count degrades; budget
+      formulas untouched. sizing_config() mirrors the live legacy fallback
+      (root max_positions wins when the sizing block is absent).
+    * §4.2a daily loss stop: realized-today + fee-adjusted unrealized PnL <=
+      −daily_loss_stop_pct% × effective allocation pauses ENTRIES for the rest
+      of the simulated UTC day; flatten_on_stop closes all positions at their
+      last marks (taker, exit_label "backtest_daily_stop").
+    * §4.2b consecutive losses: >= max_consecutive_losses losing closes in a
+      row pause entries for 60 simulated minutes; any non-losing close resets.
+    * §4.5 correlation guard: entries are skipped at fill time when the BTC 5m
+      candle just closed red AND >= max_new_entries_when_btc_red fills already
+      happened in the trailing 5 minutes. BTC state comes from stored BTCUSDT
+      1m klines; with no BTC history the guard is inactive (documented).
+    * §4.3 slippage veto is OMITTED here by design: replay fills are MODELED
+      (tiered slippage + spread), so a rolling realized-slippage veto would
+      only ever feed back the model's own constants — it carries no signal.
+    Determinism contract unchanged: all of the above derive exclusively from
+    stored klines and the strategy dict.
+
 CLI
     python backtest.py --start 2026-01-01 --end 2026-06-30 --symbols approved
 """
@@ -125,6 +147,63 @@ ENTRIES_DEFAULTS: Dict[str, Any] = {
 STOP_PAUSE_COUNT        = 3
 STOP_PAUSE_WINDOW_MS    = 600_000
 STOP_PAUSE_DURATION_MS  = 300_000
+
+# ── Phase 4 §4.1/§4.2/§4.5 — sizing + risk config (live-engine parity) ───────
+# Keep defaults in sync with trade_engine._RISK_DEFAULTS / _SIZING_DEFAULTS.
+
+RISK_DEFAULTS: Dict[str, Any] = {
+    "daily_loss_stop_pct":          2.0,    # §4.2a
+    "flatten_on_stop":              False,  # §4.2a
+    "max_consecutive_losses":       4,      # §4.2b
+    "max_new_entries_when_btc_red": 2,      # §4.5
+}
+
+SIZING_DEFAULTS = {"max_positions": 9, "min_position_usdt": 10.0}
+
+CONSEC_PAUSE_MS = 3_600_000     # §4.2b: 60 min entry pause
+CORR_WINDOW_MS  = 300_000       # §4.5: rolling 5-min entry window
+DAY_MS          = 86_400_000
+
+
+def risk_config(strategy: dict) -> dict:
+    """strategy.risk with Phase 4 defaults (same resolution as the live
+    engine's _risk_cfg)."""
+    raw = strategy.get("risk") if isinstance(strategy, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    cfg: Dict[str, Any] = {}
+    for key, default in RISK_DEFAULTS.items():
+        val = raw.get(key, default)
+        try:
+            cfg[key] = bool(val) if isinstance(default, bool) else float(val)
+        except (TypeError, ValueError):
+            cfg[key] = default
+    return cfg
+
+
+def sizing_config(strategy: dict) -> dict:
+    """§4.1 strategy.sizing with A4 defaults (max_positions 9,
+    min_position_usdt 10). LEGACY FALLBACK (identical to the live engine):
+    when the sizing block is absent, the root strategy.max_positions key
+    (default config.MAX_OPEN_POSITIONS) still wins."""
+    strategy = strategy if isinstance(strategy, dict) else {}
+    sizing = strategy.get("sizing")
+    if isinstance(sizing, dict):
+        try:
+            max_pos = int(sizing.get("max_positions", SIZING_DEFAULTS["max_positions"]))
+        except (TypeError, ValueError):
+            max_pos = SIZING_DEFAULTS["max_positions"]
+        try:
+            min_pos = float(sizing.get("min_position_usdt",
+                                       SIZING_DEFAULTS["min_position_usdt"]))
+        except (TypeError, ValueError):
+            min_pos = SIZING_DEFAULTS["min_position_usdt"]
+    else:
+        try:
+            max_pos = int(strategy.get("max_positions", config.MAX_OPEN_POSITIONS))
+        except (TypeError, ValueError):
+            max_pos = config.MAX_OPEN_POSITIONS
+        min_pos = SIZING_DEFAULTS["min_position_usdt"]
+    return {"max_positions": max(0, max_pos), "min_position_usdt": max(0.0, min_pos)}
 
 
 def entries_config(strategy: dict) -> dict:
@@ -656,10 +735,16 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
         starting_balance = float(bt_cfg.get("starting_balance_usdt", 1000.0))
     except (TypeError, ValueError):
         starting_balance = 1000.0
+    # ── Phase 4 §4.1/§4.2/§4.5 (live-engine parity; §4.3 omitted — modeled
+    # fills, see module docstring) ────────────────────────────────────────────
+    sz_cfg = sizing_config(strategy)
+    risk_cfg = risk_config(strategy)
     try:
-        max_positions = int(strategy.get("max_positions", config.MAX_OPEN_POSITIONS))
+        bot_allocation = float(strategy.get("bot_allocation_usdt", 0) or 0)
     except (TypeError, ValueError):
-        max_positions = config.MAX_OPEN_POSITIONS
+        bot_allocation = 0.0
+    corr_limit = int(risk_cfg["max_new_entries_when_btc_red"])
+    max_consec = int(risk_cfg["max_consecutive_losses"])
 
     start_ms, end_ms = int(start_ms), int(end_ms)
 
@@ -691,6 +776,39 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
     # REGIME_risk_off veto never fires.
     btc_1h = _load_btc_1h(start_ms, end_ms)
     _btc_state = {"ptr": 0, "ts": -1, "regime": "neutral"}
+
+    # ── §4.5 correlation guard — BTC 5m red state from stored BTCUSDT 1m
+    # klines (close-so-far vs bucket open). No BTC 1m history → guard inactive
+    # (documented fallback; determinism preserved either way).
+    btc_1m_by_ts: Dict[int, dict] = {}
+    if corr_limit > 0:
+        try:
+            _btc_rows = database.get_klines("BTCUSDT", "1m",
+                                            start_ms=start_ms - 10 * MINUTE_MS,
+                                            end_ms=end_ms)
+        except Exception:
+            _btc_rows = []
+        for _r in _btc_rows:
+            _c = _row_to_candle(_r)
+            if _c is not None:
+                btc_1m_by_ts[_c["open_time"]] = _c
+
+    def _btc_red_at(t_ms: int) -> bool:
+        """True when the BTC 5m candle at t_ms is red so far. Fills land on
+        5m boundaries (§3.1), where the in-progress candle has no data yet —
+        so at an exact boundary the JUST-CLOSED 5m candle is judged (the live
+        engine's 'last closed + live price' proxy collapses to the same
+        thing there). Missing candles → False (fail-open, like live)."""
+        if not btc_1m_by_ts:
+            return False
+        bucket = t_ms - t_ms % (5 * MINUTE_MS)
+        if t_ms == bucket:
+            bucket -= 5 * MINUTE_MS
+        open_c = btc_1m_by_ts.get(bucket)
+        close_c = btc_1m_by_ts.get(min(t_ms - MINUTE_MS, bucket + 4 * MINUTE_MS))
+        if open_c is None or close_c is None:
+            return False
+        return close_c["close"] < open_c["open"]
 
     def _regime_at(t_ms: int) -> str:
         """3-state regime using 1h candles CLOSED at t_ms. Query times are
@@ -735,6 +853,13 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
     cooldown_until: Dict[str, int] = {}   # sym -> ms until which entries are blocked
     stop_out_ts: List[int] = []           # rolling stop-out timestamps (ms)
     pause_until_ms = 0                    # global correlated-dump pause
+    # §4.1/§4.2/§4.5 risk state (live parity)
+    daily_stop_until_ms = 0               # §4.2a — entries paused until next UTC midnight
+    daily_realized = 0.0                  # §4.2a — realized PnL of the current sim day
+    day_cur = -1                          # current simulated UTC day (ts // DAY_MS)
+    consec_losses = 0                     # §4.2b — losing closes in a row
+    consec_pause_until_ms = 0             # §4.2b — 60-min entry pause
+    entry_fill_ts: List[int] = []         # §4.5 — rolling 5-min window of fills
     trades: List[dict] = []
     equity_curve: List[List[float]] = []
     exposed_ts = 0
@@ -747,6 +872,22 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
             eq += p["qty"] * last_close.get(s, p["entry_px"])
         return eq
 
+    def _eff_allocation() -> float:
+        """§4.1 effective allocation: bot_allocation_usdt when set, else the
+        bot's current capital (cash + deployed cost) — the replay analog of
+        the live free-balance + deployed snapshot."""
+        if bot_allocation > 0:
+            return bot_allocation
+        return cash + sum(p["cost"] for p in positions.values())
+
+    def _eff_slots() -> int:
+        """§4.1/A3 auto-degraded slot count (see trade_engine.effective_slots)."""
+        min_pos = sz_cfg["min_position_usdt"]
+        if min_pos > 0:
+            return max(0, min(sz_cfg["max_positions"],
+                              int(_eff_allocation() // min_pos)))
+        return sz_cfg["max_positions"]
+
     def _mark(ts: int) -> None:
         eq = round(_equity(), 8)
         if equity_curve and equity_curve[-1][0] == ts:
@@ -756,7 +897,8 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
 
     def _close_position(sym: str, ts: int, raw_px: float, label: str,
                         maker: bool) -> None:
-        nonlocal cash, pause_until_ms
+        nonlocal cash, pause_until_ms, daily_realized, consec_losses, \
+            consec_pause_until_ms
         pos = positions.pop(sym)
         fm = fee_models[sym]
         if maker:
@@ -771,6 +913,16 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
         cash += proceeds - exit_fee
         gross = pos["qty"] * (exit_px - pos["entry_px"])
         total_fees = pos["fee"] + exit_fee
+        net = gross - total_fees
+        # ── §4.2a/§4.2b bookkeeping (live parity: _note_trade_closed) ────────
+        daily_realized += net
+        if net < 0:
+            consec_losses += 1
+            if (max_consec > 0 and consec_losses >= max_consec
+                    and ts >= consec_pause_until_ms):
+                consec_pause_until_ms = ts + CONSEC_PAUSE_MS
+        else:
+            consec_losses = 0
         trades.append({
             "symbol": sym,
             "entry_ts": pos["entry_ts"],
@@ -800,6 +952,31 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
 
     # ── Replay ───────────────────────────────────────────────────────────────
     for ts in timeline:
+        # ── §4.2a daily loss stop (evaluated once per timeline step) ─────────
+        d_day = ts // DAY_MS
+        if d_day != day_cur:
+            day_cur = d_day
+            daily_realized = 0.0     # UTC-day rollover; a same-day stop expired
+            # daily_stop_until_ms points at the day boundary, so it has
+            # naturally expired here — nothing else to reset.
+        if (ts >= start_ms and ts >= daily_stop_until_ms
+                and risk_cfg["daily_loss_stop_pct"] > 0
+                and (positions or daily_realized < 0)):
+            unreal = 0.0
+            for _s, _p in positions.items():
+                _px = last_close.get(_s, _p["entry_px"])
+                _proceeds = _p["qty"] * _px
+                unreal += _proceeds * (1.0 - fee_models[_s].taker()) - _p["cost"]
+            _limit = risk_cfg["daily_loss_stop_pct"] / 100.0 * _eff_allocation()
+            if _limit > 0 and daily_realized + unreal <= -_limit:
+                # Entries pause for the REST of the simulated UTC day; exits
+                # keep running (only entry paths consult this timestamp).
+                daily_stop_until_ms = (d_day + 1) * DAY_MS
+                if risk_cfg["flatten_on_stop"]:
+                    for _s in sorted(positions.keys()):
+                        _close_position(_s, ts,
+                                        last_close.get(_s, positions[_s]["entry_px"]),
+                                        "backtest_daily_stop", False)
         for sym, i in sorted(ts_events[ts]):
             step += 1
             candles = data[sym]
@@ -827,11 +1004,21 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
                 #   * neutral regime  → budget × neutral_size_mult
                 #   * per-symbol SL cooldown / global stop pause → skip
                 _fill_regime = _regime_at(ts)
+                # §4.5 correlation guard: prune the rolling window, then block
+                # when BTC's 5m candle is red and the window is full.
+                entry_fill_ts[:] = [t for t in entry_fill_ts
+                                    if t > ts - CORR_WINDOW_MS]
+                _corr_blocked = (corr_limit > 0
+                                 and len(entry_fill_ts) >= corr_limit
+                                 and _btc_red_at(ts))
                 if (in_replay and sym not in positions
-                        and len(positions) < max_positions
+                        and len(positions) < _eff_slots()   # §4.1 effective slots
+                        and not _corr_blocked                # §4.5
                         and _fill_regime != "risk_off"
                         and ts >= cooldown_until.get(sym, 0)
-                        and ts >= pause_until_ms):
+                        and ts >= pause_until_ms
+                        and ts >= daily_stop_until_ms        # §4.2a
+                        and ts >= consec_pause_until_ms):    # §4.2b
                     deployed = sum(p["cost"] for p in positions.values())
                     budget = _budget_for(strategy, cash, deployed)
                     if budget is not None and _fill_regime == "neutral":
@@ -892,6 +1079,7 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
                                 "be_moved": False, "be_stop": 0.0,
                                 "peak": 0.0, "ratchet": 0.0,
                             }
+                            entry_fill_ts.append(ts)   # §4.5 rolling window
                             _mark(ts)
 
             # 2) Exits — ADVERSE FIRST when several levels sit inside one
@@ -978,7 +1166,9 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
                     and i + 1 < len(candles) and i + 1 >= MIN_EVAL_CANDLES
                     and (tick_entries or is_5m_close)
                     and close_ts >= cooldown_until.get(sym, 0)   # §3.4b SL cooldown
-                    and close_ts >= pause_until_ms):             # §3.4c global pause
+                    and close_ts >= pause_until_ms               # §3.4c global pause
+                    and close_ts >= daily_stop_until_ms          # §4.2a daily stop
+                    and close_ts >= consec_pause_until_ms):      # §4.2b consec pause
                 window = candles[max(0, i - INDICATOR_WINDOW + 1): i + 1]
                 # Advance the closed-5m pointer ALWAYS (signal data + ATR need
                 # it, not just the 5m veto).
