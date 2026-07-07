@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Star, Search, AlertCircle, Ban, PauseCircle } from 'lucide-react';
+import { Star, Search, AlertCircle, Ban, PauseCircle, Loader2 } from 'lucide-react';
 import type { LivePrices } from '@/lib/trading-engine';
 import { useUniverseHealth, type InvalidInfo } from '@/hooks/useUniverseHealth';
 
@@ -10,6 +10,9 @@ import { useUniverseHealth, type InvalidInfo } from '@/hooks/useUniverseHealth';
 // 'renamed' remains a delisted-family case (pair replaced by suggested_rename).
 type DeadKind = 'break' | 'delisted';
 function classifyInvalid(info: InvalidInfo): DeadKind {
+  // Prefer the backend's authoritative excluded_kind; sniff status only if absent.
+  if (info.excludedKind === 'break') return 'break';
+  if (info.excludedKind === 'delisted') return 'delisted';
   const s = (info.status ?? '').toUpperCase();
   if (s === 'BREAK' || s.includes('HALT')) return 'break';
   return 'delisted';
@@ -87,11 +90,13 @@ async function fetchValidSymbols(): Promise<Set<string>> {
 
 function CoinRow({
   symbol, price, changePct, isActive, isFav, onSelect, onFav, invalidInfo, ticketTooSmall,
+  warming, backfillPct,
 }: {
   symbol: string; price: number; changePct: number;
   isActive: boolean; isFav: boolean;
   onSelect: () => void; onFav: () => void;
   invalidInfo?: InvalidInfo; ticketTooSmall?: boolean;
+  warming?: boolean; backfillPct?: number;
 }) {
   const ticker = symbol.replace('USDT', '');
   const color  = COIN_COLORS[ticker] ?? '#6b7280';
@@ -146,6 +151,16 @@ function CoinRow({
               </span>
             </div>
           )
+        ) : warming ? (
+          // WARMING — in the universe but not backfill_ready yet (freshly added).
+          // Amber + muted: it will start trading automatically once warmed.
+          <span
+            className="inline-flex items-center gap-0.5 px-1 py-px mt-0.5 rounded bg-warn/10 text-warn/80 text-[8px] font-semibold"
+            title="This coin is in your universe but still backfilling history. It will start trading automatically once warmed up."
+          >
+            <Loader2 className="w-2 h-2 animate-spin" />
+            warming up — backfilling{typeof backfillPct === 'number' ? ` ${Math.round(backfillPct)}%` : ''}
+          </span>
         ) : ticketTooSmall ? (
           <span
             className="inline-flex items-center px-1 py-px mt-0.5 rounded bg-warn/15 text-warn text-[8px] font-semibold"
@@ -176,8 +191,20 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
   const [extraPrices, setExtraPrices]   = useState<Record<string, { price: number; changePct: number }>>({});
   // null = still loading, empty Set = fetch failed (show all), non-empty = validated
   const [validSymbols, setValidSymbols] = useState<Set<string> | null>(null);
-  // Backend-driven watchlist health: delisted/renamed pairs + lot-waste flags.
-  const { invalid, lotWaste } = useUniverseHealth();
+  // Backend-driven watchlist health: delisted/renamed pairs + lot-waste flags,
+  // plus backfill readiness so freshly-added coins show a "warming up" badge.
+  const { invalid, lotWaste, warming, ready, backfillPct } = useUniverseHealth();
+
+  // A selected coin is "warming" when it's not delisted/halted, and either the
+  // backend explicitly lists it as backfilling, or readiness is known and this
+  // coin isn't ready yet. Never treat a coin as warming when readiness is
+  // unknown (both sets empty) — graceful degradation, no phantom badges.
+  const isWarming = (sym: string): boolean => {
+    const u = sym.toUpperCase();
+    if (invalid[u]) return false;
+    if (warming.has(u)) return true;
+    return ready.size > 0 && !ready.has(u);
+  };
 
   // Fetch valid Binance spot symbols once on mount
   useEffect(() => {
@@ -334,6 +361,8 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
                 onFav={() => toggleFav(coin)}
                 invalidInfo={invalid[coin.toUpperCase()]}
                 ticketTooSmall={lotWaste.has(coin.toUpperCase())}
+                warming={isWarming(coin)}
+                backfillPct={backfillPct[coin.toUpperCase()]}
               />
             );
           })

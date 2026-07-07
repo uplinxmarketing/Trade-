@@ -118,6 +118,9 @@ class DataConfig(BaseModel):
     kline_retention_days: float = Field(180.0, ge=7.0, le=730.0)
     legacy_rest_scan:     bool  = False
     eval_retention_days:  int   = Field(14, ge=1, le=365)
+    # I4 — three-tier auto-management of the approved_coins watchlist.
+    auto_remove_delisted:        bool = True   # remove confirmed-delisted coins
+    auto_replace_with_successor: bool = False  # also auto-add the renamed successor
 
 
 class StrategyConfig(BaseModel):
@@ -350,6 +353,18 @@ SCHEMA: Dict[str, dict] = {
                                       "How long buy-rejection and entry-snapshot rows are kept "
                                       "before the daily maintenance loop prunes them.",
                                       1, 365, 1, "days"),
+    "data.auto_remove_delisted": _meta("data.auto_remove_delisted", "bool", "Data",
+                                       "Auto-remove delisted coins",
+                                       "Automatically drop an approved coin from the watchlist once "
+                                       "it is confirmed delisted (absent from exchangeInfo / known "
+                                       "delisted) across two consecutive validation passes. A held "
+                                       "coin is never removed while it has an open position or order."),
+    "data.auto_replace_with_successor": _meta("data.auto_replace_with_successor", "bool", "Data",
+                                              "Auto-add rename successor",
+                                              "When a removed coin has a known rename successor that "
+                                              "is TRADING (e.g. MATICUSDT→POLUSDT), also add the "
+                                              "successor to the watchlist automatically. Off by "
+                                              "default — the successor is only suggested."),
 }
 
 

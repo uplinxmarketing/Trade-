@@ -22,6 +22,9 @@ import { RiskPanel } from './RiskPanel';
 import { StrategySettingsPanel } from './StrategySettingsPanel';
 import { SignalsEditorPanel } from './SignalsEditorPanel';
 import { ConfigHistoryPanel } from './ConfigHistoryPanel';
+import UniverseNoticesBanner from './UniverseNoticesBanner';
+import { useUniverseHealth } from '@/hooks/useUniverseHealth';
+import { resolveCoinStatus, type CoinLifecycle } from '@/lib/coin-status';
 
 // ── Simple 4-signal analyser (no API key, Binance public data only) ────────────────────
 const BIN = '/api/proxy/binance';
@@ -142,6 +145,38 @@ const SIGNAL_SHORT_LABELS: Record<string, string> = {
   TM1_bad_hour:            'Hour',
   M2_stoch_rsi_oversold:   'SRSI',
 };
+
+// I4 — status badge for a selected coin that has NO signal-cache entry yet, so
+// it still renders in the Market Signals list (operator must always see all N).
+function placeholderBadge(lifecycle: CoinLifecycle, successor?: string, backfillPct?: number):
+  { text: string; cls: string; title: string } {
+  switch (lifecycle) {
+    case 'warming':
+      return {
+        text: `warming up — backfilling${typeof backfillPct === 'number' ? ` ${Math.round(backfillPct)}%` : ''}`,
+        cls: 'bg-warn/10 text-warn/80',
+        title: 'In your universe but still backfilling history — starts trading automatically once warmed up.',
+      };
+    case 'halted':
+      return {
+        text: 'halted — auto-restores',
+        cls: 'bg-warn/15 text-warn',
+        title: 'Trading on this pair is halted (BREAK/AUCTION). The bot auto-restores it when it resumes.',
+      };
+    case 'delisted':
+      return {
+        text: successor ? `delisted → ${successor.replace('USDT', '')}` : 'delisted',
+        cls: 'bg-loss/15 text-loss',
+        title: 'This pair is no longer tradable. Remove or replace it (see the auto-removed banner above).',
+      };
+    default:
+      return {
+        text: 'awaiting signal…',
+        cls: 'bg-muted/30 text-muted-foreground',
+        title: 'Selected and warm — no signal-cache entry yet this scan cycle.',
+      };
+  }
+}
 
 // Safe numeric price from the WebSocket ticker map (entries are objects, not numbers).
 function numPrice(prices: LivePrices, sym: string): number | undefined {
@@ -448,7 +483,40 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const { data: positionsData, loading: positionsLoading, lastUpdate: positionsUpdated } =
     useDataFetcher(`${botUrl}/api/positions`, 2000, { positions: [] as any[] }, isServerMode);
   const { data: signalsData, loading: signalsLoading, lastUpdate: signalsUpdated } =
-    useDataFetcher(`${botUrl}/api/signals-summary?limit=30`, 5000, { signals: [] as any[], total_tracked: 0 }, isServerMode);
+    // I4 — limit raised so every selected coin with a signal-cache entry gets a
+    // real row (operator runs ~100 coins). Coins still without an entry are
+    // rendered below as status placeholders so the list always shows all N.
+    useDataFetcher(`${botUrl}/api/signals-summary?limit=250`, 5000, { signals: [] as any[], total_tracked: 0 }, isServerMode);
+
+  // I4 — universe health drives placeholder status for selected coins that have
+  // no signal-cache entry yet, and readiness for the "warming up" state.
+  const universe = useUniverseHealth();
+  const universeInputs = useMemo(() => ({
+    invalid: universe.invalid,
+    warming: universe.warming,
+    ready: universe.ready,
+    backfillPct: universe.backfillPct,
+  }), [universe.invalid, universe.warming, universe.ready, universe.backfillPct]);
+
+  // I4 — "Add successor" on an auto-remove notice: append the successor to the
+  // watchlist (which the debounced effect syncs to POST /api/coins) and also
+  // POST immediately so the operator's universe changes without a round-trip.
+  const handleAddSuccessor = useCallback(async (successor: string) => {
+    const sym = successor.toUpperCase();
+    if (selectedCoins.some(c => c.toUpperCase() === sym)) return;
+    const next = [...selectedCoins, sym];
+    onCoinsChange?.(next);
+    try {
+      await fetch(`${botUrl}/api/coins`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ coins: next }),
+      });
+      toast.success(`Added successor ${sym.replace('USDT', '')}`);
+    } catch {
+      toast.error(`Failed to add ${sym.replace('USDT', '')}`);
+    }
+  }, [selectedCoins, onCoinsChange, botUrl]);
 
   const addLog = useCallback((msg: string) => {
     setActLog(prev => [msg, ...prev].slice(0, MAX_LOG_LINES));
@@ -1107,6 +1175,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           </button>
         </div>
       </div>
+
+      {/* I4 — auto-remove notices: tell the operator when the universe changed
+          under them (delisted → successor), with one-click "Add successor". */}
+      <UniverseNoticesBanner selectedCoins={selectedCoins} onAddSuccessor={handleAddSuccessor} />
 
       {/* Stats row */}
       <div className="grid grid-cols-4 divide-x divide-border border-b border-border">
@@ -1818,9 +1890,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Market Signals</p>
           <FreshnessIndicator lastUpdate={signalsUpdated} />
         </div>
-        {/* Dynamic registry-driven table (server mode) */}
-        {(isServerMode && signalsData.signals.length > 0 && signalRegistry.length > 0) ? (() => {
+        {/* Dynamic registry-driven table (server mode). Renders EVERY selected
+            coin: real rows for coins with a signal-cache entry, plus status
+            placeholder rows for the rest so the operator always sees all N. */}
+        {(isServerMode && signalRegistry.length > 0 && (signalsData.signals.length > 0 || selectedCoins.length > 0)) ? (() => {
           const cols = `4.5rem ${signalRegistry.map(() => '1fr').join(' ')} 2.5rem 3rem`;
+          const present = new Set(
+            signalsData.signals.map((s: any) => String(s.symbol ?? '').toUpperCase())
+          );
+          const missing = selectedCoins.filter(c => !present.has(c.toUpperCase()));
           return (
             <div className="space-y-0 overflow-x-auto">
               {/* Header */}
@@ -1902,6 +1980,31 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 );
               })}
               </AnimatePresence>
+              {/* Placeholder rows — selected coins without a signal-cache entry.
+                  Never silently drop a selected coin from the list. */}
+              {missing.map(sym => {
+                const st = resolveCoinStatus(sym, universeInputs);
+                const badge = placeholderBadge(st.lifecycle, st.successor, st.backfillPct);
+                return (
+                  <div key={`ph-${sym}`}
+                    className="grid items-center py-0.5 border-b border-border/20 last:border-0"
+                    style={{gridTemplateColumns: cols}}>
+                    <span className="text-[9px] font-mono font-semibold truncate text-muted-foreground">
+                      {sym.replace('USDT','')}
+                    </span>
+                    <span
+                      style={{gridColumn: '2 / -1'}}
+                      className={`text-[8px] font-semibold px-1 py-px rounded justify-self-start ${badge.cls}`}
+                      title={badge.title}>
+                      {badge.text}
+                    </span>
+                  </div>
+                );
+              })}
+              {/* Truthful count so the operator can confirm all N render. */}
+              <div className="pt-1 text-[8px] text-muted-foreground">
+                {signalsData.signals.length} live · {missing.length} awaiting · {selectedCoins.length} selected
+              </div>
             </div>
           );
         })() : (isServerMode && signalsLoading && signalsData.signals.length === 0) ? (

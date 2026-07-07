@@ -199,6 +199,46 @@ def notify_positions_changed():
     _positions_changed.set()
 
 
+def purge_symbol(symbol: str) -> None:
+    """Purge — clean data-plane removal of a symbol that has LEFT the watchlist
+    (e.g. control_api auto-removed a delisted coin, I4). Drops every per-symbol
+    buffer/cache/tracking entry so no stream or cache still references it, then
+    signals a subscription diff so its live streams are UNSUBSCRIBED on the next
+    (debounced) reconcile — the diff compares _current_coins against the now
+    symbol-free watchlist, so this MUST leave _current_coins untouched.
+
+    Guarded: a missing key in any map is fine and an unknown symbol is a safe
+    no-op (beyond nudging the diff). The symbol also leaves naturally via
+    _load_persisted_watchlist once it's gone from approved_coins; purge_symbol
+    is the immediate-cleanup complement."""
+    if not symbol:
+        return
+    sym = str(symbol).upper()
+    # Candle buffers — mutate under the same lock the WS/backfill paths use.
+    with _buffers_lock:
+        ws_candles.pop(sym, None)
+        ws_candles_5m.pop(sym, None)
+        ws_candles_15m.pop(sym, None)
+    # Price / book / tick / sample caches.
+    prices.pop(sym, None)
+    book_ticker.pop(sym, None)
+    last_price_ts.pop(sym, None)
+    price_ticks.pop(sym, None)
+    price_samples.pop(sym, None)
+    _price_sample_ts.pop(sym, None)
+    # Delist/exclusion tracking.
+    with _excluded_lock:
+        _excluded_symbols.pop(sym, None)
+        _excluded_warned.discard(sym)
+    # I1 universe tracking — a re-add later is correctly treated as new again.
+    with _known_universe_lock:
+        _known_universe.discard(sym)
+    # Trigger a subscription diff: the next debounced reconcile re-reads the
+    # (symbol-free) watchlist and UNSUBSCRIBEs this symbol's streams.
+    _reconnect_requested.set()
+    print(f"[DataCollector] purged data-plane state for {sym}")
+
+
 # ── G2/H3: dead/renamed-ticker exclusion ─────────────────────────────────────
 # Delisted or renamed symbols (AGIX, EOS, FTM, LRC, MATIC, OCEAN, MKR) never
 # subscribe. Filter the stream universe through exchange_info's tradeable set so
@@ -1097,6 +1137,16 @@ _BACKFILL_CONCURRENCY = 10
 _backfill_running = threading.Event()
 _bg_tasks: set = set()   # keep task refs so they aren't GC'd
 
+# I1 — mid-flight watchlist-add backfill. The resolved (verified/tradeable)
+# universe seen so far. A watchlist ADDITION brings symbols NEVER in the
+# universe before; those are diffed against this set so a TARGETED backfill runs
+# for just them (instead of warming slowly over WS). Seeded with the startup
+# universe so boot symbols aren't treated as mid-flight adds. This does NOT gate
+# entries — _backfill_complete stays the BOOT-only gate; a mid-flight add simply
+# isn't backfill_ready (so trade_engine skips scoring it) until its buffers fill.
+_known_universe: set = set()
+_known_universe_lock = threading.Lock()
+
 
 def _backfill_symbol(sym: str) -> int:
     """Blocking single-symbol backfill through the rate-limited path.
@@ -1231,6 +1281,51 @@ def _spawn_backfill(coins: list, reason: str, is_startup: bool = False):
         task.add_done_callback(_bg_tasks.discard)
     except Exception as e:
         print(f"[DataCollector] Could not schedule backfill: {e}")
+
+
+def _seed_known_universe(coins: list) -> None:
+    """I1 — record `coins` as part of the resolved universe WITHOUT triggering a
+    watchlist-add backfill (used to seed the startup universe so boot symbols
+    aren't later re-detected as mid-flight additions)."""
+    with _known_universe_lock:
+        _known_universe.update(c for c in coins if c)
+
+
+async def _backfill_watchlist_additions(active: list, reason: str = "watchlist-add") -> None:
+    """I1 — after the universe set is (re)built, detect symbols that were NEVER
+    in the resolved universe before (diff against _known_universe) and run a
+    TARGETED backfill for just those, skipping any already warm (backfill_ready
+    True) so warm symbols are never re-backfilled. Held-first ordering is N/A
+    here; concurrency is limited by _backfill_buffers as usual. Deliberately
+    does NOT touch _backfill_complete — that flag is the BOOT gate only; a
+    mid-flight add stays backfill_ready False (excluded from ENTRY scoring by
+    trade_engine) until this targeted backfill fills its 1m/5m buffers."""
+    active = [c for c in active if c]
+    with _known_universe_lock:
+        known = set(_known_universe)
+        _known_universe.update(active)
+    new_syms = [c for c in active if c not in known]
+    # Never re-backfill an already-warm symbol.
+    targets = [c for c in new_syms if not backfill_ready(c)]
+    if not targets:
+        return
+    t0 = time.time()
+    await _backfill_buffers(targets, reason=reason, is_startup=False)
+    dur = time.time() - t0
+    ready = [c for c in targets if backfill_ready(c)]
+    print(f"[DataCollector] watchlist-add backfill: {len(ready)}/{len(targets)} "
+          f"new symbols → ready in {dur:.1f}s")
+
+
+def _spawn_watchlist_add_backfill(active: list, reason: str = "watchlist-add"):
+    """Fire-and-forget I1 watchlist-add backfill on the running WS event loop."""
+    try:
+        task = asyncio.get_running_loop().create_task(
+            _backfill_watchlist_additions(list(active), reason))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+    except Exception as e:
+        print(f"[DataCollector] Could not schedule watchlist-add backfill: {e}")
 
 
 def _batch_ticker_prices(symbols: list) -> Dict[str, float]:
@@ -1854,8 +1949,10 @@ async def _apply_watchlist_diff(new_coins: list):
     if diff_streams > _LIVE_DIFF_MAX_STREAMS or not _connections:
         # Documented choice: large diffs (or a cold start) use full reconnect.
         await _rebuild_market_connections(list(new_coins))
-        if added:
-            _spawn_backfill(added, "watchlist-rebuild")
+        # I1 — targeted backfill for genuinely-new symbols (diffed against the
+        # resolved universe, warm symbols skipped) so mid-flight adds reach
+        # backfill_ready fast instead of warming slowly over WS.
+        _spawn_watchlist_add_backfill(new_coins)
         return
 
     removed_set = set(removed)
@@ -1882,8 +1979,9 @@ async def _apply_watchlist_diff(new_coins: list):
             await target.add_streams(streams)
 
     _current_coins[:] = list(new_coins)
-    if added:
-        _spawn_backfill(added, "watchlist-add")
+    # I1 — targeted backfill for genuinely-new symbols (diffed against the
+    # resolved universe, warm symbols skipped).
+    _spawn_watchlist_add_backfill(new_coins)
 
 
 # F5 — coverage reconciliation state. Symbols in the canonical watchlist that
@@ -1934,6 +2032,9 @@ async def _reconcile_coverage() -> None:
             print(f"[DataCollector] Coverage re-subscribe failed for {sym}: {e}")
     if active:
         _ws_health["resubscribe_count"] = _ws_health.get("resubscribe_count", 0) + 1
+        # The coverage backfill fills these symbols; mark them known so the
+        # refresh_watchlist/debounce path doesn't re-target them (I1).
+        _seed_known_universe(active)
         _spawn_backfill(list(active), "coverage-reconcile")
         print(f"[DataCollector] Coverage reconcile: re-subscribed "
               f"{len(active)}/{len(uncovered)} uncovered watchlist symbol(s)")
@@ -2104,6 +2205,9 @@ async def _start_websocket_loop():
         desired = list(config.WATCHED_COINS)
     active = await _verify_symbols(desired)
     await _rebuild_market_connections(active)
+    # I1 — seed the resolved startup universe so these boot symbols aren't later
+    # re-detected as mid-flight watchlist additions (which would double-backfill).
+    _seed_known_universe(active)
     # §6.2 b + I1 — fill 1m→120 / 5m→60 / 15m→60, held symbols first, retried
     # until the readiness targets are met; flips _backfill_complete when done.
     _spawn_backfill(list(active), "startup", is_startup=True)

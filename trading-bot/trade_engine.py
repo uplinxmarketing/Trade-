@@ -3295,7 +3295,11 @@ _DAILY_PNL_TTL_SEC = 30.0
 _daily_stop_logged_day: str = ""      # ERROR log fired once per UTC day
 _daily_stop_flattened_day: str = ""   # flatten fired once per UTC day
 _daily_stop_resumed_day: str = ""     # manual resume disarms re-trip for the day
-_last_daily_stop_log_ts: float = 0.0  # buy-loop pause heartbeat throttle
+# I3.4 — transition-only logging: True while the daily stop is latched. Set when
+# the stop trips (ERROR logged once), cleared when it releases (INFO logged
+# once). The persistent "stopped" flag for the UI stays in get_risk_status();
+# the log stream only carries the two transition lines, not a 60 s heartbeat.
+_daily_stop_logged: bool = False
 
 
 def _utc_day_str() -> str:
@@ -3409,6 +3413,7 @@ def _check_daily_loss_stop() -> bool:
     """Lazy §4.2a breaker evaluation (30 s cached PnL). Returns True while
     buys must stay paused. Exits are unaffected — only buy paths call this."""
     global _daily_stop_until, _daily_stop_logged_day, _daily_stop_flattened_day
+    global _daily_stop_logged
     now = time.time()
     if now < _daily_stop_until:
         return True
@@ -3427,6 +3432,7 @@ def _check_daily_loss_stop() -> bool:
         _daily_stop_until = _next_utc_midnight_ts()
         first_trip_today = _daily_stop_logged_day != day
         _daily_stop_logged_day = day
+        _daily_stop_logged = True   # latched — release will log the INFO line
     if first_trip_today:
         try:
             database.log_activity(
@@ -3452,17 +3458,21 @@ def _check_daily_loss_stop() -> bool:
 def resume_daily_stop() -> dict:
     """Manual resume (control_api): clears the daily-stop pause and disarms
     re-tripping for the remainder of the current UTC day."""
-    global _daily_stop_until, _daily_stop_resumed_day
+    global _daily_stop_until, _daily_stop_resumed_day, _daily_stop_logged
     was_stopped = time.time() < _daily_stop_until
     _daily_stop_until = 0.0
     _daily_stop_resumed_day = _utc_day_str()
     _daily_pnl_cache["ts"] = 0.0   # force fresh state on next check
-    try:
-        database.log_activity(
-            "DAILY LOSS STOP: manually resumed — buys re-enabled "
-            "(breaker disarmed for the rest of today UTC)", "warn")
-    except Exception:
-        pass
+    # I3.4: this IS the release transition — clear the latch so the buy loop
+    # does not also emit a release line, and log it once here.
+    _daily_stop_logged = False
+    if was_stopped:
+        try:
+            database.log_activity(
+                "DAILY LOSS STOP: manually resumed — buys re-enabled "
+                "(breaker disarmed for the rest of today UTC)", "info")
+        except Exception:
+            pass
     return {"resumed": was_stopped, "day": _daily_stop_resumed_day}
 
 
@@ -3477,7 +3487,10 @@ _consec_lock = threading.Lock()
 _consec_losses: Optional[int] = None       # None → not yet seeded from DB
 _consec_loss_pause_until: float = 0.0
 _CONSEC_PAUSE_SEC = 3600.0                 # 60 min
-_last_consec_pause_log_ts: float = 0.0
+# I3.4 — transition-only logging for the consecutive-loss pause: True while the
+# pause is latched (ERROR logged once when armed), cleared + INFO logged once
+# when it expires. No 60 s heartbeat while latched.
+_consec_pause_logged: bool = False
 
 
 def _seed_consec_losses_locked() -> int:
@@ -3507,7 +3520,7 @@ def _consec_loss_count() -> int:
 def _maybe_trigger_consec_pause_locked(count: int) -> None:
     """Arm the 60-min pause when the counter reaches the limit. Caller holds
     _consec_lock."""
-    global _consec_loss_pause_until
+    global _consec_loss_pause_until, _consec_pause_logged
     try:
         limit = int(_risk_cfg()["max_consecutive_losses"])
     except Exception:
@@ -3515,6 +3528,7 @@ def _maybe_trigger_consec_pause_locked(count: int) -> None:
     now = time.time()
     if limit > 0 and count >= limit and now >= _consec_loss_pause_until:
         _consec_loss_pause_until = now + _CONSEC_PAUSE_SEC
+        _consec_pause_logged = True   # latched — expiry will log the INFO line
         try:
             database.log_activity(
                 f"CONSECUTIVE-LOSS PAUSE: {count} losing trades in a row "
@@ -3831,6 +3845,83 @@ def get_risk_status() -> dict:
         "slots": effective_slots(),
         "bnb":   get_bnb_fee_status(),
     }
+
+
+def purge_symbol_state(symbol: str) -> None:
+    """Clean symbol removal (supports control_api I4 auto-remove of a delisted
+    symbol). Clears EVERY per-symbol engine cache/cooldown/tracker so no code
+    path can touch the symbol again. Idempotent and safe for an unknown symbol
+    (every key access is guarded — a missing key is fine).
+
+    NEVER purges a symbol that currently has an open position: _positions is the
+    source of truth for held coins and control_api guards against removing them,
+    but as a defensive backstop we log and skip if one is somehow present. Global
+    (non-per-symbol) state such as _corr_entry_ts is intentionally untouched."""
+    if not symbol:
+        return
+    # Defensive: never purge state for a coin we still hold.
+    try:
+        with _positions_lock:
+            held = any(p.get("symbol") == symbol for p in _positions)
+    except Exception:
+        held = False
+    if held:
+        try:
+            database.log_activity(
+                f"purge_symbol_state({symbol}) SKIPPED — symbol has an open "
+                f"position; state retained", "warn")
+        except Exception:
+            pass
+        return
+
+    # Plain per-symbol dicts (accessed under the GIL — pop is atomic).
+    for _d in (
+        _cooldowns, _loss_cooldown, _candidacy_cooldown,
+        _sell_last_failed_ts, _sell_last_failed_reason, _ghost_check_fails,
+        _maker_abandon_counts, _lot_waste_flags, _bookticker_cache,
+        _rest_px, _rest_px_sym_ts, _last_ws_price_ts, _pos_peaks,
+        _stop_loss_confirmation, _slippage_cache, _slippage_vetoed,
+    ):
+        try:
+            _d.pop(symbol, None)
+        except Exception:
+            pass
+    # Per-symbol sets.
+    try:
+        _bad_symbols.discard(symbol)
+    except Exception:
+        pass
+
+    # Lock-guarded caches.
+    try:
+        with _signal_cache_lock:
+            _signal_cache.pop(symbol, None)
+    except Exception:
+        pass
+    try:
+        with _stuck_lock:
+            _stuck_positions.pop(symbol, None)
+            _sell_skip_track.pop(symbol, None)
+    except Exception:
+        pass
+    # Buy-rejection example cache: keyed by reason, each a list of example dicts
+    # carrying a "symbol" — drop this symbol's examples from every reason bucket.
+    try:
+        with _rejection_lock:
+            for _reason, _examples in list(_rejection_examples.items()):
+                kept = [e for e in _examples if e.get("symbol") != symbol]
+                if kept:
+                    _rejection_examples[_reason] = kept
+                else:
+                    _rejection_examples.pop(_reason, None)
+    except Exception:
+        pass
+
+    try:
+        database.log_activity(
+            f"purged engine state for {symbol} (removed from watchlist)", "info")
+    except Exception:
+        pass
 
 
 # ── Reversal confirmation ──────────────────────────────────────────────────────
@@ -5924,33 +6015,34 @@ def _check_buys_from_cache(prices: Dict[str, float]):
 
     # ── §4.2a daily loss stop: pause ALL buys until next UTC midnight (or
     # manual resume). EXITS KEEP RUNNING — this only returns from the buy path.
+    # I3.4: transition-only logging. The ERROR trip line is emitted once by
+    # _check_daily_loss_stop(); here we only keep the UI rejection reason fresh
+    # while latched and log a single INFO line when the stop releases. No 60 s
+    # heartbeat. Persistent "stopped" state stays in get_risk_status().
+    global _daily_stop_logged
     if _check_daily_loss_stop():
-        global _last_daily_stop_log_ts
-        _now_ds = time.time()
-        if _now_ds - _last_daily_stop_log_ts >= 60.0:
-            _last_daily_stop_log_ts = _now_ds
-            _st_ds = _daily_pnl_state()
-            database.log_activity(
-                f"Buy check: daily_loss_stop active (pnl_today="
-                f"{_st_ds['pnl_today']:.2f} USDT, limit -{_st_ds['limit_usdt']:.2f}) "
-                f"— buys paused until next UTC midnight; exits keep running", "warn")
-            _record_rejection("(all)", 0, "daily_loss_stop",
-                              f"pnl_today={_st_ds['pnl_today']:.2f}")
+        _st_ds = _daily_pnl_state()
+        _record_rejection("(all)", 0, "daily_loss_stop",
+                          f"pnl_today={_st_ds['pnl_today']:.2f}")
         return
+    if _daily_stop_logged:
+        _daily_stop_logged = False
+        database.log_activity(
+            "DAILY LOSS STOP: released — buys re-enabled "
+            "(new UTC day or manual resume); exits were never paused", "info")
 
     # ── §4.2b consecutive-loss pause: buys paused 60 min after N losses in a row.
+    global _consec_pause_logged
     _now_cl = time.time()
     if _now_cl < _consec_loss_pause_until:
-        global _last_consec_pause_log_ts
-        if _now_cl - _last_consec_pause_log_ts >= 60.0:
-            _last_consec_pause_log_ts = _now_cl
-            _rem_cl = int(_consec_loss_pause_until - _now_cl)
-            database.log_activity(
-                f"Buy check: consecutive_loss_pause active ({_rem_cl}s remaining) "
-                f"— {_consec_loss_count()} losses in a row", "warn")
-            _record_rejection("(all)", 0, "consecutive_loss_pause",
-                              f"{_rem_cl}s remaining")
+        _rem_cl = int(_consec_loss_pause_until - _now_cl)
+        _record_rejection("(all)", 0, "consecutive_loss_pause",
+                          f"{_rem_cl}s remaining")
         return
+    if _consec_pause_logged:
+        _consec_pause_logged = False
+        database.log_activity(
+            "CONSECUTIVE-LOSS PAUSE: expired — buys re-enabled", "info")
 
     # Fast pre-check: any coin signalling BUY? (no lock needed for scalar read)
     # Use the runtime min_signals setting — the hardcoded config default would
