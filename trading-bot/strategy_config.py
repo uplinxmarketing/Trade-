@@ -73,7 +73,7 @@ class ExitsConfig(BaseModel):
     rr_ratio:                  Optional[float] = Field(1.6, ge=0.5, le=10.0)
     tp_buffer_pct:             float = Field(0.05, ge=0.0, le=1.0)
     min_profit_usdt:           float = Field(0.01, ge=0.001, le=1.0)
-    breakeven_at_r:            Optional[float] = Field(1.0, ge=0.1, le=5.0)
+    breakeven_at_r:            Optional[float] = Field(1.2, ge=0.1, le=5.0)
     k_trail:                   float = Field(0.8, ge=0.0, le=5.0)
     smart_hold_score_gate:     bool  = False
     maker_tp:                  bool  = True
@@ -97,6 +97,8 @@ class RegimeConfig(BaseModel):
     enabled:           bool  = True
     refresh_sec:       float = Field(60.0, ge=1.0, le=3600.0)   # read-only (engine cache TTL)
     neutral_size_mult: float = Field(0.5, ge=0.0, le=1.0)
+    # risk_off requires BOTH price<EMA50 (1h) AND pct_4h < this threshold (F2).
+    risk_off_pct_4h:   float = Field(-1.0, ge=-20.0, le=0.0)
 
 
 class RiskConfig(BaseModel):
@@ -208,7 +210,10 @@ SCHEMA: Dict[str, dict] = {
 
     # ── Entries ───────────────────────────────────────────────────────────
     "entries.min_score": _meta("entries.min_score", "int", "Entries", "Min signal score",
-                               "Minimum scored signals required to enter.", 1, 10, 1),
+                               "Minimum scored signals required to enter. "
+                               "Canonical key is signal_engine.min_scored (what the "
+                               "signal registry reads); this field is a user-facing "
+                               "alias and writing either updates both.", 1, 10, 1),
     "entries.maker_first": _meta("entries.maker_first", "bool", "Entries", "Maker-first entries",
                                  "Try a maker (post-only) entry before crossing the spread."),
     "entries.chase_seconds": _meta("entries.chase_seconds", "float", "Entries", "Chase seconds",
@@ -292,6 +297,10 @@ SCHEMA: Dict[str, dict] = {
                                       "Neutral size multiplier",
                                       "Position-size multiplier while the regime is neutral.",
                                       0.0, 1.0, 0.05, "×"),
+    "regime.risk_off_pct_4h": _meta("regime.risk_off_pct_4h", "float", "Regime",
+                                    "Risk-off 4h threshold",
+                                    "risk_off requires BOTH price<EMA50(1h) AND BTC 4h move below this %.",
+                                    -20.0, 0.0, 0.1, "%"),
 
     # ── Risk ──────────────────────────────────────────────────────────────
     "risk.daily_loss_stop_pct": _meta("risk.daily_loss_stop_pct", "float", "Risk",
@@ -471,6 +480,31 @@ def migrate_to_v2(raw: dict) -> Tuple[dict, list]:
                         f"{blk}.{field} — kept at root, block uses default")
             out[blk] = block
             warnings.append(f"added missing '{blk}' block")
+        # F3 — explicit roles completeness. Ensure signal_engine.roles carries
+        # an EXPLICIT role for EVERY registered signal (fill missing ones from
+        # the registry's default role, including 'off'). This makes
+        # active-but-implicit signals (P2_bb_upper_touch_5m / REGIME_risk_off)
+        # and the default-off signals appear in the persisted dict. Idempotent:
+        # a re-run adds nothing once every signal has a role.
+        try:
+            import signal_registry as _sr
+            _se_present = isinstance(out.get("signal_engine"), dict)
+            se = dict(out["signal_engine"]) if _se_present else dict(_sr.DEFAULT_SIGNAL_ENGINE)
+            roles = dict(se["roles"]) if isinstance(se.get("roles"), dict) else {}
+            added_roles = [sid for sid in _sr.SIGNAL_REGISTRY if sid not in roles]
+            for sid in added_roles:
+                roles[sid] = _sr._default_role_for(sid)
+            if added_roles or not _se_present or se.get("roles") != roles:
+                se["roles"] = roles
+                out["signal_engine"] = se
+                if not _se_present:
+                    warnings.append("added 'signal_engine' block (defaults + explicit roles)")
+                if added_roles:
+                    warnings.append(
+                        f"filled {len(added_roles)} explicit signal role(s): "
+                        + ", ".join(sorted(added_roles)))
+        except Exception as _rexc:
+            warnings.append(f"roles completeness skipped: {_rexc}")
         if out.get("schema_version") != SCHEMA_VERSION:
             out["schema_version"] = SCHEMA_VERSION
             warnings.append(f"set schema_version={SCHEMA_VERSION}")

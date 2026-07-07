@@ -241,11 +241,12 @@ def _ema_last(values: List[float], period: int) -> float:
     return ema_val
 
 
-def btc_regime_from_closes(closes: List[float]) -> str:
+def btc_regime_from_closes(closes: List[float],
+                           risk_off_pct_4h: float = -1.0) -> str:
     """§3.3 3-state BTC regime classifier over 1h closes (oldest→newest).
     MUST stay in sync with trade_engine.compute_btc_regime_from_closes
     (backtest cannot import trade_engine — trade_engine imports this module):
-      risk_off : price < EMA50 OR pct_4h < -2.0
+      risk_off : price < EMA50 AND pct_4h < risk_off_pct_4h  (F2.2: was OR/-2.0)
       risk_on  : price > EMA20 > EMA50 AND pct_4h > -0.5
       neutral  : everything else (also when <55 closes are available)."""
     if not closes or len(closes) < 55:
@@ -254,7 +255,7 @@ def btc_regime_from_closes(closes: List[float]) -> str:
     ema_20 = _ema_last(closes, 20)
     ema_50 = _ema_last(closes, 50)
     pct_4h = (closes[-1] - closes[-5]) / closes[-5] * 100 if closes[-5] > 0 else 0.0
-    if price < ema_50 or pct_4h < -2.0:
+    if price < ema_50 and pct_4h < risk_off_pct_4h:
         return "risk_off"
     if price > ema_20 > ema_50 and pct_4h > -0.5:
         return "risk_on"
@@ -330,7 +331,7 @@ EXIT_DEFAULTS: Dict[str, Any] = {
     "rr_ratio":                   1.6,    # TP distance = rr_ratio × SL distance
     "tp_buffer_pct":              0.05,   # TP floored at BEP × (1 + buffer/100)
     "min_profit_usdt":            0.01,   # read live via trade_engine._min_profit_usdt
-    "breakeven_at_r":             1.0,    # move stop to BEP at +1R unrealized
+    "breakeven_at_r":             1.2,    # F1: move stop to BEP at +1.2R (was +1R)
     "k_trail":                    0.8,    # trail gap = k_trail × ATR% below peak (<=0 disables)
     "smart_hold_score_gate":      False,  # fresh-score gate before trail exits above TP
     "sl_confirm_ticks":           2,      # confirmation ticks for stop_price exits
@@ -810,6 +811,14 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
             return False
         return close_c["close"] < open_c["open"]
 
+    # F2.2: config-driven risk_off 4h threshold (strategy.regime.risk_off_pct_4h,
+    # default −1.0) — mirrors trade_engine._regime_risk_off_pct_4h.
+    try:
+        _risk_off_pct_4h = float(
+            (strategy.get("regime") or {}).get("risk_off_pct_4h", -1.0))
+    except (TypeError, ValueError):
+        _risk_off_pct_4h = -1.0
+
     def _regime_at(t_ms: int) -> str:
         """3-state regime using 1h candles CLOSED at t_ms. Query times are
         nondecreasing across the replay loop, so a single forward pointer
@@ -829,7 +838,7 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
         _btc_state["ptr"] = p
         closes = [c["close"] for c in btc_1h[max(0, p - 72): p]]
         _btc_state["ts"] = t_ms
-        _btc_state["regime"] = btc_regime_from_closes(closes)
+        _btc_state["regime"] = btc_regime_from_closes(closes, _risk_off_pct_4h)
         return _btc_state["regime"]
 
     # ── Timeline ─────────────────────────────────────────────────────────────
@@ -1078,17 +1087,22 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
                                                        or 0.0),
                                 "be_moved": False, "be_stop": 0.0,
                                 "peak": 0.0, "ratchet": 0.0,
+                                "trail_armed": False,   # F1: trail arms only past TP
                             }
                             entry_fill_ts.append(ts)   # §4.5 rolling window
                             _mark(ts)
 
             # 2) Exits — ADVERSE FIRST when several levels sit inside one
-            #    candle (SL-first bias extended, §2.1-§2.3): hard SL, then
-            #    stop, then trail floor, and only then TP / peak updates.
+            #    candle (SL-first bias extended, §2.1-§2.3, F1-decoupled): hard
+            #    SL, then the protective stop (BE-escalated), then — ONLY once a
+            #    prior candle armed the trail above TP — the trail floor, and
+            #    only then TP / peak updates. There is NO trailing exit below TP.
             if sym in positions:
                 pos = positions[sym]
                 sl, tp, hard = pos["sl"], pos["tp"], pos["hard_sl"]
+                trailing_on = pos["k_trail"] > 0
                 closed = False
+                # Hard SL — bypasses everything.
                 if hard is not None and candle["open"] <= hard:
                     _close_position(sym, ts, candle["open"],
                                     "backtest_hard_sl", False)
@@ -1096,61 +1110,68 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
                 elif hard is not None and candle["low"] <= hard:
                     _close_position(sym, ts, hard, "backtest_hard_sl", False)
                     closed = True
-                elif sl is not None and candle["open"] <= sl:
-                    _close_position(sym, ts, candle["open"], "backtest_sl",
-                                    False)
-                    closed = True
-                elif sl is not None and candle["low"] <= sl:
-                    _close_position(sym, ts, sl, "backtest_sl", False)
-                    closed = True
 
-                if not closed and pos["k_trail"] > 0:
-                    # §2.3 BE-move + ATR trail. Adverse-first: the floor from
-                    # PRIOR candles is checked before this candle's high may
-                    # raise the peak (a spike-and-retrace inside one candle
-                    # exits on the pre-spike floor — conservative).
+                # F1: effective protective stop BELOW tp — original stop,
+                # escalated to BEP once the BE-move armed. A hit after arming is
+                # a BEP scratch ('backtest_be', no stop-out cooldown), not a loss.
+                if not closed:
                     if pos["be_moved"]:
-                        eff = max(pos["be_stop"], pos["ratchet"],
-                                  pos["peak"]
-                                  * (1.0 - pos["trail_gap_pct"] / 100.0))
-                        if candle["open"] <= eff:
-                            _close_position(sym, ts, candle["open"],
-                                            "backtest_trail", False)
-                            closed = True
-                        elif candle["low"] <= eff:
-                            _close_position(sym, ts, eff, "backtest_trail",
-                                            False)
-                            closed = True
+                        prot = max(pos["be_stop"], sl or 0.0)
+                        prot_label = "backtest_be"
+                    else:
+                        prot = sl
+                        prot_label = "backtest_sl"
+
+                # F1: once the trail is armed (a PRIOR candle pushed price to/past
+                # tp), the profit-side floor = max(peak-trail, tp) — never below
+                # tp. Checked adverse-first before this candle's high raises peak.
+                if not closed and pos.get("trail_armed"):
+                    trail_stop = pos["peak"] * (1.0 - pos["trail_gap_pct"] / 100.0)
+                    eff = max(trail_stop, tp)
+                    # At the tp floor → clean 'tp'; above it → 'trail'.
+                    _lbl = "backtest_trail" if trail_stop > tp else "backtest_tp"
+                    _mkr = exit_is_maker if _lbl == "backtest_tp" else False
+                    if candle["open"] <= eff:
+                        _close_position(sym, ts, candle["open"], _lbl, _mkr)
+                        closed = True
+                    elif candle["low"] <= eff:
+                        _close_position(sym, ts, eff, _lbl, _mkr)
+                        closed = True
+                    if not closed:
+                        pos["peak"] = max(pos["peak"], candle["high"])
+
+                # F1: not yet armed → protective stop, then arming checks.
+                if not closed and not pos.get("trail_armed"):
+                    if prot is not None and candle["open"] <= prot:
+                        _close_position(sym, ts, candle["open"], prot_label, False)
+                        closed = True
+                    elif prot is not None and candle["low"] <= prot:
+                        _close_position(sym, ts, prot, prot_label, False)
+                        closed = True
                     if not closed:
                         hi = candle["high"]
+                        # BE-move (capital protection): stop → BEP at +be_at_r×R.
                         if not pos["be_moved"]:
                             gain_pct = (hi / pos["entry_px"] - 1.0) * 100.0
-                            armed = (pos["be_at_r"] is not None
-                                     and pos["sl_dist"]
-                                     and gain_pct >= pos["sl_dist"]
-                                     * float(pos["be_at_r"])) or hi >= tp
-                            if armed:
-                                # BE-move: stop can no longer lose (§2.3)
+                            if (pos["be_at_r"] is not None and pos["sl_dist"]
+                                    and gain_pct >= pos["sl_dist"]
+                                    * float(pos["be_at_r"])):
                                 pos["be_moved"] = True
                                 pos["be_stop"] = max(sl or 0.0, pos["bep"])
-                                pos["peak"] = hi
-                        else:
-                            pos["peak"] = max(pos["peak"], hi)
+                        # Reaching tp: trailing on → arm the trail (ride);
+                        # trailing off → immediate clean TP at the target.
                         if hi >= tp:
-                            # TP-touch ratchet: full round-trip below TP
-                            # can't happen once the target printed.
-                            pos["ratchet"] = max(
-                                pos["ratchet"],
-                                tp * (1.0 - pos["tp_buffer_pct"] / 100.0))
-                elif not closed:
-                    # Trailing disabled (k_trail <= 0) or legacy mapping:
-                    # old immediate-sell-at-target path.
-                    if candle["open"] >= tp:
-                        _close_position(sym, ts, candle["open"],
-                                        "backtest_tp", exit_is_maker)
-                    elif candle["high"] >= tp:
-                        _close_position(sym, ts, tp, "backtest_tp",
-                                        exit_is_maker)
+                            if trailing_on:
+                                pos["trail_armed"] = True
+                                pos["peak"] = max(pos["peak"] or pos["entry_px"], hi)
+                            else:
+                                if candle["open"] >= tp:
+                                    _close_position(sym, ts, candle["open"],
+                                                    "backtest_tp", exit_is_maker)
+                                else:
+                                    _close_position(sym, ts, tp, "backtest_tp",
+                                                    exit_is_maker)
+                                closed = True
 
             # 3) Entry evaluation → schedule next-open fill.
             #    Phase 3 §3.1: entries are evaluated on 5m candle CLOSES only

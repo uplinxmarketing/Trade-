@@ -716,6 +716,18 @@ def _apply_alias_sync(s: dict, patch: dict) -> None:
                     se["min_scored"] = ms
             except (TypeError, ValueError):
                 pass
+        # signal_engine.min_scored is the canonical key the registry reads; a
+        # direct write to it must mirror back to the user-facing aliases so the
+        # duplicate keys never diverge (F3 — collapse the min-score duplication).
+        se_p = patch.get("signal_engine") if isinstance(patch.get("signal_engine"), dict) else None
+        if se_p and "min_scored" in se_p and "min_score" not in (entries_p or {}):
+            try:
+                ms = int(se_p["min_scored"])
+                s["min_signals"] = ms
+                if isinstance(s.get("entries"), dict):
+                    s["entries"]["min_score"] = ms
+            except (TypeError, ValueError):
+                pass
     except Exception:
         pass  # alias sync must never block a settings write
 
@@ -1206,6 +1218,82 @@ def _config_response():
         "bot_allocation_usdt":   strategy.get("bot_allocation_usdt",   config.BOT_ALLOCATION_USDT),
     }
 
+# F4 — Binance minimum-notional floor. A fixed/per-coin per-trade budget below
+# max(sizing.min_position_usdt, this) is rejected at settings time (422) instead
+# of being accepted and then failing forever at execution ("$5.50 < $10 min
+# notional"). Percent/capped: validate the resulting per-trade size when
+# computable, else warn.
+MIN_NOTIONAL_FLOOR = 10.0
+
+
+def _budget_floor(merged: dict) -> float:
+    """Per-trade minimum = max(sizing.min_position_usdt, MIN_NOTIONAL_FLOOR)."""
+    floor = MIN_NOTIONAL_FLOOR
+    try:
+        sizing = merged.get("sizing") if isinstance(merged.get("sizing"), dict) else {}
+        mp = sizing.get("min_position_usdt")
+        if mp is None:
+            mp = merged.get("min_position_usdt")
+        if mp is not None:
+            floor = max(float(mp), MIN_NOTIONAL_FLOOR)
+    except (TypeError, ValueError):
+        floor = MIN_NOTIONAL_FLOOR
+    return floor
+
+
+def _effective_budget_mode(merged: dict) -> str:
+    """sizing.mode (v2) wins over the legacy root budget_mode when present."""
+    sizing = merged.get("sizing") if isinstance(merged.get("sizing"), dict) else {}
+    if isinstance(sizing.get("mode"), str):
+        return sizing["mode"]
+    return merged.get("budget_mode", config.BUDGET_MODE)
+
+
+def _validate_budget_floor(merged: dict):
+    """Return (errors, warnings) for a merged (current+patch) strategy dict.
+    errors block the write (fixed/per-coin per-trade budget below the floor);
+    warnings are advisory (percent/capped resulting size below floor)."""
+    errors: dict = {}
+    warnings: list = []
+    floor = _budget_floor(merged)
+    mode = _effective_budget_mode(merged)
+    if mode == "fixed":
+        try:
+            bf = float(merged.get("budget_fixed_usdt", config.BUDGET_FIXED_USDT))
+            if bf < floor:
+                errors["budget_fixed_usdt"] = (
+                    f"fixed per-trade budget {bf:.2f} USDT is below the minimum "
+                    f"{floor:.2f} USDT (Binance min notional {MIN_NOTIONAL_FLOOR:.0f}) "
+                    f"— raise budget_fixed_usdt or lower sizing.min_position_usdt")
+        except (TypeError, ValueError):
+            errors["budget_fixed_usdt"] = "must be a number"
+    elif mode == "per_coin":
+        per_coin = merged.get("budget_per_coin", {})
+        if isinstance(per_coin, dict):
+            for sym, v in per_coin.items():
+                try:
+                    if float(v) < floor:
+                        errors[f"budget_per_coin.{sym}"] = (
+                            f"per-coin budget {float(v):.2f} USDT for {sym} is below "
+                            f"the minimum {floor:.2f} USDT (Binance min notional "
+                            f"{MIN_NOTIONAL_FLOOR:.0f})")
+                except (TypeError, ValueError):
+                    errors[f"budget_per_coin.{sym}"] = "must be a number"
+    elif mode == "capped":
+        try:
+            cap = float(merged.get("budget_total_cap_usdt", config.BUDGET_TOTAL_CAP_USDT))
+            max_pos = int(merged.get("max_positions", config.MAX_OPEN_POSITIONS) or 1)
+            if max_pos > 0 and (cap / max_pos) < floor:
+                warnings.append(
+                    f"capped per-trade size ~= {cap / max_pos:.2f} USDT "
+                    f"(cap {cap:.2f} / {max_pos} slots) is below the {floor:.2f} "
+                    f"USDT min notional — trades may be rejected at execution")
+        except (TypeError, ValueError):
+            pass
+    # percent / coin_pct scale with live balance — not statically computable.
+    return errors, warnings
+
+
 def _config_patch(body: dict):
     allowed_keys = {
         "budget_mode", "budget_fixed_usdt", "budget_pct_of_free",
@@ -1216,8 +1304,16 @@ def _config_patch(body: dict):
         patch = {k: v for k, v in body.items() if k in allowed_keys}
         if not patch:
             return {"ok": False, "error": "No valid config keys provided"}
+        # F4 — reject a sub-minimum fixed/per-coin budget (422) before writing.
+        _merged_cfg = {**_load_strategy(), **patch}
+        _berr, _bwarn = _validate_budget_floor(_merged_cfg)
+        if _berr:
+            return JSONResponse(status_code=422, content={"errors": _berr})
         _write_strategy_patch(patch)
-        return {"ok": True, "updated": list(patch.keys()), "config": patch}
+        _resp = {"ok": True, "updated": list(patch.keys()), "config": patch}
+        if _bwarn:
+            _resp["warnings"] = _bwarn
+        return _resp
     except Exception as e:
         database.log_activity(f"Config save error: {e}", "error")
         return Response(
@@ -2587,6 +2683,10 @@ def api_signal_registry():
                 "category":    sig_def.category,
                 "description": sig_def.description,
                 "role":        role,
+                # F3 — True when the role came from an explicit signal_engine.roles
+                # entry (post-migration every signal has one), False when resolved
+                # from the list/registry defaults.
+                "role_explicit": _cfg_role in _VALID_ROLES,
             }
             # Per-signal editable thresholds (resolved values) — the
             # SignalsEditorPanel renders threshold inputs from this.
@@ -2961,6 +3061,7 @@ def _compute_health_snapshot() -> dict:
     engine = _health_engine_section()
 
     causes: list = []
+    warns: list = []   # F5 — degraded/yellow tier (not red, but not healthy)
 
     # RED RULE 1: any active symbol's 1m candle age > 90s
     try:
@@ -3050,9 +3151,39 @@ def _compute_health_snapshot() -> dict:
     except Exception:
         pass
 
+    # ── F5 — degraded (YELLOW) rules: not fatal, but health must not read green.
+    # WARN RULE A: stale signals present (cache older than the scanner's
+    # staleness threshold) — previously left health green while 6 symbols went
+    # unscanned.
+    try:
+        sc = engine.get("scanner") if isinstance(engine.get("scanner"), dict) else {}
+        stale_n = _health_num(sc.get("stale_signal_count"))
+        if stale_n is not None and stale_n > 0:
+            stale_syms = engine.get("stale_signal_syms") or []
+            listed = (": " + ", ".join(str(s) for s in stale_syms[:10])) if stale_syms else ""
+            warns.append(f"{stale_n:.0f} symbol(s) have stale signal data{listed}.")
+    except Exception:
+        pass
+
+    # WARN RULE B: subscription coverage below the universe — some watchlist
+    # symbols have no active market stream.
+    try:
+        covered = _health_num(data.get("symbols_covered"))
+        expected = _health_num(data.get("expected_symbols"))
+        if covered is not None and expected is not None and covered < expected:
+            missing = data.get("uncovered_symbols") or []
+            listed = (": " + ", ".join(str(s) for s in missing[:15])) if missing else ""
+            warns.append(
+                f"Subscription coverage {covered:.0f}/{expected:.0f} symbols — "
+                f"{expected - covered:.0f} uncovered{listed}.")
+    except Exception:
+        pass
+
+    status = "red" if causes else ("yellow" if warns else "green")
     return {
-        "status": "red" if causes else "green",
+        "status": status,
         "causes": causes,
+        "warns": warns,
         "data": data,
         "limits": limits,
         "engine": engine,
@@ -3359,11 +3490,15 @@ def api_diagnostics_bundle():
         out.write(f"  status={snap.get('status')}\n")
         for c in snap.get("causes", []):
             out.write(f"  CAUSE: {c}\n")
+        for w in snap.get("warns", []):
+            out.write(f"  WARN: {w}\n")
         d = snap.get("data") or {}
         if d.get("available"):
             out.write(f"  ws_connections={len(d.get('connections', []))} "
                       f"msgs/s={d.get('total_msgs_per_sec')} "
                       f"subscribed={d.get('subscribed_coins')} "
+                      f"covered={d.get('symbols_covered')}/{d.get('expected_symbols')} "
+                      f"streams={d.get('streams')} "
                       f"buffer_1m={d.get('buffer_fill_pct_1m')}% "
                       f"buffer_5m={d.get('buffer_fill_pct_5m')}% "
                       f"gap_repairs_24h={d.get('gap_repairs_24h')} "
@@ -3462,6 +3597,10 @@ def api_diagnostics_bundle():
                       f"avg_win={ex.get('avg_win')} avg_loss={ex.get('avg_loss')} "
                       f"expectancy={ex.get('expectancy_per_trade')} "
                       f"profit_factor={ex.get('profit_factor')}\n")
+            if ex.get("note"):
+                out.write(f"  NOTE: {ex.get('note')}\n")
+            else:
+                out.write(f"  data_start={ex.get('data_start_ts')}\n")
             out.write(f"  total_fees={ex.get('total_fees')} "
                       f"fee_share={ex.get('fee_share_of_gross')} "
                       f"avg_hold={ex.get('avg_hold_time_sec')}s\n")
@@ -3475,6 +3614,47 @@ def api_diagnostics_bundle():
                 out.write(f"    {row.get('symbol'):<12} trades={row.get('trades')} "
                           f"pnl={row.get('net_pnl'):+.2f} wr={row.get('win_rate')}%\n")
         safe(_an, f"analytics{days}")
+
+    # -- Exit-R distribution (F1/F9) -------------------------------------------
+    section("EXIT-R (planned vs realized)")
+    def _exitr():
+        er = api_diagnostics_exit_r()
+        if not er.get("available"):
+            out.write(f"  unavailable: {er.get('reason') or er.get('error')}\n")
+            return
+        dist = er.get("distribution") or er.get("buckets") or er.get("r_distribution")
+        if isinstance(dist, dict):
+            out.write("  distribution: " + ", ".join(
+                f"{k}={v}" for k, v in dist.items()) + "\n")
+        elif isinstance(dist, list):
+            out.write("  distribution: " + ", ".join(str(x) for x in dist) + "\n")
+        for k in ("planned_r_avg", "realized_r_avg", "planned_r_median",
+                  "realized_r_median", "count", "n", "unlabeled_exits",
+                  "unlabeled_count"):
+            if k in er:
+                out.write(f"  {k}={er.get(k)}\n")
+    safe(_exitr, "exit_r")
+
+    # -- Chronic spread (E1) vetoes (F10) --------------------------------------
+    section("SPREAD-VETO STATS (E1, 24h)")
+    def _veto():
+        vs = api_diagnostics_veto_stats(hours=24.0)
+        if vs.get("error"):
+            out.write(f"  error: {vs.get('error')}\n")
+            return
+        syms = vs.get("symbols") or {}
+        prune = vs.get("prune_candidates") or []
+        out.write(f"  symbols_tracked={len(syms)} prune_candidates={len(prune)}\n")
+        if prune:
+            out.write("  PRUNE (E1>70%): " + ", ".join(
+                f"{s}({syms[s]['e1_veto_pct']}% of {syms[s]['evals']})"
+                for s in prune[:20]) + "\n")
+        worst = sorted(syms.items(),
+                       key=lambda kv: kv[1].get("e1_veto_pct", 0), reverse=True)[:8]
+        for s, d in worst:
+            out.write(f"    {s:<12} e1={d.get('e1_veto_pct')}% "
+                      f"evals={d.get('evals')} vetoes={d.get('e1_vetoes')}\n")
+    safe(_veto, "veto_stats")
 
     # -- Open positions --------------------------------------------------------
     section("OPEN POSITIONS")
@@ -4361,6 +4541,10 @@ class SettingsRequest(BaseModel):
     min_signals:         Optional[int]   = None
     strategy_notes:      Optional[str]   = None
     slippage_buffer_pct: Optional[float] = None  # 0.05–0.50%, default 0.10%
+    # F4 — budget fields (validated against the min-notional floor before write).
+    budget_mode:         Optional[str]   = None
+    budget_fixed_usdt:   Optional[float] = None
+    budget_per_coin:     Optional[dict]  = None
     # Phase 2 §2.6 — optional exits block (validated by _validate_exits_patch;
     # a plain dict so unknown keys reach validation and get field-level errors
     # instead of being silently dropped by pydantic).
@@ -4414,6 +4598,26 @@ def api_save_settings(req: SettingsRequest):
         if req.min_signals         is not None: patch["min_signals"]        = max(1,   min(6,    req.min_signals))
         if req.strategy_notes      is not None: patch["strategy_notes"]     = req.strategy_notes[:2000]
         if req.slippage_buffer_pct is not None: patch["slippage_buffer_pct"] = max(0.05, min(0.50, req.slippage_buffer_pct))
+        # F4 — budget fields, floor-validated BEFORE the write (reject, never
+        # accept-then-spam "$5.50 < $10 min notional" forever at execution).
+        if req.budget_mode         is not None: patch["budget_mode"]        = req.budget_mode
+        if req.budget_fixed_usdt   is not None: patch["budget_fixed_usdt"]  = float(req.budget_fixed_usdt)
+        if req.budget_per_coin     is not None: patch["budget_per_coin"]    = req.budget_per_coin
+        if any(k in patch for k in ("budget_mode", "budget_fixed_usdt", "budget_per_coin")):
+            _merged_budget = {**_load_strategy(), **patch}
+            _berr, _bwarn = _validate_budget_floor(_merged_budget)
+            # Also flag an explicitly-set fixed size below the floor even when the
+            # active mode isn't 'fixed' — storing a sub-notional value is the F4
+            # footgun (accepted, then fails forever the moment fixed mode is used).
+            if "budget_fixed_usdt" in patch and "budget_fixed_usdt" not in _berr:
+                _fl = _budget_floor(_merged_budget)
+                if float(patch["budget_fixed_usdt"]) < _fl:
+                    _berr["budget_fixed_usdt"] = (
+                        f"per-trade budget {float(patch['budget_fixed_usdt']):.2f} USDT is "
+                        f"below the minimum {_fl:.2f} USDT (Binance min notional "
+                        f"{MIN_NOTIONAL_FLOOR:.0f})")
+            if _berr:
+                return {"ok": False, "error": "invalid budget settings", "errors": _berr}
         # ── Phase 2 §2.6 — exits block (validated; field-level errors, no 500) ──
         if req.exits is not None:
             _s_cur = _load_strategy()
@@ -4468,12 +4672,21 @@ def api_save_settings(req: SettingsRequest):
                 patch["regime"] = {**_cur, **_validated}
         if not patch:
             return {"ok": False, "error": "No valid settings provided"}
+        # F4 — reject a sub-minimum fixed/per-coin per-trade budget (422) before
+        # writing, so an unfillable size can never be accepted then spam at exec.
+        _merged_set = {**_load_strategy(), **patch}
+        _berr, _bwarn = _validate_budget_floor(_merged_set)
+        if _berr:
+            return JSONResponse(status_code=422, content={"errors": _berr})
         _write_strategy_patch(patch)
         database.log_activity(
             "Settings updated: " + ", ".join(f"{k}={v}" for k, v in patch.items() if k != "strategy_notes"),
             "info"
         )
-        return {"ok": True, **patch}
+        _resp = {"ok": True, **patch}
+        if _bwarn:
+            _resp["warnings"] = _bwarn
+        return _resp
     except Exception as e:
         database.log_activity(f"Settings save error: {e}", "error")
         return Response(
@@ -5570,10 +5783,23 @@ def api_stats_expectancy(days: int = 30, mode: Optional[str] = None):
             rows = conn.execute(f"""
                 SELECT coin, net_profit, buy_fee, sell_fee,
                        entry_fee_usdt, exit_fee_usdt,
-                       hold_time_sec, duration_seconds, exit_label
+                       hold_time_sec, duration_seconds, exit_label,
+                       timestamp_sell
                 FROM trades
                 WHERE {' AND '.join(where)}
             """, params).fetchall()
+            # F8 — earliest closed trade for THIS mode ignoring the window, so we
+            # can tell whether the window is truncated by available history
+            # (7d and 30d returning identical data = all trades since deploy).
+            _hist_where = ["exit_price IS NOT NULL", "net_profit IS NOT NULL"]
+            _hist_params: list = []
+            if m != "all":
+                _hist_where.append("mode = ?")
+                _hist_params.append(m)
+            _hist_row = conn.execute(
+                f"SELECT MIN(timestamp_sell) AS first_ts FROM trades "
+                f"WHERE {' AND '.join(_hist_where)}", _hist_params).fetchone()
+            earliest_overall = _hist_row["first_ts"] if _hist_row else None
         finally:
             conn.close()
 
@@ -5581,7 +5807,11 @@ def api_stats_expectancy(days: int = 30, mode: Optional[str] = None):
         pnls, fees, gross_abs, holds = [], 0.0, 0.0, []
         per_symbol: dict = {}
         exit_labels: dict = {}
+        data_start_ts = None   # F8 — earliest trade timestamp IN this window
         for r in rows:
+            _ts = r["timestamp_sell"]
+            if _ts and (data_start_ts is None or _ts < data_start_ts):
+                data_start_ts = _ts
             pnl = float(r["net_profit"] or 0.0)
             # Phase 1 fee columns first, legacy buy_fee/sell_fee as fallback
             ef = r["entry_fee_usdt"] if r["entry_fee_usdt"] is not None else r["buy_fee"]
@@ -5621,10 +5851,24 @@ def api_stats_expectancy(days: int = 30, mode: Optional[str] = None):
         for el in exit_labels.values():
             el["net_pnl"] = round(el["net_pnl"], 4)
 
+        # F8 — window is truncated by available history when the earliest trade
+        # in the window equals the earliest trade overall AND it starts after the
+        # requested cutoff. Surfaced so the frontend labels windows truthfully
+        # instead of implying "N days" when only M days of data exist.
+        truncated = bool(data_start_ts and data_start_ts > cutoff)
+        note = None
+        if truncated:
+            note = f"data since {str(data_start_ts)[:10]} (window truncated by available history)"
+
         return {
             "days": days,
             "mode": m,
             "trades": n,
+            "window_start_ts": cutoff,
+            "data_start_ts": data_start_ts,
+            "earliest_trade_ts": earliest_overall,
+            "window_truncated": truncated,
+            "note": note,
             "win_rate": round(100.0 * len(wins) / n, 1) if n else 0.0,
             "avg_win": round(gross_win / len(wins), 4) if wins else 0.0,
             "avg_loss": round(-gross_loss / len(losses), 4) if losses else 0.0,
@@ -5642,6 +5886,111 @@ def api_stats_expectancy(days: int = 30, mode: Optional[str] = None):
         }
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/diagnostics/veto-stats")
+def api_diagnostics_veto_stats(hours: float = 24.0, min_evals: int = 20):
+    """F10 — per-symbol chronic spread (E1) veto rate over a rolling window.
+
+    Source: the buy_rejections table the engine already records (no new engine
+    hooks). The signal-engine veto reason is 'veto_E1_spread_too_wide_fired';
+    older/legacy spread rejections ('spread', '*spread_too_wide*') are folded in.
+    evals = total recorded buy rejections for the symbol in the window (the
+    available proxy for "evaluated then not entered"); e1_veto_pct = E1 vetoes /
+    evals. prune_candidates = symbols E1-vetoed >70% of evals (>= min_evals)."""
+    try:
+        import sqlite3 as _sq
+        hours = max(0.5, min(168.0, float(hours)))
+        min_evals = max(1, int(min_evals))
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)
+                  ).strftime("%Y-%m-%dT%H:%M:%S")
+        conn = _sq.connect(database.DB_PATH)
+        conn.row_factory = _sq.Row
+        try:
+            rows = conn.execute("""
+                SELECT coin,
+                       COUNT(*) AS evals,
+                       SUM(CASE WHEN reason LIKE 'veto_E1_spread_too_wide%'
+                                  OR reason = 'spread'
+                                  OR reason LIKE '%spread_too_wide%'
+                                THEN 1 ELSE 0 END) AS e1
+                FROM buy_rejections
+                WHERE timestamp >= ? AND coin IS NOT NULL AND coin != '(all)'
+                GROUP BY coin
+            """, (cutoff,)).fetchall()
+        finally:
+            conn.close()
+        symbols: dict = {}
+        prune: list = []
+        for r in rows:
+            evals = int(r["evals"] or 0)
+            e1 = int(r["e1"] or 0)
+            if evals <= 0:
+                continue
+            pct = round(100.0 * e1 / evals, 1)
+            symbols[r["coin"]] = {"e1_veto_pct": pct, "evals": evals, "e1_vetoes": e1}
+            if pct > 70.0 and evals >= min_evals:
+                prune.append(r["coin"])
+        prune.sort(key=lambda s: symbols[s]["e1_veto_pct"], reverse=True)
+        return {
+            "window_hours": hours,
+            "since": cutoff,
+            "min_evals": min_evals,
+            "source": "buy_rejections",
+            "symbols": symbols,
+            "prune_candidates": prune,
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}",
+                "symbols": {}, "prune_candidates": []}
+
+
+@app.get("/api/diagnostics/exit-r")
+def api_diagnostics_exit_r():
+    """F1/F9 — planned vs realized R distribution from
+    trade_engine.get_exit_r_stats(). Defensive: returns {available: false} when
+    the engine helper isn't present yet (parallel rollout)."""
+    try:
+        import trade_engine as _te
+        fn = getattr(_te, "get_exit_r_stats", None)
+        if not callable(fn):
+            return {"available": False,
+                    "reason": "trade_engine.get_exit_r_stats not available"}
+        data = fn()
+        if not isinstance(data, dict):
+            return {"available": False, "reason": "unexpected return type"}
+        out = dict(data)
+        out["available"] = True
+        return out
+    except Exception as e:
+        return {"available": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.post("/api/risk/rebaseline")
+def api_risk_rebaseline(body: dict = Body(...)):
+    """F9 — rebase the risk engine's initial balance to current equity. Requires
+    {confirm: true}. Calls trade_engine.rebaseline_initial_balance()."""
+    try:
+        if not isinstance(body, dict) or body.get("confirm") is not True:
+            return JSONResponse(
+                status_code=422,
+                content={"errors": {"confirm": "must be true to rebaseline"}})
+        import trade_engine as _te
+        fn = getattr(_te, "rebaseline_initial_balance", None)
+        if not callable(fn):
+            return JSONResponse(
+                status_code=503,
+                content={"error": "trade_engine.rebaseline_initial_balance not available"})
+        result = fn()
+        try:
+            database.log_activity("Risk initial balance rebaselined via API", "warn")
+        except Exception:
+            pass
+        return {"ok": True,
+                "result": result if isinstance(result, (dict, list, int, float, str)) else None}
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
 # ── Attribution / edge report ────────────────────────────────────────────────
@@ -5854,6 +6203,18 @@ def api_put_strategy(body: dict = Body(...)):
         merged, errors = _scfg.validate_patch(raw, patch)
         if errors:
             return JSONResponse(status_code=422, content={"errors": errors})
+
+        # F4 — budget floor guard: when the sizing block is touched (mode /
+        # min_position_usdt), verify the fixed/per-coin per-trade budget still
+        # clears the min-notional floor. Merge the new sizing block over the raw
+        # root keys the engine actually reads for budget math.
+        if isinstance(patch.get("sizing"), dict):
+            _bmerged = {**raw}
+            if isinstance(merged.get("sizing"), dict):
+                _bmerged["sizing"] = merged["sizing"]
+            _berr, _ = _validate_budget_floor(_bmerged)
+            if _berr:
+                return JSONResponse(status_code=422, content={"errors": _berr})
 
         old_view = _scfg.current_v2_view(raw, mode=_strategy_v2_mode())
         merged["mode"] = old_view.get("mode", merged.get("mode"))

@@ -749,6 +749,16 @@ def _neutral_size_mult() -> float:
         return 0.5
 
 
+def _regime_risk_off_pct_4h() -> float:
+    """F2.2 strategy.regime.risk_off_pct_4h (default −1.0): the 4h-return
+    threshold BTC must break (AND price<EMA50) to classify risk_off."""
+    try:
+        raw = _load_strategy().get("regime", {})
+        return float(raw.get("risk_off_pct_4h", -1.0))
+    except Exception:
+        return -1.0
+
+
 # §3.4c — global correlated-dump pause: >=3 stop-outs within 10 minutes pause
 # ALL entries for 5 minutes (module state; surfaced as gate blocker
 # 'global_stop_pause' and in the activity log).
@@ -842,7 +852,10 @@ def _exit_config_fallback(strategy: dict) -> dict:
     defaults = {
         "k_sl": 1.2, "sl_min_pct": 0.5, "sl_max_pct": 2.5, "hard_sl_pct": 3.0,
         "rr_ratio": 1.6, "tp_buffer_pct": 0.05, "min_profit_usdt": 0.01,
-        "breakeven_at_r": 1.0, "k_trail": 0.8, "smart_hold_score_gate": False,
+        # F1: BE-move arms at +1.2R (was +1.0R) so the TP target has room to
+        # print before the stop rises to BEP — keeps a +1R-then-fade a small
+        # BEP scratch instead of a floor-scratch masquerading as a win.
+        "breakeven_at_r": 1.2, "k_trail": 0.8, "smart_hold_score_gate": False,
         "sl_confirm_ticks": 2, "min_hold_sec": 10.0,
         "maker_tp": True, "maker_tp_timeout_ms": 1500,
         "oco_enabled": False, "oco_stop_limit_buffer_pct": 0.5,
@@ -976,6 +989,67 @@ def _log_shadow_dedup(symbol: str, reason: str, message: str) -> None:
     _shadow_log_dedupe[key] = {"last_ts": now, "suppressed": 0}
     log_diag_issue("signal_shadow", "warn", message + suffix)
 
+
+# ── F6: candidate-churn control ───────────────────────────────────────────────
+# A fresh-engine re-check FAIL in the buy path (e.g. score_2_below_min) used to
+# leave the STALE high score in the signal cache, so the fast pre-check
+# re-selected the same coin every ~7s (TRXUSDT diagnostic). We now (1) write the
+# fresh score back to the cache so the pre-check reflects reality, and (2) apply
+# a per-symbol candidacy cooldown so a just-failed coin is not re-evaluated for
+# 60s. [SKIP] activity lines are deduped per (symbol, reason) over 15 min.
+_candidacy_cooldown: Dict[str, float] = {}          # sym -> ts until re-eligible
+_CANDIDACY_COOLDOWN_SEC = 60.0
+_skip_log_dedupe: Dict[Tuple[str, str], dict] = {}  # (sym, reason) -> {last_ts, suppressed}
+_SKIP_DEDUPE_WINDOW_SEC = 900.0                     # 15 minutes
+
+
+def _log_skip_dedup(symbol: str, reason: str, message: str,
+                    level: str = "info") -> None:
+    """Emit a [SKIP] activity line deduped per (symbol, reason) per 15 min —
+    identical entries inside the window are counted, the next emitted line
+    carries '(×N in last 15m)'."""
+    key = (symbol, reason)
+    now = time.time()
+    ent = _skip_log_dedupe.get(key)
+    if ent and (now - ent["last_ts"]) < _SKIP_DEDUPE_WINDOW_SEC:
+        ent["suppressed"] += 1
+        return
+    suffix = ""
+    if ent and ent["suppressed"] > 0:
+        suffix = f" (×{ent['suppressed'] + 1} in last 15m)"
+    _skip_log_dedupe[key] = {"last_ts": now, "suppressed": 0}
+    try:
+        database.log_activity(message + suffix, level)
+    except Exception:
+        pass
+
+
+def _note_candidacy_fail(symbol: str, fresh_score, reason: str = "") -> None:
+    """F6: on a fresh re-check FAIL, write the fresh score back to the signal
+    cache (so the fast pre-check stops re-selecting the coin) and arm a 60s
+    candidacy cooldown."""
+    try:
+        if fresh_score is not None:
+            with _signal_cache_lock:
+                ent = _signal_cache.get(symbol)
+                if ent is not None:
+                    ent["score"] = int(fresh_score)
+                    ent["buy_ready"] = False
+    except Exception:
+        pass
+    _candidacy_cooldown[symbol] = time.time() + _CANDIDACY_COOLDOWN_SEC
+
+
+def _in_candidacy_cooldown(symbol: str) -> bool:
+    """True while the F6 per-symbol candidacy cooldown is active."""
+    until = _candidacy_cooldown.get(symbol, 0.0)
+    if until <= 0.0:
+        return False
+    if time.time() >= until:
+        _candidacy_cooldown.pop(symbol, None)
+        return False
+    return True
+
 # ── Phase 1 §1.3 — entry snapshots (executed buys + near-misses) ──────────────
 # Near-miss snapshot throttle: one row per (symbol, reason) per 5 minutes so a
 # persistent blocker (e.g. cooldown, bb_upper) can't write thousands of rows.
@@ -1088,6 +1162,7 @@ _EXIT_LABEL_MAP = {
     "hard-stop-loss":  "hard_sl",
     "trail":           "trail",
     "smart-hold-trail": "trail",
+    "breakeven-stop":  "breakeven",   # F1: faded back to BEP after the BE-move armed
     "auto-recycle":    "recycler",
     "force-sell":      "force",
     "manual":          "manual",
@@ -1302,6 +1377,90 @@ from collections import deque as _deque
 
 _diag_log: "_deque[dict]" = _deque(maxlen=100)
 _diag_log_lock = threading.Lock()
+
+# ── F1 exit-R analytics — last 100 closed trades' realized_r vs planned_rr ─────
+# The trades table has no realized_r/planned_rr columns (fixed-column INSERT), so
+# the R stats live here (in-memory ring) + the activity log. get_exit_r_stats()
+# exposes a summary for the analytics API (control_api adds the endpoint).
+_exit_r_stats: "_deque[dict]" = _deque(maxlen=100)
+_exit_r_stats_lock = threading.Lock()
+
+
+def _record_exit_r(sym: str, entry: float, exit_px: float,
+                   sl_dist_pct, planned_rr, label: str) -> None:
+    """Compute signed realized_r for a close and log/store it (F1.1).
+
+    realized_r = (exit_px − entry) / (entry × sl_distance_pct/100) — how many
+    R-multiples the exit landed at, signed. Losers cap near −1R (stop), a
+    BEP scratch is ~0R, a clean TP is ≈ planned_rr, a trailed runner ≥ that."""
+    try:
+        entry = float(entry or 0)
+        exit_px = float(exit_px or 0)
+        sl_dist = float(sl_dist_pct) if sl_dist_pct else 0.0
+        realized_r = None
+        if entry > 0 and sl_dist > 0:
+            realized_r = (exit_px - entry) / (entry * sl_dist / 100.0)
+        prr = None
+        try:
+            prr = float(planned_rr) if planned_rr is not None else None
+        except (TypeError, ValueError):
+            prr = None
+        rec = {
+            "symbol": sym, "label": label,
+            "entry": entry, "exit_px": exit_px,
+            "sl_distance_pct": sl_dist or None,
+            "realized_r": (round(realized_r, 4) if realized_r is not None else None),
+            "planned_rr": prr, "ts": time.time(),
+        }
+        with _exit_r_stats_lock:
+            _exit_r_stats.append(rec)
+        try:
+            database.log_activity(
+                f"EXIT {sym} label={label} "
+                f"planned_rr={('%.2f' % prr) if prr is not None else 'na'} "
+                f"realized_r={('%.2f' % realized_r) if realized_r is not None else 'na'} "
+                f"planned_tp={exit_px if realized_r is None else round(entry * (1 + (prr or 0) * sl_dist / 100.0), 6)} "
+                f"exit_px={exit_px:.6f}", "info")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def get_exit_r_stats() -> dict:
+    """F1 analytics accessor: rolling stats over the last (≤100) closed trades'
+    realized_r vs planned_rr. Shape:
+      {n, avg_realized_r, median_realized_r, avg_planned_rr, win_rate,
+       by_label:{label:{n, avg_realized_r}}, samples:[last 20 records]}.
+    win_rate here = fraction with realized_r > 0. Empty-safe."""
+    with _exit_r_stats_lock:
+        rows = [r for r in _exit_r_stats if r.get("realized_r") is not None]
+        all_rows = list(_exit_r_stats)
+    if not rows:
+        return {"n": 0, "avg_realized_r": None, "median_realized_r": None,
+                "avg_planned_rr": None, "win_rate": None, "by_label": {},
+                "samples": all_rows[-20:]}
+    rs = sorted(r["realized_r"] for r in rows)
+    n = len(rs)
+    mid = n // 2
+    median = rs[mid] if n % 2 else (rs[mid - 1] + rs[mid]) / 2.0
+    prrs = [r["planned_rr"] for r in rows if r.get("planned_rr") is not None]
+    by_label: dict = {}
+    for r in rows:
+        b = by_label.setdefault(r["label"], {"n": 0, "_sum": 0.0})
+        b["n"] += 1
+        b["_sum"] += r["realized_r"]
+    for b in by_label.values():
+        b["avg_realized_r"] = round(b.pop("_sum") / b["n"], 4)
+    return {
+        "n": n,
+        "avg_realized_r": round(sum(rs) / n, 4),
+        "median_realized_r": round(median, 4),
+        "avg_planned_rr": (round(sum(prrs) / len(prrs), 4) if prrs else None),
+        "win_rate": round(sum(1 for x in rs if x > 0) / n, 4),
+        "by_label": by_label,
+        "samples": all_rows[-20:],
+    }
 
 
 def log_diag_issue(source: str, severity: str, message: str, detail: str = "") -> None:
@@ -2038,7 +2197,7 @@ def load_positions_from_db():
     for _pos_geo in _positions:
         try:
             if not _pos_geo.get("tp_price"):
-                _apply_entry_exit_geometry(_pos_geo)
+                _apply_entry_exit_geometry(_pos_geo, log_open=False)  # restore: no OPEN log
         except Exception:
             pass  # geometry restore must never break startup
 
@@ -2257,6 +2416,76 @@ def _get_usdt_balance() -> float:
     return 0.0
 
 
+# ── F9: initial_balance semantics ─────────────────────────────────────────────
+# initial_balance_usdt is the P&L baseline the UI measures growth against. It
+# was captured as free USDT ALONE at an arbitrary moment (45.60 while the true
+# portfolio was 96.73), so any USDT already tied up in open positions was
+# silently excluded and the baseline read far too low. Correct definition:
+#
+#   initial_balance_usdt = free USDT + current in-position (mark) value
+#
+# i.e. total portfolio value at arming time. rebaseline_initial_balance()
+# recomputes and persists it on demand (control_api exposes an endpoint).
+def _in_position_value_usdt() -> float:
+    """Mark value of all open positions (Σ quantity × current price; falls back
+    to entry price when no live quote is available)."""
+    total = 0.0
+    for p in get_open_positions():
+        try:
+            qty = float(p.get("quantity") or 0)
+            if qty <= 0:
+                continue
+            sym = p.get("symbol") or ""
+            px = _current_price_for(sym) or float(p.get("entry_price") or 0)
+            total += qty * float(px or 0)
+        except Exception:
+            continue
+    return total
+
+
+def rebaseline_initial_balance() -> dict:
+    """F9: recompute initial_balance_usdt = free USDT + in-position value NOW,
+    persist it to strategy.json, and return the new baseline.
+
+    Returns {"initial_balance_usdt", "free_usdt", "in_position_usdt", "ok"}.
+    Safe to call from an API thread; never raises."""
+    free = 0.0
+    inpos = 0.0
+    try:
+        free = float(_get_usdt_balance() or 0.0)
+        inpos = float(_in_position_value_usdt() or 0.0)
+    except Exception:
+        pass
+    new_baseline = round(free + inpos, 2)
+    ok = False
+    try:
+        path = config.STRATEGY_FILE
+        s = {}
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                s = json.load(f)
+        s["initial_balance_usdt"] = new_baseline
+        tmp = f"{path}.rebaseline.tmp"
+        with open(tmp, "w") as f:
+            json.dump(s, f, indent=2)
+        os.replace(tmp, path)
+        ok = True
+    except Exception as _e:
+        try:
+            database.log_activity(
+                f"rebaseline_initial_balance persist failed: {_e}", "warn")
+        except Exception:
+            pass
+    try:
+        database.log_activity(
+            f"initial_balance rebaselined → {new_baseline} USDT "
+            f"(free={round(free, 2)} + in_position={round(inpos, 2)})", "info")
+    except Exception:
+        pass
+    return {"initial_balance_usdt": new_baseline, "free_usdt": round(free, 2),
+            "in_position_usdt": round(inpos, 2), "ok": ok}
+
+
 def _get_actual_balance(symbol: str) -> float:
     """Return free+locked balance for the base asset of symbol, or 0.0 on error."""
     try:
@@ -2403,10 +2632,11 @@ def evaluate_buy_gates(sym: str) -> dict:
     if _corr_guard_state()["blocked"]:
         blockers.append("btc_red_entry_limit")
 
-    if bool(strategy.get("macro_gate_enabled", True)):
-        _btc = get_btc_state()
-        if _btc and _btc.get("regime") == "bearish":
-            blockers.append("btc_bearish_macro_gate")
+    # F2.1: the legacy binary macro gate is gone — surface the 3-state regime
+    # veto directly. Only an actual risk_off classification blocks buys (mirrors
+    # the REGIME_risk_off registry veto); neutral only downsizes, never blocks.
+    if get_btc_regime() == "risk_off":
+        blockers.append("regime_risk_off")
 
     with _signal_cache_lock:
         cached = _signal_cache.get(sym)
@@ -2541,17 +2771,24 @@ _btc_state_cache: dict = {"ts": 0.0, "data": None}
 _BTC_STATE_TTL_SEC = 60.0
 
 
-def compute_btc_regime_from_closes(closes: List[float]) -> Tuple[str, dict]:
+def compute_btc_regime_from_closes(closes: List[float],
+                                   risk_off_pct_4h: float = -1.0) -> Tuple[str, dict]:
     """Pure §3.3 classifier over 1h closes (oldest→newest). Returns
-    (regime, details). Shared shape with backtest._btc_regime_from_closes —
-    keep the thresholds in sync. <55 closes → neutral (EMA50 not meaningful)."""
+    (regime, details). Shared shape with backtest.btc_regime_from_closes —
+    keep the thresholds in sync. <55 closes → neutral (EMA50 not meaningful).
+
+    F2.2: risk_off requires BOTH a lagging-EMA break AND real 4h weakness —
+    `price < ema_50 AND pct_4h < risk_off_pct_4h` (default −1.0). The old
+    `price < ema_50 OR pct_4h < -2.0` flagged risk_off on any green day where
+    BTC merely sat below the sluggish 50-EMA (e.g. +1.9% 24h / −0.09% 4h), which
+    spammed the now-removed legacy macro gate. risk_on is unchanged."""
     if not closes or len(closes) < 55:
         return "neutral", {"error": "insufficient_1h_data", "n": len(closes or [])}
     price   = closes[-1]
     ema_20  = _ema_calc(closes, 20)
     ema_50  = _ema_calc(closes, 50)
     pct_4h  = (closes[-1] - closes[-5]) / closes[-5] * 100 if closes[-5] > 0 else 0.0
-    if price < ema_50 or pct_4h < -2.0:
+    if price < ema_50 and pct_4h < risk_off_pct_4h:
         regime = "risk_off"
     elif price > ema_20 > ema_50 and pct_4h > -0.5:
         regime = "risk_on"
@@ -2565,8 +2802,30 @@ def compute_btc_regime_from_closes(closes: List[float]) -> Tuple[str, dict]:
     }
 
 
+# F2.3: last logged 3-state regime — transition-only logging (no per-eval spam).
+_last_logged_regime: Optional[str] = None
+_last_logged_regime_lock = threading.Lock()
+
+
+def _log_btc_regime_transition(regime3: str, det: dict) -> None:
+    """Log the BTC regime only when it CHANGES state. Idempotent per state."""
+    global _last_logged_regime
+    with _last_logged_regime_lock:
+        prev = _last_logged_regime
+        if regime3 == prev:
+            return
+        _last_logged_regime = regime3
+    try:
+        database.log_activity(
+            f"BTC regime: {prev or 'unknown'} → {regime3} "
+            f"(price={det.get('price')} ema20={det.get('ema_20')} "
+            f"ema50={det.get('ema_50')} 4h={det.get('pct_4h')}%)", "info")
+    except Exception:
+        pass
+
+
 def get_btc_state() -> Optional[dict]:
-    """BTC macro state (legacy dict shape) for the macro gate + UI. 60 s cache.
+    """BTC macro state (legacy dict shape) for the UI. 60 s cache.
     Must run on a buy-check/worker thread (REST fetch).
 
     §3.3: the legacy binary "regime" key now maps from the 3-state classifier
@@ -2586,8 +2845,11 @@ def get_btc_state() -> Optional[dict]:
                if len(closes) >= 25 and closes[-25] > 0
                else ((closes[-1] - closes[0]) / closes[0] * 100 if closes[0] > 0 else 0))
     pct_4h  = (closes[-1] - closes[-5]) / closes[-5] * 100 if closes[-5] > 0 else 0
-    regime3, det = compute_btc_regime_from_closes(closes)
+    regime3, det = compute_btc_regime_from_closes(closes, _regime_risk_off_pct_4h())
     legacy = {"risk_off": "bearish", "risk_on": "bullish"}.get(regime3, "choppy")
+    # F2.3: log BTC regime ONLY on a state change (risk_on↔neutral↔risk_off),
+    # never per-evaluation — the old macro gate spammed a line every ~10s.
+    _log_btc_regime_transition(regime3, det)
     data = {
         "price":   closes[-1],
         "ema_8":   round(ema_8, 2),
@@ -3729,7 +3991,7 @@ def _atr_pct_5m_at_entry(symbol: str, price: float) -> Tuple[Optional[float], st
     return None, "unavailable"
 
 
-def _apply_entry_exit_geometry(pos: dict) -> None:
+def _apply_entry_exit_geometry(pos: dict, log_open: bool = True) -> None:
     """Compute and STORE §2.1/§2.2 exit geometry on the position dict:
 
       atr_pct_at_entry  ATR(14, 5m) / price × 100 (None + atr_source flag when
@@ -3785,6 +4047,26 @@ def _apply_entry_exit_geometry(pos: dict) -> None:
         pos["tp_price"] = tp
         pos["hard_sl_price"] = (entry * (1.0 - cfg["hard_sl_pct"] / 100.0)
                                 if cfg.get("hard_sl_pct") else None)
+        # F1.1 instrumentation — store the full planned geometry on the pos so
+        # the exit path can compute realized_r and the OPEN log records intent.
+        pos["bep"] = bep if bep > 0 else None
+        try:
+            pos["planned_rr"] = ((tp_dist / sl_dist)
+                                 if (sl_dist and tp_dist) else None)
+        except (TypeError, ZeroDivisionError):
+            pos["planned_rr"] = None
+        if log_open:
+            try:
+                database.log_activity(
+                    f"OPEN {sym} entry={entry:.6f} "
+                    f"atr%={pos.get('atr_pct_at_entry')} "
+                    f"sl_dist={pos.get('sl_distance_pct')}% "
+                    f"stop={pos.get('stop_price')} tp={pos.get('tp_price')} "
+                    f"tp_dist={pos.get('tp_distance_pct')}% "
+                    f"bep={pos.get('bep')} planned_rr={pos.get('planned_rr')}",
+                    "info")
+            except Exception:
+                pass
     except Exception as _ge:
         try:
             log_diag_issue("exit_geometry", "warn",
@@ -4895,12 +5177,23 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
             float(duration) if duration > 0 else None)
     except Exception:
         _hold_sec = float(duration) if duration else None
+    # F1.1: realized_r vs planned_rr for this close (activity log + R-stats ring).
+    _record_exit_r(sym, pos.get("entry_price"), fill_price,
+                   pos.get("sl_distance_pct"), pos.get("planned_rr"),
+                   _exit_label_for(reason))
+    # F7: every close MUST carry an explicit exit_label. _exit_label_for never
+    # returns empty, but assert loudly + default to 'unknown' so an unlabeled
+    # exit can never silently reach the DB (6-of-16 unlabeled diagnostic).
+    _exit_lbl = _exit_label_for(reason) or "unknown"
+    if not _exit_label_for(reason):
+        log_diag_issue("unlabeled_exit", "warn",
+                       f"UNLABELED EXIT {sym}: reason={reason!r} — defaulted to 'unknown'")
     try:
         database.log_trade(trade_record,
                            target_crossed_to_trigger_ms=_target_to_trigger_ms,
                            trigger_to_filled_ms=_trigger_to_filled_ms,
                            target_crossed_ts=_target_crossed_iso,
-                           exit_label=_exit_label_for(reason),
+                           exit_label=_exit_lbl,
                            slippage_bps=_slip_bps,
                            entry_fee_usdt=buy_fee,
                            exit_fee_usdt=sell_fee,
@@ -5184,20 +5477,13 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             "info"
         )
 
-    # ── BTC macro gate — checked once per scan, not per symbol ────────────────
-    macro_gate_enabled = bool(strategy.get("macro_gate_enabled", True))
-    if macro_gate_enabled:
-        _btc = get_btc_state()
-        if _btc and _btc.get("regime") == "bearish":
-            database.log_activity(
-                f"MACRO GATE: BTC bearish (24h={_btc['pct_24h']}% 4h={_btc['pct_4h']}%) — all buys paused",
-                "warn"
-            )
-            for _s, _c in cache_snapshot.items():
-                if _s in approved:
-                    _record_rejection(_s, _c.get("score", 0), "btc_bearish_regime",
-                                      f"pct_24h={_btc['pct_24h']} pct_4h={_btc['pct_4h']}")
-            return
+    # ── F2.1: legacy binary BTC macro gate REMOVED ───────────────────────────
+    # The 3-state regime is now the sole macro control: risk_off is enforced by
+    # the REGIME_risk_off veto in signal_registry (per-coin), and neutral halves
+    # size via get_budget_for_coin/_neutral_size_mult. The old scan-level gate
+    # here duplicated the risk_off veto and — on the OR-based classifier — paused
+    # ALL buys on green days, spamming "MACRO GATE: BTC bearish" every ~10s.
+    # Regime transitions are now logged once via _log_btc_regime_transition.
 
     # Read mandatory signal thresholds once (hot-reloadable from strategy.json).
     # Single source of truth for the RSI buy threshold: the nested
@@ -5220,6 +5506,11 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 break
 
         if sym not in approved:
+            continue
+        # F6: skip coins in the post-fail candidacy cooldown (prevents ~7s churn
+        # of a coin the fresh engine re-check just rejected).
+        if _in_candidacy_cooldown(sym):
+            _record_rejection(sym, cached["score"], "candidacy_cooldown")
             continue
         if not signal_engine_active and cached["score"] < min_sigs:
             _record_rejection(sym, cached["score"], "below_min_signals", f"needed {min_sigs}, got {cached['score']}")
@@ -5303,6 +5594,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 # (now removed) score<3 filter.
                 _record_rejection(sym, _dec.get("score", score), _dec["reason"],
                                   f"score={_dec['score']} fired={_dec['fired_signals']}")
+                # F6: write the fresh engine score back + arm the candidacy
+                # cooldown so the fast pre-check stops re-selecting this coin.
+                _note_candidacy_fail(sym, _dec.get("score"), _dec["reason"])
                 continue
             # Passed new engine — fall through to existing veto checks below
         else:
@@ -5598,24 +5892,29 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     _fresh_dec = _sr_evaluate_buy_decision(sym, _fresh_data, strategy)
                     if not _fresh_dec["allowed"]:
                         cache_age = round(time.time() - cached.get("ts", 0), 1)
-                        database.log_activity(
+                        # F6: dedupe the [SKIP] line per (symbol, reason) 15 min.
+                        _log_skip_dedup(
+                            sym, f"fresh_engine:{_fresh_dec['reason']}",
                             f"[SKIP] {sym}: fresh engine re-check FAILED — "
-                            f"{_fresh_dec['reason']} (cache age={cache_age}s)", "warn"
-                        )
+                            f"{_fresh_dec['reason']} (cache age={cache_age}s)", "warn")
                         _record_rejection(sym, _fresh_dec.get("score", score), "stale_signals",
                                           f"fresh_engine={_fresh_dec['reason']} age={cache_age}s")
+                        # F6: write fresh score back + candidacy cooldown so the
+                        # pre-check stops re-selecting this coin every ~7s.
+                        _note_candidacy_fail(sym, _fresh_dec.get("score"), _fresh_dec["reason"])
                         _release_buy_claim()
                         continue
                 else:
                     _fresh_score = sum(_fresh_sigs.values())
                     if _fresh_score < min_sigs:
                         cache_age = round(time.time() - cached.get("ts", 0), 1)
-                        database.log_activity(
+                        _log_skip_dedup(
+                            sym, f"fresh_score_below_{min_sigs}",
                             f"[SKIP] {sym}: fresh re-check FAILED — score {_fresh_score}/6 < {min_sigs} "
-                            f"(cache had {score}/6, age={cache_age}s)", "warn"
-                        )
+                            f"(cache had {score}/6, age={cache_age}s)", "warn")
                         _record_rejection(sym, score, "stale_signals",
                                           f"fresh={_fresh_score} cache={score} age={cache_age}s")
+                        _note_candidacy_fail(sym, _fresh_score, "fresh_score_below_min")
                         _release_buy_claim()
                         continue
                 _live_price = _fresh_closes[-1]
@@ -6017,79 +6316,77 @@ def _evaluate_exit_decision(pos: dict, sym: str, price: float,
         _stop_loss_confirmation.pop(sym, None)
         return None, False
 
-    # ── NEW geometry (§2.1-2.3) — per-position stop/tp stored at entry ───────
+    # ── NEW geometry (§2.1-2.3, F1-decoupled) — per-position stop/tp at entry ─
     stop_price = pos.get("stop_price")
     sl_dist = pos.get("sl_distance_pct")
     # §2.2: BEP floor recomputed at trigger time — gate can never veto.
-    tp_trigger = max(float(pos.get("tp_price") or 0.0), real_target)
+    tp_price = float(pos.get("tp_price") or 0.0)
+    tp_trigger = max(tp_price, real_target)
     k_trail = float(cfg.get("k_trail") or 0.0)
     trailing_on = k_trail > 0
     crossed = price >= tp_trigger
 
-    if crossed and not trailing_on:
-        # Trailing disabled → old immediate-sell-at-target path.
-        _stop_loss_confirmation.pop(sym, None)
-        return "take-profit", True
+    # ── F1 §2.3: BE-move (CAPITAL PROTECTION only) ───────────────────────────
+    # At +breakeven_at_r × R the stop rises to BEP so the position can no longer
+    # lose. This ONLY raises the protective stop; it NEVER arms a trailing exit
+    # below tp_price. That is the F1 fix: a +1R-then-fade now scratches at BEP
+    # (a real breakeven), instead of the old trail firing at ~BEP+min_profit
+    # and being booked as a floor-scale "win" that never reached the RR target.
+    if not pos.get("be_moved"):
+        gain_pct = (price / entry - 1.0) * 100.0
+        be_r = cfg.get("breakeven_at_r")
+        if be_r is not None and sl_dist and gain_pct >= float(sl_dist) * float(be_r):
+            pos["be_moved"] = True
+            pos["be_stop_price"] = max(stop_price or 0.0, real_target)
 
-    if trailing_on:
-        if not pos.get("be_moved"):
-            # §2.3: arm the BE-move at +breakeven_at_r × R unrealized gain —
-            # or on a TP touch (covers rr_ratio < breakeven_at_r configs so a
-            # touched target can never round-trip into a full stop-out).
-            gain_pct = (price / entry - 1.0) * 100.0
-            be_r = cfg.get("breakeven_at_r")
-            armed = (be_r is not None and sl_dist
-                     and gain_pct >= float(sl_dist) * float(be_r)) or crossed
-            if armed:
-                pos["be_moved"] = True
-                # BE-move stop: position can no longer lose.
-                pos["be_stop_price"] = max(stop_price or 0.0, real_target)
-                pos["peak_price"] = max(float(pos.get("peak_price") or 0.0), price)
-        if crossed:
-            # TP-touch ratchet: trail floor rises to tp × (1 − buffer) so a
-            # full round-trip below the printed target can't happen.
-            ratchet = tp_trigger * (1.0 - (cfg.get("tp_buffer_pct") or 0.0) / 100.0)
-            if ratchet > float(pos.get("tp_ratchet_floor") or 0.0):
-                pos["tp_ratchet_floor"] = ratchet
+    # Effective protective stop BELOW tp: original stop, escalated to BEP once
+    # the BE-move armed. There is deliberately NO trailing exit below tp_price.
+    protective_stop = stop_price
+    if pos.get("be_moved"):
+        protective_stop = max(float(pos.get("be_stop_price") or 0.0),
+                              float(stop_price or 0.0))
 
-        if pos.get("be_moved"):
-            pos["peak_price"] = max(float(pos.get("peak_price") or entry), price)
-            peak = pos["peak_price"]
-            # Trail gap = k_trail × ATR% (entry ATR; sl_distance fallback when
-            # ATR was unavailable at entry).
-            atr_ref = (pos.get("atr_pct_at_entry") or sl_dist
-                       or cfg["sl_min_pct"])
-            trail_stop = peak * (1.0 - k_trail * float(atr_ref) / 100.0)
-            eff_stop = max(trail_stop,
-                           float(pos.get("be_stop_price") or 0.0),
-                           float(pos.get("tp_ratchet_floor") or 0.0))
-            # Gate-bypassing backstop: if repeated vetoed trail sells let the
-            # price slide all the way below the ORIGINAL stop, exit as a
-            # normal stop-loss (which bypasses the profit gate).
-            if stop_price and price <= stop_price and not in_min_hold:
-                _stop_loss_confirmation[sym] = _stop_loss_confirmation.get(sym, 0) + 1
-                if _stop_loss_confirmation[sym] >= _sl_confirm_ticks():
-                    _stop_loss_confirmation.pop(sym, None)
-                    return "stop-loss", crossed
-                return None, crossed
-            if price <= eff_stop:
-                # Optional smart-hold score gate (default OFF): only a FRESH
-                # bullish score may defer a trail exit ABOVE the TP target.
-                if (cfg.get("smart_hold_score_gate") and crossed
-                        and _fresh_bullish_score(sym, now)):
-                    return None, crossed
-                # Trail/BE-stop exits are profit-side → 1 confirmation tick.
-                _stop_loss_confirmation.pop(sym, None)
-                return "trail", crossed
+    # ── F1 §2.3: trailing ARMS ONLY at/after price reaches tp_price ──────────
+    # Trailing off → reaching tp is an immediate clean take-profit. Trailing on
+    # → arm the trail (hard-floored at tp_price) and let a runner ride: a fade
+    # back to the tp floor exits 'take-profit' (label 'tp', ≥ the RR target); a
+    # fade from a higher peak exits 'trail' (still ≥ tp_price). A trailing exit
+    # can never fire below tp_price.
+    if crossed:
+        if not trailing_on:
             _stop_loss_confirmation.pop(sym, None)
-            return None, crossed
+            return "take-profit", True
+        pos["trail_armed"] = True
 
-    # Pre-BE-move: plain stop_price exit with confirmation ticks + min-hold.
-    if stop_price and price <= stop_price and not in_min_hold:
+    if pos.get("trail_armed"):
+        peak = pos["peak_price"] = max(float(pos.get("peak_price") or entry), price)
+        # Trail gap = k_trail × ATR% (entry ATR; sl_distance fallback when ATR
+        # was unavailable at entry).
+        atr_ref = (pos.get("atr_pct_at_entry") or sl_dist or cfg["sl_min_pct"])
+        trail_stop = peak * (1.0 - k_trail * float(atr_ref) / 100.0)
+        floor = tp_trigger                       # HARD floor — never give back below TP
+        eff_trail = max(trail_stop, floor)
+        if price <= eff_trail:
+            # Optional smart-hold score gate (default OFF): a FRESH bullish
+            # score may defer an above-TP trail exit.
+            if cfg.get("smart_hold_score_gate") and _fresh_bullish_score(sym, now):
+                return None, True
+            _stop_loss_confirmation.pop(sym, None)
+            # At the tp floor → clean 'take-profit'; above it (peak ran past TP)
+            # → 'trail'. Both land ≥ tp_price.
+            return ("trail" if trail_stop > floor else "take-profit"), True
+        return None, True
+
+    # ── Below tp_price: ONLY the (BE-escalated) protective stop can exit ─────
+    if protective_stop and price <= protective_stop and not in_min_hold:
         _stop_loss_confirmation[sym] = _stop_loss_confirmation.get(sym, 0) + 1
         if _stop_loss_confirmation[sym] >= _sl_confirm_ticks():
             _stop_loss_confirmation.pop(sym, None)
-            return "stop-loss", crossed
+            # BE-move stop hit (faded back to BEP after arming) vs a real loss
+            # at the original stop — distinct labels so R stats separate them.
+            be_hit = (pos.get("be_moved") and stop_price
+                      and price > float(stop_price))
+            return ("breakeven-stop" if be_hit else "stop-loss"), crossed
         return None, crossed
     _stop_loss_confirmation.pop(sym, None)
     return None, crossed
@@ -6752,6 +7049,9 @@ def _place_managed_exit(pos: dict) -> None:
                     f"[ManagedExit] {sym}: OCO placed — tp={_floor_price_tick(tp, sym):.8f} "
                     f"stop={_floor_price_tick(stop, sym):.8f} qty={qty}", "info")
         elif cfg.get("maker_tp"):
+            # F1.4 CONFIRMED: the maker-TP rests at pos['tp_price'] (the ≥1.6R RR
+            # target from _apply_entry_exit_geometry), NOT at a floor/BEP price —
+            # so the managed exit and the local monitor both target the same TP.
             resp = exit_orders.place_maker_tp(sym, qty, _floor_price_tick(tp, sym))
             if isinstance(resp, dict) and resp.get("rejected"):
                 # -2010 'would immediately match and take': price is already
@@ -6838,6 +7138,15 @@ def _finalize_managed_exit(pos: dict, sym: str, exit_price: float, reason: str,
         "intended_sell_price": exit_price,
         "sell_slippage_pct":  0.0,      # limit fill at the resting price
     }
+    # F1.1: realized_r for the managed (exchange-side) close.
+    _record_exit_r(sym, entry_px, exit_price, pos.get("sl_distance_pct"),
+                   pos.get("planned_rr"), exit_label)
+    # F7: managed exits must also carry an explicit label.
+    if not exit_label:
+        log_diag_issue("unlabeled_exit", "warn",
+                       f"UNLABELED EXIT {sym}: managed close reason={reason!r} "
+                       f"— defaulted to 'unknown'")
+        exit_label = "unknown"
     try:
         database.log_trade(trade_record,
                            exit_label=exit_label,

@@ -1398,6 +1398,74 @@ async def _apply_watchlist_diff(new_coins: list):
         _spawn_backfill(added, "watchlist-add")
 
 
+# F5 — coverage reconciliation state. Symbols in the canonical watchlist that
+# still had no active market stream on the PREVIOUS reconcile pass; a symbol
+# uncovered on two consecutive passes is WARN-logged (persistently uncovered).
+_reconcile_uncovered_prev: set = set()
+
+
+async def _reconcile_coverage() -> None:
+    """§F5 — every ~60 s, reconcile actually-subscribed symbols against the
+    canonical watchlist (_load_persisted_watchlist) and auto-subscribe any
+    that are missing (a silent SUBSCRIBE-frame drop or lost stream leaves a
+    watchlist symbol uncovered even though _current_coins claims it). Symbols
+    that stay uncovered across consecutive passes are WARN-logged by name."""
+    global _reconcile_uncovered_prev
+    try:
+        watchlist = await asyncio.to_thread(_load_persisted_watchlist)
+    except Exception:
+        watchlist = list(_current_coins)
+    covered = {s for c in _connections for s in c.symbols()}
+    uncovered = [s for s in watchlist if s not in covered]
+    if not uncovered:
+        _reconcile_uncovered_prev = set()
+        return
+    # Auto-subscribe the uncovered symbols via the same add path the live
+    # watchlist diff uses (verify first so delisted symbols are skipped).
+    try:
+        active = await _verify_symbols(uncovered)
+    except Exception:
+        active = []
+    for sym in active:
+        try:
+            streams = _market_streams_for([sym])
+            target = None
+            for conn in _connections:
+                if len(conn.streams) + len(streams) <= _MAX_STREAMS_PER_CONN:
+                    target = conn
+                    break
+            if target is None:
+                conn = _WSConnection(next(_conn_seq), streams)
+                _connections.append(conn)
+                conn.start()
+            else:
+                await target.add_streams(streams)
+            if sym not in _current_coins:
+                _current_coins.append(sym)
+        except Exception as e:
+            print(f"[DataCollector] Coverage re-subscribe failed for {sym}: {e}")
+    if active:
+        _ws_health["resubscribe_count"] = _ws_health.get("resubscribe_count", 0) + 1
+        _spawn_backfill(list(active), "coverage-reconcile")
+        print(f"[DataCollector] Coverage reconcile: re-subscribed "
+              f"{len(active)}/{len(uncovered)} uncovered watchlist symbol(s)")
+    # WARN on symbols that were uncovered on the PREVIOUS pass too — a transient
+    # gap self-heals in one pass; a persistent one needs a human/diag flag.
+    still = sorted(s for s in uncovered if s in _reconcile_uncovered_prev)
+    if still:
+        print(f"[DataCollector] WARN: {len(still)} watchlist symbol(s) remain "
+              f"uncovered after reconcile: {', '.join(still)}")
+        try:
+            import trade_engine as _te_rc
+            _te_rc.log_diag_issue(
+                "data", "warn",
+                f"{len(still)} watchlist symbol(s) uncovered by market streams",
+                detail=", ".join(still))
+        except Exception:
+            pass
+    _reconcile_uncovered_prev = set(uncovered)
+
+
 def _held_symbols() -> list:
     """Symbols with open positions (guarded trade_engine access)."""
     try:
@@ -1548,6 +1616,7 @@ async def _start_websocket_loop():
     last_watch_poll   = time.time()
     last_held_check   = time.time()
     last_rotate_check = time.time()
+    last_reconcile    = time.time()
     last_subs_apply   = 0.0
     watch_change_pending = False
 
@@ -1599,6 +1668,16 @@ async def _start_websocket_loop():
             except Exception as e:
                 print(f"[DataCollector] Rotation error: {e}")
 
+        # ── F5 — coverage reconciliation (watchlist vs actually-subscribed),
+        # once a minute; auto-subscribes any uncovered symbols and WARNs on
+        # ones that stay uncovered.
+        if now - last_reconcile >= 60.0:
+            last_reconcile = now
+            try:
+                await _reconcile_coverage()
+            except Exception as e:
+                print(f"[DataCollector] Coverage reconcile error: {e}")
+
 
 # ── Health / freshness exports (§6.3, §6.5) ──────────────────────────────────
 
@@ -1636,6 +1715,17 @@ def get_data_health() -> dict:
         })
 
     subscribed = sorted({s for c in _connections for s in c.symbols()})
+    # F5 — coverage vs the canonical watchlist. "subscribed_coins" previously
+    # conflated distinct-symbols with stream count; expose them separately so
+    # health can tell "69 in universe / 61 covered / 138 streams" truthfully.
+    try:
+        _universe = _load_persisted_watchlist()
+    except Exception:
+        _universe = list(_current_coins)
+    _universe_set = set(_universe)
+    _covered = set(subscribed)
+    _uncovered = sorted(_universe_set - _covered)
+    _total_streams = sum(len(c.streams) for c in _connections)
     ages = []
     for sym in subscribed:
         buf = ws_candles.get(sym)
@@ -1670,6 +1760,12 @@ def get_data_health() -> dict:
         "reconnect_attempts_5min":    recon_5m,
         "resubscribe_count":          _ws_health.get("resubscribe_count", 0),
         "subscribed_coins":           len(subscribed),
+        # F5 — distinct-symbol coverage vs universe, and raw stream count.
+        "symbols_covered":            len(_covered),
+        "expected_symbols":           len(_universe_set),
+        "streams":                    _total_streams,
+        "uncovered_symbols":          _uncovered[:50],
+        "uncovered_count":            len(_uncovered),
     }
 
 

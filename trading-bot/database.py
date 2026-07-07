@@ -723,6 +723,17 @@ def log_trade(trade: dict, *,
         hold_time_sec = trade.get("hold_time_sec")
     if origin is None:
         origin = trade.get("origin")
+    # F7: no exit may be written silently unlabeled. A SELL/close with no label
+    # is a bug in the calling path — default to 'unknown' so it is at least
+    # visible in analytics, and log loudly so the leaking path can be found.
+    if not exit_label and str(trade.get("side", "")).upper() != "BUY":
+        exit_label = "unknown"
+        try:
+            _sym = trade.get("coin") or trade.get("symbol") or "?"
+            log_activity(f"UNLABELED EXIT {_sym} reason={trade.get('sell_reason')} "
+                         f"— labeled 'unknown' (F7 guard)", "warn")
+        except Exception:
+            pass
     with _lock:
         conn = _conn()
         conn.execute("""
