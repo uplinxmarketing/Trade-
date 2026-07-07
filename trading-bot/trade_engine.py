@@ -40,6 +40,14 @@ import connection
 from connection import get_mode
 import binance_direct
 
+# Phase 2 §2.4/§2.5 — exchange-side exit-order managers (maker TP / OCO).
+# Guarded import: the engine must keep trading on pure local monitoring if
+# the module is missing or fails to import.
+try:
+    import exit_orders
+except Exception:  # pragma: no cover
+    exit_orders = None
+
 try:
     import thread_health as _thread_health
 except Exception:
@@ -402,6 +410,140 @@ _ABORT_LOG_THROTTLE_SEC = 60.0
 # Minimum hold time after a buy — prevents race-condition sells within seconds of entry
 _MIN_HOLD_SEC = 10.0
 
+# ── Phase 2 §2.6 — exits config ───────────────────────────────────────────────
+# The CANONICAL exit-config resolver (defaults + legacy-key mapping) lives in
+# backtest.exit_config so live engine and replay always resolve identical
+# geometry from identical strategy dicts. A byte-identical local fallback keeps
+# the live engine independent of backtest.py importability (backtest pulls in
+# signal_registry, which this module already treats as optional).
+#
+# LEGACY MAPPING (documented in backtest.exit_config; summary):
+#   no "exits" block + legacy keys present →
+#     stop_loss_pct   → sl_min_pct == sl_max_pct (fixed distance, k_sl=0)
+#     stop_loss_enabled → sl_enabled
+#     take_profit_pct → rr_ratio=None + tp_pct (tp = max(entry×(1+tp%), BEP))
+#     take_profit_enabled → tp_enabled
+#     smart_hold_enabled  → smart_hold_score_gate
+#     trailing_stop_pct   → legacy_trailing_stop_pct
+#     hard_sl / BE-move / ATR-trail disabled (old behavior preserved).
+_exit_cfg_cache: dict = {}
+_exit_cfg_cache_mtime: float = -1.0
+_exit_cfg_impl = None  # resolved lazily: backtest.exit_config or local fallback
+
+
+def _exit_config_fallback(strategy: dict) -> dict:
+    """Identical fallback copy of backtest.exit_config — keep in sync."""
+    defaults = {
+        "k_sl": 1.2, "sl_min_pct": 0.5, "sl_max_pct": 2.5, "hard_sl_pct": 3.0,
+        "rr_ratio": 1.6, "tp_buffer_pct": 0.05, "min_profit_usdt": 0.01,
+        "breakeven_at_r": 1.0, "k_trail": 0.8, "smart_hold_score_gate": False,
+        "sl_confirm_ticks": 2, "min_hold_sec": 10.0,
+        "maker_tp": True, "maker_tp_timeout_ms": 1500,
+        "oco_enabled": False, "oco_stop_limit_buffer_pct": 0.5,
+        "oco_skip_rescue_sec": 3.0,
+    }
+    legacy_keys = ("stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
+                   "stop_loss_enabled", "take_profit_enabled",
+                   "smart_hold_enabled")
+    strategy = strategy if isinstance(strategy, dict) else {}
+    exits_raw = strategy.get("exits")
+    has_exits = isinstance(exits_raw, dict)
+    exits = exits_raw if has_exits else {}
+    cfg: dict = {}
+    for key, default in defaults.items():
+        val = exits.get(key, default)
+        try:
+            if isinstance(default, bool):
+                cfg[key] = bool(val)
+            elif isinstance(default, int) and not isinstance(default, bool):
+                cfg[key] = int(val)
+            else:
+                cfg[key] = float(val)
+        except (TypeError, ValueError):
+            cfg[key] = default
+    cfg["legacy_mode"] = False
+    cfg["sl_enabled"] = True
+    cfg["tp_enabled"] = True
+    cfg["tp_pct"] = None
+    cfg["legacy_trailing_stop_pct"] = None
+    if not has_exits and any(k in strategy for k in legacy_keys):
+        try:
+            sl_pct = float(strategy.get("stop_loss_pct", 0.4))
+        except (TypeError, ValueError):
+            sl_pct = 0.4
+        try:
+            tp_pct = float(strategy.get("take_profit_pct", 0.1))
+        except (TypeError, ValueError):
+            tp_pct = 0.1
+        try:
+            trail_pct = float(strategy.get("trailing_stop_pct", 0.5))
+        except (TypeError, ValueError):
+            trail_pct = 0.5
+        cfg["legacy_mode"] = True
+        cfg["sl_enabled"] = bool(strategy.get("stop_loss_enabled", True))
+        cfg["sl_min_pct"] = sl_pct
+        cfg["sl_max_pct"] = sl_pct
+        cfg["k_sl"] = 0.0
+        cfg["hard_sl_pct"] = None
+        cfg["rr_ratio"] = None
+        cfg["tp_enabled"] = bool(strategy.get("take_profit_enabled", True))
+        cfg["tp_pct"] = tp_pct
+        cfg["tp_buffer_pct"] = 0.0
+        cfg["breakeven_at_r"] = None
+        cfg["k_trail"] = 0.0
+        cfg["smart_hold_score_gate"] = bool(strategy.get("smart_hold_enabled", False))
+        cfg["legacy_trailing_stop_pct"] = trail_pct
+    return cfg
+
+
+def _exit_cfg() -> dict:
+    """Effective exits config (§2.6) from strategy.json — hot-reloadable.
+
+    Cached on the strategy file mtime (via _load_strategy), so edits apply on
+    the next tick without a restart. Returns the dict documented in
+    backtest.exit_config (k_sl, sl_min_pct, sl_max_pct, hard_sl_pct, rr_ratio,
+    tp_buffer_pct, min_profit_usdt, breakeven_at_r, k_trail,
+    smart_hold_score_gate, sl_confirm_ticks, min_hold_sec, maker_tp,
+    maker_tp_timeout_ms, oco_enabled, oco_stop_limit_buffer_pct,
+    oco_skip_rescue_sec + derived legacy_mode/sl_enabled/tp_enabled/tp_pct/
+    legacy_trailing_stop_pct)."""
+    global _exit_cfg_cache, _exit_cfg_cache_mtime, _exit_cfg_impl
+    strategy = _load_strategy()
+    if _exit_cfg_cache and _exit_cfg_cache_mtime == _strategy_mtime:
+        return _exit_cfg_cache
+    if _exit_cfg_impl is None:
+        try:
+            from backtest import exit_config as _exit_cfg_impl_fn
+            _exit_cfg_impl = _exit_cfg_impl_fn
+        except Exception:
+            _exit_cfg_impl = _exit_config_fallback
+    try:
+        cfg = _exit_cfg_impl(strategy)
+    except Exception:
+        cfg = _exit_config_fallback(strategy)
+    _exit_cfg_cache = cfg
+    _exit_cfg_cache_mtime = _strategy_mtime
+    return cfg
+
+
+def _sl_confirm_ticks() -> int:
+    """Stop-loss confirmation ticks — exits.sl_confirm_ticks (default: the
+    legacy module constant _STOP_LOSS_CONFIRMATION_TICKS)."""
+    try:
+        return max(1, int(_exit_cfg().get("sl_confirm_ticks",
+                                          _STOP_LOSS_CONFIRMATION_TICKS)))
+    except Exception:
+        return _STOP_LOSS_CONFIRMATION_TICKS
+
+
+def _min_hold_sec() -> float:
+    """Minimum hold before a stop-loss may fire — exits.min_hold_sec (default:
+    the legacy module constant _MIN_HOLD_SEC)."""
+    try:
+        return max(0.0, float(_exit_cfg().get("min_hold_sec", _MIN_HOLD_SEC)))
+    except Exception:
+        return _MIN_HOLD_SEC
+
 # Per-symbol throttle for SELL_TRACE diagnostic log (1 per 60s per symbol)
 _sell_trace_log_ts: Dict[str, float] = {}
 
@@ -533,7 +675,12 @@ def _snapshot_near_miss(symbol: str, reason: str, detail: str, score) -> None:
 # label — it was an invisible loss channel when lumped in with force sells.
 _EXIT_LABEL_MAP = {
     "take-profit":     "tp",
+    "maker-tp":        "tp",
+    "oco-tp":          "tp",
+    "oco-sl":          "sl",
     "stop-loss":       "sl",
+    "hard-stop-loss":  "hard_sl",
+    "trail":           "trail",
     "smart-hold-trail": "trail",
     "auto-recycle":    "recycler",
     "force-sell":      "force",
@@ -1460,6 +1607,18 @@ def load_positions_from_db():
     _rebuild_pos_index()
     print(f"[TradeEngine] Loaded {len(_positions)} open position(s) from DB.")
 
+    # Phase 2 §2.1: the positions table has fixed columns, so exit geometry
+    # (atr_pct_at_entry / sl_distance_pct / stop_price / tp_price /
+    # hard_sl_price) does not survive a restart — recompute it for every
+    # restored position that is missing it. Uses the current 5m/1m data
+    # sources; when none are warm yet the conservative sl_min_pct stop applies.
+    for _pos_geo in _positions:
+        try:
+            if not _pos_geo.get("tp_price"):
+                _apply_entry_exit_geometry(_pos_geo)
+        except Exception:
+            pass  # geometry restore must never break startup
+
     # Push current state to Supabase immediately so the next redeploy can restore it.
     # This runs even when SQLite had data (not just after a restore) so Supabase
     # always has an up-to-date snapshot regardless of how the data got into SQLite.
@@ -1564,6 +1723,7 @@ def load_positions_from_db():
                         "timestamp":    now_ts,
                         "mode":         "live",
                     }
+                    _apply_entry_exit_geometry(pos_record)  # Phase 2 §2.1
                     pos_id = database.save_position(pos_record)
                     pos_record["id"] = pos_id
                     with _positions_lock:
@@ -2124,6 +2284,46 @@ def _floor_qty(qty: float, symbol: str = "", decimals: int = 8) -> float:
     return math.floor(qty * factor) / factor
 
 
+# ── PRICE_FILTER tick size (Phase 2 §2.4/§2.5 exit-order pricing) ────────────
+# exchange_info.get_symbol_filters only caches LOT_SIZE/NOTIONAL (step_size,
+# min_qty, min_notional) — it does NOT expose PRICE_FILTER. Tick size is
+# therefore fetched from the client's get_symbol_info (same source and cache
+# pattern as _floor_qty's LOT_SIZE lookup). Fallback: 8-decimal rounding —
+# Binance price precision never exceeds 8 dp, so an un-tick-rounded price at
+# 8 dp only risks a -1013 PRICE_FILTER reject, which the placement callers
+# already treat as "fall back to local monitoring".
+_tick_size_cache: Dict[str, float] = {}
+
+
+def _tick_size(symbol: str) -> Optional[float]:
+    """PRICE_FILTER tickSize for symbol (cached), or None when unavailable."""
+    if not symbol:
+        return None
+    tick = _tick_size_cache.get(symbol)
+    if tick is None:
+        try:
+            info = _client().get_symbol_info(symbol)
+            for f in (info or {}).get("filters", []):
+                if f.get("filterType") == "PRICE_FILTER":
+                    tick = float(f["tickSize"])
+                    break
+        except Exception:
+            tick = 0.0
+        # Cache only successful lookups (mirror _floor_qty): transient failures
+        # must retry on the next call instead of pinning a bad value.
+        if tick and tick > 0:
+            _tick_size_cache[symbol] = tick
+    return tick if tick and tick > 0 else None
+
+
+def _floor_price_tick(price: float, symbol: str) -> float:
+    """Floor a price to the symbol's tick size (8-dp floor when tick unknown)."""
+    tick = _tick_size(symbol)
+    if tick:
+        return math.floor(price / tick + 1e-9) * tick
+    return math.floor(price * 1e8) / 1e8
+
+
 # ── Indicator helpers (derive from candle dict) ─────────────────────────────
 
 def _derive_ma_pos(price: float, ma20: Optional[float]) -> Optional[str]:
@@ -2259,6 +2459,135 @@ def _ws_buffer_candles(symbol: str, min_candles: int = 16) -> list:
         return []
     out = [c for c in (_row_to_candle(r) for r in buf) if c is not None]
     return out if len(out) >= min_candles else []
+
+
+# ── Phase 2 §2.1 — ATR-based stop geometry at entry ──────────────────────────
+
+def _atr_pct_5m_at_entry(symbol: str, price: float) -> Tuple[Optional[float], str]:
+    """ATR(14) on 5m candles as a % of `price` (§2.1). Source ladder:
+
+      1. data_collector.ws_candles_5m (>= 15 candles)         → "ws_5m"
+      2. WS 1m buffer aggregated to 5m (aggregate_candles)    → "ws_1m_agg"
+      3. DB 1m candles aggregated to 5m                       → "db_1m_agg"
+      4. 1m ATR × sqrt(5) approximation (WS buffer, flagged)  → "1m_sqrt5_approx"
+
+    Returns (atr_pct or None, source). None → caller uses sl_min_pct and flags
+    the position "atr_unavailable" (conservative tight stop)."""
+    if price <= 0:
+        return None, "unavailable"
+    # 1) live 5m WS buffer
+    try:
+        import data_collector as _dc_atr
+        buf5 = list((getattr(_dc_atr, "ws_candles_5m", None) or {}).get(symbol) or [])
+        c5 = [c for c in (_row_to_candle(r) for r in buf5) if c is not None]
+        if len(c5) >= 15:
+            atr = indicators.calc_atr(c5, 14)
+            if atr:
+                return atr / price * 100.0, "ws_5m"
+    except Exception:
+        pass
+    # 2) 1m WS buffer aggregated → 5m
+    try:
+        one_m = _ws_buffer_candles(symbol, min_candles=75)
+        if one_m:
+            c5 = indicators.aggregate_candles(one_m, group=5)
+            if len(c5) >= 15:
+                atr = indicators.calc_atr(c5, 14)
+                if atr:
+                    return atr / price * 100.0, "ws_1m_agg"
+    except Exception:
+        pass
+    # 3) DB 1m candles aggregated → 5m (covers cold restart)
+    try:
+        rows = database.get_candles(symbol, config.CANDLE_TIMEFRAME, limit=120)
+        c1 = [c for c in (_row_to_candle(r) for r in (rows or [])) if c is not None]
+        if c1:
+            c5 = indicators.aggregate_candles(c1, group=5)
+            if len(c5) >= 15:
+                atr = indicators.calc_atr(c5, 14)
+                if atr:
+                    return atr / price * 100.0, "db_1m_agg"
+            # 4) final fallback — 1m ATR scaled by sqrt(5), flagged
+            if len(c1) >= 15:
+                atr1 = indicators.calc_atr(c1, 14)
+                if atr1:
+                    return atr1 * math.sqrt(5.0) / price * 100.0, "1m_sqrt5_approx"
+    except Exception:
+        pass
+    # 4b) sqrt(5) approximation from the WS 1m buffer
+    try:
+        one_m = _ws_buffer_candles(symbol, min_candles=16)
+        if one_m:
+            atr1 = indicators.calc_atr(one_m, 14)
+            if atr1:
+                return atr1 * math.sqrt(5.0) / price * 100.0, "1m_sqrt5_approx"
+    except Exception:
+        pass
+    return None, "unavailable"
+
+
+def _apply_entry_exit_geometry(pos: dict) -> None:
+    """Compute and STORE §2.1/§2.2 exit geometry on the position dict:
+
+      atr_pct_at_entry  ATR(14, 5m) / price × 100 (None + atr_source flag when
+                        no source could produce it)
+      sl_distance_pct   clamp(k_sl × atr_pct, sl_min_pct, sl_max_pct)
+                        (ATR unavailable → sl_min_pct, atr_unavailable=True;
+                         legacy mapping → fixed stop_loss_pct, None when the
+                         legacy stop is disabled)
+      stop_price        entry × (1 − sl_distance_pct/100)
+      tp_distance_pct   rr_ratio × sl_distance_pct (legacy: fixed tp_pct)
+      tp_price          max(entry × (1 + tp_dist/100), BEP × (1 + tp_buffer/100))
+      hard_sl_price     entry × (1 − hard_sl_pct/100) (None in legacy mapping)
+
+    The positions table is a fixed-column INSERT (database.save_position
+    ignores unknown keys), so these live in-memory only —
+    load_positions_from_db recomputes them for restored positions.
+
+    PARITY: same formulas as backtest.exit_levels — identical strategy dicts
+    must produce identical geometry live and in replay."""
+    try:
+        cfg = _exit_cfg()
+        sym = pos.get("symbol", "")
+        entry = float(pos.get("entry_price") or 0)
+        if entry <= 0:
+            return
+        atr_pct, atr_src = _atr_pct_5m_at_entry(sym, entry)
+        pos["atr_pct_at_entry"] = round(atr_pct, 6) if atr_pct else None
+        pos["atr_source"] = atr_src
+        pos["atr_unavailable"] = atr_pct is None
+
+        if cfg["legacy_mode"]:
+            sl_dist = cfg["sl_min_pct"] if cfg["sl_enabled"] else None
+        elif atr_pct is None:
+            sl_dist = cfg["sl_min_pct"]   # conservative tight stop, flagged above
+        else:
+            sl_dist = min(max(cfg["k_sl"] * atr_pct, cfg["sl_min_pct"]),
+                          cfg["sl_max_pct"])
+
+        pos["sl_distance_pct"] = round(sl_dist, 6) if sl_dist is not None else None
+        pos["stop_price"] = (entry * (1.0 - sl_dist / 100.0)) if sl_dist else None
+
+        # BEP floor at entry — recomputed AGAIN at trigger time (§2.2) so the
+        # profit gate can never veto a trigger.
+        bep = compute_real_breakeven_price(pos)
+        if cfg["rr_ratio"]:
+            tp_dist = cfg["rr_ratio"] * (sl_dist if sl_dist else cfg["sl_min_pct"])
+        else:  # legacy fixed-TP path
+            tp_dist = (cfg["tp_pct"] or 0.0) if cfg["tp_enabled"] else 0.0
+        pos["tp_distance_pct"] = round(tp_dist, 6)
+        tp = entry * (1.0 + tp_dist / 100.0)
+        if bep > 0:
+            tp = max(tp, bep * (1.0 + (cfg["tp_buffer_pct"] or 0.0) / 100.0))
+        pos["tp_price"] = tp
+        pos["hard_sl_price"] = (entry * (1.0 - cfg["hard_sl_pct"] / 100.0)
+                                if cfg.get("hard_sl_pct") else None)
+    except Exception as _ge:
+        try:
+            log_diag_issue("exit_geometry", "warn",
+                           f"{pos.get('symbol')}: entry exit-geometry failed: {_ge}")
+        except Exception:
+            pass
 
 
 def _five_m_state(symbol: str, prev: dict) -> tuple:
@@ -2658,6 +2987,19 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     # capture it BEFORE any fresh-quote reassignment; slippage_bps baseline.
     _trigger_price = price
 
+    # ── Phase 2 §2.4/§2.5 NO-DOUBLE-SELL contract ─────────────────────────────
+    # A managed exchange-side exit (maker TP / OCO) for this symbol MUST be
+    # cancelled BEFORE any local market sell — otherwise the resting order can
+    # fill while our market sell is in flight and the coins get sold twice.
+    # Runs inside the _selling critical section (guard held by the caller).
+    if exit_orders is not None and mode == "live":
+        if not _clear_managed_exit_before_sell(pos, sym, reason):
+            # Either the exchange order turned out FILLED (position finalized
+            # from that fill — nothing left to sell) or the cancel failed and
+            # selling now would risk a double sell. Abort this attempt; the
+            # caller's finally releases the _selling claim.
+            return
+
     # Ensure PaperClient price is current before the sell
     try:
         _client().update_price(sym, price)
@@ -2690,7 +3032,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     # Stop-loss and force-sell bypass this check (they're meant to fire even at a loss).
     # auto-recycle bypasses too: the recycler explicitly frees capital from positions
     # >3% underwater — the profit gate would veto every one of its sells otherwise.
-    if reason not in ("stop-loss", "force-sell", "manual", "user-initiated", "auto-recycle"):
+    if reason not in ("stop-loss", "hard-stop-loss", "force-sell", "manual", "user-initiated", "auto-recycle"):
         # force_fresh=True: _profitable_sell_check fetches a fresh REST price for this
         # symbol RIGHT NOW before evaluating. This prevents a stale price from passing
         # the check while the actual Binance fill comes back at a lower level.
@@ -2730,6 +3072,13 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         _log_order_result("SELL", sym, qty, price, result)
         pos["_sell_binance_done_ts"] = time.time()
         _ghost_check_fails.pop(sym, None)  # reset -2010 backoff on success
+        # Local sell completed — drop any managed-exit tracking (defensive: the
+        # pre-sell cancel above normally already forgot it).
+        if exit_orders is not None:
+            try:
+                exit_orders.forget(sym)
+            except Exception:
+                pass
     except Exception as e:
         pos["_sell_binance_done_ts"] = time.time()
         err_str = str(e)
@@ -2853,6 +3202,11 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
                             pass
                     database.log_activity(f"{sym}: position removed from records", "warn")
             _rebuild_pos_index()
+            if exit_orders is not None:
+                try:
+                    exit_orders.forget(sym)
+                except Exception:
+                    pass
         return
 
     # ── Fee-aware fill parsing ───────────────────────────────────────────────────
@@ -3805,6 +4159,17 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 "engine_enabled":  bool(strategy.get("signal_engine", {}).get("enabled", False)),
             }),
         }
+        # Phase 2 §2.1/§2.2 — ATR stop / TP / hard-SL geometry, stored on the
+        # position dict (in-memory; the positions table is fixed-column and
+        # save_position ignores unknown keys — load_positions_from_db
+        # recomputes geometry for restored positions).
+        _apply_entry_exit_geometry(pos_record)
+        if pos_record.get("atr_unavailable"):
+            database.log_activity(
+                f"{sym}: ATR unavailable at entry — stop set to sl_min_pct "
+                f"({pos_record.get('sl_distance_pct')}%) as a conservative tight stop",
+                "warn"
+            )
         # Update stagger tracking
         _last_buy_ts = time.time()
         _buys_this_scan += 1
@@ -3814,6 +4179,17 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         with _positions_lock:
             _positions.append(pos_record)
         _rebuild_pos_index()
+
+        # ── Phase 2 §2.4/§2.5: exchange-side exit order (LIVE only) ───────────
+        # Placed AFTER the position is fully created and geometry applied.
+        # Any failure/rejection falls back to full local monitoring — it can
+        # never block the position. Paper mode / paper fallback: no-op.
+        try:
+            _place_managed_exit(pos_record)
+            start_managed_exit_poller()
+        except Exception as _mex:
+            log_diag_issue("managed_exit", "warn",
+                           f"{sym}: managed-exit placement hook failed: {_mex}")
 
         # ── Phase 1 §1.3: entry snapshot for the EXECUTED auto buy ────────────
         # Wrapped so a snapshot failure can never break the buy path.
@@ -3910,6 +4286,171 @@ def _inline_refresh_from_ticks(sym: str, price: float):
     update_coin_signals(sym, closes, vols)
 
 
+# ── Phase 2 §2.1-2.3 — shared exit decision (A1 parity) ──────────────────────
+# ONE evaluator used by BOTH realtime_monitor and _sell_monitor_loop so the
+# two monitors can never disagree on trigger geometry.
+
+def _fresh_bullish_score(sym: str, now: float) -> bool:
+    """True when the signal cache holds a FRESH (<=120s) score >= 3 for sym.
+    A stale score must never hold a profitable position (ported from the
+    original smart-hold gate)."""
+    with _signal_cache_lock:
+        _sc = _signal_cache.get(sym, {})
+        score = _sc.get("score", 0)
+        score_ts = _sc.get("ts", 0)
+    return score >= 3 and (now - score_ts) <= 120
+
+
+def _evaluate_exit_decision(pos: dict, sym: str, price: float,
+                            now: float) -> Tuple[Optional[str], bool]:
+    """Decide whether `pos` should be sold at `price`. Returns
+    (sell_reason_or_None, target_crossed).
+
+    Mutates shared decision state exactly like the old inline monitor code:
+    _stop_loss_confirmation counters, _pos_peaks (legacy smart-hold), and the
+    per-position BE-move/trail fields (be_moved, be_stop_price, peak_price,
+    tp_ratchet_floor).
+
+    Exit ladder (§2.1-2.3):
+      hard-stop-loss  price <= hard_sl_price — bypasses confirmation ticks,
+                      min-hold AND the profit gate (crash stop)
+      stop-loss       price <= stop_price — sl_confirm_ticks + min-hold apply
+      trail           post-BE-move trail/floor crossed — 1 tick, profit-side
+      take-profit     price >= TP trigger while trailing is disabled
+    TP trigger = max(pos['tp_price'], compute_real_breakeven_price(pos)) — the
+    BEP floor is recomputed at trigger time (fees can change) so the profit
+    gate (_profitable_sell_check) can never veto a trigger (A1 parity).
+
+    Legacy path (no exits block / positions without stored geometry): the
+    original global-mult logic verbatim — stop from _stop_loss_mult, target
+    from _user_tp_mult, optional smart-hold trailing with the score gate."""
+    cfg = _exit_cfg()
+    entry = pos["entry_price"]
+    opened_ts = pos.get("opened_at_ts", 0)
+    # Minimum hold applies to STOP-LOSS only (prevents race-condition flips
+    # right after the buy). Take-profit/trail are never delayed; hard SL
+    # bypasses everything.
+    in_min_hold = opened_ts > 0 and (now - opened_ts) < _min_hold_sec()
+
+    # ── HARD SL (§2.1) — immediate, bypasses ticks + min-hold ────────────────
+    hard_sl = pos.get("hard_sl_price")
+    if hard_sl and price <= hard_sl:
+        _stop_loss_confirmation.pop(sym, None)
+        return "hard-stop-loss", False
+
+    # Real breakeven trigger — SAME call as the profit gate (A1 parity).
+    real_target = compute_real_breakeven_price(pos)
+    if real_target <= 0:
+        _bep_m = pos.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
+        real_target = entry * _bep_m  # fallback for incomplete positions
+
+    use_new = (not cfg["legacy_mode"]) and pos.get("tp_price")
+    if not use_new:
+        # ── LEGACY global-mult path (pre-Phase-2 behavior, verbatim) ─────────
+        stop = entry * _stop_loss_mult
+        if _take_profit_enabled:
+            target = max(real_target, entry * _user_tp_mult)
+        else:
+            target = real_target
+        if price >= target:
+            if _smart_hold_enabled and target > real_target:
+                _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
+                peak = _pos_peaks[sym]
+                # Trail hard-floored at the exit target (never give back below it)
+                trail_stop = max(peak * (1.0 - _trailing_stop_pct / 100.0), target)
+                if price <= trail_stop:
+                    return "smart-hold-trail", True
+                if not _fresh_bullish_score(sym, now):
+                    return "take-profit", True
+                return None, True   # fresh bullish score defers the sell
+            return "take-profit", True
+        if _stop_loss_mult < 1.0 and price <= stop and not in_min_hold:
+            _stop_loss_confirmation[sym] = _stop_loss_confirmation.get(sym, 0) + 1
+            if _stop_loss_confirmation[sym] >= _sl_confirm_ticks():
+                _stop_loss_confirmation.pop(sym, None)
+                return "stop-loss", False
+            return None, False
+        _stop_loss_confirmation.pop(sym, None)
+        return None, False
+
+    # ── NEW geometry (§2.1-2.3) — per-position stop/tp stored at entry ───────
+    stop_price = pos.get("stop_price")
+    sl_dist = pos.get("sl_distance_pct")
+    # §2.2: BEP floor recomputed at trigger time — gate can never veto.
+    tp_trigger = max(float(pos.get("tp_price") or 0.0), real_target)
+    k_trail = float(cfg.get("k_trail") or 0.0)
+    trailing_on = k_trail > 0
+    crossed = price >= tp_trigger
+
+    if crossed and not trailing_on:
+        # Trailing disabled → old immediate-sell-at-target path.
+        _stop_loss_confirmation.pop(sym, None)
+        return "take-profit", True
+
+    if trailing_on:
+        if not pos.get("be_moved"):
+            # §2.3: arm the BE-move at +breakeven_at_r × R unrealized gain —
+            # or on a TP touch (covers rr_ratio < breakeven_at_r configs so a
+            # touched target can never round-trip into a full stop-out).
+            gain_pct = (price / entry - 1.0) * 100.0
+            be_r = cfg.get("breakeven_at_r")
+            armed = (be_r is not None and sl_dist
+                     and gain_pct >= float(sl_dist) * float(be_r)) or crossed
+            if armed:
+                pos["be_moved"] = True
+                # BE-move stop: position can no longer lose.
+                pos["be_stop_price"] = max(stop_price or 0.0, real_target)
+                pos["peak_price"] = max(float(pos.get("peak_price") or 0.0), price)
+        if crossed:
+            # TP-touch ratchet: trail floor rises to tp × (1 − buffer) so a
+            # full round-trip below the printed target can't happen.
+            ratchet = tp_trigger * (1.0 - (cfg.get("tp_buffer_pct") or 0.0) / 100.0)
+            if ratchet > float(pos.get("tp_ratchet_floor") or 0.0):
+                pos["tp_ratchet_floor"] = ratchet
+
+        if pos.get("be_moved"):
+            pos["peak_price"] = max(float(pos.get("peak_price") or entry), price)
+            peak = pos["peak_price"]
+            # Trail gap = k_trail × ATR% (entry ATR; sl_distance fallback when
+            # ATR was unavailable at entry).
+            atr_ref = (pos.get("atr_pct_at_entry") or sl_dist
+                       or cfg["sl_min_pct"])
+            trail_stop = peak * (1.0 - k_trail * float(atr_ref) / 100.0)
+            eff_stop = max(trail_stop,
+                           float(pos.get("be_stop_price") or 0.0),
+                           float(pos.get("tp_ratchet_floor") or 0.0))
+            # Gate-bypassing backstop: if repeated vetoed trail sells let the
+            # price slide all the way below the ORIGINAL stop, exit as a
+            # normal stop-loss (which bypasses the profit gate).
+            if stop_price and price <= stop_price and not in_min_hold:
+                _stop_loss_confirmation[sym] = _stop_loss_confirmation.get(sym, 0) + 1
+                if _stop_loss_confirmation[sym] >= _sl_confirm_ticks():
+                    _stop_loss_confirmation.pop(sym, None)
+                    return "stop-loss", crossed
+                return None, crossed
+            if price <= eff_stop:
+                # Optional smart-hold score gate (default OFF): only a FRESH
+                # bullish score may defer a trail exit ABOVE the TP target.
+                if (cfg.get("smart_hold_score_gate") and crossed
+                        and _fresh_bullish_score(sym, now)):
+                    return None, crossed
+                # Trail/BE-stop exits are profit-side → 1 confirmation tick.
+                _stop_loss_confirmation.pop(sym, None)
+                return "trail", crossed
+            _stop_loss_confirmation.pop(sym, None)
+            return None, crossed
+
+    # Pre-BE-move: plain stop_price exit with confirmation ticks + min-hold.
+    if stop_price and price <= stop_price and not in_min_hold:
+        _stop_loss_confirmation[sym] = _stop_loss_confirmation.get(sym, 0) + 1
+        if _stop_loss_confirmation[sym] >= _sl_confirm_ticks():
+            _stop_loss_confirmation.pop(sym, None)
+            return "stop-loss", crossed
+        return None, crossed
+    _stop_loss_confirmation.pop(sym, None)
+    return None, crossed
+
+
 # ── Process 1: realtime monitor (called on every WebSocket tick) ──────────────
 
 def realtime_monitor(prices: Dict[str, float]):
@@ -3943,95 +4484,33 @@ def realtime_monitor(prices: Dict[str, float]):
         last_fail = _sell_last_failed_ts.get(sym, 0)
         if last_fail:
             _cooldown = (_SELL_RETRY_COOLDOWN_LOSS
-                         if _sell_last_failed_reason.get(sym, "") in ("stop-loss", "force-sell")
+                         if _sell_last_failed_reason.get(sym, "") in ("stop-loss", "hard-stop-loss", "force-sell")
                          else _SELL_RETRY_COOLDOWN_PROFIT)
             if (now - last_fail) < _cooldown:
                 continue
-        # Minimum hold applies to STOP-LOSS only (prevents race-condition flips
-        # right after the buy). Take-profit must never be delayed — an immediate
-        # post-buy pump that reaches the target sells instantly.
-        opened_ts = pos.get("opened_at_ts", 0)
-        in_min_hold = opened_ts > 0 and (now - opened_ts) < _MIN_HOLD_SEC
-        entry  = pos["entry_price"]
-        # Real breakeven trigger: (budget + buy_fee + min_profit) / (qty × (1 - sell_fee)).
-        # Only fires when a sell would actually net profit — no phantom triggers for
-        # BTC/BNB where lot-step rounding raises the true break-even above simple BEP.
-        # _profitable_sell_check in _do_execute_sell is the final safety net at execution.
-        real_target = compute_real_breakeven_price(pos)
-        if real_target <= 0:
-            _bep_m = pos.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
-            real_target = entry * _bep_m  # fallback for incomplete positions
-        # Stop measured from ENTRY price — matches the frontend's "% below entry"
-        # label. (Measuring from fee-inclusive BEP fired ~0.26% earlier than the
-        # user's configured distance.)
-        stop = entry * _stop_loss_mult
-        # Take-profit trigger: the user's TP target, floored at real breakeven —
-        # never fire at bare breakeven when the user asked for more.
-        if _take_profit_enabled:
-            target = max(real_target, entry * _user_tp_mult)
-        else:
-            target = real_target
-
-        if price >= target:
-            # Record first-seen crossing time — distinct from _sell_trigger_ts (which is
-            # set when we actually call .submit()). The gap between these two timestamps
-            # reveals event-loop starvation: if target_crossed_to_trigger_ms >> 0, sells
-            # are being delayed by blocking work elsewhere on the event loop thread.
-            if pos.get("_sell_target_crossed_ts") is None:
-                pos["_sell_target_crossed_ts"] = now
+        # ── Phase 2 §2.1-2.3: shared exit decision (A1 parity with the sell
+        # monitor). Per-position ATR stop / TP / hard SL / BE-move / trail when
+        # geometry is stored; legacy global-mult path otherwise.
+        with _selling_lock:
+            already = sym in _selling
+        if already:
+            continue
+        sell_reason, target_crossed = _evaluate_exit_decision(pos, sym, price, now)
+        # Record first-seen crossing time — distinct from _sell_trigger_ts (which is
+        # set when we actually call .submit()). The gap between these two timestamps
+        # reveals event-loop starvation: if target_crossed_to_trigger_ms >> 0, sells
+        # are being delayed by blocking work elsewhere on the event loop thread.
+        if (target_crossed or sell_reason) and pos.get("_sell_target_crossed_ts") is None:
+            pos["_sell_target_crossed_ts"] = now
+        if sell_reason:
             with _selling_lock:
-                already = sym in _selling
-            if not already:
-                if _smart_hold_enabled and price >= target and target > real_target:
-                    _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
-                    peak = _pos_peaks[sym]
-                    # Trail is hard-floored at the exit target: smart-hold may ride
-                    # the gain higher, but can never give back below the target.
-                    trail_stop = max(peak * (1.0 - _trailing_stop_pct / 100.0), target)
-                    sell_reason: Optional[str] = None
-                    if price <= trail_stop:
-                        sell_reason = "smart-hold-trail"
-                    else:
-                        with _signal_cache_lock:
-                            _sc = _signal_cache.get(sym, {})
-                            score = _sc.get("score", 0)
-                            score_ts = _sc.get("ts", 0)
-                        # A stale score must not hold a profitable position —
-                        # only a FRESH bullish score may defer the sell.
-                        if score < 3 or (now - score_ts) > 120:
-                            sell_reason = "take-profit"
-                    if sell_reason:
-                        with _selling_lock:
-                            if sym not in _selling:
-                                _selling.add(sym)
-                                _selling_ts[sym] = time.time()
-                                pos["_sell_trigger_ts"] = time.time()
-                                pos["_sell_reason"] = sell_reason
-                                _sell_executor.submit(_execute_sell, pos, price, sell_reason)
-                else:
-                    with _selling_lock:
-                        if sym not in _selling:
-                            _selling.add(sym)
-                            _selling_ts[sym] = time.time()
-                            pos["_sell_trigger_ts"] = time.time()
-                            pos["_sell_reason"] = "take-profit"
-                            _sell_executor.submit(_execute_sell, pos, price, "take-profit")
-        elif _stop_loss_mult < 1.0 and price <= stop and not in_min_hold:
-            _stop_loss_confirmation[sym] = _stop_loss_confirmation.get(sym, 0) + 1
-            if _stop_loss_confirmation[sym] >= _STOP_LOSS_CONFIRMATION_TICKS:
-                _stop_loss_confirmation.pop(sym, None)
-                if pos.get("_sell_target_crossed_ts") is None:
-                    pos["_sell_target_crossed_ts"] = now
-                with _selling_lock:
-                    if sym in _selling:
-                        continue
-                    _selling.add(sym)
-                    _selling_ts[sym] = time.time()
-                    pos["_sell_trigger_ts"] = time.time()
-                    pos["_sell_reason"] = "stop-loss"
-                _sell_executor.submit(_execute_sell, pos, price, "stop-loss")
-        else:
-            _stop_loss_confirmation.pop(sym, None)
+                if sym in _selling:
+                    continue
+                _selling.add(sym)
+                _selling_ts[sym] = time.time()
+                pos["_sell_trigger_ts"] = time.time()
+                pos["_sell_reason"] = sell_reason
+            _sell_executor.submit(_execute_sell, pos, price, sell_reason)
 
     # ── Inline signal refresh — throttled to every 30 s per coin ─────────────
     for sym, price in prices.items():
@@ -4564,6 +5043,501 @@ def start_capital_recycler():
     _capital_recycler_thread.start()
 
 
+# ── Phase 2 §2.4/§2.5 — exchange-side exit-order management ───────────────────
+# Managers (exit_orders module) are LIVE-ONLY: paper mode and the live
+# paper-fallback client keep pure local monitoring. Every entry point below is
+# guarded on _managed_exits_active().
+
+_managed_exit_thread: Optional[threading.Thread] = None
+_managed_reconcile_last_ts: float = 0.0
+_MANAGED_POLL_SEC = 2.0
+_MANAGED_RECONCILE_SEC = 60.0
+
+
+def _managed_exits_active() -> bool:
+    """True only when exchange-side exit orders may be placed/polled:
+    exit_orders importable, live mode, real Binance client (not the paper
+    fallback)."""
+    if exit_orders is None:
+        return False
+    try:
+        if get_mode() != "live":
+            return False
+        return not connection.is_using_paper_fallback()
+    except Exception:
+        return False
+
+
+def _current_price_for(sym: str) -> float:
+    """Freshest known price for sym (WS first, REST cache fallback); 0 unknown."""
+    px = 0.0
+    try:
+        import data_collector as _dc_me
+        px = float(_dc_me.prices.get(sym, 0) or 0)
+    except Exception:
+        px = 0.0
+    if px <= 0:
+        px = float(_rest_px.get(sym, 0) or 0)
+    return px
+
+
+def _place_managed_exit(pos: dict) -> None:
+    """Place the exchange-side exit for a freshly opened LIVE position.
+
+    oco_enabled → SELL OCO (LIMIT_MAKER TP above + STOP_LOSS_LIMIT below);
+    else maker_tp → post-only LIMIT_MAKER TP. Any rejection or failure is
+    logged and the position falls back to FULL local monitoring — placement
+    can never block or undo the position. Paper mode / paper fallback: no-op.
+    Nothing new is stored on the position dict — exit_orders owns the state."""
+    if not _managed_exits_active():
+        return
+    sym = pos.get("symbol") or ""
+    tp = float(pos.get("tp_price") or 0)
+    qty = _floor_qty(float(pos.get("quantity") or 0), sym)
+    if not sym or tp <= 0 or qty <= 0:
+        return
+    cfg = _exit_cfg()
+    try:
+        if cfg.get("oco_enabled"):
+            stop = float(pos.get("stop_price") or 0)
+            if stop <= 0:
+                database.log_activity(
+                    f"[ManagedExit] {sym}: OCO skipped — no stop_price on position "
+                    f"(legacy/disabled stop); local monitoring only", "warn")
+                return
+            resp = exit_orders.place_oco(
+                sym, qty, _floor_price_tick(tp, sym), _floor_price_tick(stop, sym),
+                float(cfg.get("oco_stop_limit_buffer_pct") or 0.5))
+            if resp is None:
+                database.log_activity(
+                    f"[ManagedExit] {sym}: OCO rejected by engine (price through a leg) "
+                    f"— local monitors will exit", "warn")
+            else:
+                database.log_activity(
+                    f"[ManagedExit] {sym}: OCO placed — tp={_floor_price_tick(tp, sym):.8f} "
+                    f"stop={_floor_price_tick(stop, sym):.8f} qty={qty}", "info")
+        elif cfg.get("maker_tp"):
+            resp = exit_orders.place_maker_tp(sym, qty, _floor_price_tick(tp, sym))
+            if isinstance(resp, dict) and resp.get("rejected"):
+                # -2010 'would immediately match and take': price is already
+                # through the target — the local monitors will exit immediately.
+                database.log_activity(
+                    f"[ManagedExit] {sym}: maker TP rejected ({resp.get('code')}: "
+                    f"{resp.get('msg')}) — price already through target, local exit imminent",
+                    "info")
+            else:
+                database.log_activity(
+                    f"[ManagedExit] {sym}: maker TP resting @ {_floor_price_tick(tp, sym):.8f} "
+                    f"qty={qty}", "info")
+    except Exception as _pe:
+        # NEVER block the position — full local monitoring covers it.
+        log_diag_issue("managed_exit", "warn",
+                       f"{sym}: exit-order placement failed — local monitoring only",
+                       detail=f"{type(_pe).__name__}: {_pe}")
+
+
+def _finalize_managed_exit(pos: dict, sym: str, exit_price: float, reason: str,
+                           exit_label: str, maker_exit: bool) -> None:
+    """Book a position close for an exchange-side exit that FILLED — WITHOUT
+    placing any order (the exchange already sold the coins).
+
+    exit_price: the managed order's price (tp_price for TP legs; ≈stop_trigger
+    for the OCO stop leg — the STOP_LOSS_LIMIT fill can be marginally lower,
+    accepted approximation per §2.5). Fees come from the fees model: maker for
+    LIMIT_MAKER fills, taker for the stop leg. Mirrors _do_execute_sell's
+    close bookkeeping (trade record → position removal → sync/learning)."""
+    from datetime import timezone as _tz
+    now_iso = datetime.now(_tz.utc).isoformat()
+    qty = float(pos.get("quantity") or 0)
+    entry_px = float(pos.get("entry_price") or 0)
+    exit_price = float(exit_price or 0)
+    try:
+        fm = fees.get_fee_model(sym)
+        fee_frac = fm.maker() if maker_exit else fm.taker()
+    except Exception:
+        fee_frac = _fee_rate_for(sym)
+    quote = exit_price * qty
+    sell_fee = quote * fee_frac
+    usdt_returned = quote - sell_fee
+    cost = qty * entry_px
+    buy_fee = float(pos.get("buy_fee_usdt") or cost * _fee_rate_for(sym))
+    net_profit = usdt_returned - cost - buy_fee
+
+    buy_ts = pos.get("timestamp", now_iso)
+    try:
+        buy_dt = datetime.fromisoformat(str(buy_ts).replace("Z", "+00:00"))
+        sell_dt = datetime.fromisoformat(now_iso)
+        duration = int((sell_dt - buy_dt).total_seconds()) if buy_dt.tzinfo else 0
+    except Exception:
+        duration = 0
+        buy_dt = datetime.now(_tz.utc)
+    try:
+        _opened_ts = float(pos.get("opened_at_ts") or 0)
+        hold_sec = (time.time() - _opened_ts) if _opened_ts > 0 else (
+            float(duration) if duration > 0 else None)
+    except Exception:
+        hold_sec = float(duration) if duration else None
+
+    trade_record = {
+        "coin":               sym,
+        "mode":               "live",   # managers are live-only
+        "entry_price":        entry_px,
+        "exit_price":         exit_price,
+        "quantity":           qty,
+        "budget_usdt":        pos.get("budget_usdt"),
+        "buy_fee":            buy_fee,
+        "sell_fee":           sell_fee,
+        "net_profit":         net_profit,
+        "profitable":         1 if net_profit > 0 else 0,
+        "duration_seconds":   duration,
+        "entry_rsi":          pos.get("entry_rsi"),
+        "entry_ma_position":  pos.get("entry_ma_position"),
+        "entry_bb_position":  pos.get("entry_bb_position"),
+        "entry_volume_trend": pos.get("entry_volume_trend"),
+        "hour_of_day":        buy_dt.hour,
+        "day_of_week":        buy_dt.weekday(),
+        "timestamp_buy":      buy_ts,
+        "timestamp_sell":     now_iso,
+        "sell_reason":        reason,
+        "signal_snapshot":    pos.get("signal_snapshot"),
+        "intended_sell_price": exit_price,
+        "sell_slippage_pct":  0.0,      # limit fill at the resting price
+    }
+    try:
+        database.log_trade(trade_record,
+                           exit_label=exit_label,
+                           slippage_bps=0.0,
+                           entry_fee_usdt=buy_fee,
+                           exit_fee_usdt=sell_fee,
+                           hold_time_sec=hold_sec,
+                           origin=pos.get("origin", "auto"))
+    except Exception as _te_err:
+        database.log_activity(f"log_trade error ({sym}, {reason}): {_te_err}", "warn")
+
+    # Remove position from DB + memory (exchange fill is the confirmation).
+    if pos.get("id"):
+        try:
+            database.delete_position(pos["id"])
+        except Exception:
+            pass
+    with _positions_lock:
+        _positions[:] = [p for p in _positions if p.get("id") != pos.get("id")]
+    _rebuild_pos_index()
+    _pos_peaks.pop(sym, None)
+    _stop_loss_confirmation.pop(sym, None)
+    if exit_orders is not None:
+        try:
+            exit_orders.forget(sym)   # normally already forgotten by check_*
+        except Exception:
+            pass
+
+    try:
+        import supabase_sync
+        supabase_sync.sync_sell_result_sync(trade_record, sym, _get_usdt_balance())
+    except Exception as _se:
+        try:
+            database.log_activity(f"Supabase sync error after {reason} {sym}: {_se}", "error")
+        except Exception:
+            pass
+    try:
+        learning.learn_from_trade(trade_record)
+    except Exception as _le:
+        database.log_activity(f"learn_from_trade error ({sym}): {_le}", "warn")
+
+    pnl_sign = "+" if net_profit >= 0 else ""
+    msg = (f"[LIVE] SOLD {sym} @ ${exit_price:.4f} via exchange exit ({reason}) "
+           f"· received {usdt_returned:.4f} USDT · P&L: {pnl_sign}{net_profit:.4f} USDT "
+           f"(held {duration}s)")
+    print(f"[{now_iso}] {msg}")
+    try:
+        database.log_activity(msg, "info")
+    except Exception:
+        pass
+
+
+def _clear_managed_exit_before_sell(pos: dict, sym: str, reason: str) -> bool:
+    """NO-DOUBLE-SELL enforcement (called from _do_execute_sell, _selling held).
+
+    Returns True → no managed order remains, proceed with the local market
+    sell. Returns False → ABORT the local sell because either:
+      * the exchange order was already FILLED (-2011 race) — the position is
+        finalized HERE from that fill (documented choice: we hold the _selling
+        guard and have the managed entry's prices, so booking it immediately
+        beats waiting a poll cycle), or
+      * the cancel failed for an unknown reason — selling now could double-
+        sell; the claim is released by the caller and the next tick retries.
+    """
+    managed = exit_orders.get_managed(sym)
+    if not managed:
+        return True
+    cancelled = False
+    try:
+        if managed.get("kind") == "maker_tp":
+            # False here means -2011: the order already filled/was cancelled.
+            cancelled = exit_orders.cancel_maker_tp(sym)
+        else:
+            try:
+                binance_direct.cancel_order_list(sym, managed["order_list_id"])
+                cancelled = True
+            except binance_direct.BinanceDirectError as _ce:
+                if _ce.code != -2011:
+                    raise
+                cancelled = False
+            exit_orders.forget(sym)
+    except Exception as _cx:
+        database.log_activity(
+            f"[ManagedExit] {sym}: cancel before local sell failed "
+            f"({type(_cx).__name__}: {_cx}) — sell aborted, will retry", "warn")
+        _sell_last_failed_ts[sym] = time.time()
+        _sell_last_failed_reason[sym] = reason
+        return False
+    if cancelled:
+        database.log_activity(
+            f"[ManagedExit] {sym}: exchange exit cancelled before local sell ({reason})",
+            "info")
+        return True
+
+    # -2011: the exchange already closed the order. Re-check its final state
+    # instead of selling (NO-DOUBLE-SELL contract step 3).
+    try:
+        if managed.get("kind") == "maker_tp":
+            order = binance_direct.get_order(sym, managed["order_id"])
+            if order.get("status") == "FILLED":
+                _finalize_managed_exit(pos, sym, managed.get("tp_price"),
+                                       "maker-tp", "tp", maker_exit=True)
+                return False
+        else:
+            for oid, rsn, lbl, mk in (
+                    (managed.get("tp_order_id"), "oco-tp", "tp", True),
+                    (managed.get("sl_order_id"), "oco-sl", "sl", False)):
+                if oid is None:
+                    continue
+                try:
+                    leg = binance_direct.get_order(sym, oid)
+                except binance_direct.BinanceDirectError as _le:
+                    if _le.code == -2011:
+                        continue
+                    raise
+                if leg.get("status") == "FILLED":
+                    px = managed.get("tp_price") if mk else managed.get("stop_trigger")
+                    _finalize_managed_exit(pos, sym, px, rsn, lbl, maker_exit=mk)
+                    return False
+    except Exception as _qe:
+        database.log_activity(
+            f"[ManagedExit] {sym}: post-cancel state check failed "
+            f"({type(_qe).__name__}: {_qe}) — sell aborted, will retry", "warn")
+        _sell_last_failed_ts[sym] = time.time()
+        _sell_last_failed_reason[sym] = reason
+        return False
+
+    # Order gone but NOT filled (cancelled externally): the coins are still
+    # ours — proceed with the local market sell.
+    database.log_activity(
+        f"[ManagedExit] {sym}: exchange exit was already cancelled externally — "
+        f"proceeding with local sell ({reason})", "warn")
+    return True
+
+
+def _maybe_replace_oco_stop(pos: dict, sym: str, entry: dict, cfg: dict) -> None:
+    """OCO trailing: when BE-move/trail logic has raised the effective stop
+    above the resting OCO's trigger, cancel/replace the OCO with the new
+    level. Throttling + minimum-improvement checks live in replace_oco_stop."""
+    desired = max(float(pos.get("be_stop_price") or 0.0),
+                  float(pos.get("tp_ratchet_floor") or 0.0))
+    if pos.get("be_moved"):
+        k_trail = float(cfg.get("k_trail") or 0.0)
+        atr_ref = (pos.get("atr_pct_at_entry") or pos.get("sl_distance_pct")
+                   or cfg.get("sl_min_pct") or 0.0)
+        peak = float(pos.get("peak_price") or 0.0)
+        if k_trail > 0 and peak > 0 and atr_ref:
+            desired = max(desired, peak * (1.0 - k_trail * float(atr_ref) / 100.0))
+    if desired <= float(entry.get("stop_trigger") or 0.0):
+        return
+    new_stop = _floor_price_tick(desired, sym)
+    tick = _tick_size(sym) or 1e-8
+    try:
+        if exit_orders.replace_oco_stop(
+                sym, new_stop, tick,
+                float(cfg.get("oco_stop_limit_buffer_pct") or 0.5)):
+            database.log_activity(
+                f"[ManagedExit] {sym}: OCO stop raised to {new_stop:.8f}", "info")
+    except Exception as _re:
+        log_diag_issue("managed_exit", "warn",
+                       f"{sym}: OCO stop replace failed: {type(_re).__name__}: {_re}")
+
+
+def _managed_exit_poll_cycle() -> None:
+    """One pass over all managed exits (2s cadence, live only).
+
+    Per symbol: claim the _selling guard (skips symbols mid-sell — the local
+    path's pre-sell cancel covers those), poll the manager, and act:
+      maker_tp: filled → finalize as TP (no order); timeout_cancelled →
+        normal market sell through the profit gate; gone → local monitoring.
+      oco: filled_tp/filled_sl → finalize; skipped_rescue → immediate local
+        market sell as stop-loss (gate-bypassing); gone → local monitoring;
+        resting → trailing-stop replace when the local stop has risen."""
+    if not _managed_exits_active():
+        return
+    managed = exit_orders.all_managed()
+    if not managed:
+        return
+    cfg = _exit_cfg()
+    pos_index = _pos_by_symbol
+    for sym, entry in managed.items():
+        pos = pos_index.get(sym)
+        if pos is None:
+            continue   # orphan — the reconcile pass cancels it
+        price = _current_price_for(sym)
+        with _selling_lock:
+            if sym in _selling:
+                continue
+            _selling.add(sym)
+            _selling_ts[sym] = time.time()
+        release = True   # False when the claim is handed to _execute_sell
+        try:
+            if entry.get("kind") == "maker_tp":
+                verdict = exit_orders.check_maker_tp(
+                    sym, price, float(cfg.get("maker_tp_timeout_ms") or 1500))
+                if verdict == "filled":
+                    _finalize_managed_exit(pos, sym, entry.get("tp_price"),
+                                           "maker-tp", "tp", maker_exit=True)
+                elif verdict == "timeout_cancelled":
+                    # Maker order cancelled after the touch-timeout — dispatch
+                    # the NORMAL market sell (through the profit gate).
+                    pos["_sell_trigger_ts"] = time.time()
+                    pos["_sell_reason"] = "take-profit"
+                    release = False
+                    _sell_executor.submit(
+                        _execute_sell, pos,
+                        price or float(entry.get("tp_price") or 0), "take-profit")
+                elif verdict == "gone":
+                    database.log_activity(
+                        f"[ManagedExit] {sym}: maker TP vanished externally — "
+                        f"local monitoring continues", "warn")
+            else:  # oco
+                verdict = exit_orders.check_oco(
+                    sym, price, float(cfg.get("oco_skip_rescue_sec") or 3.0))
+                if verdict == "filled_tp":
+                    _finalize_managed_exit(pos, sym, entry.get("tp_price"),
+                                           "oco-tp", "tp", maker_exit=True)
+                elif verdict == "filled_sl":
+                    # Stop fill ≈ stop_trigger (accepted approximation).
+                    _finalize_managed_exit(pos, sym, entry.get("stop_trigger"),
+                                           "oco-sl", "sl", maker_exit=False)
+                elif verdict == "skipped_rescue":
+                    # A2 rescue: list cancelled because the stop leg was
+                    # skipped — market-sell locally NOW. 'stop-loss' bypasses
+                    # the profit gate (loss-side exit).
+                    pos["_sell_trigger_ts"] = time.time()
+                    pos["_sell_reason"] = "stop-loss"
+                    release = False
+                    _sell_executor.submit(
+                        _execute_sell, pos,
+                        price or float(entry.get("stop_trigger") or 0), "stop-loss")
+                elif verdict == "gone":
+                    database.log_activity(
+                        f"[ManagedExit] {sym}: OCO vanished externally — "
+                        f"local monitoring continues", "warn")
+                elif verdict == "resting":
+                    _maybe_replace_oco_stop(pos, sym, entry, cfg)
+        except Exception as _me:
+            log_diag_issue("managed_exit", "warn",
+                           f"{sym}: managed-exit poll error",
+                           detail=f"{type(_me).__name__}: {_me}")
+        finally:
+            if release:
+                with _selling_lock:
+                    _selling.discard(sym)
+                    _selling_ts.pop(sym, None)
+
+
+def _managed_exit_reconcile() -> None:
+    """~60s cross-check of the managed table vs positions + open orders.
+
+    managed-but-no-position → cancel the orphan order + forget;
+    position-but-order-vanished → log only; the next check_* poll classifies
+    it (filled → finalize, gone → forget) and local monitors keep covering."""
+    if not _managed_exits_active():
+        return
+    if not exit_orders.all_managed():
+        return
+    with _positions_lock:
+        snap = [{"symbol": p.get("symbol")} for p in _positions if p.get("symbol")]
+    pos_syms = {p["symbol"] for p in snap}
+    try:
+        stale = exit_orders.reconcile(snap, binance_direct.get_open_orders)
+    except Exception as _rce:
+        log_diag_issue("managed_exit", "warn",
+                       f"managed-exit reconcile failed: {type(_rce).__name__}: {_rce}")
+        return
+    for sym in stale:
+        entry = exit_orders.get_managed(sym)
+        if not entry:
+            continue
+        if sym not in pos_syms:
+            try:
+                if entry.get("kind") == "maker_tp":
+                    exit_orders.cancel_maker_tp(sym)
+                else:
+                    try:
+                        binance_direct.cancel_order_list(sym, entry["order_list_id"])
+                    except binance_direct.BinanceDirectError as _oe:
+                        if _oe.code != -2011:
+                            raise
+                    exit_orders.forget(sym)
+                database.log_activity(
+                    f"[ManagedExit] {sym}: orphan exchange exit cancelled "
+                    f"(no local position)", "warn")
+            except Exception as _oce:
+                log_diag_issue("managed_exit", "warn",
+                               f"{sym}: orphan exit-order cancel failed",
+                               detail=f"{type(_oce).__name__}: {_oce}")
+        else:
+            database.log_activity(
+                f"[ManagedExit] {sym}: managed order missing from open orders — "
+                f"next poll classifies it (filled/cancelled); local monitors active",
+                "warn")
+
+
+def _managed_exit_loop():
+    """Daemon loop: manager polling every 2s + reconcile every ~60s."""
+    global _managed_reconcile_last_ts
+    while True:
+        try:
+            if _thread_health:
+                _thread_health.heartbeat("managed_exit_poller")
+        except Exception:
+            pass
+        try:
+            _managed_exit_poll_cycle()
+            now = time.time()
+            if now - _managed_reconcile_last_ts >= _MANAGED_RECONCILE_SEC:
+                _managed_reconcile_last_ts = now
+                _managed_exit_reconcile()
+        except Exception as _mle:
+            try:
+                log_diag_issue("managed_exit", "warn",
+                               f"managed-exit loop error: {type(_mle).__name__}: {_mle}")
+            except Exception:
+                pass
+        time.sleep(_MANAGED_POLL_SEC)
+
+
+def start_managed_exit_poller():
+    """Idempotent — starts the managed-exit poll/reconcile daemon."""
+    global _managed_exit_thread
+    if exit_orders is None:
+        return
+    if _managed_exit_thread is not None and _managed_exit_thread.is_alive():
+        return
+    _managed_exit_thread = threading.Thread(
+        target=_managed_exit_loop,
+        name="managed-exit-poller",
+        daemon=True,
+    )
+    _managed_exit_thread.start()
+
+
 # ── Phantom position detector ──────────────────────────────────────────────────
 _phantom_checker_thread: Optional[threading.Thread] = None
 
@@ -4742,7 +5716,10 @@ def _sell_monitor_loop():
                         continue
                     _bep_m_diag = p.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
                     _bep_diag   = entry * _bep_m_diag
-                    actual = max(_bep_diag, entry * _user_tp_mult) if _take_profit_enabled else _bep_diag  # real sell threshold
+                    if p.get("tp_price"):  # Phase 2 per-position TP (§2.2)
+                        actual = max(float(p["tp_price"]), _bep_diag)
+                    else:
+                        actual = max(_bep_diag, entry * _user_tp_mult) if _take_profit_enabled else _bep_diag  # real sell threshold
                     pct    = ((price - entry) / entry * 100) if entry else 0
                     gap_pct  = ((actual - price) / price * 100) if price > 0 and actual > price else 0.0
                     qty_held = p.get("quantity", 0)
@@ -4789,21 +5766,20 @@ def _sell_monitor_loop():
                 last_fail = _sell_last_failed_ts.get(sym, 0)
                 if last_fail:
                     _cooldown = (_SELL_RETRY_COOLDOWN_LOSS
-                                 if _sell_last_failed_reason.get(sym, "") in ("stop-loss", "force-sell")
+                                 if _sell_last_failed_reason.get(sym, "") in ("stop-loss", "hard-stop-loss", "force-sell")
                                  else _SELL_RETRY_COOLDOWN_PROFIT)
                     if (now_monitor - last_fail) < _cooldown:
                         continue
-                # Minimum hold applies to STOP-LOSS only — take-profit is never delayed
-                opened_ts3 = pos.get("opened_at_ts", 0)
-                in_min_hold3 = opened_ts3 > 0 and (now_monitor - opened_ts3) < _MIN_HOLD_SEC
                 entry  = pos["entry_price"]
                 real_target3 = compute_real_breakeven_price(pos)
                 if real_target3 <= 0:
                     _bep_m3 = pos.get("breakeven_mult_at_buy") or _get_breakeven_mult(entry, sym)
                     real_target3 = entry * _bep_m3
-                stop = entry * _stop_loss_mult  # % below ENTRY — matches frontend label
-                # TP trigger = user target floored at real breakeven
-                if _take_profit_enabled:
+                # Display target for the trace: per-position tp_price (§2.2)
+                # when stored, else the legacy global-mult target.
+                if pos.get("tp_price"):
+                    target = max(float(pos["tp_price"]), real_target3)
+                elif _take_profit_enabled:
                     target = max(real_target3, entry * _user_tp_mult)
                 else:
                     target = real_target3
@@ -4822,33 +5798,11 @@ def _sell_monitor_loop():
                         "info"
                     )
 
-                sell_reason3: Optional[str] = None
-
-                if price >= target:
-                    if _smart_hold_enabled and price >= target and target > real_target3:
-                        _pos_peaks[sym] = max(_pos_peaks.get(sym, target), price)
-                        peak = _pos_peaks[sym]
-                        # Trail hard-floored at the exit target (never give back below it)
-                        trail_stop = max(peak * (1.0 - _trailing_stop_pct / 100.0), target)
-                        if price <= trail_stop:
-                            sell_reason3 = "smart-hold-trail"
-                        else:
-                            with _signal_cache_lock:
-                                _sc2 = _signal_cache.get(sym, {})
-                                score2 = _sc2.get("score", 0)
-                                score2_ts = _sc2.get("ts", 0)
-                            # Only a FRESH bullish score may defer a profitable sell
-                            if score2 < 3 or (now_monitor - score2_ts) > 120:
-                                sell_reason3 = "take-profit"
-                    else:
-                        sell_reason3 = "take-profit"
-                elif _stop_loss_mult < 1.0 and price <= stop and not in_min_hold3:
-                    _stop_loss_confirmation[sym] = _stop_loss_confirmation.get(sym, 0) + 1
-                    if _stop_loss_confirmation[sym] >= _STOP_LOSS_CONFIRMATION_TICKS:
-                        _stop_loss_confirmation.pop(sym, None)
-                        sell_reason3 = "stop-loss"
-                else:
-                    _stop_loss_confirmation.pop(sym, None)
+                # ── Phase 2 §2.1-2.3: SAME shared exit decision as
+                # realtime_monitor (A1 parity — the two monitors can never
+                # disagree on trigger geometry).
+                sell_reason3, _crossed3 = _evaluate_exit_decision(
+                    pos, sym, price, now_monitor)
 
                 if sell_reason3:
                     with _selling_lock:
