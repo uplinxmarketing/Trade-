@@ -447,6 +447,18 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("universe_validation", exc)
 
+            # 4f. Part I (I4) — three-tier watchlist auto-management: remove
+            #     confirmed-delisted coins (2-pass), suspend halted ones, never
+            #     remove a held coin. Fails open on exchangeInfo outages.
+            try:
+                _mu = await asyncio.to_thread(_manage_universe)
+                steps.append(
+                    f"universe_manage (removed={len(_mu.get('removed', []))} "
+                    f"suspended={len(_mu.get('suspended', []))} "
+                    f"pending={len(_mu.get('pending', []))})")
+            except Exception as exc:
+                _step_failed("universe_manage", exc)
+
             # 5. History download — daemon thread, never blocks
             try:
                 threading.Thread(target=data_collector.download_history, daemon=True).start()
@@ -682,6 +694,15 @@ async def _daily_maintenance_loop():
                                 + ")" for i in _uni["invalid"][:20]), "warn")
         except Exception as e:
             print(f"[Maintenance] universe validation failed: {e}")
+        # Part I (I4) — three-tier watchlist auto-management (remove confirmed
+        # delisted, suspend halted, never remove held). Fails open on outages.
+        try:
+            _mu = await _aio.to_thread(_manage_universe)
+            if _mu.get("removed") or _mu.get("held_deferred"):
+                print(f"[Maintenance] universe manage: removed="
+                      f"{_mu.get('removed')} held_deferred={_mu.get('held_deferred')}")
+        except Exception as e:
+            print(f"[Maintenance] universe manage failed: {e}")
         # §3.6 — warn when any fees.per_symbol_overrides entry is >30 days
         # unreviewed ('_reviewed_ts' absent or old): Binance fee promos change
         # monthly, and a withdrawn promo silently left at maker_pct=0 corrupts
@@ -933,9 +954,278 @@ def _validate_universe() -> dict:
             "note":             note,
             "suggested_rename": _ei.RENAMED_SYMBOLS.get(sym),
         })
-    return {"valid": valid, "invalid": invalid, "covered": len(valid),
-            "expected_valid": len(approved), "exchange_info_available": True,
-            "break_count": break_count, "delisted_count": delisted_count}
+    result = {"valid": valid, "invalid": invalid, "covered": len(valid),
+              "expected_valid": len(approved), "exchange_info_available": True,
+              "break_count": break_count, "delisted_count": delisted_count}
+    # I4 — surface the 2-pass confirmation state on each invalid entry so
+    # /api/universe/validate reflects the pending-removal countdown.
+    try:
+        with _universe_state_lock:
+            for entry in result["invalid"]:
+                entry["confirm_count"] = int(_delist_confirm.get(entry["symbol"], 0))
+                entry["pending_removal"] = (
+                    entry.get("excluded_kind") == "delisted"
+                    and entry["confirm_count"] >= 1
+                    and entry["confirm_count"] < _DELIST_CONFIRM_THRESHOLD)
+    except Exception:
+        pass
+    return result
+
+
+# ── I4 — three-tier auto-management of the approved_coins watchlist ──────────
+#
+# Tier 1 (DELISTED)  — coin permanently gone (absent from exchangeInfo, in
+#                      KNOWN_DELISTED, or a permanently-closed status). Removed
+#                      from approved_coins after TWO consecutive confirmations,
+#                      unless held (open position/order) — held coins defer to
+#                      the -1013 force-close path and are cleaned up later.
+# Tier 2 (HALTED)    — coin temporarily untradeable (BREAK/AUCTION_MATCH/HALT).
+#                      SUSPENDED not deleted: left in approved_coins, excluded
+#                      from scoring by the data-collector filter, badged in UI.
+#                      Auto-restores when it is TRADING again.
+# Tier 3 (TRADING)   — valid; confirmation counter reset.
+
+_DELIST_CONFIRM_THRESHOLD = 2               # consecutive invalid passes before removal
+_delist_confirm: dict = {}                  # sym -> consecutive delisted passes
+import collections as _collections
+_universe_notices = _collections.deque(maxlen=50)
+_universe_state_lock = threading.Lock()
+
+# Statuses that mean "temporarily halted" (suspend, do NOT delete). Everything
+# else that is not TRADING and not reachable-as-valid is treated as delisted.
+_HALTED_STATUSES = {"BREAK", "AUCTION_MATCH", "HALT", "PRE_TRADING", "POST_TRADING"}
+
+
+def _push_universe_notice(action: str, symbol: str, reason: str,
+                          successor: Optional[str] = None) -> None:
+    """Append an auto-management action to the notices queue (last ~50)."""
+    notice = {"ts": time.time(), "action": action, "symbol": symbol, "reason": reason}
+    if successor:
+        notice["successor"] = successor
+    try:
+        with _universe_state_lock:
+            _universe_notices.append(notice)
+    except Exception:
+        pass
+
+
+def _symbol_is_held(sym: str) -> bool:
+    """True when `sym` has an open in-memory position OR (live mode) an open
+    order on the exchange. Fully guarded — a lookup failure returns True
+    (fail-safe: never remove a coin we could not prove is flat)."""
+    try:
+        import trade_engine as _te
+        with _te._positions_lock:
+            if any((p.get("symbol") if isinstance(p, dict) else p) == sym
+                   for p in _te._positions):
+                return True
+    except Exception:
+        # Could not inspect positions — do NOT risk removing a held coin.
+        return True
+    # Live-mode open orders (paper mode has no exchange-side orders to check).
+    try:
+        if get_mode() == "live":
+            import binance_direct as _bd
+            orders = _bd.get_open_orders(sym)
+            if orders:
+                return True
+    except Exception:
+        # Live order fetch failed — be conservative and treat as held.
+        return True
+    return False
+
+
+def _manage_universe() -> dict:
+    """I4 — orchestrator for the three-tier watchlist auto-management. Runs at
+    boot, in the daily maintenance loop, and after every POST /api/coins edit.
+
+    Never raises, never removes on an exchangeInfo outage, never removes a held
+    coin. Returns a summary dict {removed, suspended, restored, held_deferred,
+    pending, exchange_info_available}.
+    """
+    summary = {"removed": [], "suspended": [], "restored": [],
+               "held_deferred": [], "pending": [], "exchange_info_available": True}
+    try:
+        import exchange_info as _ei
+    except Exception as exc:
+        summary["exchange_info_available"] = False
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+        return summary
+
+    # Serialize passes so two triggers (boot + POST /api/coins) never race the
+    # confirmation counters or double-write strategy.json.
+    with _manage_universe_lock:
+        try:
+            s = _load_strategy()
+            data_cfg = s.get("data") if isinstance(s.get("data"), dict) else {}
+            auto_remove = bool(data_cfg.get("auto_remove_delisted", True))
+            auto_replace = bool(data_cfg.get("auto_replace_with_successor", False))
+
+            approved_raw = s.get("approved_coins", []) or []
+            symbols: list = []
+            for c in approved_raw:
+                sym = c.get("symbol") if isinstance(c, dict) else c
+                if sym:
+                    symbols.append(sym)
+            symbols = list(dict.fromkeys(symbols))
+
+            # Fail-safe: no reachable exchangeInfo → classify nothing, remove
+            # nothing, and do NOT touch the confirmation counters.
+            try:
+                tradeable = _ei.get_tradeable_symbols()
+            except Exception:
+                tradeable = set()
+            if not tradeable:
+                summary["exchange_info_available"] = False
+                return summary
+
+            to_remove: list = []           # [(sym, successor)]
+            with _universe_state_lock:
+                for sym in symbols:
+                    if sym in tradeable:
+                        # Tier 3 — valid. Reset confirmation; note restores.
+                        if _delist_confirm.pop(sym, 0):
+                            pass
+                        continue
+                    try:
+                        st = _ei.symbol_status(sym)
+                    except Exception:
+                        st = ""
+                    st_up = str(st).upper()
+                    is_halted = any(h in st_up for h in _HALTED_STATUSES)
+                    # exchangeInfo reachable (tradeable non-empty) but status
+                    # empty → symbol genuinely absent from exchangeInfo = gone.
+                    if is_halted:
+                        # Tier 2 — suspend, never delete. Reset delist counter
+                        # (a halt is not a delist) and leave it in the list.
+                        _delist_confirm.pop(sym, None)
+                        summary["suspended"].append(sym)
+                        continue
+                    # Tier 1 — delisted / permanently gone. Confirm across 2 passes.
+                    count = _delist_confirm.get(sym, 0) + 1
+                    _delist_confirm[sym] = count
+                    if count < _DELIST_CONFIRM_THRESHOLD:
+                        summary["pending"].append({"symbol": sym, "confirm_count": count})
+                        continue
+                    to_remove.append(sym)
+
+            if not auto_remove:
+                # Confirmed but auto-remove disabled — just report as pending.
+                for sym in to_remove:
+                    summary["pending"].append({"symbol": sym, "confirm_count":
+                                               _delist_confirm.get(sym, 0),
+                                               "auto_remove_disabled": True})
+                return summary
+
+            for sym in to_remove:
+                successor = None
+                try:
+                    successor = _ei.RENAMED_SYMBOLS.get(sym)
+                except Exception:
+                    successor = None
+                # SAFETY OVERRIDE — never remove a held coin.
+                if _symbol_is_held(sym):
+                    summary["held_deferred"].append(sym)
+                    try:
+                        database.log_activity(
+                            f"{sym} delisted but held — deferring removal until "
+                            f"position closes (routes through -1013 force-close)",
+                            "warn")
+                    except Exception:
+                        pass
+                    continue
+                # Perform the removal.
+                removed_successor = _remove_delisted_symbol(sym, successor, auto_replace)
+                summary["removed"].append({"symbol": sym, "successor": successor,
+                                           "added_successor": removed_successor})
+            return summary
+        except Exception as exc:
+            summary["error"] = f"{type(exc).__name__}: {exc}"
+            return summary
+
+
+def _remove_delisted_symbol(sym: str, successor: Optional[str],
+                            auto_replace: bool) -> Optional[str]:
+    """Remove `sym` from approved_coins, audit it, push a UI notice, purge
+    engine state, and (when auto_replace + successor TRADING) add the successor.
+    Returns the successor symbol if it was auto-added, else None. Guarded."""
+    added_successor: Optional[str] = None
+    raw_before = _load_strategy()
+    coins = raw_before.get("approved_coins", []) or []
+    new_coins = [c for c in coins
+                 if (c.get("symbol") if isinstance(c, dict) else c) != sym]
+
+    # Optionally add the successor (only when TRADING and not already present).
+    if auto_replace and successor:
+        try:
+            import exchange_info as _ei
+            present = any((c.get("symbol") if isinstance(c, dict) else c) == successor
+                          for c in new_coins)
+            if not present and successor in _ei.get_tradeable_symbols():
+                new_coins.append({
+                    "symbol":         successor,
+                    "approved":       True,
+                    "budget_usdt":    config.BUDGET_PER_TRADE_USDT,
+                    "max_concurrent": 2,
+                    "confidence":     0.5,
+                    "reason":         f"auto-added successor of delisted {sym}",
+                })
+                added_successor = successor
+        except Exception:
+            added_successor = None
+
+    _write_strategy_patch({"approved_coins": new_coins})
+
+    # Audit trail in config_history.
+    note = f"auto-removed {sym} — delisted; successor {successor or 'none'} available"
+    if added_successor:
+        note += f"; auto-added {added_successor}"
+    try:
+        import strategy_config as _scfg
+        database.save_config_version(
+            "auto-remove-delisted",
+            _scfg.diff_views(raw_before, _load_strategy()),
+            _load_strategy())
+    except Exception:
+        pass
+    try:
+        database.log_activity(note, "warn")
+    except Exception:
+        pass
+
+    # UI notices: removal (+ optional successor-added).
+    _push_universe_notice("removed", sym,
+                          f"delisted — {'successor ' + successor if successor else 'no successor'}",
+                          successor=successor)
+    if added_successor:
+        _push_universe_notice("restored", added_successor,
+                              f"auto-added as successor of delisted {sym}")
+
+    # Engine/data purge hooks (guarded — optional in the engine).
+    try:
+        import trade_engine as _te
+        _purge = getattr(_te, "purge_symbol_state", None)
+        if callable(_purge):
+            _purge(sym)
+    except Exception:
+        pass
+    # data_collector purges its own subscription on the watchlist change.
+    try:
+        import data_collector as _dc
+        _dc.refresh_watchlist()
+    except Exception:
+        pass
+
+    # Clear confirmation counter (symbol is gone from the list now).
+    try:
+        with _universe_state_lock:
+            _delist_confirm.pop(sym, None)
+    except Exception:
+        pass
+    return added_successor
+
+
+_manage_universe_lock = threading.Lock()
 
 
 def _flush_db_state():
@@ -2108,6 +2398,14 @@ def api_set_coins(req: CoinsRequest):
     try:
         import supabase_sync
         supabase_sync.sync_selected_coins(valid)
+    except Exception:
+        pass
+
+    # Part I (I4) — classify the freshly-edited watchlist immediately so a
+    # newly-added dead ticker is caught (2-pass rule: the first add only
+    # classifies, never removes). Guarded — never breaks the coin edit.
+    try:
+        _manage_universe()
     except Exception:
         pass
 
@@ -5768,6 +6066,19 @@ def api_universe_validate():
     except Exception as e:
         return {"valid": [], "invalid": [], "covered": 0, "expected_valid": 0,
                 "exchange_info_available": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/universe/notices")
+def api_universe_notices():
+    """I4 — recent auto-management actions (last ~50) so the UI can surface
+    "auto-removed MATICUSDT — delisted; add successor POLUSDT?" with a one-click
+    add. Newest last. {notices:[{ts, action, symbol, reason, successor?}]}."""
+    try:
+        with _universe_state_lock:
+            notices = list(_universe_notices)
+        return {"notices": notices}
+    except Exception as e:
+        return {"notices": [], "error": f"{type(e).__name__}: {e}"}
 
 
 def _running_git_commit() -> str:
