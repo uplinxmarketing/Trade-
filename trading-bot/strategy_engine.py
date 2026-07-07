@@ -119,6 +119,31 @@ def write_default_strategy():
                 with open(config.STRATEGY_FILE) as f:
                     existing = json.load(f)
                 if existing.get("approved_coins"):
+                    # One-time migration (addendum Part B Step 2.4): persisted
+                    # configs written before the M4 demotion still carry
+                    # mandatory_signals=['M4_micro_pullback'] — the old code
+                    # default, not a deliberate user choice — and it overrides
+                    # the new scored default, blocking every automatic buy.
+                    # Move M4 to scored via a roles map; leave any OTHER
+                    # mandatory signals (user-chosen) untouched.
+                    se = existing.get("signal_engine")
+                    if isinstance(se, dict) and "roles" not in se:
+                        mand = se.get("mandatory_signals", [])
+                        if "M4_micro_pullback" in mand:
+                            roles = {}
+                            for sid in mand:
+                                roles[sid] = "scored" if sid == "M4_micro_pullback" else "mandatory"
+                            for sid in se.get("scored_signals", []):
+                                roles.setdefault(sid, "scored")
+                            for sid in se.get("veto_signals", []):
+                                roles.setdefault(sid, "veto")
+                            se["roles"] = roles
+                            se["mandatory_signals"] = [s for s in mand if s != "M4_micro_pullback"]
+                            if "M4_micro_pullback" not in se.get("scored_signals", []):
+                                se.setdefault("scored_signals", []).append("M4_micro_pullback")
+                            print("[StrategyEngine] MIGRATED signal_engine config: "
+                                  "M4_micro_pullback demoted mandatory → scored "
+                                  "(addendum Part B Step 2.4); roles map written")
                     # Valid file — keep all user settings, just refresh the timestamp
                     existing["updated_at"] = datetime.now(timezone.utc).isoformat()
                     _atomic_write_strategy(existing)
