@@ -4915,14 +4915,38 @@ def api_update():
         except Exception:
             pass
         app_dir = pathlib.Path(__file__).parent.parent
+        # systemd units often set PATH to just the venv (Environment=PATH=
+        # /opt/tradebot/venv/bin), so bare "git"/"npm" are NOT findable from
+        # this process — the updater silently failed on FileNotFoundError.
+        # Build a PATH that includes the standard system dirs, and resolve
+        # absolute binary paths via shutil.which as a belt-and-suspenders.
+        import shutil as _sh
+        _env = dict(os.environ)
+        _env["PATH"] = _env.get("PATH", "") + ":/usr/local/bin:/usr/bin:/bin"
+        _git = _sh.which("git", path=_env["PATH"]) or "git"
         try:
-            subprocess.run(["git", "fetch", "origin", "main"],
-                           cwd=str(app_dir), check=True, timeout=30)
-            subprocess.run(["git", "reset", "--hard", "origin/main"],
-                           cwd=str(app_dir), check=True, timeout=30)
+            # -c safe.directory covers root-owned checkouts ("dubious
+            # ownership") when the service user differs from the repo owner.
+            subprocess.run([_git, "-c", f"safe.directory={app_dir}",
+                            "fetch", "origin", "main"],
+                           cwd=str(app_dir), check=True, timeout=60,
+                           env=_env, capture_output=True, text=True)
+            subprocess.run([_git, "-c", f"safe.directory={app_dir}",
+                            "reset", "--hard", "origin/main"],
+                           cwd=str(app_dir), check=True, timeout=60,
+                           env=_env, capture_output=True, text=True)
+            print("[Update] Code updated to origin/main", flush=True)
         except Exception as exc:
             # Pull failed — nothing changed on disk; un-pause and bail.
-            print(f"[Update] ERROR pulling code: {exc}", flush=True)
+            _detail = ""
+            if isinstance(exc, subprocess.CalledProcessError):
+                _detail = f" | stderr: {(exc.stderr or '')[:300]}"
+            msg = f"UPDATE FAILED pulling code: {type(exc).__name__}: {exc}{_detail}"
+            print(f"[Update] {msg}", flush=True)
+            try:
+                database.log_activity(msg, "error")
+            except Exception:
+                pass
             try:
                 _write_strategy_patch({"trading_active": was_active,
                                        "pause_reason": None,
@@ -4934,9 +4958,14 @@ def api_update():
         # A build failure must never abort the restart (that left the process
         # running old code while the repo had already been updated).
         try:
-            subprocess.run(["npm", "run", "build"],
-                           cwd=str(app_dir), check=True, timeout=300)
-            print("[Update] Rebuild complete", flush=True)
+            _npm = _sh.which("npm", path=_env["PATH"])
+            if _npm:
+                subprocess.run([_npm, "run", "build"],
+                               cwd=str(app_dir), check=True, timeout=300,
+                               env=_env, capture_output=True, text=True)
+                print("[Update] Rebuild complete", flush=True)
+            else:
+                print("[Update] npm not found — using committed dist/", flush=True)
         except Exception as exc:
             print(f"[Update] npm build skipped/failed ({exc}) — using committed dist/", flush=True)
         print("[Update] Restarting bot", flush=True)
