@@ -1,21 +1,44 @@
 """
 Data collector — historical REST download + live WebSocket price/kline feed.
 No auth required for any endpoint in any mode.
+
+§6.2/§6.3/§6.4 additions:
+- Every REST call is gated through binance_limits (weight budget, 429/418
+  back-pressure) with a guarded import so old deploys degrade to no-ops.
+- 1m/5m candle buffers hold 120/60 closed candles, REST-backfilled at startup
+  and gap-repaired per-symbol on missing kline ranges and after reconnects.
+- Market streams are sharded across WS connections (≤300 streams each) plus a
+  DEDICATED connection for held-symbol exit feeds (@trade + @bookTicker).
+- Watchlist changes are diffed and applied via live SUBSCRIBE/UNSUBSCRIBE
+  frames (paced, batched); large diffs fall back to close-and-reconnect.
+- Connections are rotated make-before-break at ~23h (Binance drops at 24h).
+- get_data_health() feeds the §6.5 health panel.
 """
 
 import asyncio
+import itertools
 import json
+import random
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import deque
 from datetime import datetime
-from typing import Dict, Callable, Optional
+from typing import Dict, Callable, List, Optional, Tuple
 
 import config
 import database
 import indicators
 from connection import client
+
+# Shared Binance limit-compliance state (§6.4). Guarded import: the module may
+# be absent in an old deploy — every use goes through the _limits_* no-op
+# fallbacks below.
+try:
+    import binance_limits
+except Exception:
+    binance_limits = None
 
 # Shared live prices dict — imported by trade_engine and strategy_engine
 prices: Dict[str, float] = {}
@@ -36,35 +59,49 @@ _ws_health: Dict = {
     "resubscribe_count":  0,
 }
 
-# In-memory rolling candle buffer — filled by WebSocket kline-close events.
-# Used as the primary data source for signal computation when Binance REST
-# is geo-blocked from Railway's servers.  Holds up to 60 closed 1m candles
-# per coin; once 16+ have accumulated, RSI signals fire and buys can happen.
+# In-memory rolling candle buffer — filled by WebSocket kline-close events and
+# REST backfill/gap-repair. Primary data source for signal computation when
+# Binance REST is geo-blocked. Holds up to 120 closed 1m candles per coin;
+# once 16+ have accumulated, RSI signals fire and buys can happen.
 ws_candles: Dict[str, list] = {}
-_WS_CANDLE_MAX = 60   # candles to keep per coin
+_WS_CANDLE_MAX = 120  # closed 1m candles to keep per coin (§6.2)
 _MIN_CANDLES   = 16   # minimum candles needed for at least RSI signal to work
 
 # In-memory 5-minute candle buffer — filled via WebSocket @kline_5m subscription.
 # Eliminates REST calls for 5m veto checks after the first 5 candles arrive.
 ws_candles_5m: Dict[str, list] = {}
-_WS_5M_CANDLE_MAX = 30   # 150 minutes of 5m candles
+_WS_5M_CANDLE_MAX = 60   # 5 hours of 5m candles (§6.2)
 _MIN_CANDLES_5M   = 21   # enough for EMA21 to be meaningful
 
-# Rolling price-tick buffer — filled by every WebSocket @trade event.
-# Used as immediate fallback (available in seconds) but RSI quality is poor
-# because all ticks come from the same second (prices nearly identical → RSI≈50).
+# Guards ws_candles / ws_candles_5m mutation: WS event loop appends while
+# backfill/gap-repair executor threads merge. Merges REPLACE the per-symbol
+# list atomically so lock-free readers (trade_engine, futures_engine) never
+# see a half-built list.
+_buffers_lock = threading.Lock()
+
+# Rolling price-tick buffer — filled by WebSocket @trade events (held symbols'
+# dedicated feed) and by @miniTicker 1s roll-ups for everything else.
 price_ticks: Dict[str, deque] = {}
 _TICK_MAX  = 50
 _MIN_TICKS = 15
 
 # Time-sampled price buffer — one close price recorded per 1 second.
 # After 16 seconds: 16 samples → RSI(14) computes on meaningful price variation.
-# This is the primary signal source when Binance REST is geo-blocked.
 price_samples: Dict[str, list] = {}       # one price per _SAMPLE_INTERVAL
 _price_sample_ts: Dict[str, float] = {}   # last sample time per coin
 _SAMPLE_INTERVAL = 1.0    # seconds between samples
 _SAMPLE_MAX      = 300    # keep 5 minutes of samples (300 × 1s)
 _MIN_SAMPLES     = 16     # 16 seconds needed before RSI fires
+
+# ── Held-symbol freshness (§6.3) ──────────────────────────────────────────────
+# Per-symbol timestamp of the freshest WS price event (trade / bookTicker /
+# miniTicker). trade_engine's REST price watchdog consumes this via
+# held_price_age(); we only expose accurate data here.
+last_price_ts: Dict[str, float] = {}
+
+# Best bid/ask from @bookTicker (held-symbol dedicated feed):
+# {symbol: {"bid": float, "bid_qty": float, "ask": float, "ask_qty": float, "ts": float}}
+book_ticker: Dict[str, dict] = {}
 
 # Callbacks registered by main.py to avoid circular imports
 _price_callback: Optional[Callable[[Dict[str, float]], None]] = None
@@ -83,29 +120,33 @@ def register_kline_callback(cb: Callable[[str, list, list], None]):
 
 
 # ── Dynamic watchlist ─────────────────────────────────────────────────────────
-# The WS stream list is rebuilt on every (re)connect from the persisted
-# watchlist (strategy.json approved_coins — the same file /api/coins writes)
-# so dashboard changes actually re-subscribe. A watcher task also polls the
-# persisted list every _WATCHLIST_POLL_SEC as a self-healing fallback, so the
-# fix works even if control_api never calls refresh_watchlist().
+# The WS stream set is rebuilt from the persisted watchlist (strategy.json
+# approved_coins — the same file /api/coins writes). Changes are DIFFED against
+# the current subscriptions and applied via live SUBSCRIBE/UNSUBSCRIBE frames
+# (debounced to at most once per 5 s); a ~60 s poll of the persisted list is a
+# self-healing fallback even if control_api never calls refresh_watchlist().
 
 _reconnect_requested = threading.Event()
 _WATCHLIST_POLL_SEC  = 60
 
-# Binance combined streams allow ~1024 streams per connection. Klines (1m+5m)
-# are essential for signals and are always kept; miniTicker / @trade are
-# dropped first when the coin list would blow the budget.
-_MAX_COMBINED_STREAMS = 1000
+# Hook for trade_engine: positions changed → resync the dedicated held-symbol
+# exit-feed connection immediately (a 5 s poll is the fallback).
+_positions_changed = threading.Event()
+_HELD_POLL_SEC = 5.0
 
 
 def refresh_watchlist():
-    """Signal the WS loop to reconnect and rebuild its stream list from the
-    persisted watchlist. Thread-safe (just sets an Event); safe to call at any
-    time, including before the WS loop has started. control_api's /api/coins
-    handler can call this right after writing approved_coins; even without
-    that hook the WS loop self-heals via its ~60s watchlist poll."""
+    """Signal the WS manager to re-read the persisted watchlist and diff its
+    subscriptions. Thread-safe (just sets an Event); safe to call at any time,
+    including before the WS loop has started."""
     _reconnect_requested.set()
-    print("[DataCollector] Watchlist refresh requested — WebSocket will resubscribe")
+    print("[DataCollector] Watchlist refresh requested — subscriptions will be diffed")
+
+
+def notify_positions_changed():
+    """trade_engine calls this whenever _positions changes so the dedicated
+    held-symbol WS connection (@trade + @bookTicker) resubscribes right away."""
+    _positions_changed.set()
 
 
 def _load_persisted_watchlist() -> list:
@@ -149,6 +190,99 @@ def _load_persisted_watchlist() -> list:
     return out
 
 
+# ── Binance limits gate (§6.4) — guarded no-op fallbacks ─────────────────────
+
+class _RestDeferred(Exception):
+    """Raised when the limits gate stayed closed for the whole polite-wait
+    window — the caller should skip this fetch and try again later."""
+
+
+class _RestLimited(Exception):
+    """Raised on HTTP 429/418 after the event has been reported to
+    binance_limits. Callers must NOT retry through this."""
+
+    def __init__(self, code: int):
+        self.code = code
+        super().__init__(f"Binance rate limit response HTTP {code}")
+
+
+_W_KLINES  = getattr(binance_limits, "WEIGHT_KLINES", 2) if binance_limits else 2
+_W_EXINFO  = getattr(binance_limits, "WEIGHT_EXCHANGE_INFO", 20) if binance_limits else 20
+
+
+def _limits_acquire(weight: int, critical: bool = False, defer_sec: float = 0.0) -> None:
+    """Politely wait (≤ defer_sec) for the limits gate to open, recording the
+    spend when it does. Raises _RestDeferred if the window closes on us.
+    No-op when binance_limits is absent (old deploys)."""
+    if binance_limits is None:
+        return
+    deadline = time.time() + max(0.0, defer_sec)
+    while True:
+        try:
+            if binance_limits.spend(weight, critical):
+                return
+        except Exception:
+            return  # never let a limits-module bug block data collection
+        if time.time() >= deadline:
+            raise _RestDeferred(f"limits gate closed (weight {weight})")
+        time.sleep(0.5)
+
+
+def _limits_record(headers) -> None:
+    if binance_limits is None:
+        return
+    try:
+        binance_limits.record_response_headers(headers)
+    except Exception:
+        pass
+
+
+def _limits_on_429(retry_after) -> None:
+    if binance_limits is None:
+        return
+    try:
+        binance_limits.on_429(retry_after)
+    except Exception:
+        pass
+
+
+def _limits_on_418(retry_after) -> None:
+    if binance_limits is None:
+        return
+    try:
+        binance_limits.on_418(retry_after)
+    except Exception:
+        pass
+
+
+def _retry_after_sec(headers) -> Optional[float]:
+    try:
+        v = headers.get("Retry-After") if headers is not None else None
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def _urlopen_json(url: str, timeout: float = 15):
+    """One HTTP GET with full limits telemetry: response headers are recorded
+    on success AND on error; 429/418 are reported and re-raised as
+    _RestLimited so callers never hammer through back-pressure."""
+    req = urllib.request.Request(url, headers={"User-Agent": "WolfBot/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            _limits_record(getattr(resp, "headers", None))
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        _limits_record(getattr(e, "headers", None))
+        if e.code == 429:
+            _limits_on_429(_retry_after_sec(getattr(e, "headers", None)))
+            raise _RestLimited(429) from e
+        if e.code == 418:
+            _limits_on_418(_retry_after_sec(getattr(e, "headers", None)))
+            raise _RestLimited(418) from e
+        raise
+
+
 # ── REST historical download ────────────────────────────────────────────
 
 _BINANCE_BASES = [
@@ -162,14 +296,25 @@ _BINANCE_BASES = [
 ]
 
 
-def _fetch_klines_rest(symbol: str, interval: str, limit: int = 500):
-    """Try each Binance base URL in order; return first successful response."""
+def _fetch_klines_rest(symbol: str, interval: str, limit: int = 500,
+                       start_ms: Optional[int] = None, end_ms: Optional[int] = None,
+                       critical: bool = False, defer_sec: float = 10.0):
+    """Try each Binance base URL in order; return first successful response.
+    Rate-limit gated (weight 2); optional startTime/endTime for gap repair.
+    On 429/418 the base-fallback loop ABORTS immediately (shared IP budget)."""
+    _limits_acquire(_W_KLINES, critical=critical, defer_sec=defer_sec)
+    qs = f"symbol={symbol}&interval={interval}&limit={int(limit)}"
+    if start_ms is not None:
+        qs += f"&startTime={int(start_ms)}"
+    if end_ms is not None:
+        qs += f"&endTime={int(end_ms)}"
     last_err = None
     for base in _BINANCE_BASES:
-        url = f"{base}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        url = f"{base}/api/v3/klines?{qs}"
         try:
-            with urllib.request.urlopen(url, timeout=15) as resp:
-                return json.loads(resp.read())
+            return _urlopen_json(url, timeout=15)
+        except _RestLimited:
+            raise  # 429/418 already reported — never try the other bases
         except Exception as e:
             last_err = e
     raise last_err
@@ -195,25 +340,21 @@ def fetch_5m_candles(symbol: str, limit: int = 30) -> list:
             for k in buf[-limit:]
         ]
 
-    for base in _BINANCE_BASES:
-        url = f"{base}/api/v3/klines?symbol={symbol}&interval=5m&limit={limit}"
-        try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
-                raw = json.loads(resp.read())
-            return [
-                {
-                    "open_time": int(k[0]),
-                    "open":      float(k[1]),
-                    "high":      float(k[2]),
-                    "low":       float(k[3]),
-                    "close":     float(k[4]),
-                    "volume":    float(k[5]),
-                }
-                for k in raw
-            ]
-        except Exception:
-            continue
-    return []
+    try:
+        raw = _fetch_klines_rest(symbol, "5m", limit=limit, defer_sec=2.0)
+        return [
+            {
+                "open_time": int(k[0]),
+                "open":      float(k[1]),
+                "high":      float(k[2]),
+                "low":       float(k[3]),
+                "close":     float(k[4]),
+                "volume":    float(k[5]),
+            }
+            for k in raw
+        ]
+    except Exception:
+        return []
 
 
 def _compute_and_save(symbol: str, raw_klines: list, save_all: bool = False):
@@ -284,7 +425,10 @@ def _bootstrap_5m_from_db():
     Each aligned bucket of 5 consecutive 1m candles becomes one 5m candle:
     o = first open, h = max high, l = min low, c = last close, v = sum volume.
     Only complete, fully-elapsed buckets are used; the most recent
-    _WS_5M_CANDLE_MAX per coin are kept. Runs once per process."""
+    _WS_5M_CANDLE_MAX per coin are kept. Runs once per process.
+
+    This stays the FIRST (free) source; the REST startup backfill fills the
+    remainder up to the buffer targets afterwards."""
     global _bootstrap_5m_done
     with _bootstrap_5m_lock:
         if _bootstrap_5m_done:
@@ -339,13 +483,14 @@ def _bootstrap_5m_from_db():
                 continue
 
             # Merge with anything the live WS already collected (WS entries win)
-            buf = ws_candles_5m.setdefault(sym, [])
-            have = {int(k[0]) for k in buf}
-            merged = [k for k in synth if int(k[0]) not in have] + list(buf)
-            merged.sort(key=lambda k: int(k[0]))
-            ws_candles_5m[sym] = merged[-_WS_5M_CANDLE_MAX:]
+            with _buffers_lock:
+                buf = ws_candles_5m.setdefault(sym, [])
+                have = {int(k[0]) for k in buf}
+                merged = [k for k in synth if int(k[0]) not in have] + list(buf)
+                merged.sort(key=lambda k: int(k[0]))
+                ws_candles_5m[sym] = merged[-_WS_5M_CANDLE_MAX:]
+                total += len(ws_candles_5m[sym])
             seeded += 1
-            total += len(ws_candles_5m[sym])
         except Exception as e:
             print(f"[DataCollector] 5m bootstrap error ({sym}): {e}")
 
@@ -372,7 +517,7 @@ def download_history():
     print(f"[DataCollector] Downloading {config.CANDLE_LOOKBACK * 20} candles per coin…")
     for coin in _load_persisted_watchlist():
         try:
-            raw = _fetch_klines_rest(coin, config.CANDLE_TIMEFRAME, limit=1000)
+            raw = _fetch_klines_rest(coin, config.CANDLE_TIMEFRAME, limit=1000, defer_sec=30.0)
             _compute_and_save(coin, raw, save_all=True)
             print(f"  {coin}: {len(raw)} candles saved")
             time.sleep(0.3)  # be polite to Binance rate limits
@@ -381,34 +526,302 @@ def download_history():
     print("[DataCollector] History download complete.")
 
 
-# ── Live WebSocket ─────────────────────────────────────────────────────────────────────────────
+# ── Buffer merge / gap repair / backfill (§6.2, §6.4) ────────────────────────
 
-def _build_ws_url(coins: list) -> str:
-    """Compose the combined-stream URL, respecting Binance's per-connection
-    stream budget. Klines (1m + 5m) are essential for signal computation and
-    are always included for every coin; miniTicker (1s price roll-up, feeds
-    the sell path) is next; per-trade tick streams are optional and dropped
-    first when the watchlist is large."""
-    n = len(coins)
-    suffixes = [f"kline_{config.CANDLE_TIMEFRAME}", "kline_5m"]   # 2 per coin, always
-    if n * 3 <= _MAX_COMBINED_STREAMS:
-        suffixes.append("miniTicker")                             # 3 per coin
-    if n * 4 <= _MAX_COMBINED_STREAMS:
-        suffixes.append("trade")                                  # 4 per coin
-    dropped = [s for s in ("trade", "miniTicker") if s not in suffixes]
-    if dropped:
-        print(f"[DataCollector] {n} coins would exceed the stream budget "
-              f"({_MAX_COMBINED_STREAMS}) — dropping {dropped} streams, klines kept for all")
-    streams = "/".join(
-        f"{coin.lower()}@{suffix}" for coin in coins for suffix in suffixes
-    )
-    return f"wss://data-stream.binance.vision/stream?streams={streams}"
+def _buffer_meta(interval: str) -> Tuple[Dict[str, list], int, int]:
+    """(buffer dict, interval ms, max length) for an interval string."""
+    if interval == "5m":
+        return ws_candles_5m, 300_000, _WS_5M_CANDLE_MAX
+    return ws_candles, 60_000, _WS_CANDLE_MAX
+
+
+def _append_closed_candle(sym: str, interval: str, closed: list):
+    """Append one WS closed candle to its buffer, detecting gaps.
+    Returns (appended, gap, snapshot):
+      appended — False when the candle is a duplicate/out-of-order
+                 (reconnect-overlap re-delivery); buffer untouched.
+      gap      — (start_ms, end_ms) of the MISSING range when
+                 open_time != last.open_time + interval_ms, else None.
+      snapshot — copy of the buffer after the operation (signal source)."""
+    buf_map, step, maxlen = _buffer_meta(interval)
+    with _buffers_lock:
+        buf = buf_map.setdefault(sym, [])
+        last = int(buf[-1][0]) if buf else None
+        ot = int(closed[0])
+        if last is not None and ot <= last:
+            return False, None, list(buf)
+        gap = None
+        if last is not None and ot != last + step:
+            gap = (last + step, ot - 1)
+        buf.append(closed)
+        while len(buf) > maxlen:
+            buf.pop(0)
+        return True, gap, list(buf)
+
+
+def _merge_candles(sym: str, interval: str, rest_rows: list) -> int:
+    """Merge REST kline rows into the WS buffer without duplicates, keyed by
+    open_time — existing (WS) entries win. Only fully-CLOSED candles are
+    merged. The per-symbol list is REPLACED atomically for lock-free readers.
+    Returns the number of candles added."""
+    if not rest_rows:
+        return 0
+    buf_map, step, maxlen = _buffer_meta(interval)
+    now_ms = int(time.time() * 1000)
+    parsed = []
+    for r in rest_rows:
+        try:
+            ot = int(r[0])
+            # Row 6 is the candle close time when present (raw REST shape);
+            # otherwise infer closure from open_time + interval.
+            close_ms = int(r[6]) if len(r) > 6 else ot + step - 1
+            if close_ms >= now_ms:
+                continue  # in-progress candle — never buffer it
+            parsed.append([ot, float(r[1]), float(r[2]), float(r[3]),
+                           float(r[4]), float(r[5])])
+        except Exception:
+            continue
+    if not parsed:
+        return 0
+    with _buffers_lock:
+        buf = buf_map.setdefault(sym, [])
+        have = {int(k[0]) for k in buf}
+        add = [row for row in parsed if row[0] not in have]
+        if not add:
+            return 0
+        merged = list(buf) + add
+        merged.sort(key=lambda k: int(k[0]))
+        buf_map[sym] = merged[-maxlen:]
+        return len(add)
+
+
+# Rolling operational counters (health panel)
+_counters_lock = threading.Lock()
+_gap_repairs: deque = deque()        # ts of each gap repair (24 h window)
+_connect_attempts: deque = deque()   # ts of each WS connect attempt (5 min window)
+_last_reconnect_alarm_ts = 0.0
+_backfill_last_duration = 0.0
+_manager_started_ts = 0.0
+
+_RECONNECT_ALARM_THRESHOLD = 30      # attempts per 5 min → ALARM (§6.4 item g)
+
+
+def _record_gap_repair():
+    now = time.time()
+    with _counters_lock:
+        _gap_repairs.append(now)
+        while _gap_repairs and _gap_repairs[0] < now - 86_400:
+            _gap_repairs.popleft()
+
+
+def _record_connect_attempt():
+    global _last_reconnect_alarm_ts
+    now = time.time()
+    with _counters_lock:
+        _connect_attempts.append(now)
+        while _connect_attempts and _connect_attempts[0] < now - 300:
+            _connect_attempts.popleft()
+        n = len(_connect_attempts)
+        alarm = n > _RECONNECT_ALARM_THRESHOLD and now - _last_reconnect_alarm_ts > 60
+        if alarm:
+            _last_reconnect_alarm_ts = now
+    if alarm:
+        print(f"[DataCollector] ALARM: {n} WebSocket connection attempts in the "
+              f"last 5 minutes — connectivity is flapping")
+        try:
+            import trade_engine as _te
+            _te.log_diag_issue("websocket", "error",
+                               f"ALARM: {n} WS connect attempts in 5 min (flapping)")
+        except Exception:
+            pass
+
+
+# In-flight guard so one symbol/interval never runs concurrent repairs.
+_repair_lock = threading.Lock()
+_repair_inflight: set = set()
+
+
+def _gap_repair_range(sym: str, interval: str, start_ms: int, end_ms: int,
+                      reason: str = "kline-gap"):
+    """Fetch ONLY the missing kline range for ONLY this symbol through the
+    limits path and merge it into the buffer (WS entries win). Blocking —
+    runs on an executor thread. Counted in gap_repairs_24h."""
+    key = (sym, interval)
+    with _repair_lock:
+        if key in _repair_inflight:
+            return
+        _repair_inflight.add(key)
+    try:
+        _, step, maxlen = _buffer_meta(interval)
+        n = int((end_ms - start_ms) // step) + 1
+        n = max(1, min(n, maxlen, 1000))
+        raw = _fetch_klines_rest(sym, interval, limit=n,
+                                 start_ms=start_ms, end_ms=end_ms, defer_sec=15.0)
+        added = _merge_candles(sym, interval, raw)
+        _record_gap_repair()
+        print(f"[DataCollector] Gap repair ({reason}) {sym} {interval}: "
+              f"fetched {len(raw)}, merged {added} candle(s)")
+        # Keep the SQLite candle history whole too (parity with the old
+        # post-disconnect gap fill, which persisted refetched 1m rows).
+        if interval == config.CANDLE_TIMEFRAME and raw:
+            try:
+                _compute_and_save(sym, raw, save_all=True)
+            except Exception:
+                pass
+    except _RestDeferred:
+        print(f"[DataCollector] Gap repair deferred for {sym} {interval} — limits gate closed")
+    except Exception as e:
+        print(f"[DataCollector] Gap repair failed for {sym} {interval}: {e}")
+    finally:
+        with _repair_lock:
+            _repair_inflight.discard(key)
+
+
+def _gap_repair_tail(symbols: list, reason: str):
+    """After a reconnect (or make-before-break rotation): for every symbol
+    whose buffer tail is ≥2 intervals old, fetch just the missing tail range.
+    Blocking — runs on an executor thread."""
+    for sym in symbols:
+        for interval in (config.CANDLE_TIMEFRAME, "5m"):
+            try:
+                buf_map, step, _maxlen = _buffer_meta(interval)
+                buf = buf_map.get(sym)
+                if not buf:
+                    continue  # empty buffers are the backfill's job
+                last = int(buf[-1][0])
+                now_ms = int(time.time() * 1000)
+                if now_ms - last >= 2 * step:
+                    _gap_repair_range(sym, interval, last + step, now_ms, reason=reason)
+            except Exception as e:
+                print(f"[DataCollector] Tail repair error ({sym} {interval}): {e}")
+
+
+def _spawn_gap_repair(symbols, reason: str):
+    """Schedule tail gap repair on the executor (call from the WS event loop)."""
+    try:
+        asyncio.get_running_loop().run_in_executor(
+            None, _gap_repair_tail, sorted(symbols), reason)
+    except Exception as e:
+        print(f"[DataCollector] Could not schedule gap repair: {e}")
+
+
+_BACKFILL_CONCURRENCY = 10
+_backfill_running = threading.Event()
+_bg_tasks: set = set()   # keep task refs so they aren't GC'd
+
+
+def _backfill_symbol(sym: str) -> int:
+    """Blocking single-symbol backfill through the rate-limited path.
+    Fills the 1m buffer to 120 and the 5m buffer to 60 closed candles."""
+    merged = 0
+    try:
+        if len(ws_candles.get(sym, [])) < _WS_CANDLE_MAX:
+            raw = _fetch_klines_rest(sym, config.CANDLE_TIMEFRAME,
+                                     limit=_WS_CANDLE_MAX, defer_sec=20.0)
+            merged += _merge_candles(sym, config.CANDLE_TIMEFRAME, raw)
+        if len(ws_candles_5m.get(sym, [])) < _WS_5M_CANDLE_MAX:
+            raw = _fetch_klines_rest(sym, "5m", limit=_WS_5M_CANDLE_MAX, defer_sec=20.0)
+            merged += _merge_candles(sym, "5m", raw)
+    except _RestDeferred:
+        pass  # budget closed — the next backfill trigger will finish the job
+    except Exception as e:
+        print(f"[DataCollector] Backfill error ({sym}): {e}")
+    return merged
+
+
+async def _backfill_buffers(coins: list, reason: str):
+    """Startup / new-coin REST backfill (§6.2 b): fill 1m buffers to 120 and
+    5m buffers to 60 closed candles, ≤10 symbols in flight, all through the
+    binance_limits gate. Logs total duration + symbols filled."""
+    global _backfill_last_duration
+    coins = [c for c in coins if c]
+    if not coins:
+        return
+    if _backfill_running.is_set():
+        print("[DataCollector] Backfill already running — skipping duplicate sweep")
+        return
+    _backfill_running.set()
+    t0 = time.time()
+    filled: list = []
+    sem = asyncio.Semaphore(_BACKFILL_CONCURRENCY)
+
+    async def one(sym: str):
+        async with sem:
+            n = await asyncio.to_thread(_backfill_symbol, sym)
+            if n:
+                filled.append(sym)
+
+    try:
+        await asyncio.gather(*(one(c) for c in coins), return_exceptions=True)
+    finally:
+        _backfill_running.clear()
+    dur = time.time() - t0
+    _backfill_last_duration = dur
+    print(f"[DataCollector] Backfill ({reason}): filled {len(filled)}/{len(coins)} "
+          f"symbols in {dur:.1f}s")
+
+
+def _spawn_backfill(coins: list, reason: str):
+    """Fire-and-forget backfill task on the running WS event loop."""
+    try:
+        task = asyncio.get_running_loop().create_task(_backfill_buffers(list(coins), reason))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+    except Exception as e:
+        print(f"[DataCollector] Could not schedule backfill: {e}")
+
+
+# ── Live WebSocket ────────────────────────────────────────────────────────────
+
+# Market-data WS host: data-stream.binance.vision (geo-block workaround —
+# same reason REST uses data-api.binance.vision). Do NOT change this host.
+_WS_BASE = "wss://data-stream.binance.vision"
+
+# §6.4: cap streams per connection well below Binance's 1024 combined-stream
+# limit; shard the coin list across connections instead.
+_MAX_STREAMS_PER_CONN = 300
+
+# Streams every watched coin gets on the sharded market connections.
+_MARKET_SUFFIXES = (f"kline_{config.CANDLE_TIMEFRAME}", "kline_5m", "miniTicker")
+
+# §6.4 control-message pacing: live SUBSCRIBE/UNSUBSCRIBE frames are used for
+# small diffs; larger diffs fall back to the proven close-and-reconnect path.
+_LIVE_DIFF_MAX_STREAMS = 20
+_SUBS_DEBOUNCE_SEC = 5.0          # watchlist diffs applied at most once per 5 s
+_CONTROL_SEND_MIN_INTERVAL = 0.3  # ≥300 ms between outgoing frames → ≤3.3 msg/s,
+                                  # comfortably under Binance's 5 msg/s cap even
+                                  # counting the pong frames the websockets lib
+                                  # sends automatically for server pings.
+_CONTROL_BATCH_MAX = 50           # stream names per SUBSCRIBE/UNSUBSCRIBE payload
+
+_ROTATE_AFTER_SEC = 23 * 3600     # make-before-break before Binance's 24 h drop
+_ROTATE_CONFIRM_TIMEOUT = 45.0    # replacement must produce a message in this window
+
+
+def _market_streams_for(coins: list) -> list:
+    return [f"{c.lower()}@{sfx}" for c in coins for sfx in _MARKET_SUFFIXES]
+
+
+def _stream_symbol(stream: str) -> str:
+    return stream.split("@", 1)[0].upper()
+
+
+def _shard_coins(coins: list) -> List[list]:
+    """Split the coin list into shards whose stream count fits one connection."""
+    per_shard = max(1, _MAX_STREAMS_PER_CONN // len(_MARKET_SUFFIXES))
+    return [coins[i:i + per_shard] for i in range(0, len(coins), per_shard)]
+
+
+def _build_ws_url(streams: list) -> str:
+    """Combined-stream URL for one connection's stream list."""
+    return f"{_WS_BASE}/stream?streams={'/'.join(streams)}"
 
 
 # Cache exchangeInfo verification so rapid resubscribes/reconnects don't
-# hammer the endpoint; keyed by the exact coin set.
+# hammer the endpoint; keyed by the exact coin set (a watchlist change busts
+# the key), TTL 24 h per the exchangeInfo caching guidance (weight 20).
 _verify_cache: Dict = {"key": None, "ok": None, "ts": 0.0}
-_VERIFY_TTL_SEC = 600
+_VERIFY_TTL_SEC = 86_400
 
 
 async def _verify_symbols(coins: list) -> list:
@@ -418,9 +831,9 @@ async def _verify_symbols(coins: list) -> list:
         return list(_verify_cache["ok"])
     try:
         def _fetch():
+            _limits_acquire(_W_EXINFO, critical=False, defer_sec=10.0)
             url = "https://data-api.binance.vision/api/v3/exchangeInfo?permissions=SPOT"
-            with urllib.request.urlopen(url, timeout=15) as r:
-                return json.loads(r.read())
+            return _urlopen_json(url, timeout=15)
         data = await asyncio.to_thread(_fetch)
         valid = {s["symbol"] for s in data.get("symbols", []) if s["status"] == "TRADING"}
         ok    = [c for c in coins if c in valid]
@@ -463,228 +876,675 @@ def _persist_and_signal(sym: str, closed: list, buf_snapshot: list):
         print(f"[DataCollector] Candle persist/signal error ({sym}): {e}")
 
 
-async def _watchlist_watcher(ws, desired_set: set):
-    """Runs alongside an open WS connection. Closes the socket — so the
-    reconnect loop rebuilds the stream list — when refresh_watchlist() was
-    called or the persisted watchlist (strategy.json approved_coins ∪ open
-    positions) no longer matches what this connection subscribed to. The
-    ~60s poll is a self-healing fallback that keeps /api/coins changes
-    effective even if control_api never calls refresh_watchlist()."""
-    try:
-        while True:
-            # Check the explicit refresh flag every second for responsiveness;
-            # fall back to re-reading the persisted list every poll interval.
-            for _ in range(_WATCHLIST_POLL_SEC):
+def _record_sample_and_ticks(symbol: str, price: float, now_ts: float):
+    """Shared tick/sample bookkeeping for @trade and @miniTicker events.
+    (Non-held coins no longer stream @trade — the miniTicker 1 s roll-up
+    feeds price_ticks/price_samples for them instead.)"""
+    ticks = price_ticks.setdefault(symbol, deque(maxlen=_TICK_MAX))
+    ticks.append(price)
+    if now_ts - _price_sample_ts.get(symbol, 0) >= _SAMPLE_INTERVAL:
+        _price_sample_ts[symbol] = now_ts
+        buf = price_samples.setdefault(symbol, [])
+        buf.append(price)
+        if len(buf) > _SAMPLE_MAX:
+            buf.pop(0)
+
+
+def _handle_ws_message(raw: str):
+    """Shared message handler for ALL WS connections (market shards + the
+    dedicated held-symbol exit feed). Must only be called from the WS loop."""
+    msg = json.loads(raw)
+    if "result" in msg and "id" in msg and "data" not in msg:
+        return  # SUBSCRIBE/UNSUBSCRIBE ack — nothing to do
+    stream = str(msg.get("stream", ""))
+    data = msg.get("data", msg)
+    evt = data.get("e")
+    now_ts = time.time()
+
+    if evt == "trade":
+        symbol = data["s"]
+        price  = float(data["p"])
+        prices[symbol] = price
+        last_price_ts[symbol] = now_ts
+        _record_sample_and_ticks(symbol, price, now_ts)
+        client.update_price(symbol, price)
+        try:
+            import trade_engine as _te_tr
+            _te_tr._last_ws_price_ts[symbol] = now_ts
+        except Exception:
+            pass
+        if _price_callback:
+            _price_callback(dict(prices))
+
+    elif evt == "kline":
+        k = data["k"]
+        if k.get("x"):   # candle closed
+            sym      = k["s"]
+            interval = k.get("i", "1m")
+            closed = [
+                int(k["t"]),   float(k["o"]), float(k["h"]),
+                float(k["l"]), float(k["c"]), float(k["v"]),
+            ]
+            appended, gap, snapshot = _append_closed_candle(sym, interval, closed)
+            if gap is not None:
+                # §6.2 c: fetch ONLY the missing range for ONLY this symbol.
+                asyncio.get_running_loop().run_in_executor(
+                    None, _gap_repair_range, sym, interval, gap[0], gap[1], "kline-gap")
+            if interval != "5m" and appended:
+                # ── Persist + signal on a worker thread so the blocking
+                # SQLite work never stalls this loop. (Duplicates from
+                # reconnect overlap are skipped — already persisted.)
+                asyncio.get_running_loop().run_in_executor(
+                    None, _persist_and_signal, sym, closed, snapshot)
+
+    elif evt == "24hrMiniTicker":
+        symbol = data["s"]
+        close_price = float(data["c"])
+        # miniTicker arrives every ~1s per coin — it is the price feed for all
+        # non-held coins (held coins additionally stream @trade on the
+        # dedicated exit connection).
+        prices[symbol] = close_price
+        last_price_ts[symbol] = now_ts
+        _record_sample_and_ticks(symbol, close_price, now_ts)
+        client.update_price(symbol, close_price)
+        try:
+            import trade_engine as _te_mt
+            _te_mt._last_ws_price_ts[symbol] = now_ts
+            # For HELD positions, evaluate sell triggers on this tick too —
+            # low-trade-volume coins may only get miniTicker updates, and
+            # waiting for another coin's @trade event (or the 0.25s fallback
+            # loop) delays the exit.
+            if _price_callback and symbol in _te_mt._pos_by_symbol:
+                _price_callback(dict(prices))
+        except Exception:
+            pass
+
+    elif stream.lower().endswith("@bookticker") or (
+            evt is None and "b" in data and "a" in data and "s" in data):
+        # @bookTicker payloads carry no "e" field — detect via stream name.
+        symbol = data.get("s")
+        if symbol:
+            book_ticker[symbol] = {
+                "bid":     float(data["b"]),
+                "bid_qty": float(data["B"]),
+                "ask":     float(data["a"]),
+                "ask_qty": float(data["A"]),
+                "ts":      now_ts,
+            }
+            last_price_ts[symbol] = now_ts
+            try:
+                import trade_engine as _te_bt
+                _te_bt._last_ws_price_ts[symbol] = now_ts
+            except Exception:
+                pass
+
+
+class _WSConnection:
+    """One WebSocket connection (market shard or the held-symbol exit feed).
+    Owns its reconnect loop with jittered exponential backoff (1 s → 60 s cap)
+    and supports live SUBSCRIBE/UNSUBSCRIBE frames with paced, batched sends.
+    All connections feed the same _handle_ws_message handler."""
+
+    def __init__(self, conn_id: int, streams: list, kind: str = "market"):
+        self.id = conn_id
+        self.kind = kind
+        self.streams: list = list(streams)
+        self.ws = None
+        self.connected_since: float = 0.0
+        self.last_message_ts: float = 0.0
+        self.first_message = asyncio.Event()
+        self._stop = False
+        self._task: Optional[asyncio.Task] = None
+        self._send_lock = asyncio.Lock()
+        self._last_send_ts = 0.0
+        self._sub_id = 0
+        self._sec_counts: deque = deque(maxlen=15)   # [epoch_sec, msg_count]
+        self._rotate_retry_at = 0.0
+
+    # ── Introspection ────────────────────────────────────────────────────
+    def symbols(self) -> set:
+        return {_stream_symbol(s) for s in self.streams}
+
+    def _count_msg(self):
+        now_s = int(time.time())
+        if self._sec_counts and self._sec_counts[-1][0] == now_s:
+            self._sec_counts[-1][1] += 1
+        else:
+            self._sec_counts.append([now_s, 1])
+
+    def msgs_per_sec(self) -> float:
+        now_s = int(time.time())
+        total = sum(c for t, c in self._sec_counts if now_s - 10 <= t < now_s)
+        return round(total / 10.0, 2)
+
+    # ── Lifecycle ────────────────────────────────────────────────────────
+    def start(self):
+        self._task = asyncio.get_running_loop().create_task(self.run())
+
+    async def stop(self):
+        self._stop = True
+        ws = self.ws
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        t = self._task
+        if t is not None and not t.done():
+            try:
+                await asyncio.wait_for(t, timeout=5.0)  # cancels t on timeout
+            except Exception:
+                pass
+
+    async def force_reconnect(self):
+        """Close the socket so run() reconnects with the (updated) stream
+        list — the close-and-reconnect fallback for live-frame failures."""
+        ws = self.ws
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    # ── Live subscription management (§6.4 control-message pacing) ───────
+    async def _send_control(self, method: str, streams: list):
+        """Batched (≤50 names/payload) and paced (≥300 ms apart, ≤5 msg/s per
+        connection incl. the auto-pongs websockets sends for server pings)."""
+        ws = self.ws
+        if ws is None:
+            raise RuntimeError("not connected")
+        async with self._send_lock:
+            for i in range(0, len(streams), _CONTROL_BATCH_MAX):
+                chunk = streams[i:i + _CONTROL_BATCH_MAX]
+                wait = self._last_send_ts + _CONTROL_SEND_MIN_INTERVAL - time.time()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self._sub_id += 1
+                await ws.send(json.dumps(
+                    {"method": method, "params": list(chunk), "id": self._sub_id}))
+                self._last_send_ts = time.time()
+
+    async def add_streams(self, streams: list) -> bool:
+        new = [s for s in streams if s not in self.streams]
+        self.streams.extend(new)
+        if not new or self.ws is None:
+            return True  # offline: picked up on the next (re)connect
+        try:
+            await self._send_control("SUBSCRIBE", new)
+            return True
+        except Exception as e:
+            print(f"[DataCollector] WS#{self.id} live SUBSCRIBE failed ({e}) — "
+                  f"falling back to reconnect")
+            await self.force_reconnect()
+            return False
+
+    async def remove_streams(self, streams: list) -> bool:
+        gone = [s for s in streams if s in self.streams]
+        if not gone:
+            return True
+        gone_set = set(gone)
+        self.streams = [s for s in self.streams if s not in gone_set]
+        if self.ws is None:
+            return True
+        try:
+            await self._send_control("UNSUBSCRIBE", gone)
+            return True
+        except Exception as e:
+            print(f"[DataCollector] WS#{self.id} live UNSUBSCRIBE failed ({e}) — "
+                  f"falling back to reconnect")
+            await self.force_reconnect()
+            return False
+
+    # ── Connection loop ──────────────────────────────────────────────────
+    async def run(self):
+        global last_ws_message_ts
+        import websockets
+        backoff = 1.0
+        had_connection = False
+        while not self._stop:
+            if not self.streams:
                 await asyncio.sleep(1.0)
-                if _reconnect_requested.is_set():
+                continue
+            _record_connect_attempt()
+            url = _build_ws_url(self.streams)
+            try:
+                async with websockets.connect(
+                        url, ping_interval=20, ping_timeout=30, open_timeout=10) as ws:
+                    self.ws = ws
+                    self.connected_since = time.time()
+                    backoff = 1.0
+                    _ws_health["connect_count"]   += 1
+                    _ws_health["last_connect_ts"]  = self.connected_since
+                    print(f"[DataCollector] WS#{self.id} ({self.kind}) connected ✓ "
+                          f"({len(self.streams)} streams)")
+                    if had_connection:
+                        # §6.2 c: gap repair for all of this shard's symbols
+                        # after every reconnect.
+                        _spawn_gap_repair(self.symbols(), f"ws#{self.id}-reconnect")
+                        try:
+                            import trade_engine as _te_dc
+                            _te_dc.log_diag_issue(
+                                "websocket", "info",
+                                f"WS#{self.id} reconnected ({len(self.streams)} streams)")
+                        except Exception:
+                            pass
+                    had_connection = True
+
+                    async for raw in ws:
+                        if self._stop:
+                            break
+                        self._count_msg()
+                        self.last_message_ts = time.time()
+                        if not self.first_message.is_set():
+                            self.first_message.set()
+                        _ws_health["messages_received"] += 1
+                        _ws_health["last_message_ts"]    = self.last_message_ts
+                        last_ws_message_ts               = self.last_message_ts
+                        try:
+                            _handle_ws_message(raw)
+                        except Exception as e:
+                            print(f"[DataCollector] Message error: {e}")
+
+                # Clean close: watchlist resubscribe, rotation, or Binance's
+                # scheduled 24 h disconnect (close frame) — reconnect quickly
+                # with the current stream list; gap repair runs on reconnect.
+                self.ws = None
+                self.connected_since = 0.0
+                _ws_health["last_disconnect_ts"] = time.time()
+                if self._stop:
                     break
-            changed = _reconnect_requested.is_set()
-            if not changed:
+                print(f"[DataCollector] WS#{self.id} closed — reconnecting with "
+                      f"{len(self.streams)} streams…")
+                await asyncio.sleep(1.0)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.ws = None
+                self.connected_since = 0.0
+                _ws_health["disconnect_count"]   += 1
+                _ws_health["last_disconnect_ts"]  = time.time()
+                if self._stop:
+                    break
+                # §6.4 g: jittered exponential backoff, 1 s → 60 s cap.
+                delay = min(backoff, 60.0) * random.uniform(0.7, 1.3)
+                print(f"[DataCollector] WS#{self.id} disconnected: {e}")
+                print(f"[DataCollector] WS#{self.id} reconnecting in {delay:.1f}s…")
                 try:
-                    current = set(await asyncio.to_thread(_load_persisted_watchlist))
-                    changed = current != desired_set
-                except Exception:
-                    changed = False
-            if changed:
-                _ws_health["resubscribe_count"] = _ws_health.get("resubscribe_count", 0) + 1
-                print("[DataCollector] Watchlist changed — closing WebSocket to resubscribe")
-                try:
-                    await ws.close()
+                    import trade_engine as _te_dc
+                    _te_dc.log_diag_issue(
+                        "websocket", "warn",
+                        f"WS#{self.id} disconnected, reconnect "
+                        f"#{_ws_health['disconnect_count']}",
+                        detail=f"{type(e).__name__}: {e} — backoff {delay:.1f}s")
                 except Exception:
                     pass
-                return
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        print(f"[DataCollector] Watchlist watcher error: {e}")
+                await asyncio.sleep(delay)
+                backoff = min(backoff * 2.0, 60.0)
+        self.ws = None
+        self.connected_since = 0.0
+
+
+# ── Connection manager state ─────────────────────────────────────────────────
+_conn_seq = itertools.count(1)
+_connections: List[_WSConnection] = []      # sharded market-data connections
+_held_conn: Optional[_WSConnection] = None  # dedicated held-symbol exit feed
+_current_coins: list = []                   # coins the market shards cover
+
+
+def _update_aggregate_health():
+    conns = list(_connections) + ([_held_conn] if _held_conn is not None else [])
+    _ws_health["connected"] = any(c.ws is not None for c in conns)
+    _ws_health["subscribed_coins"] = len({s for c in _connections for s in c.symbols()})
+
+
+async def _rebuild_market_connections(coins: list):
+    """Close-and-reconnect path: tear down all market shards and rebuild them
+    for `coins`. Used at startup and as the fallback for large watchlist diffs."""
+    for c in list(_connections):
+        try:
+            await c.stop()
+        except Exception:
+            pass
+    del _connections[:]
+    shards = _shard_coins(list(coins))
+    for shard in shards:
+        conn = _WSConnection(next(_conn_seq), _market_streams_for(shard))
+        _connections.append(conn)
+        conn.start()
+    _current_coins[:] = list(coins)
+    print(f"[DataCollector] Subscribing {len(coins)} coins across "
+          f"{len(_connections)} WS connection(s) "
+          f"(≤{_MAX_STREAMS_PER_CONN} streams each)")
+
+
+async def _apply_watchlist_diff(new_coins: list):
+    """§6.4 e: DIFF the desired coin set against current subscriptions.
+    Small diffs (≤{_LIVE_DIFF_MAX_STREAMS} streams) are applied via live
+    SUBSCRIBE/UNSUBSCRIBE frames; larger diffs fall back to the proven
+    close-and-reconnect rebuild. Never resubscribe-all on a single toggle."""
+    old = set(_current_coins)
+    new = set(new_coins)
+    added   = [c for c in new_coins if c not in old]
+    removed = sorted(old - new)
+    if not added and not removed:
+        return
+    _ws_health["resubscribe_count"] = _ws_health.get("resubscribe_count", 0) + 1
+    diff_streams = len(_MARKET_SUFFIXES) * (len(added) + len(removed))
+    print(f"[DataCollector] Watchlist diff: +{len(added)}/-{len(removed)} coins "
+          f"({diff_streams} streams)")
+
+    if diff_streams > _LIVE_DIFF_MAX_STREAMS or not _connections:
+        # Documented choice: large diffs (or a cold start) use full reconnect.
+        await _rebuild_market_connections(list(new_coins))
+        if added:
+            _spawn_backfill(added, "watchlist-rebuild")
+        return
+
+    removed_set = set(removed)
+    for conn in list(_connections):
+        rem = [s for s in conn.streams if _stream_symbol(s) in removed_set]
+        if rem:
+            await conn.remove_streams(rem)
+    for conn in [c for c in list(_connections) if not c.streams]:
+        await conn.stop()
+        _connections.remove(conn)
+
+    for sym in added:
+        streams = _market_streams_for([sym])
+        target = None
+        for conn in _connections:
+            if len(conn.streams) + len(streams) <= _MAX_STREAMS_PER_CONN:
+                target = conn
+                break
+        if target is None:
+            conn = _WSConnection(next(_conn_seq), streams)
+            _connections.append(conn)
+            conn.start()
+        else:
+            await target.add_streams(streams)
+
+    _current_coins[:] = list(new_coins)
+    if added:
+        _spawn_backfill(added, "watchlist-add")
+
+
+def _held_symbols() -> list:
+    """Symbols with open positions (guarded trade_engine access)."""
+    try:
+        import trade_engine as _te
+        with _te._positions_lock:
+            syms = {str(p.get("symbol", "")).upper() for p in _te._positions}
+        return sorted(s for s in syms if s)
+    except Exception:
+        return []
+
+
+async def _sync_held_connection():
+    """§6.4 d: DEDICATED connection for held-symbol exit feeds (@trade +
+    @bookTicker) so market chatter can't queue ahead of exit ticks. Rebuilt
+    whenever the position set changes (notify_positions_changed() hook, with
+    a 5 s poll as fallback)."""
+    global _held_conn
+    syms = await asyncio.to_thread(_held_symbols)
+    desired = ([f"{s.lower()}@trade" for s in syms] +
+               [f"{s.lower()}@bookTicker" for s in syms])
+    desired_set = set(desired)
+
+    if _held_conn is None:
+        if not desired:
+            return
+        _held_conn = _WSConnection(next(_conn_seq), desired, kind="held")
+        _held_conn.start()
+        print(f"[DataCollector] Dedicated exit-feed connection started for "
+              f"{len(syms)} held symbol(s)")
+        return
+
+    current = set(_held_conn.streams)
+    if current == desired_set:
+        return
+    if not desired:
+        await _held_conn.stop()
+        _held_conn = None
+        print("[DataCollector] No open positions — dedicated exit-feed connection closed")
+        return
+
+    add = [s for s in desired if s not in current]
+    rem = [s for s in current if s not in desired_set]
+    if len(add) + len(rem) <= _LIVE_DIFF_MAX_STREAMS and _held_conn.ws is not None:
+        if rem:
+            await _held_conn.remove_streams(rem)
+        if add:
+            await _held_conn.add_streams(add)
+    else:
+        _held_conn.streams = list(desired)
+        await _held_conn.force_reconnect()
+    print(f"[DataCollector] Exit-feed subscriptions updated "
+          f"({len(syms)} held symbol(s))")
+
+
+async def _rotate_connection(old: _WSConnection) -> _WSConnection:
+    """§6.4 f: 23 h make-before-break. Open a replacement with the same
+    streams, wait for its first message, close the old connection, then run
+    gap repair for its symbols. On failure, keep the old one and retry later
+    (Binance's own 24 h disconnect is handled by the normal reconnect path)."""
+    print(f"[DataCollector] WS#{old.id} approaching Binance's 24h limit — "
+          f"opening replacement (make-before-break)")
+    repl = _WSConnection(next(_conn_seq), list(old.streams), kind=old.kind)
+    repl.start()
+    try:
+        await asyncio.wait_for(repl.first_message.wait(), timeout=_ROTATE_CONFIRM_TIMEOUT)
+    except (asyncio.TimeoutError, Exception):
+        print(f"[DataCollector] Replacement WS#{repl.id} produced no messages — "
+              f"keeping WS#{old.id}, will retry in 10 min")
+        await repl.stop()
+        old._rotate_retry_at = time.time() + 600
+        return old
+    await old.stop()
+    print(f"[DataCollector] WS#{old.id} → WS#{repl.id} rotation complete")
+    _spawn_gap_repair(repl.symbols(), f"ws#{repl.id}-rotation")
+    return repl
+
+
+async def _rotate_aged_connections():
+    """Rotate at most ONE aged connection per invocation (spreads connect load)."""
+    global _held_conn
+    now = time.time()
+    for i, conn in enumerate(list(_connections)):
+        if (conn.connected_since and now - conn.connected_since >= _ROTATE_AFTER_SEC
+                and now >= conn._rotate_retry_at):
+            repl = await _rotate_connection(conn)
+            if repl is not conn:
+                try:
+                    _connections[_connections.index(conn)] = repl
+                except ValueError:
+                    _connections.append(repl)
+            return
+    hc = _held_conn
+    if (hc is not None and hc.connected_since
+            and now - hc.connected_since >= _ROTATE_AFTER_SEC
+            and now >= hc._rotate_retry_at):
+        repl = await _rotate_connection(hc)
+        if repl is not hc:
+            _held_conn = repl
+
+
+def _revive_dead_connections():
+    """A connection task should never finish on its own — restart it if it does."""
+    for conn in list(_connections) + ([_held_conn] if _held_conn is not None else []):
+        t = conn._task
+        if t is not None and t.done() and not conn._stop:
+            try:
+                exc = t.exception()
+            except Exception:
+                exc = None
+            print(f"[DataCollector] FATAL: WS#{conn.id} task died "
+                  f"({exc!r}) — restarting it")
+            conn.start()
 
 
 async def _start_websocket_loop():
     """
-    Async WebSocket loop with exponential-backoff reconnect.
-    On each trade event: update prices, call trade_engine via callback.
-    On closed kline: update candle DB.
-    The stream list is rebuilt from the persisted watchlist on every
-    (re)connect, so /api/coins changes take effect without a restart.
+    WebSocket manager: builds sharded market connections (+ the dedicated
+    held-symbol exit feed), REST-backfills the candle buffers, then supervises
+    — watchlist diffs (debounced 5 s), held-position resyncs (5 s), 23 h
+    make-before-break rotation, and dead-task revival.
     """
-    global last_ws_message_ts
-    import websockets
-    backoff = 1
-    loop = asyncio.get_running_loop()
+    global _manager_started_ts
+    import websockets  # fail fast (and loudly, via the supervised runner) if missing
+    _ = websockets
+    _manager_started_ts = time.time()
 
     # Cold-start: seed 5m buffers from stored 1m candles (idempotent — also
-    # attempted from download_history) so the 5m veto works right away.
+    # attempted from download_history) so the 5m veto works right away. This
+    # stays the first, free source; REST backfill below fills the rest.
     try:
         await asyncio.to_thread(_bootstrap_5m_from_db)
     except Exception as e:
         print(f"[DataCollector] 5m bootstrap failed: {e}")
 
+    _reconnect_requested.clear()
+    try:
+        desired = await asyncio.to_thread(_load_persisted_watchlist)
+    except Exception:
+        desired = list(config.WATCHED_COINS)
+    active = await _verify_symbols(desired)
+    await _rebuild_market_connections(active)
+    _spawn_backfill(list(active), "startup")   # §6.2 b — fill 1m→120 / 5m→60
+    try:
+        await _sync_held_connection()
+    except Exception as e:
+        print(f"[DataCollector] Held-feed sync error: {e}")
+
+    last_watch_poll   = time.time()
+    last_held_check   = time.time()
+    last_rotate_check = time.time()
+    last_subs_apply   = 0.0
+    watch_change_pending = False
+
     while True:
-        # Rebuild the stream list on every (re)connect: persisted watchlist
-        # (/api/coins → strategy.json approved_coins) ∪ open-position symbols,
-        # falling back to config.WATCHED_COINS when nothing is persisted.
-        _reconnect_requested.clear()
-        try:
-            desired = await asyncio.to_thread(_load_persisted_watchlist)
-        except Exception:
-            desired = list(config.WATCHED_COINS)
-        desired_set = set(desired)
+        await asyncio.sleep(1.0)
+        now = time.time()
+        _update_aggregate_health()
+        _revive_dead_connections()
 
-        # Drop symbols Binance doesn't trade (invalid/delisted) — cached 10 min
-        active_coins = await _verify_symbols(desired)
-        if len(active_coins) * 2 > _MAX_COMBINED_STREAMS:
-            keep = _MAX_COMBINED_STREAMS // 2
-            print(f"[DataCollector] Watchlist too large ({len(active_coins)} coins) — "
-                  f"subscribing the first {keep}")
-            active_coins = active_coins[:keep]
-
-        url = _build_ws_url(active_coins)
-        print(f"[DataCollector] Connecting WebSocket ({len(active_coins)} coins)…")
-        watcher = None
-        try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=30, open_timeout=10) as ws:
-                backoff = 1  # reset on successful connect
-                _ws_health["connected"]        = True
-                _ws_health["connect_count"]   += 1
-                _ws_health["last_connect_ts"]  = time.time()
-                _ws_health["subscribed_coins"] = len(active_coins)
-                watcher = loop.create_task(_watchlist_watcher(ws, desired_set))
-                print("[DataCollector] WebSocket connected ✓")
-                if _ws_health["disconnect_count"] > 0:
-                    try:
-                        import trade_engine as _te_dc
-                        _te_dc.log_diag_issue(
-                            "websocket", "info",
-                            f"WebSocket reconnected (subscribed {len(active_coins)} symbols)",
-                        )
-                    except Exception:
-                        pass
-
-                async for raw in ws:
-                    _ws_health["messages_received"] += 1
-                    _ws_health["last_message_ts"]    = time.time()
-                    last_ws_message_ts               = _ws_health["last_message_ts"]
-                    try:
-                        msg  = json.loads(raw)
-                        data = msg.get("data", msg)
-                        evt  = data.get("e")
-
-                        if evt == "trade":
-                            symbol = data["s"]
-                            price  = float(data["p"])
-                            prices[symbol] = price
-                            # Raw ticks (fast, but too uniform for quality RSI)
-                            ticks = price_ticks.setdefault(symbol, deque(maxlen=_TICK_MAX))
-                            ticks.append(price)
-                            # Time-sampled prices (one per 1s → quality RSI after 16s)
-                            now_ts = time.time()
-                            if now_ts - _price_sample_ts.get(symbol, 0) >= _SAMPLE_INTERVAL:
-                                _price_sample_ts[symbol] = now_ts
-                                buf = price_samples.setdefault(symbol, [])
-                                buf.append(price)
-                                if len(buf) > _SAMPLE_MAX:
-                                    buf.pop(0)
-                            client.update_price(symbol, price)
-                            if _price_callback:
-                                _price_callback(dict(prices))
-
-                        elif evt == "kline":
-                            k = data["k"]
-                            if k.get("x"):   # candle closed
-                                sym      = k["s"]
-                                interval = k.get("i", "1m")
-                                closed = [
-                                    int(k["t"]),   float(k["o"]), float(k["h"]),
-                                    float(k["l"]), float(k["c"]), float(k["v"]),
-                                ]
-
-                                # ── Route 5m candles to separate buffer
-                                if interval == "5m":
-                                    buf5 = ws_candles_5m.setdefault(sym, [])
-                                    buf5.append(closed)
-                                    if len(buf5) > _WS_5M_CANDLE_MAX:
-                                        buf5.pop(0)
-                                    continue
-
-                                # ── Update in-memory candle buffer (primary signal source)
-                                buf = ws_candles.setdefault(sym, [])
-                                buf.append(closed)
-                                if len(buf) > _WS_CANDLE_MAX:
-                                    buf.pop(0)
-
-                                # ── Persist + signal on a worker thread so the
-                                # blocking SQLite work never stalls this loop.
-                                loop.run_in_executor(
-                                    None, _persist_and_signal, sym, closed, list(buf)
-                                )
-
-                        elif evt == "24hrMiniTicker":
-                            symbol = data["s"]
-                            close_price = float(data["c"])
-                            # miniTicker arrives every ~1s per coin — update price
-                            # only when no @trade event has updated it more recently
-                            # (trade events are sub-second; miniTicker is a 1s roll-up).
-                            prices[symbol] = close_price
-                            client.update_price(symbol, close_price)
-                            try:
-                                import trade_engine as _te_mt
-                                _te_mt._last_ws_price_ts[symbol] = time.time()
-                                # For HELD positions, evaluate sell triggers on this
-                                # tick too — low-trade-volume coins may only get
-                                # miniTicker updates, and waiting for another coin's
-                                # @trade event (or the 0.25s fallback loop) delays
-                                # the exit.
-                                if _price_callback and symbol in _te_mt._pos_by_symbol:
-                                    _price_callback(dict(prices))
-                            except Exception:
-                                pass
-
-                    except Exception as e:
-                        print(f"[DataCollector] Message error: {e}")
-
-            # Graceful close (e.g. watchlist resubscribe) — loop reconnects
-            # immediately with a freshly rebuilt stream list, no backoff.
-            _ws_health["connected"]          = False
-            _ws_health["last_disconnect_ts"] = time.time()
-            print("[DataCollector] WebSocket closed — rebuilding stream list…")
-
-        except Exception as e:
-            _ws_health["connected"]            = False
-            _ws_health["disconnect_count"]    += 1
-            _ws_health["last_disconnect_ts"]   = time.time()
-            print(f"[DataCollector] WebSocket disconnected: {e}")
-            print(f"[DataCollector] Reconnecting in {backoff}s…")
+        # ── Dedicated held-symbol feed: hook event or 5 s poll
+        if _positions_changed.is_set() or now - last_held_check >= _HELD_POLL_SEC:
+            _positions_changed.clear()
+            last_held_check = now
             try:
-                import trade_engine as _te_dc
-                _te_dc.log_diag_issue(
-                    "websocket", "warn",
-                    f"WebSocket disconnected, reconnect #{_ws_health['disconnect_count']}",
-                    detail=f"{type(e).__name__}: {e} — backoff {backoff}s",
-                )
+                await _sync_held_connection()
+            except Exception as e:
+                print(f"[DataCollector] Held-feed sync error: {e}")
+
+        # ── Watchlist change detection: explicit flag every tick; the ~60 s
+        # poll of the persisted list is the self-healing fallback.
+        if _reconnect_requested.is_set():
+            _reconnect_requested.clear()
+            watch_change_pending = True
+        elif now - last_watch_poll >= _WATCHLIST_POLL_SEC:
+            last_watch_poll = now
+            try:
+                cur = await asyncio.to_thread(_load_persisted_watchlist)
+                if set(cur) != set(_current_coins):
+                    watch_change_pending = True
             except Exception:
                 pass
 
-            # Fill gap: re-fetch last 10 candles via REST for active coins only.
-            # Run in a thread so the blocking urlopen never freezes the event loop.
-            def _gap_fill():
-                for coin in active_coins:
-                    try:
-                        raw = _fetch_klines_rest(coin, config.CANDLE_TIMEFRAME, limit=10)
-                        _compute_and_save(coin, raw, save_all=True)
-                    except Exception:
-                        pass
+        # ── Debounced diff application: at most once per 5 s (§6.4 e)
+        if watch_change_pending and now - last_subs_apply >= _SUBS_DEBOUNCE_SEC:
+            watch_change_pending = False
+            last_subs_apply = now
             try:
-                await asyncio.to_thread(_gap_fill)
-            except Exception:
-                pass
+                desired = await asyncio.to_thread(_load_persisted_watchlist)
+                active = await _verify_symbols(desired)
+                await _apply_watchlist_diff(active)
+            except Exception as e:
+                print(f"[DataCollector] Watchlist apply error: {e}")
 
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
-        finally:
-            # Never leak watcher tasks across reconnects.
-            if watcher is not None:
-                watcher.cancel()
+        # ── 23 h make-before-break rotation (checked once a minute)
+        if now - last_rotate_check >= 60.0:
+            last_rotate_check = now
+            try:
+                await _rotate_aged_connections()
+            except Exception as e:
+                print(f"[DataCollector] Rotation error: {e}")
 
+
+# ── Health / freshness exports (§6.3, §6.5) ──────────────────────────────────
+
+def held_price_age() -> Dict[str, Optional[float]]:
+    """Per held symbol: age (seconds) of the freshest WS price event
+    (trade/bookTicker/miniTicker). None = no WS price seen this session.
+    trade_engine's REST price watchdog consumes this."""
+    now = time.time()
+    out: Dict[str, Optional[float]] = {}
+    for sym in _held_symbols():
+        ts = last_price_ts.get(sym, 0.0)
+        out[sym] = round(now - ts, 3) if ts else None
+    return out
+
+
+def get_data_health() -> dict:
+    """Cheap snapshot for the §6.5 health panel — counters are maintained
+    incrementally; only the top-5 candle-age scan is computed here (O(coins))."""
+    now = time.time()
+    conns_out = []
+    total_rate = 0.0
+    for c in list(_connections) + ([_held_conn] if _held_conn is not None else []):
+        rate = c.msgs_per_sec()
+        total_rate += rate
+        conns_out.append({
+            "id": c.id,
+            "kind": c.kind,
+            "streams": len(c.streams),
+            "connected_since": c.connected_since or None,
+            "msgs_per_sec": rate,
+            # websockets auto-pongs server pings but doesn't cheaply expose
+            # their receipt time — last-message age is the documented proxy.
+            "last_ping_age_sec": (round(now - c.last_message_ts, 1)
+                                  if c.last_message_ts else None),
+        })
+
+    subscribed = sorted({s for c in _connections for s in c.symbols()})
+    ages = []
+    for sym in subscribed:
+        buf = ws_candles.get(sym)
+        if buf:
+            # Age relative to the expected close of the last buffered 1m candle.
+            age = now - (int(buf[-1][0]) / 1000.0 + 60.0)
+        else:
+            # Never received a candle — age is how long we've been waiting.
+            age = now - (_manager_started_ts or now)
+        ages.append((sym, round(max(0.0, age), 1)))
+    ages.sort(key=lambda t: t[1], reverse=True)
+
+    fill1 = [min(1.0, len(ws_candles.get(s, [])) / _WS_CANDLE_MAX) for s in subscribed]
+    fill5 = [min(1.0, len(ws_candles_5m.get(s, [])) / _WS_5M_CANDLE_MAX) for s in subscribed]
+
+    with _counters_lock:
+        while _gap_repairs and _gap_repairs[0] < now - 86_400:
+            _gap_repairs.popleft()
+        while _connect_attempts and _connect_attempts[0] < now - 300:
+            _connect_attempts.popleft()
+        gap_24h  = len(_gap_repairs)
+        recon_5m = len(_connect_attempts)
+
+    return {
+        "connections":                conns_out,
+        "total_msgs_per_sec":         round(total_rate, 2),
+        "worst_candle_ages":          ages[:5],
+        "buffer_fill_pct_1m":         round(100.0 * sum(fill1) / len(fill1), 1) if fill1 else 0.0,
+        "buffer_fill_pct_5m":         round(100.0 * sum(fill5) / len(fill5), 1) if fill5 else 0.0,
+        "backfill_last_duration_sec": round(_backfill_last_duration, 2),
+        "gap_repairs_24h":            gap_24h,
+        "reconnect_attempts_5min":    recon_5m,
+        "resubscribe_count":          _ws_health.get("resubscribe_count", 0),
+        "subscribed_coins":           len(subscribed),
+    }
+
+
+# ── Thread bootstrap ─────────────────────────────────────────────────────────
 
 _ws_thread: Optional[threading.Thread] = None
 

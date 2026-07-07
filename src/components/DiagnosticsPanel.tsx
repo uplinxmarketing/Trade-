@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { DataHealthChip, DataHealthPanelView, useDataHealth } from './dashboard/DataHealthPanel';
 
 interface DiagIssue {
   ts: number;
@@ -138,6 +139,10 @@ export function DiagnosticsPanel() {
   // on green dots forever even after the bot dies.
   const [lastOkAt, setLastOkAt]     = useState(0);
   const [failCount, setFailCount]   = useState(0);
+  // Causes-first data health (GET /api/health/data) — drives the Signal Scan
+  // chip that replaced the old age-based red/green dot.
+  const dataHealth = useDataHealth('');
+  const [dataHealthOpen, setDataHealthOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -316,11 +321,17 @@ export function DiagnosticsPanel() {
           </div>
         </section>
 
-        {/* Signal scanner */}
+        {/* Signal scanner — the old standalone red/green dot was misleading
+            (a "fresh scan" could look green while the data underneath was
+            degraded). Replaced by a causes-first health chip that anchors
+            the full data-health panel. */}
         <section>
           <div className="flex items-center gap-2 mb-1">
-            <StatusDot
-              ok={!stale && (diag.signal_scanner.last_refresh_age_sec ?? 999) < diag.signal_scanner.interval_sec * 2}
+            <DataHealthChip
+              health={dataHealth.health}
+              stale={stale || dataHealth.stale}
+              open={dataHealthOpen}
+              onToggle={() => setDataHealthOpen(o => !o)}
             />
             <span className="font-semibold">Signal Scan</span>
             <span className="ml-auto text-gray-500 text-[10px]">
@@ -332,6 +343,15 @@ export function DiagnosticsPanel() {
             <span>{diag.signal_scanner.scans_completed} runs</span>
           </div>
           <Bar pct={diag.signal_scanner.scan_progress_pct} color="bg-blue-500" />
+          {dataHealthOpen && (
+            <div className="mt-2 p-2 rounded border border-gray-700 bg-black/30">
+              <DataHealthPanelView
+                health={dataHealth.health}
+                error={dataHealth.error}
+                stale={dataHealth.stale}
+              />
+            </div>
+          )}
         </section>
 
         {/* Sell monitor */}
