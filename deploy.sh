@@ -7,6 +7,25 @@ cd "$(dirname "$0")"
 echo "── Pulling latest main…"
 git pull origin main
 
+# Rebuild the frontend bundle from source so the served dist/ always matches the
+# committed code (avoids the white-screen trap where index.html references a
+# hashed asset that never got committed). Best-effort: if npm is unavailable the
+# committed dist/ is used as-is.
+if command -v npm >/dev/null 2>&1; then
+    echo "── Building frontend…"
+    if npm ci --silent 2>/dev/null || npm install --silent; then
+        if npm run build --silent; then
+            echo "  ✓ frontend built"
+        else
+            echo "  ! frontend build failed — serving committed dist/ as-is"
+        fi
+    else
+        echo "  ! npm install failed — serving committed dist/ as-is"
+    fi
+else
+    echo "── npm not found — serving committed dist/ as-is"
+fi
+
 # Rebuild the venv if its interpreter is missing/broken (e.g. clobbered by git)
 if ! venv/bin/python -c "import fastapi" >/dev/null 2>&1; then
     echo "── venv broken or missing deps — rebuilding…"
