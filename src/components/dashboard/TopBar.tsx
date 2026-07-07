@@ -1,5 +1,6 @@
-import { Activity, Bot, Key, Wifi, WifiOff, RefreshCw, Download, ShieldCheck, ClipboardCopy } from 'lucide-react';
+import { Activity, Bot, Key, Wifi, WifiOff, RefreshCw, Download, ShieldCheck, ClipboardCopy, AlertTriangle } from 'lucide-react';
 import { useUpdateChecker } from '@/hooks/useUpdateChecker';
+import { useBackendVersion } from '@/hooks/useBackendVersion';
 import { toast } from 'sonner';
 import { useState } from 'react';
 
@@ -13,6 +14,7 @@ const APP_VERSION = __APP_VERSION__;
 
 const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
   const { updateAvailable, checking, updating, checkForUpdates, applyUpdate } = useUpdateChecker();
+  const { backendVersion, mismatch, reloadNow } = useBackendVersion();
   const [reconciling, setReconciling] = useState(false);
   const [copyingDiag, setCopyingDiag] = useState(false);
 
@@ -107,9 +109,18 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
             <Bot className="w-6 h-6 text-primary" />
             <h1 className="text-lg font-semibold tracking-tight">TradeBot AI</h1>
           </div>
-          <span className="text-xs font-mono text-muted-foreground bg-secondary px-2 py-0.5 rounded">
-            v{APP_VERSION}
-          </span>
+          {mismatch ? (
+            <span
+              className="text-xs font-mono text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded"
+              title="Your browser bundle is older than the running backend. Reload to update."
+            >
+              UI v{APP_VERSION} · server v{backendVersion}
+            </span>
+          ) : (
+            <span className="text-xs font-mono text-muted-foreground bg-secondary px-2 py-0.5 rounded">
+              v{APP_VERSION}
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-4">
@@ -152,6 +163,19 @@ const TopBar = ({ isConnected, wsConnected, onConnectClick }: TopBarProps) => {
             <ClipboardCopy className={`w-3.5 h-3.5 ${copyingDiag ? 'animate-spin' : ''}`} />
             <span className="hidden sm:inline">Copy diagnostics</span>
           </button>
+
+          {/* Backend-version mismatch: browser bundle is stale relative to the
+              running backend. Distinct from the git-based update checker below. */}
+          {mismatch && (
+            <button
+              onClick={reloadNow}
+              className="flex items-center gap-1.5 px-3 py-1 rounded-md bg-loss/15 border border-loss/50 text-loss text-xs font-semibold hover:bg-loss/25 transition-colors animate-pulse"
+              title="A newer backend version is running than the bundle your browser loaded. Click to hard-reload."
+            >
+              <AlertTriangle className="w-3.5 h-3.5" />
+              New version {backendVersion} deployed — click to reload
+            </button>
+          )}
 
           {/* Check for updates button */}
           {updateAvailable ? (

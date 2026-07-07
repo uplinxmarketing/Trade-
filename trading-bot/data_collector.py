@@ -40,6 +40,14 @@ try:
 except Exception:
     binance_limits = None
 
+# Shared symbol-status source (G2). Guarded import: an old deploy may lack the
+# get_tradeable_symbols()/symbol_status() helpers — every use fails OPEN (no
+# filtering) via _get_tradeable_symbols() returning None.
+try:
+    import exchange_info
+except Exception:
+    exchange_info = None
+
 # Shared live prices dict — imported by trade_engine and strategy_engine
 prices: Dict[str, float] = {}
 
@@ -181,11 +189,135 @@ def notify_positions_changed():
     _positions_changed.set()
 
 
+# ── G2: dead/renamed-ticker exclusion ────────────────────────────────────────
+# Delisted or renamed symbols (AGIX, EOS, FTM, LRC, MATIC, OCEAN, MKR, TON, …)
+# never subscribe. Filter the stream universe through exchange_info's tradeable
+# set so they are DROPPED (with a one-time WARN each) instead of being
+# auto-resubscribed forever by the F5 reconcile. The tradeable set is cached
+# locally with a 1 h TTL so the reconcile checks excluded symbols at most once
+# per hour (they could get relisted). Everything fails OPEN: when exchange_info
+# is unavailable the universe is used unchanged.
+
+_tradeable_cache: Dict = {"symbols": None, "ts": 0.0}
+_TRADEABLE_TTL_SEC = 3600.0                 # 1 h — excluded symbols re-checked ≤1/h
+_tradeable_lock = threading.Lock()
+
+# sym -> non-TRADING status (e.g. "BREAK", "DELISTED", "UNKNOWN"); exposed via
+# get_data_health() as excluded_symbols.
+_excluded_symbols: Dict[str, str] = {}
+_excluded_warned: set = set()               # syms already WARN-logged (one-time)
+_excluded_lock = threading.Lock()
+
+
+def _get_tradeable_symbols() -> Optional[set]:
+    """Cached tradeable-symbol set from exchange_info (1 h TTL). Returns None
+    when exchange_info / get_tradeable_symbols is unavailable so callers fail
+    OPEN. On a transient fetch error the last good set is reused rather than
+    dropping all filtering."""
+    if exchange_info is None:
+        return None
+    fn = getattr(exchange_info, "get_tradeable_symbols", None)
+    if fn is None:
+        return None
+    now = time.time()
+    with _tradeable_lock:
+        cached = _tradeable_cache["symbols"]
+        if cached is not None and now - _tradeable_cache["ts"] < _TRADEABLE_TTL_SEC:
+            return cached
+    try:
+        syms = fn()
+        if syms:
+            syms = set(syms)
+            with _tradeable_lock:
+                _tradeable_cache["symbols"] = syms
+                _tradeable_cache["ts"] = now
+            return syms
+    except Exception:
+        pass
+    # Empty/error: reuse the stale set if we have one, else fail open (None).
+    with _tradeable_lock:
+        return _tradeable_cache["symbols"]
+
+
+def _symbol_status(sym: str) -> str:
+    """Best-effort non-TRADING status string for a dropped symbol."""
+    fn = getattr(exchange_info, "symbol_status", None) if exchange_info else None
+    if fn is not None:
+        try:
+            st = fn(sym)
+            if st:
+                return str(st)
+        except Exception:
+            pass
+    return "UNKNOWN"
+
+
+def _filter_tradeable(coins: list) -> list:
+    """G2: drop non-TRADING (delisted/renamed) symbols from the stream
+    universe using the cached tradeable set. Fails OPEN — when the set is
+    unavailable the list is returned unchanged. Dropped symbols + their status
+    are recorded in _excluded_symbols and WARN-logged exactly ONCE each (not
+    once per reconcile pass)."""
+    tradeable = _get_tradeable_symbols()
+    if not tradeable:
+        return list(coins)
+    kept: list = []
+    dropped: list = []
+    for c in coins:
+        (kept if c in tradeable else dropped).append(c)
+    to_warn: list = []
+    with _excluded_lock:
+        # A previously-excluded symbol that is tradeable again (relisted) is
+        # cleared so it can re-subscribe and WARN afresh if it re-delists.
+        for c in coins:
+            if c in tradeable and _excluded_symbols.pop(c, None) is not None:
+                _excluded_warned.discard(c)
+        for c in dropped:
+            if c not in _excluded_symbols:
+                _excluded_symbols[c] = _symbol_status(c)
+            if c not in _excluded_warned:
+                _excluded_warned.add(c)
+                to_warn.append((c, _excluded_symbols[c]))
+    for c, status in to_warn:
+        print(f"[DataCollector] Excluding non-tradeable symbol {c} "
+              f"(status={status}) — dropped from stream universe")
+        try:
+            import trade_engine as _te_ex
+            _te_ex.log_diag_issue(
+                "data", "warn",
+                f"{c} excluded from market streams (status={status})")
+        except Exception:
+            pass
+    return kept
+
+
+def _bookticker_universe_enabled() -> bool:
+    """G1a: strategy.json entries.bookticker_universe (default False). When
+    True, @bookTicker is streamed for ALL covered symbols (not just held) so
+    entry pricing can read streamed book quotes; when False, only held symbols
+    get @bookTicker (dedicated exit feed) and the engine's on-demand REST
+    covers entry pricing. Defensive read — any error → default False."""
+    try:
+        with open(config.STRATEGY_FILE) as f:
+            s = json.load(f)
+        ent = s.get("entries")
+        if isinstance(ent, dict):
+            return bool(ent.get("bookticker_universe", False))
+    except Exception:
+        pass
+    return False
+
+
 def _load_persisted_watchlist() -> list:
     """Symbols the WS feed should stream: the user's approved coins from
     strategy.json (written by /api/coins), union any symbols with open
     positions (held coins must keep streaming prices for the sell path),
-    falling back to config.WATCHED_COINS when nothing is persisted."""
+    falling back to config.WATCHED_COINS when nothing is persisted.
+
+    G2: the approved/base universe is filtered through exchange_info's
+    tradeable set (fail-open) so delisted/renamed symbols never enter the
+    stream list. Held-position symbols are unioned AFTER the filter so an open
+    position always keeps its price feed even if the symbol is non-TRADING."""
     coins: list = []
     try:
         with open(config.STRATEGY_FILE) as f:
@@ -199,6 +331,9 @@ def _load_persisted_watchlist() -> list:
         coins = []
     if not coins:
         coins = list(config.WATCHED_COINS)
+
+    # G2: drop delisted/renamed (non-TRADING) symbols before anything else.
+    coins = _filter_tradeable(coins)
 
     # Union with open-position symbols (guarded — trade_engine may not be
     # importable yet during early startup).
@@ -910,8 +1045,17 @@ _ROTATE_AFTER_SEC = 23 * 3600     # make-before-break before Binance's 24 h drop
 _ROTATE_CONFIRM_TIMEOUT = 45.0    # replacement must produce a message in this window
 
 
+def _market_suffixes() -> tuple:
+    """Per-coin market-shard streams. G1a: when entries.bookticker_universe is
+    ON, every covered symbol also gets @bookTicker (+1 stream/symbol) so entry
+    pricing can use streamed book quotes instead of on-demand REST."""
+    if _bookticker_universe_enabled():
+        return _MARKET_SUFFIXES + ("bookTicker",)
+    return _MARKET_SUFFIXES
+
+
 def _market_streams_for(coins: list) -> list:
-    return [f"{c.lower()}@{sfx}" for c in coins for sfx in _MARKET_SUFFIXES]
+    return [f"{c.lower()}@{sfx}" for c in coins for sfx in _market_suffixes()]
 
 
 def _stream_symbol(stream: str) -> str:
@@ -920,7 +1064,7 @@ def _stream_symbol(stream: str) -> str:
 
 def _shard_coins(coins: list) -> List[list]:
     """Split the coin list into shards whose stream count fits one connection."""
-    per_shard = max(1, _MAX_STREAMS_PER_CONN // len(_MARKET_SUFFIXES))
+    per_shard = max(1, _MAX_STREAMS_PER_CONN // max(1, len(_market_suffixes())))
     return [coins[i:i + per_shard] for i in range(0, len(coins), per_shard)]
 
 
@@ -1359,7 +1503,7 @@ async def _apply_watchlist_diff(new_coins: list):
     if not added and not removed:
         return
     _ws_health["resubscribe_count"] = _ws_health.get("resubscribe_count", 0) + 1
-    diff_streams = len(_MARKET_SUFFIXES) * (len(added) + len(removed))
+    diff_streams = len(_market_suffixes()) * (len(added) + len(removed))
     print(f"[DataCollector] Watchlist diff: +{len(added)}/-{len(removed)} coins "
           f"({diff_streams} streams)")
 
@@ -1619,6 +1763,11 @@ async def _start_websocket_loop():
     last_reconcile    = time.time()
     last_subs_apply   = 0.0
     watch_change_pending = False
+    # G1a — track the bookTicker-universe flag; a flip rebuilds all market
+    # shards ONCE (adds/removes @bookTicker for every covered symbol) rather
+    # than churning per-symbol. Captured from the flag the initial build used.
+    bt_universe_state = _bookticker_universe_enabled()
+    bt_flip_pending = False
 
     while True:
         await asyncio.sleep(1.0)
@@ -1649,16 +1798,35 @@ async def _start_websocket_loop():
             except Exception:
                 pass
 
+        # ── G1a: bookTicker-universe flag flip detection (checked every tick;
+        # applied via the same debounce so a flip is a single reconnect).
+        cur_bt = _bookticker_universe_enabled()
+        if cur_bt != bt_universe_state:
+            bt_flip_pending = True
+
         # ── Debounced diff application: at most once per 5 s (§6.4 e)
-        if watch_change_pending and now - last_subs_apply >= _SUBS_DEBOUNCE_SEC:
-            watch_change_pending = False
+        if (watch_change_pending or bt_flip_pending) and now - last_subs_apply >= _SUBS_DEBOUNCE_SEC:
             last_subs_apply = now
             try:
                 desired = await asyncio.to_thread(_load_persisted_watchlist)
                 active = await _verify_symbols(desired)
-                await _apply_watchlist_diff(active)
+                if bt_flip_pending:
+                    # A flag flip changes the per-coin suffix set for EVERY
+                    # covered symbol — the coin-set diff can't express that, so
+                    # rebuild all shards once with the new suffix set. This also
+                    # absorbs any pending watchlist change in the same reconnect.
+                    bt_flip_pending = False
+                    watch_change_pending = False
+                    bt_universe_state = cur_bt
+                    await _rebuild_market_connections(active)
+                    print(f"[DataCollector] bookTicker-universe "
+                          f"{'ENABLED' if cur_bt else 'disabled'} — rebuilt market "
+                          f"streams for {len(active)} coin(s)")
+                elif watch_change_pending:
+                    watch_change_pending = False
+                    await _apply_watchlist_diff(active)
             except Exception as e:
-                print(f"[DataCollector] Watchlist apply error: {e}")
+                print(f"[DataCollector] Watchlist/bookTicker apply error: {e}")
 
         # ── 23 h make-before-break rotation (checked once a minute)
         if now - last_rotate_check >= 60.0:
@@ -1725,6 +1893,8 @@ def get_data_health() -> dict:
     _universe_set = set(_universe)
     _covered = set(subscribed)
     _uncovered = sorted(_universe_set - _covered)
+    with _excluded_lock:
+        _excluded_snapshot = dict(_excluded_symbols)
     _total_streams = sum(len(c.streams) for c in _connections)
     ages = []
     for sym in subscribed:
@@ -1762,10 +1932,17 @@ def get_data_health() -> dict:
         "subscribed_coins":           len(subscribed),
         # F5 — distinct-symbol coverage vs universe, and raw stream count.
         "symbols_covered":            len(_covered),
+        # G2 — expected_symbols is the count of VALID (tradeable) watchlist
+        # symbols: _load_persisted_watchlist already drops non-TRADING ones, so
+        # covering every valid symbol reads as 100% (health green). Delisted/
+        # renamed symbols are reported separately via excluded_symbols.
         "expected_symbols":           len(_universe_set),
         "streams":                    _total_streams,
         "uncovered_symbols":          _uncovered[:50],
         "uncovered_count":            len(_uncovered),
+        # G2 — {sym: non-TRADING status} dropped from the stream universe.
+        "excluded_symbols":           _excluded_snapshot,
+        "excluded_count":             len(_excluded_snapshot),
     }
 
 

@@ -99,6 +99,16 @@ def is_data_persistent() -> bool:
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # G4.5 — concurrency/durability pragmas. journal_mode=WAL is persisted in
+    # the DB header (a no-op after the first connection); busy_timeout and
+    # synchronous are per-connection, so they are set on every connect. All are
+    # best-effort: a read-only / locked DB must never break connection open.
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
     return conn
 
 
@@ -263,6 +273,10 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_buy_rejections_ts     ON buy_rejections(timestamp);
             CREATE INDEX IF NOT EXISTS idx_buy_rejections_reason ON buy_rejections(reason);
+
+            -- G4.5 — query indexes for the analytics/prune paths.
+            CREATE INDEX IF NOT EXISTS idx_trades_timestamp_sell ON trades(timestamp_sell);
+            CREATE INDEX IF NOT EXISTS idx_trades_coin           ON trades(coin);
 
             CREATE TABLE IF NOT EXISTS phantom_alerts (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -583,6 +597,83 @@ def prune_klines_from_config() -> int:
     except Exception:
         days = 180.0
     return prune_klines(days)
+
+
+def prune_buy_rejections(retention_days: float) -> int:
+    """Delete buy_rejections older than now - retention_days. The timestamp
+    column is an ISO-8601 UTC string, so an ISO cutoff string compares
+    correctly. Guarded/CREATE-safe: missing table → 0. Returns rows deleted."""
+    import time as _t
+    cutoff_iso = datetime.fromtimestamp(
+        _t.time() - float(retention_days) * 86400.0, tz=timezone.utc).isoformat()
+    try:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute("""CREATE TABLE IF NOT EXISTS buy_rejections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
+                    coin TEXT NOT NULL, reason TEXT NOT NULL, detail TEXT,
+                    score INTEGER, rsi_value REAL)""")
+                cur = conn.execute(
+                    "DELETE FROM buy_rejections WHERE timestamp < ?", (cutoff_iso,))
+                deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                conn.commit()
+            finally:
+                conn.close()
+        return deleted
+    except Exception as e:
+        print(f"[Database] prune_buy_rejections failed: {e}")
+        return 0
+
+
+def prune_entry_snapshots(retention_days: float) -> int:
+    """Delete entry_snapshots older than now - retention_days. The ts column is
+    an epoch-seconds float. Guarded/CREATE-safe. Returns rows deleted."""
+    import time as _t
+    cutoff = _t.time() - float(retention_days) * 86400.0
+    try:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute("""CREATE TABLE IF NOT EXISTS entry_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, symbol TEXT,
+                    origin TEXT, executed INTEGER, price REAL, raw_json TEXT,
+                    gates_json TEXT, config_hash TEXT)""")
+                cur = conn.execute(
+                    "DELETE FROM entry_snapshots WHERE ts < ?", (cutoff,))
+                deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                conn.commit()
+            finally:
+                conn.close()
+        return deleted
+    except Exception as e:
+        print(f"[Database] prune_entry_snapshots failed: {e}")
+        return 0
+
+
+def prune_evaluations_from_config() -> dict:
+    """Prune buy_rejections + entry_snapshots using strategy.json
+    `data.eval_retention_days` (default 14). Reads the file defensively — any
+    problem means the 14-day default. Returns {buy_rejections, entry_snapshots}
+    deleted counts. Safe to call any time (daily maintenance loop)."""
+    days = 14.0
+    try:
+        import config as _cfg
+        with open(_cfg.STRATEGY_FILE, "r") as f:
+            s = json.load(f)
+        raw = None
+        if isinstance(s, dict):
+            d = s.get("data")
+            if isinstance(d, dict):
+                raw = d.get("eval_retention_days")
+        if raw is not None:
+            days = max(1.0, float(raw))
+    except Exception:
+        days = 14.0
+    return {
+        "buy_rejections":  prune_buy_rejections(days),
+        "entry_snapshots": prune_entry_snapshots(days),
+    }
 
 
 def kline_coverage(symbol: str, interval: str) -> dict:

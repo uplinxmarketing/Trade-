@@ -30,6 +30,12 @@ except ImportError:  # pragma: no cover
     _limits = None
 
 BASE = "https://api.binance.com"
+# Public (unsigned) market-data host. api.binance.com is geo-blocked (HTTP 451)
+# from this datacenter for public GETs the same way it is for signed calls, so
+# public helpers use data-api.binance.vision — the geo-block-safe host every
+# other public REST reader in the codebase already uses (data_collector,
+# backfill, futures_engine, exchange_info, control_api).
+PUBLIC_BASE = "https://data-api.binance.vision"
 _RECV_WINDOW_MS = 10_000
 _TIME_RESYNC_S = 1800  # re-sync clock offset every 30 min
 
@@ -181,6 +187,59 @@ def order_limit_maker(symbol: str, side: str, quantity: float, price: float) -> 
         "price": _fmt(price),
         "newOrderRespType": "FULL",
     })
+
+
+def get_book_ticker(symbol: str, timeout: float = 5) -> dict:
+    """GET /api/v3/ticker/bookTicker?symbol=X — PUBLIC best bid/ask (weight 2).
+
+    Unsigned market-data read over the geo-block-safe data-api.binance.vision
+    host (no API key, no HMAC — a plain urllib GET like the other public
+    helpers). Returns the raw Binance payload:
+        {"symbol", "bidPrice", "bidQty", "askPrice", "askQty"}  (values are strings)
+
+    Rate limiting is guarded so this module stays usable standalone: the call is
+    gated through binance_limits.can_spend(2, critical=True) when the module is
+    importable (never blocks when accounting is absent), and actual usage is fed
+    back via record_response_headers so the weight-2 spend is accounted for.
+    Raises BinanceDirectError on HTTP/Binance errors (including a synthetic -1
+    when a rate-limit gate defers the call)."""
+    if _limits is not None:
+        try:
+            if not _limits.can_spend(2, critical=True):
+                raise BinanceDirectError(-1, "book ticker deferred — REST rate-limited")
+        except BinanceDirectError:
+            raise
+        except Exception:
+            pass  # accounting failure must never block a market-data read
+    sym = urllib.parse.quote(str(symbol).strip().upper())
+    url = f"{PUBLIC_BASE}/api/v3/ticker/bookTicker?symbol={sym}"
+    req = urllib.request.Request(url, headers={"User-Agent": "WolfBot/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if _limits is not None:
+                try:
+                    _limits.record_response_headers(r.headers)
+                except Exception:
+                    pass
+            body = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if _limits is not None:
+            try:
+                _limits.record_response_headers(e.headers)
+                if e.code == 429:
+                    _limits.on_429(_retry_after(e.headers))
+                elif e.code == 418:
+                    _limits.on_418(_retry_after(e.headers))
+            except Exception:
+                pass
+        try:
+            err = json.loads(e.read())
+        except Exception:
+            raise BinanceDirectError(e.code, f"HTTP {e.code}: {e.reason}") from e
+        raise BinanceDirectError(err.get("code", e.code), err.get("msg", e.reason)) from e
+    if isinstance(body, dict) and body.get("code", 0) < 0:
+        raise BinanceDirectError(body["code"], body.get("msg", ""))
+    return body
 
 
 def get_order(symbol: str, order_id: int) -> dict:

@@ -62,6 +62,9 @@ class EntriesConfig(BaseModel):
     falling_knife_atr_mult: float = Field(1.0, ge=0.1, le=5.0)
     eval_heartbeat_sec:     float = Field(15.0, ge=5.0, le=120.0)
     tick_entries:           bool  = False
+    max_lot_waste_pct:      float = Field(5.0, ge=0.0, le=50.0)
+    maker_abandon_max:      int   = Field(3, ge=1, le=20)
+    bookticker_universe:    bool  = False
 
 
 class ExitsConfig(BaseModel):
@@ -114,6 +117,7 @@ class DataConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kline_retention_days: float = Field(180.0, ge=7.0, le=730.0)
     legacy_rest_scan:     bool  = False
+    eval_retention_days:  int   = Field(14, ge=1, le=365)
 
 
 class StrategyConfig(BaseModel):
@@ -238,6 +242,19 @@ SCHEMA: Dict[str, dict] = {
                                         "Cadence of the entry-evaluation loop.", 5.0, 120.0, 1, "s"),
     "entries.tick_entries": _meta("entries.tick_entries", "bool", "Entries", "Tick-driven entries",
                                   "Also evaluate entries on every price tick (higher CPU)."),
+    "entries.max_lot_waste_pct": _meta("entries.max_lot_waste_pct", "float", "Entries",
+                                       "Max lot waste %",
+                                       "Veto/flag an entry when LOT_SIZE step rounding would waste "
+                                       "more than this % of the intended notional.",
+                                       0.0, 50.0, 0.5, "%"),
+    "entries.maker_abandon_max": _meta("entries.maker_abandon_max", "int", "Entries",
+                                       "Maker abandon max",
+                                       "Abandon the maker chase after this many unfilled reposts.",
+                                       1, 20, 1),
+    "entries.bookticker_universe": _meta("entries.bookticker_universe", "bool", "Entries",
+                                         "Book-ticker universe",
+                                         "Use the bookTicker (best bid/ask) stream across the whole "
+                                         "universe for spread/price checks."),
 
     # ── Exits ─────────────────────────────────────────────────────────────
     "exits.k_sl": _meta("exits.k_sl", "float", "Exits", "SL ATR multiple (k_sl)",
@@ -328,6 +345,11 @@ SCHEMA: Dict[str, dict] = {
                                        7.0, 730.0, 1, "days"),
     "data.legacy_rest_scan": _meta("data.legacy_rest_scan", "bool", "Data", "Legacy REST scan",
                                    "Keep the old REST polling scanner running alongside websockets."),
+    "data.eval_retention_days": _meta("data.eval_retention_days", "int", "Data",
+                                      "Eval retention (days)",
+                                      "How long buy-rejection and entry-snapshot rows are kept "
+                                      "before the daily maintenance loop prunes them.",
+                                      1, 365, 1, "days"),
 }
 
 

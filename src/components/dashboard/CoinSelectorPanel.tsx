@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Star, Search, AlertCircle } from 'lucide-react';
+import { Star, Search, AlertCircle, Ban } from 'lucide-react';
 import type { LivePrices } from '@/lib/trading-engine';
+import { useUniverseHealth, type InvalidInfo } from '@/hooks/useUniverseHealth';
 
 const COIN_COLORS: Record<string, string> = {
   BTC: '#F7931A', ETH: '#627EEA', SOL: '#9945FF', BNB: '#F3BA2F',
@@ -73,11 +74,12 @@ async function fetchValidSymbols(): Promise<Set<string>> {
 }
 
 function CoinRow({
-  symbol, price, changePct, isActive, isFav, onSelect, onFav,
+  symbol, price, changePct, isActive, isFav, onSelect, onFav, invalidInfo, ticketTooSmall,
 }: {
   symbol: string; price: number; changePct: number;
   isActive: boolean; isFav: boolean;
   onSelect: () => void; onFav: () => void;
+  invalidInfo?: InvalidInfo; ticketTooSmall?: boolean;
 }) {
   const ticker = symbol.replace('USDT', '');
   const color  = COIN_COLORS[ticker] ?? '#6b7280';
@@ -106,7 +108,34 @@ function CoinRow({
       </div>
       <div className="flex-1 min-w-0">
         <div className={`text-xs font-semibold leading-none ${isActive ? 'text-gain' : 'text-foreground'}`}>{ticker}</div>
-        <div className="text-[9px] text-muted-foreground">USDT</div>
+        {invalidInfo ? (
+          <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+            <span
+              className="inline-flex items-center gap-0.5 px-1 py-px rounded bg-loss/15 text-loss text-[8px] font-semibold uppercase tracking-wide"
+              title="This pair is no longer tradable on Binance. Remove or replace it in your watchlist."
+            >
+              <Ban className="w-2 h-2" />
+              {invalidInfo.status === 'renamed' || invalidInfo.suggestedRename ? 'renamed' : 'delisted'}
+            </span>
+            {invalidInfo.suggestedRename && (
+              <span
+                className="px-1 py-px rounded bg-warn/15 text-warn text-[8px] font-semibold"
+                title={`Suggested replacement: ${invalidInfo.suggestedRename}`}
+              >
+                → {invalidInfo.suggestedRename.replace('USDT', '')}
+              </span>
+            )}
+          </div>
+        ) : ticketTooSmall ? (
+          <span
+            className="inline-flex items-center px-1 py-px mt-0.5 rounded bg-warn/15 text-warn text-[8px] font-semibold"
+            title="Trades on this coin are chronically skipped because the min lot/notional is larger than your trade size. Raise trade size for this coin."
+          >
+            ticket too small
+          </span>
+        ) : (
+          <div className="text-[9px] text-muted-foreground">USDT</div>
+        )}
       </div>
       <div className="text-right flex-shrink-0">
         <div className="text-xs font-mono tabular-nums text-foreground">{priceStr}</div>
@@ -127,6 +156,8 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
   const [extraPrices, setExtraPrices]   = useState<Record<string, { price: number; changePct: number }>>({});
   // null = still loading, empty Set = fetch failed (show all), non-empty = validated
   const [validSymbols, setValidSymbols] = useState<Set<string> | null>(null);
+  // Backend-driven watchlist health: delisted/renamed pairs + lot-waste flags.
+  const { invalid, lotWaste } = useUniverseHealth();
 
   // Fetch valid Binance spot symbols once on mount
   useEffect(() => {
@@ -193,6 +224,12 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
     return list;
   }, [allCoins, tab, favorites, search]);
 
+  // Count how many of the coins actually in the watchlist are delisted/renamed.
+  const invalidInWatchlist = useMemo(
+    () => allCoins.filter(c => invalid[c.toUpperCase()]).length,
+    [allCoins, invalid],
+  );
+
   return (
     <div className="flex flex-col h-full bg-card border-r border-border">
       {/* Search */}
@@ -233,6 +270,14 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
         </div>
       )}
 
+      {/* Delisted/renamed summary — prompt the user to prune */}
+      {invalidInWatchlist > 0 && (
+        <div className="px-3 py-1 text-[9px] text-loss flex items-center gap-1 border-b border-loss/20 bg-loss/5">
+          <Ban className="w-2.5 h-2.5 flex-shrink-0" />
+          {invalidInWatchlist} watchlist coin{invalidInWatchlist === 1 ? ' is' : 's are'} delisted/renamed — prune them
+        </div>
+      )}
+
       {/* Coin list */}
       <div className="flex-1 overflow-y-auto scrollbar-thin">
         {filtered.length === 0 ? (
@@ -246,6 +291,8 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
                 isActive={activeCoin === coin} isFav={favorites.has(coin)}
                 onSelect={() => onActiveCoin(coin)}
                 onFav={() => toggleFav(coin)}
+                invalidInfo={invalid[coin.toUpperCase()]}
+                ticketTooSmall={lotWaste.has(coin.toUpperCase())}
               />
             );
           })

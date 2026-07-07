@@ -299,6 +299,111 @@ def _maker_best_bid(sym: str, max_age_sec: float = 5.0):
         return None
 
 
+# ── G1a — on-demand best-bid for maker-first entries ─────────────────────────
+# data_collector subscribes @bookTicker for HELD symbols only. With 0 open
+# positions there is NO bookTicker stream, so _maker_best_bid returns None and
+# every maker entry aborted ("best bid unavailable/stale"). Fix: when the WS
+# book is missing/stale, fetch a fresh quote via the PUBLIC REST bookTicker
+# (weight 2, geo-block-safe host) and cache it briefly. Preference order:
+#   fresh WS bookTicker (<5s)  →  2s on-demand cache  →  on-demand REST.
+# When entries.bookticker_universe is on, the data agent streams @bookTicker for
+# the whole universe, so we TRUST the WS book and skip the REST fetch entirely.
+_bookticker_cache: Dict[str, tuple] = {}   # sym -> (bid, ask, ts)
+_BOOKTICKER_CACHE_TTL = 2.0                 # seconds
+
+
+def _fresh_maker_bid(sym: str):
+    """Best bid for maker pricing: fresh WS book → 2s on-demand cache →
+    on-demand PUBLIC REST bookTicker (gated). Returns a positive float bid, or
+    None only when every source fails."""
+    # 1. Fresh WS bookTicker (held-symbol stream, <5s).
+    bid = _maker_best_bid(sym)
+    if bid is not None:
+        return bid
+    # 2. Recent on-demand cache (2s TTL) — avoids re-fetching inside a chase.
+    ce = _bookticker_cache.get(sym)
+    if ce and (time.time() - ce[2]) <= _BOOKTICKER_CACHE_TTL:
+        return ce[0] if ce[0] > 0 else None
+    # 3. Universe streaming on → trust the WS book, do not spend REST weight.
+    try:
+        if _entries_cfg().get("bookticker_universe"):
+            return None
+    except Exception:
+        pass
+    # 4. On-demand REST fetch (rare/staggered on a 5m strategy; ~2 weight).
+    #    Gate through binance_limits.can_spend(2, critical=True) so it defers
+    #    under a 429/418 rather than piling on.
+    try:
+        bl = _get_blimits()
+        if bl is not None and not bl.can_spend(2, critical=True):
+            return None
+    except Exception:
+        pass
+    try:
+        bt = binance_direct.get_book_ticker(sym)
+        bid = float(bt.get("bidPrice") or 0)
+        ask = float(bt.get("askPrice") or 0)
+        _bookticker_cache[sym] = (bid, ask, time.time())
+        return bid if bid > 0 else None
+    except Exception as _bt_e:
+        database.log_activity(
+            f"{sym}: on-demand bookTicker fetch failed ({_bt_e}) — "
+            f"no best bid for maker entry", "warn")
+        return None
+
+
+# ── G1a — maker-entry abandon churn control ──────────────────────────────────
+# A symbol whose maker entry abandons repeatedly (no book, taker disabled, etc.)
+# would otherwise re-select every scan and log a warning every ~10s. After
+# entries.maker_abandon_max consecutive abandonments it gets a 5-min candidacy
+# cooldown (reusing the F6 _candidacy_cooldown gate checked at selection time)
+# and ONE deduped log line. The counter resets on a successful entry.
+_maker_abandon_counts: Dict[str, int] = {}
+_MAKER_ABANDON_COOLDOWN_SEC = 300.0
+
+
+def _note_maker_abandon(sym: str) -> None:
+    """Increment the per-symbol maker-abandon counter; on reaching
+    entries.maker_abandon_max, arm a 5-min candidacy cooldown + one deduped log
+    and reset the counter."""
+    try:
+        limit = max(1, int(_entries_cfg().get("maker_abandon_max", 3)))
+    except Exception:
+        limit = 3
+    n = _maker_abandon_counts.get(sym, 0) + 1
+    _maker_abandon_counts[sym] = n
+    if n >= limit:
+        _candidacy_cooldown[sym] = time.time() + _MAKER_ABANDON_COOLDOWN_SEC
+        _maker_abandon_counts[sym] = 0
+        _log_skip_dedup(
+            sym, "maker_abandon_cooldown",
+            f"[SKIP] {sym}: maker entry abandoned {n}× in a row — "
+            f"candidacy cooldown for {_MAKER_ABANDON_COOLDOWN_SEC/60:.0f} min "
+            f"(no best bid / chase exhausted). Will retry after cooldown.",
+            "warn")
+
+
+def _reset_maker_abandon(sym: str) -> None:
+    """Clear the maker-abandon counter after a successful entry."""
+    _maker_abandon_counts.pop(sym, None)
+
+
+# ── G1b — lot-step rounding-waste diagnostics ────────────────────────────────
+# Rounding DOWN to the lot step is normal (an $10.86 fill vs an $11.00 budget is
+# fine). The buy path only SKIPS when the rounded notional falls below the
+# exchange minNotional, or when the waste exceeds entries.max_lot_waste_pct
+# (chronically-oversized ticket for this coin). Symbols hitting that ceiling are
+# surfaced here so the API/UI can badge "ticket too small for this coin".
+_lot_waste_flags: Dict[str, dict] = {}   # sym -> {"waste_pct": float, "ts": float}
+
+
+def get_lot_waste_flags() -> Dict[str, dict]:
+    """Symbols whose last buy attempt was SKIPPED for lot-step rounding waste
+    above entries.max_lot_waste_pct: {sym: {"waste_pct": float, "ts": float}}.
+    Consumed by the diagnostics API/UI. A copy so callers can't mutate state."""
+    return {s: dict(v) for s, v in _lot_waste_flags.items()}
+
+
 def _log_high_order_count(sym: str, context: str) -> None:
     """§3.5e — each maker post+cancel spends per-account order-count budget.
     Log the rolling 10s order count (from response-header telemetry) when it
@@ -370,9 +475,13 @@ def _execute_maker_first_buy(sym: str, budget: float,
 
     reposts = 0            # reposts AFTER the initial post (-2010 counts too)
     while True:
-        bid = _maker_best_bid(sym)
+        # G1a: fresh WS book → 2s cache → on-demand REST bookTicker. Only None
+        # when the on-demand fetch ALSO fails.
+        bid = _fresh_maker_bid(sym)
         if bid is None:
-            return _taker_fallback_buy("best bid unavailable/stale (>5s)")
+            return _taker_fallback_buy(
+                "best bid unavailable — WS book absent/stale and on-demand "
+                "REST bookTicker failed")
         price = _floor_price_tick(bid, sym)
         qty = _floor_qty(budget / bid, sym)
         if qty <= 0 or price <= 0:
@@ -705,6 +814,21 @@ _LOSS_COOLDOWN_SEC = 1800  # 30 minutes
 # §3.6:
 #   prefer_fee_promo_pairs  (False) advisory-only: log + flag when a matching
 #                                   zero-maker-fee FDUSD pair is configured
+# G1a/G1b (v0.4 Part G) — keys READ here; the strategy_config agent owns the
+# JSON-schema additions. Defaults are merged over strategy.json below so entries
+# keep working even before the schema lands:
+#   bookticker_universe     (False) when True, data_collector streams @bookTicker
+#                                   for ALL covered symbols (data agent's job);
+#                                   here it only tells the maker-first path to
+#                                   TRUST the WS book and skip the on-demand REST
+#                                   best-bid fetch.
+#   maker_abandon_max       (3)     consecutive maker-entry abandonments before a
+#                                   symbol gets a 5-min candidacy cooldown (F6
+#                                   machinery) + ONE deduped log, instead of a
+#                                   warning every scan.
+#   max_lot_waste_pct       (5.0)   lot-step rounding-waste ceiling (% of budget);
+#                                   below it the buy PROCEEDS with the floored qty
+#                                   (only exchange minNotional is a hard floor).
 _ENTRIES_DEFAULTS = {
     "eval_heartbeat_sec":     15.0,
     "tick_entries":           False,
@@ -715,6 +839,9 @@ _ENTRIES_DEFAULTS = {
     "max_reposts":            3,
     "taker_fallback":         False,
     "prefer_fee_promo_pairs": False,
+    "bookticker_universe":    False,
+    "maker_abandon_max":      3,
+    "max_lot_waste_pct":      5.0,
 }
 
 
@@ -5754,9 +5881,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             database.log_activity(f"{sym}: buy skipped — no price available", "warn")
             continue
 
-        # Lot-step rounding guard: skip if rounding would waste >1% of capital.
-        # Catches BTC/ETH-tier coins where a small budget gets floored to far fewer coins
-        # than expected, creating a trapped position that needs a 5%+ move to break even.
+        # G1b — lot-step rounding guard. Rounding DOWN to the lot step is normal
+        # and NOT a failure: an $10.86 fill against an $11.00 budget should
+        # TRADE. The ONLY hard floors are (a) qty rounds to 0, (b) the rounded
+        # notional falls below the exchange minNotional, or (c) the waste exceeds
+        # entries.max_lot_waste_pct (chronically-oversized ticket for this coin).
+        # waste_pct = (budget − rounded_notional)/budget × 100. This relaxes the
+        # SKIP decision only; the qty math below is unchanged (still floored to
+        # the lot step, never buying more than affordable).
         _ideal_qty_pre = budget / price
         _actual_qty_pre = _floor_qty(_ideal_qty_pre, sym)
         if _actual_qty_pre <= 0:
@@ -5766,17 +5898,43 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"would receive 0 qty. Increase budget or remove this coin.", "warn"
             )
             continue
-        _qty_loss_pct = (_ideal_qty_pre - _actual_qty_pre) / _ideal_qty_pre * 100
-        if _qty_loss_pct > 1.0:
-            _record_rejection(sym, score, "lot_step_loss", f"{_qty_loss_pct:.2f}% waste budget=${budget:.2f} price=${price:.4f}")
-            database.log_activity(
-                f"[SKIP] {sym}: lot-step rounding wastes {_qty_loss_pct:.2f}% of capital "
-                f"(ideal={_ideal_qty_pre:.8f}, actual={_actual_qty_pre:.8f}, "
-                f"step={_lot_step_cache.get(sym, '?')}). "
-                f"Price ${price:.4f} too high for ${budget:.2f} budget — skipping.",
-                "warn"
-            )
+        _rounded_notional = _actual_qty_pre * price
+        _waste_pct = (budget - _rounded_notional) / budget * 100 if budget > 0 else 0.0
+        # Exchange minNotional — the true hard floor (read-only exchange_info).
+        _min_notional = 0.0
+        try:
+            from exchange_info import get_symbol_filters as _gsf_wr
+            _min_notional = float((_gsf_wr(sym) or {}).get("min_notional", 0.0) or 0.0)
+        except Exception:
+            _min_notional = 0.0
+        try:
+            _max_waste_pct = float(_entries_cfg().get("max_lot_waste_pct", 5.0))
+        except Exception:
+            _max_waste_pct = 5.0
+        if _min_notional > 0 and _rounded_notional < _min_notional:
+            _record_rejection(sym, score, "min_notional",
+                              f"rounded=${_rounded_notional:.2f} < minNotional=${_min_notional:.2f}")
+            _log_skip_dedup(
+                sym, "lot_below_min_notional",
+                f"[SKIP] {sym}: rounded notional ${_rounded_notional:.2f} below "
+                f"exchange minNotional ${_min_notional:.2f} (budget=${budget:.2f}, "
+                f"price=${price:.4f}) — ticket too small for this coin.", "warn")
+            _lot_waste_flags[sym] = {"waste_pct": round(_waste_pct, 3), "ts": time.time()}
             continue
+        if _waste_pct > _max_waste_pct:
+            _record_rejection(sym, score, "lot_step_loss",
+                              f"{_waste_pct:.2f}% waste > {_max_waste_pct:.2f}% "
+                              f"budget=${budget:.2f} price=${price:.4f}")
+            _log_skip_dedup(
+                sym, "lot_waste_over_max",
+                f"[SKIP] {sym}: lot-step rounding wastes {_waste_pct:.2f}% of the "
+                f"${budget:.2f} ticket (> {_max_waste_pct:.2f}% max; "
+                f"rounded=${_rounded_notional:.2f}, step={_lot_step_cache.get(sym, '?')}) "
+                f"— ticket too small for this coin.", "warn")
+            _lot_waste_flags[sym] = {"waste_pct": round(_waste_pct, 3), "ts": time.time()}
+            continue
+        # Within tolerance — proceed and clear any stale oversized-ticket flag.
+        _lot_waste_flags.pop(sym, None)
 
         _client().update_price(sym, price)
 
@@ -5970,8 +6128,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     _record_rejection(sym, score, "maker_chase_abandoned",
                                       f"chase={_entries_cfg()['chase_seconds']}s "
                                       f"reposts={_entries_cfg()['max_reposts']}")
+                    # G1a: count the abandon; after maker_abandon_max in a row
+                    # this arms a 5-min candidacy cooldown + one deduped log
+                    # instead of re-selecting and warning every scan.
+                    _note_maker_abandon(sym)
                     _release_buy_claim()
                     continue
+                # Successful maker entry — clear the abandon streak.
+                _reset_maker_abandon(sym)
                 fill_price      = _mfr["fill_price"]
                 qty             = _mfr["qty"]
                 buy_fee_usdt    = _mfr["buy_fee_usdt"]
