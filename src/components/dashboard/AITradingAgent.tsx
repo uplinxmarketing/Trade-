@@ -5,6 +5,7 @@ import {
   RotateCcw, ChevronDown, ChevronUp, FlaskConical,
   Pencil, Check, X, BookOpen, Activity, Eye, EyeOff,
   ShoppingCart, Banknote, RefreshCw, Settings2, Shield,
+  BarChart3, History,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { supabase } from '@/integrations/supabase/client';
@@ -15,6 +16,8 @@ import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcSMA } from '@/lib/i
 import { formatTime, formatPnL } from '@/lib/format';
 import { SignalEnginePanel } from './SignalEnginePanel';
 import { DiagnosticsTab } from './DiagnosticsTab';
+import { AnalyticsPanel } from './AnalyticsPanel';
+import { BacktestPanel } from './BacktestPanel';
 
 // ── Simple 4-signal analyser (no API key, Binance public data only) ────────────────────
 const BIN = '/api/proxy/binance';
@@ -417,6 +420,8 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [showTradesSection, setShowTradesSection] = useState(true);
   const [showSignalEngine, setShowSignalEngine] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [showAnalytics, setShowAnalytics] = useState(false);
+  const [showBacktest, setShowBacktest] = useState(false);
   const [signalRegistry, setSignalRegistry] = useState<{id: string; category: string; description: string; role: string}[]>([]);
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
@@ -1802,6 +1807,50 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           {showDiagnostics && (
             <div className="px-4 pb-4">
               <DiagnosticsTab baseUrl={botUrl} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Analytics — expectancy / exit labels / attribution (server mode only) */}
+      {isServerMode && (
+        <div className="border-t border-border">
+          <button
+            onClick={() => setShowAnalytics(!showAnalytics)}
+            className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/20 transition-colors">
+            <div className="flex items-center gap-2">
+              <BarChart3 className="w-3.5 h-3.5 text-muted-foreground" />
+              <span className="text-xs font-semibold">Analytics</span>
+            </div>
+            {showAnalytics
+              ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
+              : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
+          </button>
+          {showAnalytics && (
+            <div className="px-4 pb-4">
+              <AnalyticsPanel baseUrl={botUrl} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Backtest (server mode only) */}
+      {isServerMode && (
+        <div className="border-t border-border">
+          <button
+            onClick={() => setShowBacktest(!showBacktest)}
+            className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/20 transition-colors">
+            <div className="flex items-center gap-2">
+              <History className="w-3.5 h-3.5 text-muted-foreground" />
+              <span className="text-xs font-semibold">Backtest</span>
+            </div>
+            {showBacktest
+              ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
+              : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
+          </button>
+          {showBacktest && (
+            <div className="px-4 pb-4">
+              <BacktestPanel baseUrl={botUrl} />
             </div>
           )}
         </div>

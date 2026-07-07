@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 # Unique ID generated once per process start — changes on every restart so the
@@ -351,6 +351,14 @@ async def lifespan(app: FastAPI):
                     _step_failed(f"spawn_{_task_name}", exc)
             steps.append(f"async tasks launched ({len(_spawned)}/6: {', '.join(_spawned) or 'none'})")
 
+            # 7b. Phase 1 daily maintenance: kline-store prune + nightly edge
+            #     report. First pass ~60 s after startup, then every 24 h.
+            try:
+                _spawn_bg_task(_daily_maintenance_loop(), "daily_maintenance")
+                steps.append("daily_maintenance OK")
+            except Exception as exc:
+                _step_failed("spawn_daily_maintenance", exc)
+
             # 8. Futures paper-trading agent (completely separate parallel process)
             try:
                 if config.FUTURES_ENABLED:
@@ -494,6 +502,34 @@ async def _anomaly_checker():
             conn.close()
         except Exception as e:
             print(f"[AnomalyChecker] error: {e}")
+
+
+async def _daily_maintenance_loop():
+    """Phase 1 housekeeping: prune the kline store per strategy.json retention
+    and rebuild the nightly edge report. Runs once ~60 s after startup (so the
+    edge report exists shortly after every deploy), then every 24 h. Each step
+    is guarded separately and degrades to a no-op when the parallel Phase 1
+    modules (database.prune_klines_from_config / attribution.run_nightly)
+    haven't landed yet."""
+    import asyncio as _aio
+    await _aio.sleep(60)
+    while True:
+        try:
+            _fn = getattr(database, "prune_klines_from_config", None)
+            if _fn is not None:
+                deleted = await _aio.to_thread(_fn)
+                print(f"[Maintenance] kline prune: {deleted} row(s) deleted")
+        except Exception as e:
+            print(f"[Maintenance] kline prune failed: {e}")
+        try:
+            import attribution as _attr
+            _fn = getattr(_attr, "run_nightly", None)
+            if _fn is not None:
+                await _aio.to_thread(_fn)
+                print("[Maintenance] nightly edge report rebuilt")
+        except Exception as e:
+            print(f"[Maintenance] nightly attribution failed: {e}")
+        await _aio.sleep(24 * 3600)
 
 
 # ── Internal helpers ─────────────────────────────────────────────
@@ -4303,6 +4339,364 @@ def api_futures_reset(body: dict = Body(...)):
         return {"success": True, "balance": starting}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WolfBot v0.4 Phase 1 — backtest jobs, expectancy, attribution, kline coverage
+# All endpoints degrade to {"error": "..."} — never a 500 — and wire
+# defensively into parallel-agent modules (backtest / attribution) via
+# lazy import + getattr.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _approved_symbols() -> list:
+    """Approved USDT symbols from strategy.json (the /api/coins watchlist)."""
+    try:
+        s = _load_strategy()
+        return [
+            str(c.get("symbol", "")).upper()
+            for c in s.get("approved_coins", [])
+            if c.get("approved") and str(c.get("symbol", "")).upper()
+        ]
+    except Exception:
+        return []
+
+
+def _parse_ymd_utc_ms(s: str) -> int:
+    """'YYYY-MM-DD' → epoch-ms at UTC midnight. Raises ValueError on junk."""
+    dt = datetime.strptime(str(s).strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+# ── Backtest job registry (single-flight, keep last 5) ──────────────────────
+
+_backtest_jobs: dict = {}          # job_id -> job dict (insertion-ordered)
+_backtest_jobs_lock = threading.Lock()
+_BACKTEST_KEEP = 5
+
+
+def _run_backtest_job(job_id: str, start_ms: int, end_ms: int,
+                      symbols: list, strategy: dict):
+    """Background THREAD worker — never runs on the event loop."""
+    job = _backtest_jobs.get(job_id)
+    if job is None:
+        return
+    try:
+        import backtest as _bt
+        run_fn = getattr(_bt, "run_backtest", None)
+        if run_fn is None:
+            raise RuntimeError("backtest.run_backtest not available yet")
+        job["status"] = "running"
+
+        def _progress(pct):
+            try:
+                job["progress_pct"] = max(0.0, min(100.0, round(float(pct), 1)))
+            except Exception:
+                pass
+
+        try:
+            result = run_fn(start_ms, end_ms, symbols, strategy, progress_cb=_progress)
+        except TypeError:
+            # older/parallel signature without progress_cb
+            result = run_fn(start_ms, end_ms, symbols, strategy)
+        job["result"] = result
+        job["progress_pct"] = 100.0
+        job["status"] = "done"
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        job["finished_ts"] = time.time()
+
+
+@app.post("/api/backtest")
+def api_backtest_start(body: dict = Body(default={})):
+    """Start a backtest job. Body: {start: 'YYYY-MM-DD', end: 'YYYY-MM-DD',
+    symbols: ['BTCUSDT', ...] | 'approved', config: optional strategy override}.
+    Single-flight: 409 while another job is queued/running."""
+    try:
+        try:
+            import backtest as _bt
+            if getattr(_bt, "run_backtest", None) is None:
+                return {"error": "backtest.run_backtest not available yet"}
+        except ImportError:
+            return {"error": "backtest module not available yet"}
+
+        body = body or {}
+        try:
+            start_ms = _parse_ymd_utc_ms(body.get("start"))
+            end_ms = _parse_ymd_utc_ms(body.get("end"))
+        except Exception:
+            return {"error": "start/end must be 'YYYY-MM-DD' strings"}
+        if end_ms <= start_ms:
+            return {"error": "end must be after start"}
+        # end is inclusive: run through the end of that UTC day
+        end_ms += 86_400_000 - 1
+
+        symbols = body.get("symbols", "approved")
+        if isinstance(symbols, str):
+            symbols = _approved_symbols() if symbols.strip().lower() == "approved" \
+                else [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        elif isinstance(symbols, list):
+            symbols = [str(s).upper() for s in symbols if str(s).strip()]
+        else:
+            symbols = []
+        if not symbols:
+            return {"error": "no symbols to backtest (approve coins first or pass symbols)"}
+
+        strategy = body.get("config") if isinstance(body.get("config"), dict) \
+            else _load_strategy()
+
+        with _backtest_jobs_lock:
+            if any(j.get("status") in ("queued", "running")
+                   for j in _backtest_jobs.values()):
+                return JSONResponse({"error": "a backtest is already running"},
+                                    status_code=409)
+            job_id = uuid.uuid4().hex[:8]
+            _backtest_jobs[job_id] = {
+                "job_id":       job_id,
+                "status":       "queued",
+                "progress_pct": 0.0,
+                "result":       None,
+                "error":        None,
+                "started_ts":   time.time(),
+                "finished_ts":  None,
+                "params": {"start": body.get("start"), "end": body.get("end"),
+                           "symbols": symbols},
+            }
+            # keep only the last _BACKTEST_KEEP jobs (drop oldest finished)
+            while len(_backtest_jobs) > _BACKTEST_KEEP:
+                oldest = next(iter(_backtest_jobs))
+                if oldest == job_id:
+                    break
+                _backtest_jobs.pop(oldest, None)
+
+        threading.Thread(
+            target=_run_backtest_job,
+            args=(job_id, start_ms, end_ms, symbols, strategy),
+            name=f"backtest-{job_id}", daemon=True,
+        ).start()
+        return {"job_id": job_id, "status": "queued", "symbols": symbols}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/backtest/{job_id}")
+def api_backtest_status(job_id: str):
+    """Status/result of a backtest job started via POST /api/backtest."""
+    try:
+        job = _backtest_jobs.get(job_id)
+        if job is None:
+            return {"error": f"unknown job_id '{job_id}'",
+                    "known_jobs": list(_backtest_jobs.keys())}
+        return job
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+# ── Expectancy stats ─────────────────────────────────────────────────────────
+
+@app.get("/api/stats/expectancy")
+def api_stats_expectancy(days: int = 30, mode: Optional[str] = None):
+    """Expectancy / fee / exit-label breakdown from the trades table.
+    Default mode filter = current get_mode(); ?mode=paper|live|all overrides."""
+    try:
+        import sqlite3 as _sq
+        days = max(1, min(3650, int(days)))
+        try:
+            m = (mode or get_mode() or "paper").strip().lower()
+        except Exception:
+            m = (mode or "all").strip().lower()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)
+                  ).strftime("%Y-%m-%dT%H:%M:%S")
+
+        where = ["exit_price IS NOT NULL", "net_profit IS NOT NULL",
+                 "timestamp_sell >= ?"]
+        params: list = [cutoff]
+        if m != "all":
+            where.append("mode = ?")
+            params.append(m)
+
+        conn = _sq.connect(database.DB_PATH)
+        conn.row_factory = _sq.Row
+        try:
+            rows = conn.execute(f"""
+                SELECT coin, net_profit, buy_fee, sell_fee,
+                       entry_fee_usdt, exit_fee_usdt,
+                       hold_time_sec, duration_seconds, exit_label
+                FROM trades
+                WHERE {' AND '.join(where)}
+            """, params).fetchall()
+        finally:
+            conn.close()
+
+        n = len(rows)
+        pnls, fees, gross_abs, holds = [], 0.0, 0.0, []
+        per_symbol: dict = {}
+        exit_labels: dict = {}
+        for r in rows:
+            pnl = float(r["net_profit"] or 0.0)
+            # Phase 1 fee columns first, legacy buy_fee/sell_fee as fallback
+            ef = r["entry_fee_usdt"] if r["entry_fee_usdt"] is not None else r["buy_fee"]
+            xf = r["exit_fee_usdt"] if r["exit_fee_usdt"] is not None else r["sell_fee"]
+            fee = float(ef or 0.0) + float(xf or 0.0)
+            pnls.append(pnl)
+            fees += fee
+            gross_abs += abs(pnl + fee)
+            ht = r["hold_time_sec"] if r["hold_time_sec"] is not None else r["duration_seconds"]
+            if ht is not None:
+                holds.append(float(ht))
+
+            sym = r["coin"] or "?"
+            ps = per_symbol.setdefault(sym, {"symbol": sym, "trades": 0,
+                                             "net_pnl": 0.0, "wins": 0})
+            ps["trades"] += 1
+            ps["net_pnl"] += pnl
+            if pnl > 0:
+                ps["wins"] += 1
+
+            label = r["exit_label"] if r["exit_label"] else "unlabeled"
+            el = exit_labels.setdefault(label, {"count": 0, "net_pnl": 0.0})
+            el["count"] += 1
+            el["net_pnl"] += pnl
+
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        gross_win = sum(wins)
+        gross_loss = abs(sum(losses))
+
+        sym_list = sorted(per_symbol.values(),
+                          key=lambda d: abs(d["net_pnl"]), reverse=True)[:20]
+        for d in sym_list:
+            d["win_rate"] = round(100.0 * d["wins"] / d["trades"], 1) if d["trades"] else 0.0
+            d["net_pnl"] = round(d["net_pnl"], 4)
+            d.pop("wins", None)
+        for el in exit_labels.values():
+            el["net_pnl"] = round(el["net_pnl"], 4)
+
+        return {
+            "days": days,
+            "mode": m,
+            "trades": n,
+            "win_rate": round(100.0 * len(wins) / n, 1) if n else 0.0,
+            "avg_win": round(gross_win / len(wins), 4) if wins else 0.0,
+            "avg_loss": round(-gross_loss / len(losses), 4) if losses else 0.0,
+            "expectancy_per_trade": round(sum(pnls) / n, 4) if n else 0.0,
+            # None when there are no losses (undefined) — inf is not JSON-safe
+            "profit_factor": (round(gross_win / gross_loss, 3)
+                              if gross_loss > 0 else None),
+            "total_fees": round(fees, 4),
+            "fee_share_of_gross": (round(fees / gross_abs, 4)
+                                   if gross_abs > 0 else None),
+            "avg_hold_time_sec": (round(sum(holds) / len(holds), 1)
+                                  if holds else None),
+            "per_symbol": sym_list,
+            "exit_labels": exit_labels,
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+# ── Attribution / edge report ────────────────────────────────────────────────
+
+_edge_rebuild_lock = threading.Lock()
+
+
+def _edge_rebuild_sync() -> dict:
+    """Blocking rebuild via attribution.build_edge_report(days=7); persists
+    the result to settings so the GET path serves it afterwards."""
+    import attribution as _attr
+    fn = getattr(_attr, "build_edge_report", None)
+    if fn is None:
+        raise RuntimeError("attribution.build_edge_report not available yet")
+    report = fn(days=7)
+    try:
+        database.save_setting("edge_report_json", json.dumps(report, default=str))
+        database.save_setting("edge_report_ts", str(time.time()))
+    except Exception:
+        pass
+    return report
+
+
+@app.get("/api/stats/attribution")
+def api_stats_attribution(rebuild: int = 0):
+    """Stored nightly edge report. ?rebuild=1 rebuilds synchronously in a
+    thread (120 s timeout; 409 while another rebuild is in flight)."""
+    try:
+        if rebuild:
+            try:
+                import attribution as _attr
+                if getattr(_attr, "build_edge_report", None) is None:
+                    return {"error": "attribution.build_edge_report not available yet"}
+            except ImportError:
+                return {"error": "attribution module not available yet"}
+            if not _edge_rebuild_lock.acquire(blocking=False):
+                return JSONResponse({"error": "an edge report rebuild is already running"},
+                                    status_code=409)
+            import concurrent.futures as _cf
+            ex = _cf.ThreadPoolExecutor(max_workers=1,
+                                        thread_name_prefix="edge-rebuild")
+            fut = ex.submit(_edge_rebuild_sync)
+            fut.add_done_callback(lambda _f: _edge_rebuild_lock.release())
+            ex.shutdown(wait=False)
+            try:
+                report = fut.result(timeout=120)
+                return {"report": report, "ts": time.time(), "rebuilt": True}
+            except _ConcurrentTimeoutError:
+                return {"error": "edge report rebuild timed out after 120s "
+                                 "(still finishing in the background)"}
+            except Exception as e:
+                return {"error": f"rebuild failed: {type(e).__name__}: {e}"}
+
+        raw = None
+        try:
+            raw = database.get_setting("edge_report_json")
+        except Exception:
+            pass
+        if not raw:
+            return {"report": None, "ts": None, "rebuilt": False,
+                    "error": "no edge report stored yet — nightly job has not run"}
+        try:
+            report = json.loads(raw)
+        except Exception:
+            return {"error": "stored edge report is not valid JSON"}
+        ts = None
+        try:
+            ts_raw = database.get_setting("edge_report_ts")
+            ts = float(ts_raw) if ts_raw else None
+        except Exception:
+            pass
+        if ts is None and isinstance(report, dict):
+            ts = report.get("ts") or report.get("generated_ts")
+        return {"report": report, "ts": ts, "rebuilt": False}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+# ── Kline store coverage ─────────────────────────────────────────────────────
+
+@app.get("/api/klines/coverage")
+def api_klines_coverage(symbols: str = "approved"):
+    """Per-symbol 1m + 5m kline-store coverage (backfill progress for the UI).
+    ?symbols=approved (default) or a comma-separated symbol list."""
+    try:
+        cov_fn = getattr(database, "kline_coverage", None)
+        if cov_fn is None:
+            return {"error": "kline store not available yet"}
+        if str(symbols).strip().lower() == "approved":
+            syms = _approved_symbols()
+        else:
+            syms = [s.strip().upper() for s in str(symbols).split(",") if s.strip()]
+        out = []
+        for s in syms:
+            try:
+                out.append({"symbol": s,
+                            "1m": cov_fn(s, "1m"),
+                            "5m": cov_fn(s, "5m")})
+            except Exception as e:
+                out.append({"symbol": s, "error": str(e)})
+        return {"symbols": out, "count": len(out), "ts": time.time()}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def start_control_api():

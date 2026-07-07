@@ -519,6 +519,7 @@ def download_history():
         try:
             raw = _fetch_klines_rest(coin, config.CANDLE_TIMEFRAME, limit=1000, defer_sec=30.0)
             _compute_and_save(coin, raw, save_all=True)
+            _kline_store_save(coin, config.CANDLE_TIMEFRAME, raw)  # Phase 1 store
             print(f"  {coin}: {len(raw)} candles saved")
             time.sleep(0.3)  # be polite to Binance rate limits
         except Exception as e:
@@ -595,6 +596,82 @@ def _merge_candles(sym: str, interval: str, rest_rows: list) -> int:
         return len(add)
 
 
+# ── Phase 1: durable kline store (database.klines table) ─────────────────────
+# Every CLOSED 1m/5m kline (WS close events, backfill, gap repair) also flows
+# into database.save_klines so backtests have a persistent history. WS-event
+# rows are BUFFERED and flushed on an executor thread (~30 s or 50 rows per
+# interval) — never on the WS event loop. All writes are guarded: if
+# save_klines is missing (old database.py), everything degrades to a no-op.
+
+_kline_store_lock = threading.Lock()
+_kline_store_buf: Dict[str, list] = {}            # interval -> [(sym, row), ...]
+_kline_store_last_flush: Dict[str, float] = {}    # interval -> last flush ts
+_KLINE_FLUSH_SEC  = 30.0
+_KLINE_FLUSH_ROWS = 50
+
+
+def _kline_store_available() -> bool:
+    return getattr(database, "save_klines", None) is not None
+
+
+def _kline_store_buffer(sym: str, interval: str, row: list) -> bool:
+    """Buffer one closed candle for the kline store. Cheap (list append under
+    a lock) — safe to call from the WS event loop. Returns True when a flush
+    is due; the CALLER must then schedule _kline_store_flush on an executor."""
+    if not _kline_store_available():
+        return False
+    now = time.time()
+    with _kline_store_lock:
+        buf = _kline_store_buf.setdefault(interval, [])
+        buf.append((sym, list(row)))
+        last = _kline_store_last_flush.setdefault(interval, now)
+        return len(buf) >= _KLINE_FLUSH_ROWS or now - last >= _KLINE_FLUSH_SEC
+
+
+def _kline_store_flush(interval: str):
+    """BLOCKING — executor/worker threads only. Drain the buffer for one
+    interval and write it to the kline store, grouped per symbol."""
+    fn = getattr(database, "save_klines", None)
+    if fn is None:
+        return
+    with _kline_store_lock:
+        rows = _kline_store_buf.pop(interval, [])
+        _kline_store_last_flush[interval] = time.time()
+    if not rows:
+        return
+    by_sym: Dict[str, list] = {}
+    for sym, row in rows:
+        by_sym.setdefault(sym, []).append(row)
+    for sym, rws in by_sym.items():
+        try:
+            fn(sym, interval, rws)
+        except Exception as e:
+            print(f"[DataCollector] kline store flush failed ({sym} {interval}): {e}")
+
+
+def _kline_store_save(sym: str, interval: str, raw_rows: list):
+    """BLOCKING direct write for backfill / gap-repair fetches (those already
+    run on executor threads). Skips in-progress (unclosed) candles."""
+    fn = getattr(database, "save_klines", None)
+    if fn is None or not raw_rows:
+        return
+    try:
+        _, step, _ = _buffer_meta(interval)
+        now_ms = int(time.time() * 1000)
+        closed_rows = []
+        for r in raw_rows:
+            try:
+                close_ms = int(r[6]) if len(r) > 6 else int(r[0]) + step - 1
+                if close_ms < now_ms:
+                    closed_rows.append(r)
+            except Exception:
+                continue
+        if closed_rows:
+            fn(sym, interval, closed_rows)
+    except Exception as e:
+        print(f"[DataCollector] kline store save failed ({sym} {interval}): {e}")
+
+
 # Rolling operational counters (health panel)
 _counters_lock = threading.Lock()
 _gap_repairs: deque = deque()        # ts of each gap repair (24 h window)
@@ -658,6 +735,7 @@ def _gap_repair_range(sym: str, interval: str, start_ms: int, end_ms: int,
         raw = _fetch_klines_rest(sym, interval, limit=n,
                                  start_ms=start_ms, end_ms=end_ms, defer_sec=15.0)
         added = _merge_candles(sym, interval, raw)
+        _kline_store_save(sym, interval, raw)   # Phase 1: durable kline store
         _record_gap_repair()
         print(f"[DataCollector] Gap repair ({reason}) {sym} {interval}: "
               f"fetched {len(raw)}, merged {added} candle(s)")
@@ -719,9 +797,11 @@ def _backfill_symbol(sym: str) -> int:
             raw = _fetch_klines_rest(sym, config.CANDLE_TIMEFRAME,
                                      limit=_WS_CANDLE_MAX, defer_sec=20.0)
             merged += _merge_candles(sym, config.CANDLE_TIMEFRAME, raw)
+            _kline_store_save(sym, config.CANDLE_TIMEFRAME, raw)  # Phase 1 store
         if len(ws_candles_5m.get(sym, [])) < _WS_5M_CANDLE_MAX:
             raw = _fetch_klines_rest(sym, "5m", limit=_WS_5M_CANDLE_MAX, defer_sec=20.0)
             merged += _merge_candles(sym, "5m", raw)
+            _kline_store_save(sym, "5m", raw)                     # Phase 1 store
     except _RestDeferred:
         pass  # budget closed — the next backfill trigger will finish the job
     except Exception as e:
@@ -926,6 +1006,16 @@ def _handle_ws_message(raw: str):
                 float(k["l"]), float(k["c"]), float(k["v"]),
             ]
             appended, gap, snapshot = _append_closed_candle(sym, interval, closed)
+            if appended:
+                # Phase 1: persist every closed 1m/5m kline to the durable
+                # kline store. Buffering is O(1) here; the actual SQLite
+                # write is flushed on an executor thread (~30 s / 50 rows).
+                try:
+                    if _kline_store_buffer(sym, interval, closed):
+                        asyncio.get_running_loop().run_in_executor(
+                            None, _kline_store_flush, interval)
+                except Exception:
+                    pass
             if gap is not None:
                 # §6.2 c: fetch ONLY the missing range for ONLY this symbol.
                 asyncio.get_running_loop().run_in_executor(

@@ -1,6 +1,16 @@
 """
 PaperClient — drop-in replacement for python-binance Client.
 Return shapes are byte-for-byte identical to the real Binance API.
+
+Phase 1 §1.6 — paper realism:
+  * Fees come from fees.get_fee_model(symbol).taker() (strategy.json-driven,
+    hot-reload, per-symbol overrides). The constructor's `fee_rate` param is
+    kept only as a fallback for when the fees module is unavailable.
+  * Fills carry slippage: buys fill at price*(1+slip), sells at price*(1-slip),
+    where slip = half_spread + tier_bps/10000. The half-spread is read from
+    data_collector.book_ticker (real WS bid/ask, guarded import, must be <30s
+    fresh, capped at 50bps); otherwise 0. tier_bps defaults to 5bps —
+    deterministic, documented, configurable later.
 """
 
 import time
@@ -10,9 +20,19 @@ import uuid
 from typing import Dict, Optional
 import database
 
+# Default volume-tier slippage in basis points (§1.6). Applied on top of the
+# observed half-spread. 5bps ~= typical market-order impact on liquid pairs.
+DEFAULT_TIER_SLIPPAGE_BPS = 5.0
+# Sanity cap on the half-spread component (a crossed/garbage book must not
+# produce absurd fills).
+MAX_HALF_SPREAD_FRACTION = 0.005  # 50 bps
+# Book-ticker entries older than this are considered stale and ignored.
+BOOK_TICKER_MAX_AGE_SEC = 30.0
+
 
 class PaperClient:
     def __init__(self, starting_usdt: float = 10000.0, fee_rate: float = 0.001):
+        # Fallback fee only — live fee comes from fees.get_fee_model(symbol).
         self._fee_rate = fee_rate
         self._prices: Dict[str, float] = {}
         self._lock = threading.Lock()
@@ -26,6 +46,34 @@ class PaperClient:
             self._balances = {"USDT": starting_usdt}
             database.save_paper_state(self._balances)
             print(f"[PaperClient] Fresh start — USDT: {starting_usdt:.2f}")
+
+    # ── Fee + slippage helpers (Phase 1 §1.6) ────────────────────────────────
+
+    def _fee_rate_for(self, symbol: str) -> float:
+        """Taker fee FRACTION for symbol via fees.FeeModel; constructor value
+        is the fallback when the fees module is unavailable/broken."""
+        try:
+            import fees as _fees
+            return _fees.get_fee_model(symbol).taker()
+        except Exception:
+            return self._fee_rate
+
+    def _slippage_frac(self, symbol: str) -> float:
+        """Fill slippage as a FRACTION: half-spread (real WS book ticker when
+        fresh, else 0) + tier bps. Deterministic given the current book."""
+        half_spread = 0.0
+        try:
+            import data_collector as _dc  # guarded — may not be running (tests)
+            bt = _dc.book_ticker.get(symbol)
+            if bt and (time.time() - float(bt.get("ts", 0))) < BOOK_TICKER_MAX_AGE_SEC:
+                bid = float(bt.get("bid", 0))
+                ask = float(bt.get("ask", 0))
+                mid = (bid + ask) / 2.0
+                if bid > 0 and ask >= bid and mid > 0:
+                    half_spread = min((ask - bid) / 2.0 / mid, MAX_HALF_SPREAD_FRACTION)
+        except Exception:
+            half_spread = 0.0
+        return half_spread + DEFAULT_TIER_SLIPPAGE_BPS / 10000.0
 
     # ── Price management ──────────────────────────────────────────────────────────────────────────
 
@@ -75,8 +123,10 @@ class PaperClient:
     # ── Orders ──────────────────────────────────────────────────────────────────────────────────────
 
     def order_market_buy(self, symbol: str, quoteOrderQty: float) -> dict:
-        price = self._get_price(symbol)
-        fee   = quoteOrderQty * self._fee_rate
+        mark = self._get_price(symbol)
+        # §1.6: buys fill ABOVE the mark — half-spread + tier slippage.
+        price = mark * (1.0 + self._slippage_frac(symbol))
+        fee   = quoteOrderQty * self._fee_rate_for(symbol)
         total_cost = quoteOrderQty + fee
         coin  = symbol[:-4]  # strip USDT suffix
         qty   = math.floor((quoteOrderQty / price) * 1e8) / 1e8  # floor to 8 dp
@@ -126,6 +176,8 @@ class PaperClient:
         # order execution, causing sells to execute at the wrong (lower) price.
         if price <= 0:
             price = self._get_price(symbol)
+        # §1.6: sells fill BELOW the trigger — half-spread + tier slippage.
+        price = price * (1.0 - self._slippage_frac(symbol))
         coin  = symbol[:-4]  # strip USDT
 
         with self._lock:
@@ -135,7 +187,7 @@ class PaperClient:
                     f"Insufficient paper {coin} balance: need {quantity:.8f}, have {coin_bal:.8f}"
                 )
             gross_usdt = quantity * price
-            fee        = gross_usdt * self._fee_rate
+            fee        = gross_usdt * self._fee_rate_for(symbol)
             net_usdt   = gross_usdt - fee
 
             new_coin = coin_bal - quantity

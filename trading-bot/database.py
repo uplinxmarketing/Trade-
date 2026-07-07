@@ -1,5 +1,6 @@
 """SQLite database layer — thread-safe, no async required."""
 
+import hashlib
 import os
 import sqlite3
 import threading
@@ -271,6 +272,37 @@ def init_db():
                 binance_qty REAL,
                 resolved    INTEGER DEFAULT 0
             );
+
+            -- Phase 1 measurement layer (spec §1.2): raw kline store used by
+            -- the backtester / backfill CLI. open_time is Binance epoch-ms.
+            CREATE TABLE IF NOT EXISTS klines (
+                symbol    TEXT NOT NULL,
+                interval  TEXT NOT NULL,
+                open_time INTEGER NOT NULL,
+                o         REAL,
+                h         REAL,
+                l         REAL,
+                c         REAL,
+                v         REAL,
+                quote_v   REAL,
+                PRIMARY KEY (symbol, interval, open_time)
+            );
+
+            -- Phase 1 measurement layer (spec §1.3): one row per evaluated
+            -- entry opportunity (executed or not) with full JSON context.
+            CREATE TABLE IF NOT EXISTS entry_snapshots (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts          REAL,
+                symbol      TEXT,
+                origin      TEXT,
+                executed    INTEGER,
+                price       REAL,
+                raw_json    TEXT,
+                gates_json  TEXT,
+                config_hash TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_entry_snapshots_ts     ON entry_snapshots(ts);
+            CREATE INDEX IF NOT EXISTS idx_entry_snapshots_symbol ON entry_snapshots(symbol);
         """)
 
         # ── Schema migrations for existing databases ─────────────────────────
@@ -310,6 +342,13 @@ def init_db():
             "ALTER TABLE trades ADD COLUMN sell_slippage_pct    REAL",
             "ALTER TABLE positions ADD COLUMN intended_buy_price REAL",
             "ALTER TABLE positions ADD COLUMN buy_slippage_pct   REAL",
+            # Phase 1 exit-label / fee-attribution columns (spec §1.3)
+            "ALTER TABLE trades ADD COLUMN exit_label     TEXT",
+            "ALTER TABLE trades ADD COLUMN slippage_bps   REAL",
+            "ALTER TABLE trades ADD COLUMN entry_fee_usdt REAL",
+            "ALTER TABLE trades ADD COLUMN exit_fee_usdt  REAL",
+            "ALTER TABLE trades ADD COLUMN hold_time_sec  REAL",
+            "ALTER TABLE trades ADD COLUMN origin         TEXT",
         ]
         for sql in migrations:
             try:
@@ -397,12 +436,274 @@ def candles_table_empty() -> bool:
     return row["cnt"] == 0
 
 
+# ── Klines (Phase 1 measurement layer, spec §1.2) ─────────────────────────────
+
+_KLINE_COLS = ("open_time", "o", "h", "l", "c", "v", "quote_v")
+
+
+def _num(x) -> Optional[float]:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _kline_to_tuple(row) -> Optional[tuple]:
+    """Normalise one kline into (open_time, o, h, l, c, v, quote_v).
+
+    Accepts either a raw Binance kline array
+    [open_time, open, high, low, close, volume, close_time, quote_volume, ...]
+    or a dict with short keys {open_time, o, h, l, c, v, quote_v} (long-form
+    aliases open/high/low/close/volume/quote_volume also accepted).
+    Returns None for malformed rows."""
+    try:
+        if isinstance(row, dict):
+            open_time = row.get("open_time", row.get("t"))
+            o = row.get("o", row.get("open"))
+            h = row.get("h", row.get("high"))
+            l = row.get("l", row.get("low"))
+            c = row.get("c", row.get("close"))
+            v = row.get("v", row.get("volume"))
+            quote_v = row.get("quote_v", row.get("quote_volume", row.get("q")))
+        else:  # Binance kline array (list/tuple)
+            open_time = row[0]
+            o, h, l, c, v = row[1], row[2], row[3], row[4], row[5]
+            quote_v = row[7] if len(row) > 7 else None
+        return (int(open_time), _num(o), _num(h), _num(l), _num(c),
+                _num(v), _num(quote_v))
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+
+
+def save_klines(symbol: str, interval: str, rows: list) -> int:
+    """INSERT OR REPLACE klines for (symbol, interval). `rows` is a list of
+    Binance kline arrays or dicts (see _kline_to_tuple). Duplicate open_times
+    replace the stored row (PK symbol/interval/open_time). Returns the number
+    of rows written; malformed rows are skipped."""
+    tuples = []
+    for r in rows or []:
+        t = _kline_to_tuple(r)
+        if t is not None:
+            tuples.append((symbol, interval) + t)
+    if not tuples:
+        return 0
+    with _lock:
+        conn = _conn()
+        conn.executemany("""
+            INSERT OR REPLACE INTO klines
+                (symbol, interval, open_time, o, h, l, c, v, quote_v)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, tuples)
+        conn.commit()
+        conn.close()
+    return len(tuples)
+
+
+def get_klines(symbol: str, interval: str,
+               start_ms: Optional[int] = None,
+               end_ms: Optional[int] = None,
+               limit: Optional[int] = None) -> List[dict]:
+    """Return klines as dicts {open_time,o,h,l,c,v,quote_v} in ASCENDING
+    open_time order. start_ms/end_ms are inclusive epoch-ms bounds. When
+    `limit` is given, the MOST RECENT `limit` rows inside the range are
+    returned (still ascending) — the useful shape for indicator warm-up."""
+    where = ["symbol = ?", "interval = ?"]
+    params: list = [symbol, interval]
+    if start_ms is not None:
+        where.append("open_time >= ?")
+        params.append(int(start_ms))
+    if end_ms is not None:
+        where.append("open_time <= ?")
+        params.append(int(end_ms))
+    sql = f"SELECT open_time, o, h, l, c, v, quote_v FROM klines WHERE {' AND '.join(where)}"
+    with _lock:
+        conn = _conn()
+        if limit is not None:
+            rows = conn.execute(sql + " ORDER BY open_time DESC LIMIT ?",
+                                params + [int(limit)]).fetchall()
+            rows = list(reversed(rows))
+        else:
+            rows = conn.execute(sql + " ORDER BY open_time ASC", params).fetchall()
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def prune_klines(retention_days: float) -> int:
+    """Delete klines with open_time older than now - retention_days.
+    Returns the number of rows deleted."""
+    import time as _t
+    cutoff_ms = int((_t.time() - float(retention_days) * 86400.0) * 1000)
+    with _lock:
+        conn = _conn()
+        cur = conn.execute("DELETE FROM klines WHERE open_time < ?", (cutoff_ms,))
+        deleted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+        conn.commit()
+        conn.close()
+    return deleted
+
+
+def prune_klines_from_config() -> int:
+    """Prune klines using strategy.json `data.kline_retention_days` (default
+    180; top-level `kline_retention_days` accepted as fallback). Reads the
+    file defensively — any problem means the 180-day default. A later agent
+    schedules this; it is safe to call any time. Returns rows deleted."""
+    days = 180.0
+    try:
+        import config as _cfg
+        with open(_cfg.STRATEGY_FILE, "r") as f:
+            s = json.load(f)
+        raw = None
+        if isinstance(s, dict):
+            d = s.get("data")
+            if isinstance(d, dict):
+                raw = d.get("kline_retention_days")
+            if raw is None:
+                raw = s.get("kline_retention_days")
+        if raw is not None:
+            days = max(1.0, float(raw))
+    except Exception:
+        days = 180.0
+    return prune_klines(days)
+
+
+def kline_coverage(symbol: str, interval: str) -> dict:
+    """Return {"first_ms", "last_ms", "count"} for stored (symbol, interval)
+    klines. first_ms/last_ms are None when count == 0."""
+    with _lock:
+        conn = _conn()
+        row = conn.execute("""
+            SELECT MIN(open_time) AS first_ms,
+                   MAX(open_time) AS last_ms,
+                   COUNT(*)       AS cnt
+            FROM klines WHERE symbol = ? AND interval = ?
+        """, (symbol, interval)).fetchone()
+        conn.close()
+    if row and row["cnt"]:
+        return {"first_ms": int(row["first_ms"]), "last_ms": int(row["last_ms"]),
+                "count": int(row["cnt"])}
+    return {"first_ms": None, "last_ms": None, "count": 0}
+
+
+# ── Entry snapshots (Phase 1 measurement layer, spec §1.3) ────────────────────
+
+def save_entry_snapshot(symbol: str, origin: str, executed, price,
+                        raw: Optional[dict] = None,
+                        gates: Optional[dict] = None,
+                        config_hash: Optional[str] = None) -> Optional[int]:
+    """Record one evaluated entry opportunity (whether or not it executed).
+
+    `raw` — full signal/indicator context dict; `gates` — per-gate pass/fail
+    dict. Both are JSON-serialised (non-serialisable values become str).
+    `executed` is coerced to 0/1. Returns the new row id."""
+    import time as _t
+    ts = _t.time()
+    try:
+        raw_json = json.dumps(raw if raw is not None else {}, default=str)
+    except Exception:
+        raw_json = "{}"
+    try:
+        gates_json = json.dumps(gates if gates is not None else {}, default=str)
+    except Exception:
+        gates_json = "{}"
+    with _lock:
+        conn = _conn()
+        cur = conn.execute("""
+            INSERT INTO entry_snapshots
+                (ts, symbol, origin, executed, price, raw_json, gates_json, config_hash)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (ts, symbol, origin, int(bool(executed)),
+              _num(price), raw_json, gates_json, config_hash))
+        conn.commit()
+        row_id = cur.lastrowid
+        conn.close()
+    return row_id
+
+
+def get_entry_snapshots(since_ts: Optional[float] = None,
+                        symbol: Optional[str] = None,
+                        executed: Optional[bool] = None,
+                        limit: int = 500) -> List[dict]:
+    """Return entry snapshots newest-first. `raw`/`gates` are parsed back to
+    dicts (unparseable JSON → {}). `executed=None` returns both outcomes."""
+    where = ["1=1"]
+    params: list = []
+    if since_ts is not None:
+        where.append("ts >= ?")
+        params.append(float(since_ts))
+    if symbol is not None:
+        where.append("symbol = ?")
+        params.append(symbol)
+    if executed is not None:
+        where.append("executed = ?")
+        params.append(int(bool(executed)))
+    params.append(int(limit))
+    with _lock:
+        conn = _conn()
+        rows = conn.execute(f"""
+            SELECT id, ts, symbol, origin, executed, price,
+                   raw_json, gates_json, config_hash
+            FROM entry_snapshots
+            WHERE {' AND '.join(where)}
+            ORDER BY id DESC LIMIT ?
+        """, params).fetchall()
+        conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        for src, dst in (("raw_json", "raw"), ("gates_json", "gates")):
+            try:
+                d[dst] = json.loads(d.pop(src) or "{}")
+            except Exception:
+                d[dst] = {}
+        out.append(d)
+    return out
+
+
+def config_hash(strategy: dict) -> str:
+    """Deterministic 12-hex-char fingerprint of a strategy config dict —
+    sha256 of the sort_keys JSON dump (non-serialisable values become str).
+    Stored on entry_snapshots so measurements can be grouped by the exact
+    config that produced them."""
+    try:
+        blob = json.dumps(strategy, sort_keys=True, default=str)
+    except Exception:
+        blob = repr(strategy)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+
 # ── Trades ────────────────────────────────────────────────────────────────────
 
 def log_trade(trade: dict, *,
               target_crossed_to_trigger_ms: Optional[int] = None,
               trigger_to_filled_ms: Optional[int] = None,
-              target_crossed_ts: Optional[str] = None):
+              target_crossed_ts: Optional[str] = None,
+              exit_label: Optional[str] = None,
+              slippage_bps: Optional[float] = None,
+              entry_fee_usdt: Optional[float] = None,
+              exit_fee_usdt: Optional[float] = None,
+              hold_time_sec: Optional[float] = None,
+              origin: Optional[str] = None):
+    """Insert a closed trade.
+
+    Backward compatible: existing callers pass only the `trade` dict (plus the
+    latency kwargs). The Phase 1 measurement kwargs (exit_label, slippage_bps,
+    entry_fee_usdt, exit_fee_usdt, hold_time_sec, origin) are optional; when a
+    kwarg is None the same-named key from the `trade` dict is used, so callers
+    may supply them either way. Unset values are stored as NULL.
+    """
+    # Phase 1 columns: explicit kwarg wins, else same-named trade-dict key.
+    if exit_label is None:
+        exit_label = trade.get("exit_label")
+    if slippage_bps is None:
+        slippage_bps = trade.get("slippage_bps")
+    if entry_fee_usdt is None:
+        entry_fee_usdt = trade.get("entry_fee_usdt")
+    if exit_fee_usdt is None:
+        exit_fee_usdt = trade.get("exit_fee_usdt")
+    if hold_time_sec is None:
+        hold_time_sec = trade.get("hold_time_sec")
+    if origin is None:
+        origin = trade.get("origin")
     with _lock:
         conn = _conn()
         conn.execute("""
@@ -413,8 +714,10 @@ def log_trade(trade: dict, *,
                  entry_volume_trend, hour_of_day, day_of_week,
                  timestamp_buy, timestamp_sell, sell_reason, signal_snapshot,
                  target_crossed_to_trigger_ms, trigger_to_filled_ms, target_crossed_ts,
-                 intended_buy_price, intended_sell_price, buy_slippage_pct, sell_slippage_pct)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 intended_buy_price, intended_sell_price, buy_slippage_pct, sell_slippage_pct,
+                 exit_label, slippage_bps, entry_fee_usdt, exit_fee_usdt,
+                 hold_time_sec, origin)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             trade.get("coin"), trade.get("mode"), trade.get("entry_price"),
             trade.get("exit_price"), trade.get("quantity"), trade.get("budget_usdt"),
@@ -428,6 +731,8 @@ def log_trade(trade: dict, *,
             target_crossed_to_trigger_ms, trigger_to_filled_ms, target_crossed_ts,
             trade.get("intended_buy_price"), trade.get("intended_sell_price"),
             trade.get("buy_slippage_pct"), trade.get("sell_slippage_pct"),
+            exit_label, slippage_bps, entry_fee_usdt, exit_fee_usdt,
+            hold_time_sec, origin,
         ))
         conn.commit()
         conn.close()

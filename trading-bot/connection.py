@@ -102,9 +102,58 @@ def _build_client():
     # Paper mode (configured or fallback)
     from paper_client import PaperClient
     return PaperClient(
-        starting_usdt=float(os.getenv("STARTING_PAPER_USDT", "10000.0")),
-        fee_rate=0.001,
+        starting_usdt=_paper_starting_usdt(),
+        fee_rate=_paper_fee_rate(),
     )
+
+
+_PAPER_DEFAULT_STARTING_USDT = 10000.0
+
+
+def _paper_starting_usdt() -> float:
+    """Starting balance for a FRESH paper wallet (Phase 1 §1.6, mirror-live sizing).
+
+    Precedence:
+      1. STARTING_PAPER_USDT env var, when explicitly set to something OTHER
+         than the legacy 10000 default (operator override always wins).
+      2. strategy.json bot_allocation_usdt when > 0 — paper sizing mirrors the
+         live allocation cap.
+      3. 10000 legacy default.
+
+    Only affects NEW paper states: PaperClient uses starting_usdt exclusively
+    when database.load_paper_state() has no saved balances, so an existing
+    wallet is never reset on upgrade."""
+    env_raw = os.getenv("STARTING_PAPER_USDT")
+    env_val = None
+    if env_raw is not None:
+        try:
+            env_val = float(env_raw)
+        except (TypeError, ValueError):
+            env_val = None
+    if env_val is not None and abs(env_val - _PAPER_DEFAULT_STARTING_USDT) > 1e-9:
+        return env_val  # explicitly configured to a non-default value — wins
+    try:
+        import json as _json
+        import config as _config
+        with open(_config.STRATEGY_FILE, "r") as _f:
+            _strategy = _json.load(_f)
+        alloc = float(_strategy.get("bot_allocation_usdt", 0) or 0)
+        if alloc > 0:
+            return alloc
+    except Exception:
+        pass
+    return env_val if env_val is not None else _PAPER_DEFAULT_STARTING_USDT
+
+
+def _paper_fee_rate() -> float:
+    """Fallback taker fee for PaperClient — from fees.FeeModel (spec §1.1).
+    PaperClient re-reads the FeeModel per fill; this is only its last-resort
+    constructor fallback, so it too must come from the model, not a literal."""
+    try:
+        import fees as _fees
+        return _fees.get_fee_model().taker()
+    except Exception:
+        return 0.001  # legacy constant — only when the fees module is broken
 
 
 client = _build_client()

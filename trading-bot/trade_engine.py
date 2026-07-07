@@ -33,6 +33,7 @@ from typing import Dict, List, Optional, Tuple
 
 import config
 import database
+import fees
 import indicators
 import learning
 import connection
@@ -234,7 +235,23 @@ _positions_lock = threading.Lock()
 _strategy_mtime: float = 0.0
 _strategy_cache: dict = {}
 
-_fee_rate = config.FEE_RATE  # 0.1% standard Binance spot
+# Legacy module default — kept ONLY for external legacy reads (e.g. control_api
+# imports _te._fee_rate). Refreshed from the FeeModel in _refresh_risk_params.
+# All fee math INSIDE this module goes through _fee_rate_for(symbol).
+_fee_rate = config.FEE_RATE
+
+
+def _fee_rate_for(symbol: str = "") -> float:
+    """Taker fee FRACTION (0.001 == 0.10%) for `symbol` from fees.FeeModel.
+
+    Single source of truth (spec §1.1): strategy.json fees.* (mtime-cached,
+    hot-reload, per-symbol overrides). Falls back to config.FEE_RATE only when
+    the fees module itself fails. BEP↔gate PARITY: compute_real_breakeven_price
+    and _profitable_sell_check MUST both read this same function."""
+    try:
+        return fees.get_fee_model(symbol or None).taker()
+    except Exception:
+        return config.FEE_RATE
 # Minimum multiplier needed to cover fees (breakeven floor).
 
 def _fills_fee_usdt(fills: list, fallback_usdt: float) -> tuple:
@@ -274,7 +291,9 @@ def _fills_fee_usdt(fills: list, fallback_usdt: float) -> tuple:
                 # Price unavailable — fall back to estimate for entire order
                 return fallback_usdt, "estimated"
     return total, first_asset
-_FEE_FLOOR = 1.0 / (0.999 ** 2)  # ~1.002003 — exact cost of two 0.1% Binance fees
+# ~1.002003 at default fees — exact cost of a taker round-trip. Refreshed from
+# the FeeModel in _refresh_risk_params so strategy.json fee edits hot-reload.
+_FEE_FLOOR = 1.0 / ((1.0 - config.FEE_RATE) ** 2)
 
 # Per-coin override buffers: {"SHIBUSDT": 0.30, ...} — populated from strategy.json
 _BUFFER_OVERRIDES: Dict[str, float] = {}
@@ -351,8 +370,12 @@ def compute_real_breakeven_price(pos: dict, min_profit: Optional[float] = None) 
         if qty <= 0 or entry_price <= 0:
             return 0.0
         actual_cost = qty * entry_price + buy_fee
-        # qty * price * (1 - 0.001) >= actual_cost + min_profit
-        return (actual_cost + min_profit) / (qty * (1.0 - 0.001))
+        # qty * price * (1 - sell_fee_frac) >= actual_cost + min_profit.
+        # Sell fee comes from the FeeModel (spec §1.1) — the SAME call the
+        # profit gate (_profitable_sell_check) uses, so trigger and gate can
+        # never disagree on the fee.
+        sell_fee_frac = _fee_rate_for(pos.get("symbol", ""))
+        return (actual_cost + min_profit) / (qty * (1.0 - sell_fee_frac))
     except Exception:
         return 0.0
 
@@ -404,6 +427,142 @@ def _log_shadow_dedup(symbol: str, reason: str, message: str) -> None:
         suffix = f" (×{ent['suppressed'] + 1} in last 15m)"
     _shadow_log_dedupe[key] = {"last_ts": now, "suppressed": 0}
     log_diag_issue("signal_shadow", "warn", message + suffix)
+
+# ── Phase 1 §1.3 — entry snapshots (executed buys + near-misses) ──────────────
+# Near-miss snapshot throttle: one row per (symbol, reason) per 5 minutes so a
+# persistent blocker (e.g. cooldown, bb_upper) can't write thousands of rows.
+_near_miss_snap_ts: Dict[Tuple[str, str], float] = {}
+_NEAR_MISS_SNAP_THROTTLE_SEC = 300.0
+
+# Rejection reasons that occur BEFORE the fast pre-check passes — these are not
+# "near-misses" (the coin never signalled a buy) and are never snapshotted.
+_NON_NEAR_MISS_REASONS = frozenset({
+    "signal_cache_empty", "pre_gate_below_min_signals", "below_min_signals",
+})
+
+
+def _snapshot_raw_from_cache(cached: dict, price) -> dict:
+    """Numeric signal context for an entry snapshot, from a signal-cache entry."""
+    cached = cached or {}
+    sigs = cached.get("signals") or {}
+    return {
+        "price":         price,
+        "rsi_val":       cached.get("rsi_val"),
+        "stoch_rsi_val": cached.get("stoch_rsi_val"),
+        "score":         cached.get("score"),
+        "low_24h":       cached.get("low_24h"),
+        "signals":       {k: bool(v) for k, v in sigs.items()},
+        "bb_ok":         cached.get("bb_ok"),
+        "5m_ok":         cached.get("5m_ok"),
+        "cache_ts":      cached.get("ts"),
+    }
+
+
+def _save_entry_snapshot_safe(symbol: str, origin: str, executed: bool, price,
+                              raw: dict, gates: dict) -> None:
+    """database.save_entry_snapshot wrapper — snapshots must NEVER break a buy."""
+    try:
+        strategy = _load_strategy()
+        database.save_entry_snapshot(
+            symbol, origin=origin, executed=executed, price=price,
+            raw=raw or {}, gates=gates or {},
+            config_hash=database.config_hash(strategy),
+        )
+    except Exception as _snap_exc:
+        try:
+            log.debug("entry snapshot failed for %s: %s", symbol, _snap_exc)
+        except Exception:
+            pass
+
+
+def _snapshot_near_miss(symbol: str, reason: str, detail: str, score) -> None:
+    """Record a near-miss entry snapshot (executed=False, origin='near_miss').
+
+    A near-miss = a coin that passed the fast pre-check (legacy score >=
+    min_signals, or the signal engine is active and evaluated it) but was
+    rejected by a later gate. Throttled per (symbol, reason) to 1 per 5 min."""
+    try:
+        if reason in _NON_NEAR_MISS_REASONS:
+            return
+        now = time.time()
+        key = (symbol, reason)
+        if now - _near_miss_snap_ts.get(key, 0.0) < _NEAR_MISS_SNAP_THROTTLE_SEC:
+            return
+        strategy = _load_strategy()
+        min_sigs = int(strategy.get("min_signals", config.MIN_SIGNALS_TO_BUY))
+        engine_on = (SIGNAL_REGISTRY_AVAILABLE
+                     and bool(strategy.get("signal_engine", {}).get("enabled", False)))
+        try:
+            _score_i = int(score or 0)
+        except Exception:
+            _score_i = 0
+        if _score_i < min_sigs and not engine_on:
+            return  # never passed the fast pre-check — not a near-miss
+        _near_miss_snap_ts[key] = now
+        with _signal_cache_lock:
+            cached = dict(_signal_cache.get(symbol, {}))
+        try:
+            _btc = get_btc_state()
+            _regime = _btc.get("regime") if _btc else None
+        except Exception:
+            _regime = None
+        gates = {
+            "rejected":       True,
+            "reason":         reason,
+            "detail":         str(detail)[:300] if detail else "",
+            "trading_active": bool(strategy.get("trading_active", True)),
+            "regime":         _regime,
+            "bb_ok":          cached.get("bb_ok"),
+            "5m_ok":          cached.get("5m_ok"),
+            "score":          _score_i,
+            "min_signals":    min_sigs,
+            "signal_engine":  engine_on,
+        }
+        _save_entry_snapshot_safe(
+            symbol, origin="near_miss", executed=False,
+            price=cached.get("price"),
+            raw=_snapshot_raw_from_cache(cached, cached.get("price")),
+            gates=gates,
+        )
+    except Exception:
+        pass  # near-miss telemetry must never affect the scan loop
+
+
+# ── Phase 1 §1.3 — exit labels ────────────────────────────────────────────────
+# Canonical exit-label mapping for trades.exit_label. The recycler gets its OWN
+# label — it was an invisible loss channel when lumped in with force sells.
+_EXIT_LABEL_MAP = {
+    "take-profit":     "tp",
+    "stop-loss":       "sl",
+    "smart-hold-trail": "trail",
+    "auto-recycle":    "recycler",
+    "force-sell":      "force",
+    "manual":          "manual",
+    "user-initiated":  "manual",
+    "slippage-loss":   "slippage",
+    "below-breakeven": "below_bep",
+    "ghost":           "force",
+    "delist":          "delist",
+}
+
+
+def _exit_label_for(reason: str) -> str:
+    """Map a sell-reason string to its canonical exit label (fallback: raw reason)."""
+    r = str(reason or "").strip().lower()
+    if r in _EXIT_LABEL_MAP:
+        return _EXIT_LABEL_MAP[r]
+    if "recycle" in r:
+        return "recycler"
+    if "delist" in r or "-1013" in r or "market closed" in r or "market is closed" in r:
+        return "delist"
+    if "ghost" in r:
+        return "force"
+    if "force" in r:  # e.g. "force-sell-failed: ..."
+        return "force"
+    if "manual" in r or "user" in r:
+        return "manual"
+    return r or "unknown"
+
 
 # WebSocket price freshness — updated by data_collector on every @trade or @miniTicker event.
 # Used by the pre-sell check to decide whether a REST re-fetch is needed.
@@ -987,7 +1146,18 @@ def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
 def _refresh_risk_params():
     """Read stop_loss_enabled/pct, take_profit_pct and new exit flags from strategy.json."""
     global _user_tp_mult, _take_profit_mult, _stop_loss_mult, _take_profit_enabled, _smart_hold_enabled, _trailing_stop_pct, _BUFFER_OVERRIDES
+    global _fee_rate, _FEE_FLOOR
     strategy = _load_strategy()
+
+    # Spec §1.1: refresh the legacy module fee default + breakeven floor from
+    # the FeeModel so strategy.json fee edits hot-reload everywhere.
+    try:
+        _base_taker = fees.get_fee_model().taker()
+        if 0.0 <= _base_taker < 0.02:
+            _fee_rate  = _base_taker
+            _FEE_FLOOR = 1.0 / ((1.0 - _base_taker) ** 2)
+    except Exception:
+        pass  # keep previous values — never break risk refresh on fee errors
     tp_pct = float(strategy.get("take_profit_pct", 0.1))   # e.g. 0.5 → 0.5%
     sl_pct = float(strategy.get("stop_loss_pct",   0.4))   # default 0.4% from BEP
     sl_on  = bool(strategy.get("stop_loss_enabled", True))  # always on by default
@@ -1057,7 +1227,9 @@ def _profitable_sell_check(pos: dict, price: float, force_fresh: bool = False) -
     # Use ACTUAL deployed capital (matches compute_real_breakeven_price)
     actual_cost   = qty * entry + buy_fee
     gross_quote   = price * qty
-    est_sell_fee  = gross_quote * _fee_rate
+    # FeeModel taker fraction — SAME call as compute_real_breakeven_price
+    # (BEP↔gate parity, spec §1.1).
+    est_sell_fee  = gross_quote * _fee_rate_for(symbol)
     net_returned  = gross_quote - est_sell_fee
     # GATE == TRIGGER: this check must verify exactly the same threshold the
     # sell trigger fires at (compute_real_breakeven_price with the default
@@ -1388,7 +1560,7 @@ def load_positions_from_db():
                         "exit_target":  exit_target,
                         "quantity":     sell_qty,
                         "budget_usdt":  round(value, 2),
-                        "buy_fee_usdt": round(value * _fee_rate, 6),
+                        "buy_fee_usdt": round(value * _fee_rate_for(sym), 6),
                         "timestamp":    now_ts,
                         "mode":         "live",
                     }
@@ -1573,6 +1745,8 @@ def _record_rejection(symbol: str, score, reason: str, detail: str = ""):
         database.record_buy_rejection(symbol, reason, str(detail)[:500] if detail else None, int(score or 0), None)
     except Exception:
         pass
+    # Phase 1 §1.3: near-miss entry snapshot (throttled; never raises).
+    _snapshot_near_miss(symbol, reason, detail, score)
 
 def get_rejection_stats() -> dict:
     with _rejection_lock:
@@ -2417,8 +2591,9 @@ def _execute_sell(pos: dict, price: float, reason: str):
                 _fs_entry  = float(pos.get("entry_price", 0))
                 _fs_cost   = _fs_qty * _fs_entry
                 _fs_quote  = price * _fs_qty
-                _fs_sfee   = _fs_quote * _fee_rate
-                _fs_bfee   = float(pos.get("buy_fee_usdt") or _fs_cost * _fee_rate)
+                _fs_fee_frac = _fee_rate_for(sym)
+                _fs_sfee   = _fs_quote * _fs_fee_frac
+                _fs_bfee   = float(pos.get("buy_fee_usdt") or _fs_cost * _fs_fee_frac)
                 _fs_profit = _fs_quote - _fs_sfee - _fs_cost - _fs_bfee
                 database.log_trade({
                     "coin":             sym,
@@ -2436,7 +2611,13 @@ def _execute_sell(pos: dict, price: float, reason: str):
                     "timestamp_sell":   now,
                     "sell_reason":      f"force-sell-failed: {str(_exc_sell)[:200]}",
                     "signal_snapshot":  pos.get("signal_snapshot"),
-                })
+                },
+                    exit_label="force",
+                    entry_fee_usdt=_fs_bfee,
+                    exit_fee_usdt=_fs_sfee,
+                    hold_time_sec=(time.time() - float(pos.get("opened_at_ts") or 0)
+                                   if pos.get("opened_at_ts") else None),
+                    origin=pos.get("origin", "auto"))
                 database.log_activity(
                     f"[FORCE-SELL-FAIL] {sym}: trade record logged with estimated P&L "
                     f"(est_profit={_fs_profit:.4f})",
@@ -2472,6 +2653,10 @@ def _execute_sell(pos: dict, price: float, reason: str):
 def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str, mode: str, now: str):
     """Inner sell logic — called only when the _selling guard is held."""
     from datetime import timezone as _tz
+
+    # Phase 1 §1.3: the price passed into _execute_sell is the trigger price —
+    # capture it BEFORE any fresh-quote reassignment; slippage_bps baseline.
+    _trigger_price = price
 
     # Ensure PaperClient price is current before the sell
     try:
@@ -2619,6 +2804,42 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
                 f"{sym}: force-closed — {force_close_label}",
                 detail=err_str[:400],
             )
+            # Phase 1 §1.3: record the force-close as a trade so delist/ghost
+            # losses stop being an invisible channel. Estimated P&L (no fill).
+            try:
+                _fc_qty   = float(pos.get("quantity") or 0)
+                _fc_entry = float(pos.get("entry_price") or 0)
+                _fc_cost  = _fc_qty * _fc_entry
+                _fc_fee_frac = _fee_rate_for(sym)
+                _fc_quote = price * _fc_qty
+                _fc_sfee  = _fc_quote * _fc_fee_frac
+                _fc_bfee  = float(pos.get("buy_fee_usdt") or _fc_cost * _fc_fee_frac)
+                _fc_net   = _fc_quote - _fc_sfee - _fc_cost - _fc_bfee
+                database.log_trade({
+                    "coin":            sym,
+                    "mode":            mode,
+                    "entry_price":     _fc_entry,
+                    "exit_price":      price,
+                    "quantity":        _fc_qty,
+                    "budget_usdt":     pos.get("budget_usdt"),
+                    "buy_fee":         _fc_bfee,
+                    "sell_fee":        _fc_sfee,
+                    "net_profit":      _fc_net,
+                    "profitable":      1 if _fc_net > 0 else 0,
+                    "entry_rsi":       pos.get("entry_rsi"),
+                    "timestamp_buy":   pos.get("timestamp"),
+                    "timestamp_sell":  now,
+                    "sell_reason":     f"force-close: {force_close_label}",
+                    "signal_snapshot": pos.get("signal_snapshot"),
+                },
+                    exit_label=("delist" if is_closed else "force"),
+                    entry_fee_usdt=_fc_bfee,
+                    exit_fee_usdt=_fc_sfee,
+                    hold_time_sec=(time.time() - float(pos.get("opened_at_ts") or 0)
+                                   if pos.get("opened_at_ts") else None),
+                    origin=pos.get("origin", "auto"))
+            except Exception:
+                pass
             with _positions_lock:
                 before = len(_positions)
                 _positions[:] = [p for p in _positions if p.get("symbol") != sym]
@@ -2663,7 +2884,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         actual_cost = _sold_qty * float(pos["entry_price"])
 
         if mode == "live":
-            sell_fee, fee_asset = _fills_fee_usdt(fills, raw_quote * _fee_rate)
+            sell_fee, fee_asset = _fills_fee_usdt(fills, raw_quote * _fee_rate_for(sym))
             # Binance sell-fee semantics: a stablecoin commission IS deducted from
             # the quote proceeds (received = cummulativeQuoteQty - commission);
             # a BNB commission comes out of the separate BNB balance, so the
@@ -2673,12 +2894,12 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
                 usdt_returned = raw_quote - sell_fee
             else:
                 usdt_returned = raw_quote
-            buy_fee = float(pos.get("buy_fee_usdt") or _pos_qty * float(pos["entry_price"]) * _fee_rate)
+            buy_fee = float(pos.get("buy_fee_usdt") or _pos_qty * float(pos["entry_price"]) * _fee_rate_for(sym))
             buy_fee *= _sold_frac  # charge only the sold portion's share of the buy fee
         else:
             sell_fee      = sum(float(f.get("commission") or 0) for f in fills)
             usdt_returned = raw_quote
-            buy_fee       = actual_cost * _fee_rate
+            buy_fee       = actual_cost * _fee_rate_for(sym)
 
         net_profit = usdt_returned - actual_cost - buy_fee
     except Exception as parse_err:
@@ -2690,8 +2911,9 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         fill_price    = price
         raw_quote     = price * pos.get("quantity", 0)
         actual_cost   = float(pos.get("quantity", 0)) * float(pos.get("entry_price", 0))
-        sell_fee      = raw_quote * _fee_rate
-        buy_fee       = float(pos.get("buy_fee_usdt") or actual_cost * _fee_rate)
+        _pe_fee_frac  = _fee_rate_for(sym)
+        sell_fee      = raw_quote * _pe_fee_frac
+        buy_fee       = float(pos.get("buy_fee_usdt") or actual_cost * _pe_fee_frac)
         usdt_returned = raw_quote - sell_fee
         net_profit    = usdt_returned - actual_cost - buy_fee
 
@@ -2827,11 +3049,29 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     # or DB error between the two must never lose the trade record. A leftover
     # position row is recoverable (the next sell attempt gets -2010 and the
     # ghost check cleans it up); a missing trade row is lost P&L history.
+    # Phase 1 §1.3 measurement kwargs — exit label, slippage, fees, hold time.
+    try:
+        _slip_bps = ((fill_price - _trigger_price) / _trigger_price * 10000.0
+                     if _trigger_price and _trigger_price > 0 else None)
+    except Exception:
+        _slip_bps = None
+    try:
+        _opened_ts = float(pos.get("opened_at_ts") or 0)
+        _hold_sec = (time.time() - _opened_ts) if _opened_ts > 0 else (
+            float(duration) if duration > 0 else None)
+    except Exception:
+        _hold_sec = float(duration) if duration else None
     try:
         database.log_trade(trade_record,
                            target_crossed_to_trigger_ms=_target_to_trigger_ms,
                            trigger_to_filled_ms=_trigger_to_filled_ms,
-                           target_crossed_ts=_target_crossed_iso)
+                           target_crossed_ts=_target_crossed_iso,
+                           exit_label=_exit_label_for(reason),
+                           slippage_bps=_slip_bps,
+                           entry_fee_usdt=buy_fee,
+                           exit_fee_usdt=sell_fee,
+                           hold_time_sec=_hold_sec,
+                           origin=pos.get("origin", "auto"))
     except Exception as te:
         database.log_activity(f"log_trade error ({sym}): {te}", "warn")
 
@@ -3496,9 +3736,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # In live BNB-fee mode, commission is in BNB — convert using live price.
         # Stored on the position so _do_execute_sell can use the real value.
         if mode == "live":
-            buy_fee_usdt, _ = _fills_fee_usdt(buy_fills, budget * _fee_rate)
+            buy_fee_usdt, _ = _fills_fee_usdt(buy_fills, budget * _fee_rate_for(sym))
         else:
-            buy_fee_usdt = budget * _fee_rate
+            buy_fee_usdt = budget * _fee_rate_for(sym)
 
         # Gather entry indicators from latest DB candle
         entry_rsi = entry_ma = entry_bb = entry_vol = None
@@ -3574,6 +3814,29 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         with _positions_lock:
             _positions.append(pos_record)
         _rebuild_pos_index()
+
+        # ── Phase 1 §1.3: entry snapshot for the EXECUTED auto buy ────────────
+        # Wrapped so a snapshot failure can never break the buy path.
+        try:
+            _snap_btc = get_btc_state()
+            _snap_regime = _snap_btc.get("regime") if _snap_btc else None
+        except Exception:
+            _snap_regime = None
+        _save_entry_snapshot_safe(
+            sym, origin=pos_record.get("origin", "auto"), executed=True,
+            price=fill_price,
+            raw=_snapshot_raw_from_cache(cached, fill_price),
+            gates={
+                "trading_active": bool(strategy.get("trading_active", True)),
+                "regime":         _snap_regime,
+                "bb_ok":          bb_ok,
+                "5m_ok":          five_ok,
+                "score":          score,
+                "min_signals":    min_sigs,
+                "signal_engine":  signal_engine_active,
+                "engine_reason":  _buy_decision.get("reason"),
+            },
+        )
 
         try:
             import supabase_sync
@@ -4484,9 +4747,10 @@ def _sell_monitor_loop():
                     gap_pct  = ((actual - price) / price * 100) if price > 0 and actual > price else 0.0
                     qty_held = p.get("quantity", 0)
                     budget   = p.get("budget_usdt", 0)
-                    buy_fee  = float(p.get("buy_fee_usdt") or budget * _fee_rate)
+                    _diag_fee_frac = _fee_rate_for(sym)
+                    buy_fee  = float(p.get("buy_fee_usdt") or budget * _diag_fee_frac)
                     gross_now = price * qty_held
-                    est_profit = gross_now * (1 - _fee_rate) - budget - buy_fee
+                    est_profit = gross_now * (1 - _diag_fee_frac) - budget - buy_fee
                     lines.append(
                         f"{sym} entry={entry:.4f} cur={price:.4f}({pct:+.3f}%) "
                         f"target={actual:.4f} ({'SELL' if price >= actual else f'need +{gap_pct:.3f}%'}) "
