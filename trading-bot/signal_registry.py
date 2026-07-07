@@ -60,6 +60,53 @@ def get_signal_fire_rates(window_hours: float = 1.0) -> dict:
     return result
 
 
+# ── Rolling 24h per-signal fire-rate telemetry (B Step 2.1) ───────────────────
+# 24 hourly buckets keyed by epoch-hour: {hour: {signal_id: {"evaluated", "fired"}}}.
+# O(1) per evaluation; pruned to the trailing window on write.
+_TELEMETRY_WINDOW_HOURS = 24
+_signal_telemetry_buckets: Dict[int, Dict[str, Dict[str, int]]] = {}
+_signal_telemetry_lock = _threading.Lock()
+
+
+def _telemetry_record(signal_id: str, fired: bool) -> None:
+    """Count one evaluation (and optionally one fire) in the current hour bucket."""
+    hour = int(time.time() // 3600)
+    with _signal_telemetry_lock:
+        bucket = _signal_telemetry_buckets.setdefault(hour, {})
+        ent = bucket.setdefault(signal_id, {"evaluated": 0, "fired": 0})
+        ent["evaluated"] += 1
+        if fired:
+            ent["fired"] += 1
+        # Prune buckets older than the window (dict stays <= 25 keys)
+        if len(_signal_telemetry_buckets) > _TELEMETRY_WINDOW_HOURS:
+            cutoff = hour - _TELEMETRY_WINDOW_HOURS
+            for h in [h for h in _signal_telemetry_buckets if h <= cutoff]:
+                del _signal_telemetry_buckets[h]
+
+
+def get_signal_telemetry() -> dict:
+    """Rolling-24h per-signal counters.
+
+    Returns {"window_hours": 24,
+             "signals": {signal_id: {"evaluated": int, "fired": int, "fire_rate": float}}}
+    """
+    now_hour = int(time.time() // 3600)
+    cutoff = now_hour - _TELEMETRY_WINDOW_HOURS
+    signals: Dict[str, Dict[str, Any]] = {}
+    with _signal_telemetry_lock:
+        for h, bucket in _signal_telemetry_buckets.items():
+            if h <= cutoff:
+                continue
+            for sig_id, ent in bucket.items():
+                agg = signals.setdefault(sig_id, {"evaluated": 0, "fired": 0})
+                agg["evaluated"] += ent["evaluated"]
+                agg["fired"]     += ent["fired"]
+    for agg in signals.values():
+        agg["fire_rate"] = (round(agg["fired"] / agg["evaluated"], 4)
+                            if agg["evaluated"] > 0 else 0.0)
+    return {"window_hours": _TELEMETRY_WINDOW_HOURS, "signals": signals}
+
+
 def record_coin_evaluation(symbol: str, evaluation: dict) -> None:
     now = time.time()
     with _coin_eval_lock:
@@ -403,16 +450,18 @@ register_signal(SignalDef(
 
 # ── Default signal_engine config (used when block absent in strategy.json) ───
 
+# B Step 2.3 defaults: T1 is the single mandatory trend gate; M4 is DEMOTED
+# from mandatory to scored (the signal itself is kept — only its role changed).
 DEFAULT_SIGNAL_ENGINE: Dict[str, Any] = {
     "enabled": True,
-    "mandatory_signals": ["M4_micro_pullback"],
+    "mandatory_signals": ["T1_ema_short_long"],
     "scored_signals": [
-        "T1_ema_short_long",
         "M3_macd_rising",
         "V1_volume_above_average",
         "V2_obv_rising",
         "X1_atr_sufficient",
         "R1_reversal_confirmed",
+        "M4_micro_pullback",
     ],
     "min_scored": 2,
     "veto_signals": ["E1_spread_too_wide"],
@@ -429,6 +478,74 @@ DEFAULT_SIGNAL_THRESHOLDS: Dict[str, Any] = {
 }
 
 
+# ── Config-driven roles (B Step 2.3) ──────────────────────────────────────────
+# strategy["signal_engine"]["roles"] = {signal_id: "scored"|"mandatory"|"veto"|"off"}
+# When present it fully derives the mandatory/scored/veto lists ("off" and
+# unlisted ids are excluded everywhere). Hot-reload comes for free: callers pass
+# the mtime-cached strategy dict on every evaluation.
+
+_VALID_SIGNAL_ROLES = {"scored", "mandatory", "veto", "off"}
+_roles_warned: set = set()          # one-time log keys (unknown id / invalid role)
+_roles_warned_lock = _threading.Lock()
+
+
+def _warn_roles_once(key: str, message: str, *, error: bool = False) -> None:
+    with _roles_warned_lock:
+        if key in _roles_warned:
+            return
+        _roles_warned.add(key)
+    (log.error if error else log.warning)(message)
+
+
+def _default_role_for(signal_id: str) -> str:
+    """The role a signal has in DEFAULT_SIGNAL_ENGINE ('off' if absent)."""
+    if signal_id in DEFAULT_SIGNAL_ENGINE["mandatory_signals"]:
+        return "mandatory"
+    if signal_id in DEFAULT_SIGNAL_ENGINE["veto_signals"]:
+        return "veto"
+    if signal_id in DEFAULT_SIGNAL_ENGINE["scored_signals"]:
+        return "scored"
+    return "off"
+
+
+def _derive_role_lists(roles: dict) -> Tuple[List[str], List[str], List[str]]:
+    """Derive (mandatory_ids, scored_ids, veto_ids) from a roles map.
+
+    Unknown signal ids are ignored (one-time warning). Invalid role strings
+    fall back to that signal's default role (one-time error).
+    """
+    mandatory_ids: List[str] = []
+    scored_ids:    List[str] = []
+    veto_ids:      List[str] = []
+    for sig_id, role in roles.items():
+        if sig_id not in SIGNAL_REGISTRY:
+            _warn_roles_once(
+                f"unknown::{sig_id}",
+                f"signal_engine.roles: unknown signal id '{sig_id}' — entry ignored "
+                f"(known ids: {sorted(SIGNAL_REGISTRY.keys())})",
+            )
+            continue
+        norm = role.strip().lower() if isinstance(role, str) else None
+        if norm not in _VALID_SIGNAL_ROLES:
+            fallback = _default_role_for(sig_id)
+            _warn_roles_once(
+                f"invalid::{sig_id}::{role!r}",
+                f"signal_engine.roles: invalid role {role!r} for '{sig_id}' "
+                f"(valid: scored|mandatory|veto|off) — falling back to default "
+                f"role '{fallback}'",
+                error=True,
+            )
+            norm = fallback
+        if norm == "mandatory":
+            mandatory_ids.append(sig_id)
+        elif norm == "scored":
+            scored_ids.append(sig_id)
+        elif norm == "veto":
+            veto_ids.append(sig_id)
+        # "off" → excluded from every list
+    return mandatory_ids, scored_ids, veto_ids
+
+
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
 def evaluate_signals(symbol: str, signal_data: dict, strategy: dict) -> Dict[str, Any]:
@@ -440,12 +557,14 @@ def evaluate_signals(symbol: str, signal_data: dict, strategy: dict) -> Dict[str
             did_fire, raw = sig_def.compute_fn(symbol, signal_data, strategy)
             results[signal_id] = {"fired": did_fire, "raw_value": raw}
             record_signal_fire(signal_id, did_fire)
+            _telemetry_record(signal_id, did_fire)
             if did_fire:
                 fired.append(signal_id)
         except Exception as e:
             log.warning("Signal %s failed for %s: %s", signal_id, symbol, e)
             results[signal_id] = {"fired": False, "raw_value": None, "error": str(e)}
             record_signal_fire(signal_id, False)
+            _telemetry_record(signal_id, False)
     return {"fired_signals": fired, "all_results": results}
 
 
@@ -464,9 +583,15 @@ def evaluate_buy_decision(symbol: str, signal_data: dict, strategy: dict) -> Dic
 
     engine_cfg = strategy.get("signal_engine", {})
     if isinstance(engine_cfg, dict) and engine_cfg.get("enabled", False):
-        mandatory_ids = engine_cfg.get("mandatory_signals", DEFAULT_SIGNAL_ENGINE["mandatory_signals"])
-        scored_ids    = engine_cfg.get("scored_signals",    DEFAULT_SIGNAL_ENGINE["scored_signals"])
-        veto_ids      = engine_cfg.get("veto_signals",      DEFAULT_SIGNAL_ENGINE["veto_signals"])
+        _roles = engine_cfg.get("roles")
+        if isinstance(_roles, dict) and _roles:
+            # Roles map is authoritative when present: "off"/unlisted signals
+            # are excluded everywhere; list keys below are ignored.
+            mandatory_ids, scored_ids, veto_ids = _derive_role_lists(_roles)
+        else:
+            mandatory_ids = engine_cfg.get("mandatory_signals", DEFAULT_SIGNAL_ENGINE["mandatory_signals"])
+            scored_ids    = engine_cfg.get("scored_signals",    DEFAULT_SIGNAL_ENGINE["scored_signals"])
+            veto_ids      = engine_cfg.get("veto_signals",      DEFAULT_SIGNAL_ENGINE["veto_signals"])
         min_scored    = int(engine_cfg.get("min_scored",    DEFAULT_SIGNAL_ENGINE["min_scored"]))
     else:
         # Phase 1 legacy fallback

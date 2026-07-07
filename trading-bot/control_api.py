@@ -1749,6 +1749,7 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
             "breakeven_mult_at_buy": round(_bep_m_fb, 8),
             "buy_fee_usdt": round(_buy_fee_fb, 6),   # real BEP/profit-gate accounting
             "opened_at_ts": time.time(),             # minimum-hold-time guard
+            "origin": "manual",                      # mirror of trade_engine's origin:"auto"
         }
         pos["id"] = database.save_position(pos)
         with _positions_lock:
@@ -1761,7 +1762,7 @@ def api_force_buy(symbol: str, req: Optional[ForceBuyRequest] = None):
         except Exception as _sbe:
             database.log_activity(f"Supabase sync error after force-buy {sym}: {_sbe}", "error")
 
-        database.log_activity(f"Force buy: {sym} @ ${fill_price:.4f} | qty={qty:.6f} | budget={budget:.2f} USDT", "info")
+        database.log_activity(f"Force buy: {sym} @ ${fill_price:.4f} | qty={qty:.6f} | budget={budget:.2f} USDT | origin=manual", "info")
         with _te._buying_lock:
             _te._buying.discard(sym)
             _te._buying_ts.pop(sym, None)
@@ -2303,9 +2304,23 @@ def api_signal_registry():
         scored_ids    = engine_cfg.get("scored_signals",    _sr.DEFAULT_SIGNAL_ENGINE["scored_signals"])
         veto_ids      = engine_cfg.get("veto_signals",      _sr.DEFAULT_SIGNAL_ENGINE["veto_signals"])
 
+        # Effective role resolution — mirrors the updated signal_registry:
+        # the strategy.signal_engine.roles map wins, then the list-based
+        # defaults above. Read defensively and validate roles; anything not in
+        # {scored, mandatory, veto, off} is ignored (falls through to defaults).
+        _roles_cfg = strategy.get("signal_engine", {}).get("roles", {})
+        if not isinstance(_roles_cfg, dict):
+            _roles_cfg = {}
+        _VALID_ROLES = {"scored", "mandatory", "veto", "off"}
+
         signals_info = []
         for sig_id, sig_def in _sr.SIGNAL_REGISTRY.items():
-            if sig_id in mandatory_ids:
+            _cfg_role = _roles_cfg.get(sig_id)
+            _cfg_role = _cfg_role.strip().lower() if isinstance(_cfg_role, str) else None
+            if _cfg_role in _VALID_ROLES:
+                # "off" is the roles-map spelling; the UI vocabulary is "disabled"
+                role = "disabled" if _cfg_role == "off" else _cfg_role
+            elif sig_id in mandatory_ids:
                 role = "mandatory"
             elif sig_id in scored_ids:
                 role = "scored"
@@ -2341,6 +2356,29 @@ def api_signal_registry():
 
 
 # ── Phase 5+6: Diagnostic endpoints ──────────────────────────────────────────
+
+@app.get("/api/signals/telemetry")
+def api_signals_telemetry():
+    """Per-signal telemetry (evaluated / fired / fire_rate) plus a scanner
+    health snapshot. Guarded so a version skew between control_api and
+    signal_registry/trade_engine returns {"error": ...} instead of a 500."""
+    try:
+        import signal_registry as _sr
+        import trade_engine as _te
+        if not hasattr(_sr, "get_signal_telemetry"):
+            return {"error": "signal_registry.get_signal_telemetry() not available "
+                             "(registry version skew — restart the bot after updating)"}
+        # Defensive copy: the scanner thread mutates this dict live.
+        scanner = dict(getattr(_te, "_signal_scanner_health", {}) or {})
+        tel = _sr.get_signal_telemetry()  # {"window_hours": N, "signals": {...}}
+        return {
+            "signals":      tel.get("signals", tel),
+            "scanner":      scanner,
+            "window_hours": tel.get("window_hours", 24),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 
 @app.get("/api/diagnostics/signal-rates")
 def api_diag_signal_rates(window_hours: float = 1.0):
@@ -2564,12 +2602,18 @@ def api_diagnostics():
     wh = _dc._ws_health
     last_msg_age = round(now - wh["last_message_ts"], 1) if wh["last_message_ts"] else None
 
-    ssh = _te._signal_scanner_health
-    last_scan_age = round(now - ssh["last_refresh_ts"], 1) if ssh["last_refresh_ts"] else None
-    next_scan_in  = round(max(0.0, ssh["interval_sec"] - (last_scan_age or ssh["interval_sec"])), 1)
+    ssh = dict(_te._signal_scanner_health)   # defensive copy — scanner thread mutates it live
+    last_scan_age = round(now - ssh.get("last_refresh_ts", 0.0), 1) if ssh.get("last_refresh_ts") else None
+    # Effective interval (actual pacing, incl. adaptive stretch) — falls back to
+    # the configured base interval on older trade_engine versions.
+    _eff_interval = float(ssh.get("effective_interval_sec") or ssh.get("interval_sec") or 0.0)
+    next_scan_in  = round(max(0.0, _eff_interval - (last_scan_age or _eff_interval)), 1)
     scan_progress_pct = round(
-        min(100.0, (last_scan_age or 0) / max(1, ssh["interval_sec"]) * 100), 1
+        min(100.0, (last_scan_age or 0) / max(1.0, _eff_interval) * 100), 1
     ) if last_scan_age else 0.0
+    _last_scan_dur_ms = float(ssh.get("last_duration_ms") or 0.0)
+    # Overloaded = the last scan consumed >80% of the effective scan budget.
+    _scanner_overloaded = bool(_eff_interval > 0 and _last_scan_dur_ms > 0.8 * _eff_interval * 1000)
 
     sm_hb      = getattr(_te, "_sell_monitor_heartbeat", 0)
     sm_hb_age  = round(now - sm_hb, 1) if sm_hb else None
@@ -2601,13 +2645,20 @@ def api_diagnostics():
             "subscribed_symbols":   len(_dc.prices),
         },
         "signal_scanner": {
+            # Old field names kept for the current UI — semantics now honest:
+            # ages/progress are computed against the EFFECTIVE interval, and
+            # last_duration_ms is the scan's own runtime (not runtime+sleep).
             "last_refresh_age_sec":  last_scan_age,
             "next_refresh_in_sec":   next_scan_in,
             "scan_progress_pct":     scan_progress_pct,
-            "interval_sec":          ssh["interval_sec"],
-            "last_duration_ms":      ssh["last_duration_ms"],
-            "scans_completed":       ssh["scans_completed"],
-            "cached_signals_count":  len(_te._signal_cache),
+            "interval_sec":          ssh.get("interval_sec", 0),      # configured base interval
+            "effective_interval_sec": _eff_interval,                  # actual pacing in force
+            "last_duration_ms":      _last_scan_dur_ms,
+            "scans_completed":       ssh.get("scans_completed", 0),
+            "scan_skipped_overlap":  ssh.get("scan_skipped_overlap", 0),
+            "universe_size":         ssh.get("universe_size", 0),
+            "cached_signals_count":  len(_te._signal_cache),          # signal-cache size
+            "overloaded":            _scanner_overloaded,
         },
         "sell_monitor": {
             "alive":             sm_hb_age is not None and sm_hb_age < 15,
@@ -2750,6 +2801,41 @@ def api_diagnostics_log_text(limit: int = 50, severity: str = ""):
     from datetime import datetime as _dt, timezone as _tz
 
     entries = _te.get_diag_log(limit=limit, severity_filter=severity)
+
+    # Part D1: the old header printed a single unlabeled `latency=NNNms` with no
+    # indication of which endpoint/host it measured. Probe the two distinct REST
+    # targets separately and label each with host+endpoint+method.
+    import urllib.request as _ur_diag
+
+    def _fmt_probe(v):
+        return v if isinstance(v, str) else f"{v:.0f}ms"
+
+    # (a) public_data_ms — GET https://data-api.binance.vision/api/v3/ping
+    try:
+        _t0_pub = time.time()
+        _preq = _ur_diag.Request("https://data-api.binance.vision/api/v3/ping",
+                                 headers={"User-Agent": "WolfBot/1.0"})
+        with _ur_diag.urlopen(_preq, timeout=5.0) as _pr:
+            _pr.read()
+        public_data_ms = (time.time() - _t0_pub) * 1000
+    except Exception as _pub_e:
+        public_data_ms = f"err ({type(_pub_e).__name__})"
+
+    # (b) signed_api_ms — GET api.binance.com /api/v3/account via binance_direct
+    #     (only meaningful in live mode with API keys configured)
+    if get_mode() == "live" \
+            and (os.getenv("BINANCE_API_KEY") or "").strip() \
+            and (os.getenv("BINANCE_API_SECRET") or "").strip():
+        try:
+            import binance_direct as _bd_diag
+            _t0_signed = time.time()
+            _bd_diag.get_account()
+            signed_api_ms = (time.time() - _t0_signed) * 1000
+        except Exception as _signed_e:
+            signed_api_ms = f"err ({type(_signed_e).__name__})"
+    else:
+        signed_api_ms = "n/a (paper)"
+
     try:
         bh = _te._binance_health
         wh = _dc._ws_health
@@ -2757,8 +2843,9 @@ def api_diagnostics_log_text(limit: int = 50, severity: str = ""):
             f"=== WolfBot Diagnostic Report — {_dt.now(_tz.utc).isoformat()} ===",
             f"Deploy: {_DEPLOY_ID}",
             f"Binance REST: weight={bh.get('used_weight_1m',0)}/6000  "
-            f"latency={bh.get('last_rest_latency_ms',0):.0f}ms  "
             f"errors={bh.get('rest_error_count',0)}",
+            f"REST latency: public data-api.binance.vision/ping={_fmt_probe(public_data_ms)} | "
+            f"signed api.binance.com/account={_fmt_probe(signed_api_ms)}",
             f"WebSocket: connected={wh.get('connected',False)}  "
             f"msgs={wh.get('messages_received',0)}  "
             f"disconnects={wh.get('disconnect_count',0)}",
