@@ -3319,6 +3319,227 @@ def api_diagnostics_log_clear():
     return {"ok": True, "cleared": n}
 
 
+@app.get("/api/diagnostics/bundle")
+def api_diagnostics_bundle():
+    """One-click full diagnostic bundle — plaintext report aggregating version,
+    health, limits, scanner, telemetry, gate blockers, risk, analytics and
+    recent errors, formatted for pasting into a chat for remote diagnosis.
+    Every section is independently guarded: a broken subsystem shows its error
+    instead of killing the report (that would defeat the purpose)."""
+    import io
+    out = io.StringIO()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    def section(title):
+        out.write(f"\n===== {title} =====\n")
+
+    def safe(fn, label=""):
+        try:
+            return fn()
+        except Exception as e:
+            out.write(f"  [{label or 'section'} unavailable: {type(e).__name__}: {e}]\n")
+            return None
+
+    out.write(f"WOLFBOT DIAGNOSTIC BUNDLE — {now_iso}\n")
+
+    # -- Version / deploy --------------------------------------------------
+    section("VERSION")
+    def _ver():
+        v = _read_frontend_version()
+        out.write(f"  version={v.get('version')} buildTime={v.get('buildTime')} "
+                  f"commit={v.get('commit')} deploy_id={_DEPLOY_ID[:8]}\n")
+        out.write(f"  mode={get_mode()} paper_fallback={is_using_paper_fallback()} "
+                  f"live_error={get_live_error() or 'none'}\n")
+    safe(_ver, "version")
+
+    # -- Health ------------------------------------------------------------
+    section("HEALTH")
+    def _health():
+        snap = _compute_health_snapshot()
+        out.write(f"  status={snap.get('status')}\n")
+        for c in snap.get("causes", []):
+            out.write(f"  CAUSE: {c}\n")
+        d = snap.get("data") or {}
+        if d.get("available"):
+            out.write(f"  ws_connections={len(d.get('connections', []))} "
+                      f"msgs/s={d.get('total_msgs_per_sec')} "
+                      f"subscribed={d.get('subscribed_coins')} "
+                      f"buffer_1m={d.get('buffer_fill_pct_1m')}% "
+                      f"buffer_5m={d.get('buffer_fill_pct_5m')}% "
+                      f"gap_repairs_24h={d.get('gap_repairs_24h')} "
+                      f"reconnects_5min={d.get('reconnect_attempts_5min')}\n")
+            wca = d.get("worst_candle_ages") or []
+            if wca:
+                out.write("  worst candle ages: "
+                          + ", ".join(f"{sym}={age:.0f}s" for sym, age in wca[:5]) + "\n")
+        lim = snap.get("limits") or {}
+        if lim.get("available"):
+            out.write(f"  used_weight={lim.get('used_weight')}/6000 "
+                      f"bg_spend_60s={lim.get('background_spend_60s')} "
+                      f"orders_10s={lim.get('order_count_10s')}\n")
+        eng = snap.get("engine") or {}
+        if eng.get("available"):
+            sc = eng.get("scanner") or {}
+            out.write(f"  scanner mode={sc.get('mode')} universe={sc.get('universe_size')} "
+                      f"stale_signals={sc.get('stale_signal_count')} "
+                      f"overlap_skips={sc.get('scan_skipped_overlap')} "
+                      f"held_max_price_age={eng.get('held_max_price_age_sec')}s\n")
+    safe(_health, "health")
+
+    # -- Bot status ----------------------------------------------------------
+    section("STATUS")
+    def _stat():
+        st = api_status()
+        for k in ("running", "balance_usdt", "initial_balance", "open_positions",
+                  "trades_today", "win_rate", "total_trades", "realized_pnl",
+                  "watched_coins"):
+            v = st.get(k)
+            if isinstance(v, list):
+                v = f"{len(v)} coins"
+            out.write(f"  {k}={v}\n")
+    safe(_stat, "status")
+
+    # -- Risk / breakers -----------------------------------------------------
+    section("RISK")
+    def _risk():
+        import trade_engine as _te
+        rs = _te.get_risk_status()
+        d = rs.get("daily", {})
+        out.write(f"  daily: pnl_today={d.get('pnl_today')} limit={d.get('limit_usdt')} "
+                  f"stopped={d.get('stopped')}\n")
+        c = rs.get("consecutive", {})
+        out.write(f"  consecutive_losses: {c.get('count')}/{c.get('limit')} "
+                  f"paused_until={c.get('paused_until')}\n")
+        sl = rs.get("slots", {})
+        out.write(f"  slots: {sl.get('effective_slots')}/{sl.get('max_positions')} "
+                  f"degraded={sl.get('degraded')} allocation={sl.get('effective_allocation')}\n")
+        sv = rs.get("slippage_vetoes", {})
+        if sv:
+            out.write("  slippage vetoes: "
+                      + ", ".join(f"{s}({v.get('avg_bps'):.0f}bps)" for s, v in sv.items()) + "\n")
+        corr = rs.get("correlation", {})
+        out.write(f"  correlation: entries_5min={corr.get('entries_5min')}/{corr.get('limit')} "
+                  f"btc_5m_red={corr.get('btc_5m_red')}\n")
+    safe(_risk, "risk")
+
+    # -- Gate blockers distribution (why coins aren't being bought) ----------
+    section("GATE BLOCKERS (current signals snapshot)")
+    def _gates():
+        res = api_signals_summary(limit=100)
+        reasons: dict = {}
+        allowed = 0
+        for sig in res.get("signals", []):
+            if sig.get("buy_allowed"):
+                allowed += 1
+            else:
+                r = sig.get("buy_reason", "unknown")[:70]
+                reasons[r] = reasons.get(r, 0) + 1
+        out.write(f"  tracked={res.get('total_tracked')} buy_ready={allowed}\n")
+        for r, n in sorted(reasons.items(), key=lambda x: -x[1])[:12]:
+            out.write(f"  {n:>3}x {r}\n")
+    safe(_gates, "gates")
+
+    # -- Signal telemetry -----------------------------------------------------
+    section("SIGNAL TELEMETRY (24h fire rates)")
+    def _tel():
+        import signal_registry as _sr
+        tel = _sr.get_signal_telemetry()
+        sigs = tel.get("signals", tel) or {}
+        for sid, v in sorted(sigs.items()):
+            ev, fi = v.get("evaluated", 0), v.get("fired", 0)
+            rate = (fi / ev * 100) if ev else 0.0
+            out.write(f"  {sid:<28} fired {fi}/{ev} ({rate:.1f}%)\n")
+        if not sigs:
+            out.write("  (no evaluations yet)\n")
+    safe(_tel, "telemetry")
+
+    # -- Analytics / expectancy (7d and 30d) ----------------------------------
+    for days in (7, 30):
+        section(f"ANALYTICS {days}d")
+        def _an(days=days):
+            ex = api_stats_expectancy(days=days)
+            out.write(f"  trades={ex.get('trades')} win_rate={ex.get('win_rate')}% "
+                      f"avg_win={ex.get('avg_win')} avg_loss={ex.get('avg_loss')} "
+                      f"expectancy={ex.get('expectancy_per_trade')} "
+                      f"profit_factor={ex.get('profit_factor')}\n")
+            out.write(f"  total_fees={ex.get('total_fees')} "
+                      f"fee_share={ex.get('fee_share_of_gross')} "
+                      f"avg_hold={ex.get('avg_hold_time_sec')}s\n")
+            labels = ex.get("exit_labels") or {}
+            if labels:
+                out.write("  exits: " + ", ".join(
+                    f"{k}={v.get('count')}({v.get('net_pnl'):+.2f})"
+                    for k, v in sorted(labels.items())) + "\n")
+            per = ex.get("per_symbol") or []
+            for row in per[:8]:
+                out.write(f"    {row.get('symbol'):<12} trades={row.get('trades')} "
+                          f"pnl={row.get('net_pnl'):+.2f} wr={row.get('win_rate')}%\n")
+        safe(_an, f"analytics{days}")
+
+    # -- Open positions --------------------------------------------------------
+    section("OPEN POSITIONS")
+    def _pos():
+        import trade_engine as _te
+        with _te._positions_lock:
+            snap = list(_te._positions)
+        if not snap:
+            out.write("  none\n")
+        for pth in snap:
+            out.write(f"  {pth.get('symbol'):<12} qty={pth.get('quantity')} "
+                      f"entry={pth.get('entry_price')} stop={pth.get('stop_price')} "
+                      f"tp={pth.get('tp_price')} be_moved={pth.get('be_moved')} "
+                      f"origin={pth.get('origin')} atr={pth.get('atr_pct_at_entry')}\n")
+    safe(_pos, "positions")
+
+    # -- Recent errors & warnings ----------------------------------------------
+    section("RECENT ERRORS / WARNINGS (last 40)")
+    def _errs():
+        entries = database.get_activity_log(limit=400)
+        picked = [e for e in entries
+                  if str(e.get("severity", e.get("level", ""))).lower() in ("error", "warn", "warning")][:40]
+        if not picked:
+            out.write("  none\n")
+        for e in picked:
+            ts = e.get("timestamp", e.get("ts", ""))
+            sev = str(e.get("severity", e.get("level", "?"))).upper()[:5]
+            out.write(f"  [{ts}] {sev} {str(e.get('message', ''))[:200]}\n")
+    safe(_errs, "errors")
+
+    # -- Diag issues (structured) -----------------------------------------------
+    section("DIAG ISSUES (recent)")
+    def _diag():
+        import trade_engine as _te
+        issues = getattr(_te, "get_diag_issues", None)
+        rows = issues(limit=25) if callable(issues) else []
+        if not rows:
+            out.write("  none\n")
+        for r in rows[:25]:
+            out.write(f"  [{r.get('ts', '')}] {r.get('severity', '?')} "
+                      f"{r.get('source', '?')}: {str(r.get('message', ''))[:160]}\n")
+    safe(_diag, "diag")
+
+    # -- Config snapshot ----------------------------------------------------------
+    section("CONFIG (resolved key settings)")
+    def _cfg():
+        import strategy_config as _scfg
+        raw = _load_strategy()
+        view = _scfg.current_v2_view(raw)
+        out.write(f"  config_hash={database.config_hash(raw)} "
+                  f"schema_version={view.get('schema_version')}\n")
+        for block in ("sizing", "entries", "exits", "risk", "regime", "fees", "data"):
+            b = view.get(block) or {}
+            kv = " ".join(f"{k}={v}" for k, v in sorted(b.items())
+                          if not isinstance(v, (dict, list)))
+            out.write(f"  {block}: {kv}\n")
+        se = raw.get("signal_engine", {})
+        out.write(f"  signal_engine: enabled={se.get('enabled', False)} "
+                  f"min_scored={se.get('min_scored')} roles={se.get('roles', {})}\n")
+    safe(_cfg, "config")
+
+    out.write("\n===== END OF BUNDLE =====\n")
+    return Response(content=out.getvalue(), media_type="text/plain")
+
+
 @app.get("/api/diagnostics/log/text")
 def api_diagnostics_log_text(limit: int = 50, severity: str = ""):
     """Plain-text diagnostic report — paste directly into chat or save to file."""
