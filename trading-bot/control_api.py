@@ -290,6 +290,13 @@ async def lifespan(app: FastAPI):
                 steps.append("phantom_checker OK")
             except Exception as exc:
                 _step_failed("phantom_checker", exc)
+            # Phase 2 §2.4/§2.5: exchange-side exit-order poll/reconcile daemon
+            # (no-ops in paper mode; safe to always start).
+            try:
+                trade_engine.start_managed_exit_poller()
+                steps.append("managed_exit_poller OK")
+            except Exception as exc:
+                _step_failed("managed_exit_poller", exc)
 
             # 4. Apply startup defaults and auto-resume logic.
             #    trading_active is preserved so a running bot resumes after a redeploy.
@@ -612,6 +619,13 @@ def _get_positions():
         from trade_engine import get_open_positions, _rest_px, _signal_cache, _signal_cache_lock
         from data_collector import prices
         pos = get_open_positions()
+        # Phase 2 §2.4/§2.5 — managed exchange-side exit visibility (guarded:
+        # exit_orders may be absent; the column just reads null then).
+        try:
+            import exit_orders as _eo_pos
+            _managed_map = _eo_pos.all_managed()
+        except Exception:
+            _managed_map = {}
         out = []
         for p in pos:
             sym    = p["symbol"]
@@ -684,6 +698,9 @@ def _get_positions():
                         )
             except Exception:
                 pass
+            # {managed_exit: 'maker_tp'|'oco'|None} — exchange-side exit order
+            # currently managing this position's exit (live mode only).
+            row["managed_exit"] = (_managed_map.get(sym) or {}).get("kind")
             out.append(row)
         return out
     except Exception:
@@ -3522,12 +3539,99 @@ def api_debug_refresher():
     }
 
 
+def _resolved_exit_cfg():
+    """RESOLVED exits config from the engine (defaults + strategy.json merged).
+    Defensive: any import/eval failure returns None instead of breaking
+    /api/settings."""
+    try:
+        from trade_engine import _exit_cfg
+        cfg = _exit_cfg()
+        return dict(cfg) if isinstance(cfg, dict) else None
+    except Exception:
+        return None
+
+
+# Phase 2 §2.6 — validation spec for the POST "exits" block.
+# Each entry: (type, min, max, nullable). type 'bool' ignores min/max.
+_EXITS_VALIDATION = {
+    "k_sl":                      ("float", 0.0,   10.0,    False),
+    "sl_min_pct":                ("float", 0.1,   10.0,    False),
+    "sl_max_pct":                ("float", 0.1,   10.0,    False),
+    "hard_sl_pct":               ("float", 0.5,   20.0,    False),
+    "rr_ratio":                  ("float", 0.5,   10.0,    True),
+    "tp_buffer_pct":             ("float", 0.0,   1.0,     False),
+    "min_profit_usdt":           ("float", 0.001, 1.0,     False),
+    "breakeven_at_r":            ("float", 0.1,   5.0,     True),
+    "k_trail":                   ("float", 0.0,   5.0,     False),
+    "smart_hold_score_gate":     ("bool",  None,  None,    False),
+    "maker_tp":                  ("bool",  None,  None,    False),
+    "oco_enabled":               ("bool",  None,  None,    False),
+    "maker_tp_timeout_ms":       ("float", 100.0, 30000.0, False),
+    "oco_stop_limit_buffer_pct": ("float", 0.0,   5.0,     False),
+    "oco_skip_rescue_sec":       ("float", 1.0,   30.0,    False),
+    "sl_confirm_ticks":          ("int",   1,     10,      False),
+    "min_hold_sec":              ("float", 0.0,   120.0,   False),
+}
+
+
+def _validate_exits_patch(exits: dict, current: dict):
+    """Validate a POSTed exits dict. Returns (validated, errors) — errors is a
+    {field: message} map; validated only holds keys that passed. The
+    sl_min<=sl_max cross-check runs against the MERGED (current+new) values so
+    updating one bound alone stays consistent."""
+    validated: dict = {}
+    errors: dict = {}
+    if not isinstance(exits, dict):
+        return {}, {"exits": "must be an object"}
+    for key, val in exits.items():
+        spec = _EXITS_VALIDATION.get(key)
+        if spec is None:
+            errors[key] = "unknown exits key"
+            continue
+        typ, lo, hi, nullable = spec
+        if val is None:
+            if nullable:
+                validated[key] = None
+            else:
+                errors[key] = "must not be null"
+            continue
+        if typ == "bool":
+            if isinstance(val, bool):
+                validated[key] = val
+            else:
+                errors[key] = "must be a boolean"
+            continue
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            errors[key] = "must be a number"
+            continue
+        fv = float(val)
+        if not (lo <= fv <= hi):
+            errors[key] = f"must be between {lo} and {hi}"
+            continue
+        validated[key] = int(fv) if typ == "int" else fv
+    # Cross-field: sl_min_pct <= sl_max_pct on the merged view.
+    if not errors:
+        merged = {**(current if isinstance(current, dict) else {}), **validated}
+        try:
+            _mn = float(merged.get("sl_min_pct", 0.5))
+            _mx = float(merged.get("sl_max_pct", 2.5))
+            if _mn > _mx:
+                errors["sl_min_pct"] = (
+                    f"sl_min_pct ({_mn}) must be <= sl_max_pct ({_mx})")
+        except (TypeError, ValueError):
+            pass
+    return validated, errors
+
+
 @app.get("/api/settings")
 def api_get_settings():
     """Return current bot risk/strategy settings."""
     s = _load_strategy()
     return {
         "ok":                  True,
+        # Phase 2 §2.6 — RESOLVED exits config (engine defaults merged with
+        # any strategy.json "exits" block); None if the engine is unavailable.
+        "exits":               _resolved_exit_cfg(),
         # Defaults below MUST mirror the engine's actual fallbacks:
         # trade_engine._refresh_risk_params (sl_on=True, sl_pct=0.4, tp_pct=0.1,
         # smart_hold=False, trailing=0.5) and _check_buys_from_cache (max_positions=10).
@@ -3560,6 +3664,10 @@ class SettingsRequest(BaseModel):
     min_signals:         Optional[int]   = None
     strategy_notes:      Optional[str]   = None
     slippage_buffer_pct: Optional[float] = None  # 0.05–0.50%, default 0.10%
+    # Phase 2 §2.6 — optional exits block (validated by _validate_exits_patch;
+    # a plain dict so unknown keys reach validation and get field-level errors
+    # instead of being silently dropped by pydantic).
+    exits:               Optional[dict]  = None
 
 
 class _SignalEngineConfig(BaseModel):
@@ -3600,6 +3708,17 @@ def api_save_settings(req: SettingsRequest):
         if req.min_signals         is not None: patch["min_signals"]        = max(1,   min(6,    req.min_signals))
         if req.strategy_notes      is not None: patch["strategy_notes"]     = req.strategy_notes[:2000]
         if req.slippage_buffer_pct is not None: patch["slippage_buffer_pct"] = max(0.05, min(0.50, req.slippage_buffer_pct))
+        # ── Phase 2 §2.6 — exits block (validated; field-level errors, no 500) ──
+        if req.exits is not None:
+            _s_cur = _load_strategy()
+            _cur_exits = _s_cur.get("exits") if isinstance(_s_cur.get("exits"), dict) else {}
+            _validated, _errors = _validate_exits_patch(req.exits, _cur_exits)
+            if _errors:
+                # Reject the whole request (nothing written) so a partial
+                # legacy write can't ride along with a bad exits block.
+                return {"ok": False, "error": "invalid exits settings", "errors": _errors}
+            if _validated:
+                patch["exits"] = {**_cur_exits, **_validated}
         if not patch:
             return {"ok": False, "error": "No valid settings provided"}
         _write_strategy_patch(patch)

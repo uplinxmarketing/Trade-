@@ -342,6 +342,9 @@ def init_db():
             "ALTER TABLE trades ADD COLUMN sell_slippage_pct    REAL",
             "ALTER TABLE positions ADD COLUMN intended_buy_price REAL",
             "ALTER TABLE positions ADD COLUMN buy_slippage_pct   REAL",
+            # save_position INSERTs signal_snapshot but the base CREATE TABLE
+            # never had the column — fresh databases failed on the first buy.
+            "ALTER TABLE positions ADD COLUMN signal_snapshot    TEXT",
             # Phase 1 exit-label / fee-attribution columns (spec §1.3)
             "ALTER TABLE trades ADD COLUMN exit_label     TEXT",
             "ALTER TABLE trades ADD COLUMN slippage_bps   REAL",

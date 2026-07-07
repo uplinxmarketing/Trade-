@@ -22,6 +22,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# Optional rate-limit telemetry (§6.4). Guarded so this module stays usable
+# standalone (tests, scripts) without binance_limits on the path.
+try:
+    import binance_limits as _limits
+except ImportError:  # pragma: no cover
+    _limits = None
+
 BASE = "https://api.binance.com"
 _RECV_WINDOW_MS = 10_000
 _TIME_RESYNC_S = 1800  # re-sync clock offset every 30 min
@@ -90,8 +97,18 @@ def signed_request(method: str, path: str, params: dict | None = None,
         })
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
+            if _limits is not None:
+                _limits.record_response_headers(r.headers)
             body = json.loads(r.read())
     except urllib.error.HTTPError as e:
+        if _limits is not None:
+            # Error responses carry rate-limit headers too — record them, and
+            # feed 429/418 into the shared back-pressure state before raising.
+            _limits.record_response_headers(e.headers)
+            if e.code == 429:
+                _limits.on_429(_retry_after(e.headers))
+            elif e.code == 418:
+                _limits.on_418(_retry_after(e.headers))
         try:
             err = json.loads(e.read())
         except Exception:
@@ -102,6 +119,17 @@ def signed_request(method: str, path: str, params: dict | None = None,
     if isinstance(body, dict) and body.get("code", 0) < 0:
         raise BinanceDirectError(body["code"], body.get("msg", ""))
     return body
+
+
+def _retry_after(headers):
+    """Parse Retry-After seconds off an error response; None when absent."""
+    if headers is None:
+        return None
+    try:
+        v = headers.get("Retry-After")
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _fmt(n) -> str:
@@ -134,6 +162,105 @@ def order_market_sell(symbol: str, quantity: float) -> dict:
         "type": "MARKET",
         "quantity": _fmt(quantity),
         "newOrderRespType": "FULL",
+    })
+
+
+def order_limit_maker(symbol: str, side: str, quantity: float, price: float) -> dict:
+    """Post-only limit order (POST /api/v3/order type=LIMIT_MAKER).
+
+    LIMIT_MAKER is REJECTED by the engine (code -2010, 'Order would immediately
+    match and take.') instead of matching as a taker — that rejection is the
+    point: it guarantees maker fees or nothing. Callers must expect and handle
+    the -2010 BinanceDirectError. Returns the full order payload on acceptance.
+    """
+    return signed_request("POST", "/api/v3/order", {
+        "symbol": symbol,
+        "side": side,
+        "type": "LIMIT_MAKER",
+        "quantity": _fmt(quantity),
+        "price": _fmt(price),
+        "newOrderRespType": "FULL",
+    })
+
+
+def get_order(symbol: str, order_id: int) -> dict:
+    """GET /api/v3/order — query a single order's status (weight 4)."""
+    return signed_request("GET", "/api/v3/order", {
+        "symbol": symbol,
+        "orderId": int(order_id),
+    })
+
+
+def cancel_order(symbol: str, order_id: int) -> dict:
+    """DELETE /api/v3/order — cancel a resting order.
+
+    Raises BinanceDirectError -2011 ('Unknown order sent.') when the order is
+    already filled/cancelled — callers racing a fill should tolerate that code.
+    """
+    return signed_request("DELETE", "/api/v3/order", {
+        "symbol": symbol,
+        "orderId": int(order_id),
+    })
+
+
+def get_open_orders(symbol: str | None = None) -> list:
+    """GET /api/v3/openOrders.
+
+    Weight: 6 WITH a symbol, 80 WITHOUT one — always pass `symbol` unless a
+    full-account sweep is genuinely required (e.g. one-off reconciliation).
+    """
+    params = {"symbol": symbol} if symbol else {}
+    return signed_request("GET", "/api/v3/openOrders", params)
+
+
+def order_oco_sell(symbol: str, quantity: float, tp_price: float,
+                   stop_trigger: float, stop_limit_price: float) -> dict:
+    """One-Cancels-the-Other SELL: take-profit LIMIT_MAKER above, stop-loss-limit below.
+
+    Uses the modern POST /api/v3/orderList/oco endpoint with aboveType/belowType
+    leg params. For a SELL OCO the 'above' leg must price above market and the
+    'below' leg below market:
+      - above: LIMIT_MAKER at tp_price (maker-only take profit)
+      - below: STOP_LOSS_LIMIT, stopPrice=stop_trigger, price=stop_limit_price
+        (limit set below the trigger so it fills through fast moves), GTC.
+
+    Legacy fallback (deprecated /api/v3/order/oco) param mapping, should the
+    modern endpoint ever be unavailable:
+      price=tp_price, stopPrice=stop_trigger, stopLimitPrice=stop_limit_price,
+      stopLimitTimeInForce=GTC (no aboveType/belowType; sides are implicit).
+
+    Returns the order-list payload: orderListId + orders[] (one per leg).
+    """
+    return signed_request("POST", "/api/v3/orderList/oco", {
+        "symbol": symbol,
+        "side": "SELL",
+        "quantity": _fmt(quantity),
+        "aboveType": "LIMIT_MAKER",
+        "abovePrice": _fmt(tp_price),
+        "belowType": "STOP_LOSS_LIMIT",
+        "belowStopPrice": _fmt(stop_trigger),
+        "belowPrice": _fmt(stop_limit_price),
+        "belowTimeInForce": "GTC",
+        "newOrderRespType": "FULL",
+    })
+
+
+def cancel_order_list(symbol: str, order_list_id: int) -> dict:
+    """DELETE /api/v3/orderList — cancel an entire OCO (both legs).
+
+    Raises BinanceDirectError -2011 when the list is already executed/cancelled.
+    """
+    return signed_request("DELETE", "/api/v3/orderList", {
+        "symbol": symbol,
+        "orderListId": int(order_list_id),
+    })
+
+
+def get_order_list(order_list_id: int) -> dict:
+    """GET /api/v3/orderList — query an OCO's status (listOrderStatus:
+    EXECUTING / ALL_DONE / REJECT; listStatusType tells why)."""
+    return signed_request("GET", "/api/v3/orderList", {
+        "orderListId": int(order_list_id),
     })
 
 

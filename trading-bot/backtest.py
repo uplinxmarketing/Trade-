@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import sys
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -104,47 +105,185 @@ def taker_fill_price(px: float, side: str, slip_bps: float, spread_bps_: float) 
     return px * (1.0 + adj) if side == "buy" else px * (1.0 - adj)
 
 
-def strategy_exit_levels(entry_px: float, qty: float, cost_usdt: float,
-                         strategy: dict, fee_model: "fees.FeeModel",
-                         ) -> Tuple[float, Optional[float], float]:
-    """STRATEGY-EXIT (current live engine's exit geometry, replicated).
+# ── Phase 2 §2.6 — exits config (SINGLE SOURCE for live + replay) ─────────────
+# trade_engine._exit_cfg() imports exit_config() from here (with an identical
+# local fallback) so the SAME strategy dict always produces the SAME effective
+# exit configuration in the live engine and in the backtester. If you change
+# EXIT_DEFAULTS or the legacy mapping, both surfaces pick it up together.
 
-    NOTE: Phase 2 will parameterize this into pluggable exit strategies;
-    for Phase 1 it deliberately mirrors trade_engine's geometry:
+EXIT_DEFAULTS: Dict[str, Any] = {
+    "k_sl":                       1.2,    # SL distance = k_sl × ATR%(14, 5m)
+    "sl_min_pct":                 0.5,    # clamp floor for SL distance
+    "sl_max_pct":                 2.5,    # clamp ceiling for SL distance
+    "hard_sl_pct":                3.0,    # crash stop from entry — bypasses ticks/min-hold
+    "rr_ratio":                   1.6,    # TP distance = rr_ratio × SL distance
+    "tp_buffer_pct":              0.05,   # TP floored at BEP × (1 + buffer/100)
+    "min_profit_usdt":            0.01,   # read live via trade_engine._min_profit_usdt
+    "breakeven_at_r":             1.0,    # move stop to BEP at +1R unrealized
+    "k_trail":                    0.8,    # trail gap = k_trail × ATR% below peak (<=0 disables)
+    "smart_hold_score_gate":      False,  # fresh-score gate before trail exits above TP
+    "sl_confirm_ticks":           2,      # confirmation ticks for stop_price exits
+    "min_hold_sec":               10.0,   # min hold (SL-only, like the legacy guard)
+    "maker_tp":                   True,   # consumed by exit_orders.py
+    "maker_tp_timeout_ms":        1500,   # consumed by exit_orders.py
+    "oco_enabled":                False,  # consumed by exit_orders.py
+    "oco_stop_limit_buffer_pct":  0.5,    # consumed by exit_orders.py
+    "oco_skip_rescue_sec":        3.0,    # consumed by exit_orders.py
+}
 
-      * BEP floor (same formula shape as compute_real_breakeven_price):
-            bep = (cost + min_profit) / (qty * (1 - taker))
-        where cost = actually-deployed USDT incl. entry fee.
-      * TP = max(BEP, entry * (1 + take_profit_pct/100))
-      * SL = entry * (1 - stop_loss_pct/100)   (None when disabled)
+LEGACY_EXIT_KEYS = (
+    "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
+    "stop_loss_enabled", "take_profit_enabled", "smart_hold_enabled",
+)
 
-    Reads exits.min_profit_usdt (default 0.01), take_profit_pct (default 0.1),
-    stop_loss_pct (default 0.4), stop_loss_enabled (default True) from the
-    strategy dict. Returns (tp_price, sl_price_or_None, bep_price).
+
+def exit_config(strategy: dict) -> dict:
+    """Effective exits configuration from a strategy dict (§2.6).
+
+    Reads strategy["exits"] with EXIT_DEFAULTS. LEGACY COMPATIBILITY: when the
+    strategy has NO "exits" block but carries legacy exit keys, they are mapped
+    into the effective config so existing user settings keep behaving until
+    the Phase 5 UI writes the new block:
+
+      * stop_loss_pct        → sl_min_pct == sl_max_pct == stop_loss_pct
+                               (FIXED stop distance; ATR scaling disabled, k_sl=0)
+      * stop_loss_enabled    → sl_enabled (False → no stop_price at all)
+      * take_profit_pct      → rr_ratio=None + tp_pct (fixed-TP path:
+                               tp = max(entry×(1+tp_pct/100), BEP), buffer=0)
+      * take_profit_enabled  → tp_enabled (False → TP trigger = bare BEP)
+      * smart_hold_enabled   → smart_hold_score_gate (old score-gated hold)
+      * trailing_stop_pct    → legacy_trailing_stop_pct (old smart-hold trail %)
+      * hard SL / BE-move / ATR trail are DISABLED (hard_sl_pct=None,
+        breakeven_at_r=None, k_trail=0) — the old immediate-sell-at-target
+        path stays in force.
+
+    Extra derived keys: legacy_mode, sl_enabled, tp_enabled, tp_pct,
+    legacy_trailing_stop_pct.
     """
-    exits = strategy.get("exits") if isinstance(strategy.get("exits"), dict) else {}
+    strategy = strategy if isinstance(strategy, dict) else {}
+    exits_raw = strategy.get("exits")
+    has_exits = isinstance(exits_raw, dict)
+    exits = exits_raw if has_exits else {}
+
+    cfg: dict = {}
+    for key, default in EXIT_DEFAULTS.items():
+        val = exits.get(key, default)
+        try:
+            if isinstance(default, bool):
+                cfg[key] = bool(val)
+            elif isinstance(default, int) and not isinstance(default, bool):
+                cfg[key] = int(val)
+            else:
+                cfg[key] = float(val)
+        except (TypeError, ValueError):
+            cfg[key] = default
+
+    cfg["legacy_mode"] = False
+    cfg["sl_enabled"] = True
+    cfg["tp_enabled"] = True
+    cfg["tp_pct"] = None                    # fixed-TP path (legacy only)
+    cfg["legacy_trailing_stop_pct"] = None  # old smart-hold trail % (legacy only)
+
+    if not has_exits and any(k in strategy for k in LEGACY_EXIT_KEYS):
+        # ── Legacy mapping (see docstring) ────────────────────────────────────
+        try:
+            sl_pct = float(strategy.get("stop_loss_pct", 0.4))
+        except (TypeError, ValueError):
+            sl_pct = 0.4
+        try:
+            tp_pct = float(strategy.get("take_profit_pct", 0.1))
+        except (TypeError, ValueError):
+            tp_pct = 0.1
+        try:
+            trail_pct = float(strategy.get("trailing_stop_pct", 0.5))
+        except (TypeError, ValueError):
+            trail_pct = 0.5
+        cfg["legacy_mode"] = True
+        cfg["sl_enabled"] = bool(strategy.get("stop_loss_enabled", True))
+        cfg["sl_min_pct"] = sl_pct
+        cfg["sl_max_pct"] = sl_pct
+        cfg["k_sl"] = 0.0                 # fixed distance — ATR scaling off
+        cfg["hard_sl_pct"] = None         # no crash stop in legacy behavior
+        cfg["rr_ratio"] = None            # fixed tp_pct path instead of R multiple
+        cfg["tp_enabled"] = bool(strategy.get("take_profit_enabled", True))
+        cfg["tp_pct"] = tp_pct
+        cfg["tp_buffer_pct"] = 0.0        # legacy trigger floors at bare BEP
+        cfg["breakeven_at_r"] = None      # no BE-move in legacy behavior
+        cfg["k_trail"] = 0.0              # immediate sell at target (old path)
+        cfg["smart_hold_score_gate"] = bool(strategy.get("smart_hold_enabled", False))
+        cfg["legacy_trailing_stop_pct"] = trail_pct
+    return cfg
+
+
+def exit_levels(entry_px: float, qty: float, cost_usdt: float,
+                strategy: dict, fee_model: "fees.FeeModel",
+                atr_pct: Optional[float] = None) -> dict:
+    """Phase 2 §2.1/§2.2 exit geometry — SAME math as the live engine.
+
+      * BEP (same formula as trade_engine.compute_real_breakeven_price):
+            bep = (cost + min_profit) / (qty * (1 - taker))
+        cost = actually-deployed USDT incl. entry fee; min_profit clamped
+        >= 0.001 (engine parity — _min_profit_usdt applies the same clamp).
+      * sl_distance_pct = clamp(k_sl × atr_pct, sl_min_pct, sl_max_pct);
+        ATR unavailable → sl_min_pct (conservative tight stop, flagged).
+      * stop  = entry × (1 − sl_distance/100)         (None when disabled)
+      * tp    = max(entry × (1 + rr_ratio×sl_distance/100),
+                    bep × (1 + tp_buffer_pct/100))
+      * hard  = entry × (1 − hard_sl_pct/100)         (None in legacy)
+
+    Legacy mapping (exit_config) reproduces Phase 1 geometry exactly:
+    fixed SL distance, tp = max(entry×(1+tp_pct/100), bep), no hard stop.
+    """
+    cfg = exit_config(strategy)
     try:
-        min_profit = max(0.0, float(exits.get("min_profit_usdt", 0.01)))
+        min_profit = max(0.001, float(cfg.get("min_profit_usdt", 0.01)))
     except (TypeError, ValueError):
         min_profit = 0.01
-    try:
-        tp_pct = float(strategy.get("take_profit_pct", 0.1))
-    except (TypeError, ValueError):
-        tp_pct = 0.1
-    try:
-        sl_pct = float(strategy.get("stop_loss_pct", 0.4))
-    except (TypeError, ValueError):
-        sl_pct = 0.4
-    sl_enabled = bool(strategy.get("stop_loss_enabled", True))
 
     taker = fee_model.taker()
     if qty > 0 and taker < 1.0:
         bep = (cost_usdt + min_profit) / (qty * (1.0 - taker))
     else:
         bep = entry_px
-    tp = max(bep, entry_px * (1.0 + tp_pct / 100.0))
-    sl = entry_px * (1.0 - sl_pct / 100.0) if sl_enabled else None
-    return tp, sl, bep
+
+    atr_unavailable = False
+    if cfg["legacy_mode"]:
+        sl_dist: Optional[float] = cfg["sl_min_pct"] if cfg["sl_enabled"] else None
+    elif atr_pct is None or atr_pct <= 0:
+        sl_dist = cfg["sl_min_pct"]
+        atr_unavailable = True
+    else:
+        sl_dist = min(max(cfg["k_sl"] * atr_pct, cfg["sl_min_pct"]), cfg["sl_max_pct"])
+
+    sl = entry_px * (1.0 - sl_dist / 100.0) if sl_dist else None
+
+    if cfg["rr_ratio"]:
+        tp_dist = cfg["rr_ratio"] * (sl_dist if sl_dist else cfg["sl_min_pct"])
+    else:  # legacy fixed-TP path
+        tp_dist = (cfg["tp_pct"] or 0.0) if cfg["tp_enabled"] else 0.0
+    tp = max(entry_px * (1.0 + tp_dist / 100.0),
+             bep * (1.0 + (cfg["tp_buffer_pct"] or 0.0) / 100.0))
+
+    hard = (entry_px * (1.0 - cfg["hard_sl_pct"] / 100.0)
+            if cfg.get("hard_sl_pct") else None)
+
+    return {
+        "tp": tp, "sl": sl, "hard_sl": hard, "bep": bep,
+        "sl_distance_pct": sl_dist, "tp_distance_pct": tp_dist,
+        "atr_pct": atr_pct, "atr_unavailable": atr_unavailable,
+        "cfg": cfg,
+    }
+
+
+def strategy_exit_levels(entry_px: float, qty: float, cost_usdt: float,
+                         strategy: dict, fee_model: "fees.FeeModel",
+                         atr_pct: Optional[float] = None,
+                         ) -> Tuple[float, Optional[float], float]:
+    """Back-compat wrapper (attribution.py) — returns (tp, sl_or_None, bep).
+    Phase 2: delegates to exit_levels(); without atr_pct a non-legacy strategy
+    gets the conservative sl_min_pct stop."""
+    lv = exit_levels(entry_px, qty, cost_usdt, strategy, fee_model, atr_pct)
+    return lv["tp"], lv["sl"], lv["bep"]
 
 
 # ── Strategy sanitisation for deterministic replay ────────────────────────────
@@ -269,6 +408,26 @@ def _build_signal_data(window: List[dict], low_24h: Optional[float]) -> dict:
     }
 
 
+def _entry_atr_pct(fm_series: List[dict], ptr: int, candles_1m: List[dict],
+                   i: int, fill_px: float) -> Optional[float]:
+    """ATR(14) as % of fill price at entry time (§2.1) — replay mirror of the
+    live engine's source ladder: 5m candles (stored or 1m-aggregated, which is
+    what _load_5m returns) → 1m ATR × sqrt(5) approximation. `ptr` points one
+    past the last CLOSED 5m candle at the fill timestamp; `i` is the index of
+    the fill candle (1m candles < i are closed)."""
+    window5 = fm_series[max(0, ptr - 40): ptr]
+    if len(window5) >= 15:
+        atr = indicators.calc_atr(window5, 14)
+        if atr and fill_px > 0:
+            return atr / fill_px * 100.0
+    window1 = candles_1m[max(0, i - 40): i]
+    if len(window1) >= 15:
+        atr1 = indicators.calc_atr(window1, 14)
+        if atr1 and fill_px > 0:
+            return atr1 * math.sqrt(5.0) / fill_px * 100.0
+    return None
+
+
 def _bb_gate_ok(window: List[dict]) -> bool:
     closes = [c["close"] for c in window]
     bb_u, bb_m, _ = indicators.calc_bollinger(closes)
@@ -353,7 +512,9 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
             skipped.append(sym)
             continue
         data[sym] = candles
-        fivem[sym] = _load_5m(sym, candles, start_ms, end_ms) if use_5m_veto else []
+        # 5m series is always loaded now: the §2.1 ATR-based stop needs it at
+        # entry time even when the 5m buy veto is disabled.
+        fivem[sym] = _load_5m(sym, candles, start_ms, end_ms)
         fee_models[sym] = fees.for_symbol(sym, strategy)
 
     _seed_spread_cache(list(data.keys()))
@@ -374,6 +535,7 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
     low_deques: Dict[str, list] = {s: [] for s in data}      # monotonic (idx, low)
     qv_sums: Dict[str, float] = {s: 0.0 for s in data}       # trailing 24h quote vol
     fivem_ptr: Dict[str, int] = {s: 0 for s in data}
+    atr5_ptr: Dict[str, int] = {s: 0 for s in data}          # closed-5m ptr for entry ATR
     trades: List[dict] = []
     equity_curve: List[List[float]] = []
     exposed_ts = 0
@@ -472,28 +634,110 @@ def run_backtest(start_ms: int, end_ms: int, symbols: list, strategy: dict,
                             entry_fee = qty * fill_px * fee_frac
                             cost = budget + entry_fee
                             cash -= cost
-                            tp, sl, _bep = strategy_exit_levels(
-                                fill_px, qty, cost, strategy, fm)
+                            # ── Phase 2 §2.1/§2.2 geometry at entry ──────────
+                            fm_series = fivem[sym]
+                            aptr = atr5_ptr[sym]
+                            while (aptr < len(fm_series)
+                                   and fm_series[aptr]["open_time"]
+                                   + 5 * MINUTE_MS <= ts):
+                                aptr += 1
+                            atr5_ptr[sym] = aptr
+                            atr_pct = _entry_atr_pct(fm_series, aptr,
+                                                     candles, i, fill_px)
+                            lv = exit_levels(fill_px, qty, cost, strategy,
+                                             fm, atr_pct)
+                            cfg = lv["cfg"]
+                            atr_ref = (lv["atr_pct"] or lv["sl_distance_pct"]
+                                       or cfg["sl_min_pct"])
                             positions[sym] = {
                                 "qty": qty, "entry_px": fill_px,
                                 "entry_ts": ts, "cost": cost,
-                                "fee": entry_fee, "tp": tp, "sl": sl,
+                                "fee": entry_fee,
+                                "tp": lv["tp"], "sl": lv["sl"],
+                                "hard_sl": lv["hard_sl"], "bep": lv["bep"],
+                                "sl_dist": lv["sl_distance_pct"],
+                                "atr_pct": lv["atr_pct"],
+                                # trail parameters frozen at entry (like live)
+                                "k_trail": float(cfg["k_trail"] or 0.0),
+                                "trail_gap_pct": float(cfg["k_trail"] or 0.0)
+                                                 * float(atr_ref),
+                                "be_at_r": cfg["breakeven_at_r"],
+                                "tp_buffer_pct": float(cfg["tp_buffer_pct"]
+                                                       or 0.0),
+                                "be_moved": False, "be_stop": 0.0,
+                                "peak": 0.0, "ratchet": 0.0,
                             }
                             _mark(ts)
 
-            # 2) Exits — SL first when both levels sit inside one candle.
+            # 2) Exits — ADVERSE FIRST when several levels sit inside one
+            #    candle (SL-first bias extended, §2.1-§2.3): hard SL, then
+            #    stop, then trail floor, and only then TP / peak updates.
             if sym in positions:
                 pos = positions[sym]
-                sl, tp = pos["sl"], pos["tp"]
-                if sl is not None and candle["open"] <= sl:
-                    _close_position(sym, ts, candle["open"], "backtest_sl", False)
+                sl, tp, hard = pos["sl"], pos["tp"], pos["hard_sl"]
+                closed = False
+                if hard is not None and candle["open"] <= hard:
+                    _close_position(sym, ts, candle["open"],
+                                    "backtest_hard_sl", False)
+                    closed = True
+                elif hard is not None and candle["low"] <= hard:
+                    _close_position(sym, ts, hard, "backtest_hard_sl", False)
+                    closed = True
+                elif sl is not None and candle["open"] <= sl:
+                    _close_position(sym, ts, candle["open"], "backtest_sl",
+                                    False)
+                    closed = True
                 elif sl is not None and candle["low"] <= sl:
                     _close_position(sym, ts, sl, "backtest_sl", False)
-                elif candle["open"] >= tp:
-                    _close_position(sym, ts, candle["open"], "backtest_tp",
-                                    exit_is_maker)
-                elif candle["high"] >= tp:
-                    _close_position(sym, ts, tp, "backtest_tp", exit_is_maker)
+                    closed = True
+
+                if not closed and pos["k_trail"] > 0:
+                    # §2.3 BE-move + ATR trail. Adverse-first: the floor from
+                    # PRIOR candles is checked before this candle's high may
+                    # raise the peak (a spike-and-retrace inside one candle
+                    # exits on the pre-spike floor — conservative).
+                    if pos["be_moved"]:
+                        eff = max(pos["be_stop"], pos["ratchet"],
+                                  pos["peak"]
+                                  * (1.0 - pos["trail_gap_pct"] / 100.0))
+                        if candle["open"] <= eff:
+                            _close_position(sym, ts, candle["open"],
+                                            "backtest_trail", False)
+                            closed = True
+                        elif candle["low"] <= eff:
+                            _close_position(sym, ts, eff, "backtest_trail",
+                                            False)
+                            closed = True
+                    if not closed:
+                        hi = candle["high"]
+                        if not pos["be_moved"]:
+                            gain_pct = (hi / pos["entry_px"] - 1.0) * 100.0
+                            armed = (pos["be_at_r"] is not None
+                                     and pos["sl_dist"]
+                                     and gain_pct >= pos["sl_dist"]
+                                     * float(pos["be_at_r"])) or hi >= tp
+                            if armed:
+                                # BE-move: stop can no longer lose (§2.3)
+                                pos["be_moved"] = True
+                                pos["be_stop"] = max(sl or 0.0, pos["bep"])
+                                pos["peak"] = hi
+                        else:
+                            pos["peak"] = max(pos["peak"], hi)
+                        if hi >= tp:
+                            # TP-touch ratchet: full round-trip below TP
+                            # can't happen once the target printed.
+                            pos["ratchet"] = max(
+                                pos["ratchet"],
+                                tp * (1.0 - pos["tp_buffer_pct"] / 100.0))
+                elif not closed:
+                    # Trailing disabled (k_trail <= 0) or legacy mapping:
+                    # old immediate-sell-at-target path.
+                    if candle["open"] >= tp:
+                        _close_position(sym, ts, candle["open"],
+                                        "backtest_tp", exit_is_maker)
+                    elif candle["high"] >= tp:
+                        _close_position(sym, ts, tp, "backtest_tp",
+                                        exit_is_maker)
 
             # 3) Entry evaluation on candle close → schedule next-open fill.
             if (in_replay and sym not in positions and sym not in pending
