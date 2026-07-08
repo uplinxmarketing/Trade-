@@ -3637,6 +3637,10 @@ _CONSEC_PAUSE_SEC = 3600.0                 # 60 min
 # pause is latched (ERROR logged once when armed), cleared + INFO logged once
 # when it expires. No 60 s heartbeat while latched.
 _consec_pause_logged: bool = False
+# K1.1 — trigger context captured at the moment the pause arms (counter value,
+# wall-clock trip time, and the losing streak's last symbol if known). Persisted
+# alongside the latch so a restart / the UI can explain WHY buys are paused.
+_consec_trip_ctx: Optional[dict] = None
 
 
 def _seed_consec_losses_locked() -> int:
@@ -3663,10 +3667,12 @@ def _consec_loss_count() -> int:
         return _consec_losses
 
 
-def _maybe_trigger_consec_pause_locked(count: int) -> None:
+def _maybe_trigger_consec_pause_locked(count: int,
+                                       last_symbol: Optional[str] = None) -> None:
     """Arm the 60-min pause when the counter reaches the limit. Caller holds
-    _consec_lock."""
-    global _consec_loss_pause_until, _consec_pause_logged
+    _consec_lock. K1.1 — fires reliably right after every counter increment;
+    captures trigger context so the latch can explain itself across restarts."""
+    global _consec_loss_pause_until, _consec_pause_logged, _consec_trip_ctx
     try:
         limit = int(_risk_cfg()["max_consecutive_losses"])
     except Exception:
@@ -3675,6 +3681,8 @@ def _maybe_trigger_consec_pause_locked(count: int) -> None:
     if limit > 0 and count >= limit and now >= _consec_loss_pause_until:
         _consec_loss_pause_until = now + _CONSEC_PAUSE_SEC
         _consec_pause_logged = True   # latched — expiry will log the INFO line
+        _consec_trip_ctx = {"count": count, "trip_ts": now,
+                            "last_symbol": last_symbol}
         try:
             database.log_activity(
                 f"CONSECUTIVE-LOSS PAUSE: {count} losing trades in a row "
@@ -3720,7 +3728,12 @@ def persist_risk_latches() -> None:
             "limit_pct":     (_daily_stop_trip_ctx or {}).get("limit_pct"),
         })
         consec_active = 1 if _consec_loss_pause_until > now else 0
-        consec_ctx = _json.dumps({"count": _consec_losses})
+        # K1.2 — persist the full trip context while the pause is armed so a
+        # restart can explain WHY buys are paused; fall back to the bare count.
+        if consec_active and _consec_trip_ctx:
+            consec_ctx = _json.dumps({"count": _consec_losses, **_consec_trip_ctx})
+        else:
+            consec_ctx = _json.dumps({"count": _consec_losses})
         rows = [
             ("daily_stop",   daily_active,  _daily_stop_until,        daily_ctx,  now),
             ("consec_pause", consec_active, _consec_loss_pause_until, consec_ctx, now),
@@ -3749,6 +3762,7 @@ def load_risk_latches() -> None:
     global _daily_stop_until, _daily_stop_logged_day, _daily_stop_logged
     global _daily_stop_flattened_day, _daily_stop_resumed_day, _daily_stop_trip_ctx
     global _consec_loss_pause_until, _consec_pause_logged, _consec_losses
+    global _consec_trip_ctx
     try:
         with database._lock:
             conn = database._conn()
@@ -3813,6 +3827,12 @@ def load_risk_latches() -> None:
                 _cnt = ctx.get("count")
                 if isinstance(_cnt, int):
                     _consec_losses = _cnt
+                # Preserve the original trip context across the restart.
+                _consec_trip_ctx = {
+                    "count":       ctx.get("count"),
+                    "trip_ts":     ctx.get("trip_ts"),
+                    "last_symbol": ctx.get("last_symbol"),
+                }
                 try:
                     _until_iso = datetime.fromtimestamp(
                         until, timezone.utc).isoformat()
@@ -3821,6 +3841,47 @@ def load_risk_latches() -> None:
                         f"{_until_iso}", "info")
                 except Exception:
                     pass
+
+
+def consec_pause_boot_selfcheck() -> None:
+    """K1.3 — fail-CLOSED boot guard for the consecutive-loss breaker.
+
+    control_api calls this once at boot AFTER load_risk_latches(). The DB-derived
+    streak (via _seed_consec_losses_locked — the same seed used everywhere) is the
+    source of truth: if it already meets/exceeds risk.max_consecutive_losses and
+    there is NO valid (future) pause active, engage a fresh 60-min pause right now,
+    persist it, and log ONE WARN.
+
+    This closes the exact hole live evidence exposed (consecutive_losses 8/4,
+    paused_until=None): a restart seeds the counter from trade history but the arm
+    check only ran on a *new* close, so a process that crossed the limit before its
+    last restart would resume with the counter over the limit yet never gated."""
+    global _consec_losses, _consec_loss_pause_until, _consec_pause_logged
+    global _consec_trip_ctx
+    try:
+        limit = int(_risk_cfg()["max_consecutive_losses"])
+    except Exception:
+        limit = int(_RISK_DEFAULTS["max_consecutive_losses"])
+    try:
+        with _consec_lock:
+            derived = _seed_consec_losses_locked()
+            _consec_losses = derived
+            now = time.time()
+            if limit > 0 and derived >= limit and now >= _consec_loss_pause_until:
+                _consec_loss_pause_until = now + _CONSEC_PAUSE_SEC
+                _consec_pause_logged = True
+                _consec_trip_ctx = {"count": derived, "trip_ts": now,
+                                    "last_symbol": None}
+                try:
+                    database.log_activity(
+                        f"CONSECUTIVE-LOSS PAUSE: boot self-check: {derived}/{limit} "
+                        f"consecutive losses with no active pause — engaging fresh "
+                        f"{int(_CONSEC_PAUSE_SEC // 60)}m pause (fail-closed)", "warn")
+                except Exception:
+                    pass
+                persist_risk_latches()
+    except Exception:
+        pass
 
 
 def _note_trade_closed(sym: str, net_profit: float) -> None:
@@ -3843,7 +3904,7 @@ def _note_trade_closed(sym: str, net_profit: float) -> None:
                 _consec_losses += 1
             else:
                 _consec_losses = 0
-            _maybe_trigger_consec_pause_locked(_consec_losses)
+            _maybe_trigger_consec_pause_locked(_consec_losses, sym)
     except Exception:
         pass
 
@@ -5194,6 +5255,86 @@ def on_kline5m_close(symbol: str, closed_row: list, buf_snapshot: list) -> None:
         print(f"[TradeEngine] 5m entry rebuild error {symbol}: {e}")
 
 
+# ── K3.3 — restart-reason detection (crash vs clean shutdown) ─────────────────
+# On a graceful shutdown we drop a clean-shutdown marker (settings KV). A liveness
+# heartbeat setting is refreshed from the entry-heartbeat loop so a crash leaves a
+# recent timestamp. At boot control_api calls detect_restart_reason(): a marker
+# present (and not stale vs the last heartbeat) means the previous stop was clean;
+# absent means an unclean/crash restart because the graceful path never ran. The
+# marker is cleared after reading so the NEXT boot cannot misread a stale marker.
+_CLEAN_SHUTDOWN_KEY = "clean_shutdown_ts"
+_LAST_HEARTBEAT_KEY = "last_heartbeat_ts"
+_clean_shutdown_written = False
+
+
+def _write_clean_shutdown_marker() -> None:
+    """Record a clean-shutdown marker (atexit / signal path). Idempotent within a
+    process; never raises."""
+    global _clean_shutdown_written
+    if _clean_shutdown_written:
+        return
+    _clean_shutdown_written = True
+    try:
+        database.save_setting(_CLEAN_SHUTDOWN_KEY, str(time.time()))
+        database.log_activity("clean-shutdown marker written", "info")
+    except Exception:
+        pass
+
+
+def _refresh_heartbeat_ts() -> None:
+    """Persist a recent liveness heartbeat so a crash leaves a fresh timestamp
+    that detect_restart_reason() can report. Called from the entry-heartbeat
+    loop (~every eval_heartbeat_sec). Never raises."""
+    try:
+        database.save_setting(_LAST_HEARTBEAT_KEY, str(time.time()))
+    except Exception:
+        pass
+
+
+def detect_restart_reason() -> dict:
+    """K3.3 — classify this boot as clean vs crash. control_api calls this once at
+    boot (after load_risk_latches) and logs the result. Returns
+    {clean: bool, last_heartbeat_ts, note}. The clean-shutdown marker is cleared
+    after reading so it is consumed exactly once (a marker surviving to a boot must
+    have been written by the previous run's shutdown, i.e. after the last boot)."""
+    last_hb: Optional[float] = None
+    marker_ts: Optional[float] = None
+    try:
+        raw_hb = database.get_setting(_LAST_HEARTBEAT_KEY)
+        last_hb = float(raw_hb) if raw_hb not in (None, "") else None
+    except Exception:
+        last_hb = None
+    try:
+        raw_marker = database.get_setting(_CLEAN_SHUTDOWN_KEY)
+        marker_ts = float(raw_marker) if raw_marker not in (None, "") else None
+    except Exception:
+        marker_ts = None
+    if marker_ts is not None:
+        # Marker present → graceful stop, UNLESS a heartbeat is newer than the
+        # marker (process kept running after writing it → treat as crash).
+        if last_hb is not None and last_hb > marker_ts + 1.0:
+            clean = False
+            note = ("clean-shutdown marker older than last heartbeat — process "
+                    "ran on past the marker; treating as unclean restart")
+        else:
+            clean = True
+            note = "clean-shutdown marker present — previous stop was graceful"
+    else:
+        clean = False
+        note = ("no clean-shutdown marker — previous run did not reach the "
+                "graceful shutdown path (crash / kill / OOM / hard restart)")
+    # Rotate the marker so the next boot cannot misread this one.
+    try:
+        database.save_setting(_CLEAN_SHUTDOWN_KEY, "")
+    except Exception:
+        pass
+    return {"clean": clean, "last_heartbeat_ts": last_hb, "note": note}
+
+
+import atexit as _atexit
+_atexit.register(_write_clean_shutdown_marker)
+
+
 # §3.1c(ii) — veto-only heartbeat: every entries.eval_heartbeat_sec (default
 # 15 s) re-run the buy check so an armed setup (5m signals already passing)
 # can enter the moment a VETO clears (spread narrows, regime flips back,
@@ -5206,6 +5347,7 @@ def _entry_heartbeat_loop() -> None:
     _log_entry_timing_mode_once()
     while True:
         try:
+            _refresh_heartbeat_ts()   # K3.3 — liveness marker for crash detection
             cfg = _entries_cfg()
             interval = max(1.0, float(cfg.get("eval_heartbeat_sec", 15.0)))
             if not cfg["tick_entries"]:   # tick mode has its own dispatch path
@@ -6832,10 +6974,17 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         if mode == "live" and budget < 10.0:
             _record_rejection(sym, score, "min_notional",
                               f"budget=${budget:.2f} < $10 Binance minimum")
-            database.log_activity(
-                f"{sym}: buy skipped — budget ${budget:.2f} < $10 Binance minimum notional "
-                f"(increase trade size in Settings)", "warn"
-            )
+            # K2.3 — a per-trade budget below the tradeable minimum won't change
+            # for ~15s (until the balance/sizing shifts), so re-evaluating this
+            # symbol every heartbeat only spams the log. Route it into the standard
+            # 5-min candidacy cooldown (same gate maker-abandon/score-fail use) and
+            # emit ONE deduped line. The budget math itself is unchanged.
+            _candidacy_cooldown[sym] = time.time() + _MAKER_ABANDON_COOLDOWN_SEC
+            _log_skip_dedup(
+                sym, "budget_below_min_notional",
+                f"[SKIP] {sym}: buy skipped — budget ${budget:.2f} < $10 Binance "
+                f"minimum notional (increase trade size in Settings) — candidacy "
+                f"cooldown {_MAKER_ABANDON_COOLDOWN_SEC/60:.0f} min.", "warn")
             continue
 
         # ── Atomic claim — BEFORE the slow REST gates below ─────────────────────

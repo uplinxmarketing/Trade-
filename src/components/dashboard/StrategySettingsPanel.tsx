@@ -278,9 +278,20 @@ export function StrategySettingsPanel({ baseUrl = '' }: { baseUrl?: string }) {
         body: JSON.stringify(body),
       });
       const data = await res.json().catch(() => null);
-      if (res.status === 422 && data?.errors && typeof data.errors === 'object') {
-        setServerErrors(data.errors as Record<string, string>);
-        toast.error('Validation failed — fix the highlighted fields');
+      if (res.status === 422) {
+        // Field-level errors (e.g. sizing.budget below min_position_usdt) map to
+        // inline messages on the offending fields; a bare message still toasts
+        // so a sub-minimum-budget rejection is never swallowed silently.
+        if (data?.errors && typeof data.errors === 'object') {
+          setServerErrors(data.errors as Record<string, string>);
+          toast.error('Validation failed — fix the highlighted fields');
+        } else {
+          const msg = (typeof data?.error === 'string' && data.error)
+            || (typeof data?.detail === 'string' && data.detail)
+            || (typeof data?.message === 'string' && data.message)
+            || 'Validation failed (422) — value rejected by the backend';
+          toast.error(msg);
+        }
         return;
       }
       if (res.status === 409) {
