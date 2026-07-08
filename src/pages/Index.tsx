@@ -15,6 +15,7 @@ import WalletPanelV2 from '@/components/dashboard/WalletPanelV2';
 import ReportDashboard from '@/components/dashboard/ReportDashboard';
 import OrderBookPanel from '@/components/dashboard/OrderBookPanel';
 import FuturesAgent from '@/components/dashboard/FuturesAgent';
+import { FunnelPanel } from '@/components/dashboard/FunnelPanel';
 import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
@@ -240,6 +241,9 @@ const Index = () => {
               }}
               onCoinsChange={setSelectedCoins}
             />
+
+            {/* Entry Funnel — L1.2: today's ready→recheck→budget→posted→filled */}
+            <FunnelPanel baseUrl={API_BASE} />
 
             {/* Futures Paper-Trading Agent */}
             <FuturesAgent />

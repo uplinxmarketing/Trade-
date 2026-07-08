@@ -17,7 +17,9 @@ import { formatTime, formatPnL } from '@/lib/format';
 import { SignalEnginePanel } from './SignalEnginePanel';
 import { DiagnosticsTab } from './DiagnosticsTab';
 import { AnalyticsPanel } from './AnalyticsPanel';
+import { SessionStatsPanel } from './SessionStatsPanel';
 import { BacktestPanel } from './BacktestPanel';
+import { LeverMatrixPanel } from './LeverMatrixPanel';
 import { RiskPanel } from './RiskPanel';
 import { StrategySettingsPanel } from './StrategySettingsPanel';
 import { SignalsEditorPanel } from './SignalsEditorPanel';
@@ -1842,8 +1844,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
           </button>
           {showAnalytics && (
-            <div className="px-4 pb-4">
+            <div className="px-4 pb-4 space-y-4">
               <AnalyticsPanel baseUrl={botUrl} />
+              {/* L2.3 — session / hour expectancy tables */}
+              <div className="border-t border-border/50 pt-3">
+                <SessionStatsPanel baseUrl={botUrl} />
+              </div>
             </div>
           )}
         </div>
@@ -1864,8 +1870,12 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
           </button>
           {showBacktest && (
-            <div className="px-4 pb-4">
+            <div className="px-4 pb-4 space-y-4">
               <BacktestPanel baseUrl={botUrl} />
+              {/* L3 — edge-report / lever matrix ranked variants */}
+              <div className="border-t border-border/50 pt-3">
+                <LeverMatrixPanel baseUrl={botUrl} />
+              </div>
             </div>
           )}
         </div>

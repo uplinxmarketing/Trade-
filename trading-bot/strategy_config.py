@@ -65,6 +65,16 @@ class EntriesConfig(BaseModel):
     max_lot_waste_pct:      float = Field(5.0, ge=0.0, le=50.0)
     maker_abandon_max:      int   = Field(3, ge=1, le=20)
     bookticker_universe:    bool  = False
+    # L1 — when the maker chase is exhausted, fill as TAKER if the live spread is
+    # ≤ this %. 0 disables the fallback (abandon as before). Cheap insurance
+    # against ready signals starving on tight books; wide books still abandon.
+    taker_fallback_max_spread_pct: float = Field(0.05, ge=0.0, le=5.0)
+    # L2 Tier 1 — skip an entry when (half-spread + recent avg exit slippage)
+    # exceeds this % of the planned 1R stop distance (friction eats the edge).
+    max_friction_of_stop:   float = Field(15.0, ge=0.0, le=100.0)
+    # L2 Tier 1 — liquidity floor: skip symbols whose 24h quote volume (USDT) is
+    # below this. Thin coins are where spread vetoes and slippage cluster.
+    min_quote_volume_24h_usd: float = Field(20_000_000.0, ge=0.0, le=10_000_000_000.0)
 
 
 class ExitsConfig(BaseModel):
@@ -264,6 +274,21 @@ SCHEMA: Dict[str, dict] = {
                                          "Book-ticker universe",
                                          "Use the bookTicker (best bid/ask) stream across the whole "
                                          "universe for spread/price checks."),
+    "entries.taker_fallback_max_spread_pct": _meta("entries.taker_fallback_max_spread_pct", "float",
+                                         "Entries", "Taker fallback max spread",
+                                         "After the maker chase is exhausted, fill as taker if the live "
+                                         "spread is ≤ this %. 0 disables (abandon instead).",
+                                         0.0, 5.0, 0.01, "%"),
+    "entries.max_friction_of_stop": _meta("entries.max_friction_of_stop", "float", "Entries",
+                                         "Max friction of stop",
+                                         "Skip entry when (half-spread + recent avg exit slippage) exceeds "
+                                         "this % of the planned 1R stop distance.",
+                                         0.0, 100.0, 1.0, "%"),
+    "entries.min_quote_volume_24h_usd": _meta("entries.min_quote_volume_24h_usd", "float", "Entries",
+                                         "Min 24h quote volume",
+                                         "Liquidity floor: skip symbols whose 24h quote volume (USDT) is "
+                                         "below this.",
+                                         0.0, 10_000_000_000.0, 1_000_000.0, "USDT"),
 
     # ── Exits ─────────────────────────────────────────────────────────────
     "exits.k_sl": _meta("exits.k_sl", "float", "Exits", "SL ATR multiple (k_sl)",
