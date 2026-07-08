@@ -102,6 +102,12 @@ class RegimeConfig(BaseModel):
     neutral_size_mult: float = Field(0.5, ge=0.0, le=1.0)
     # risk_off requires BOTH price<EMA50 (1h) AND pct_4h < this threshold (F2).
     risk_off_pct_4h:   float = Field(-1.0, ge=-20.0, le=0.0)
+    # M1.2 — how neutral regime reduces risk. "size" halves the ticket (legacy;
+    # can push a small-account ticket below minNotional → the $5.50 bug); "slots"
+    # halves the number of concurrent NEW entries at FULL ticket (keeps notional
+    # tradeable); "off" disables neutral scaling; "auto" (default) resolves to
+    # "slots" when allocation/max_positions < 2×tradeable_min, else "size".
+    neutral_scaling_mode: Literal["auto", "size", "slots", "off"] = "auto"
 
 
 class RiskConfig(BaseModel):
@@ -321,6 +327,12 @@ SCHEMA: Dict[str, dict] = {
                                     "Risk-off 4h threshold",
                                     "risk_off requires BOTH price<EMA50(1h) AND BTC 4h move below this %.",
                                     -20.0, 0.0, 0.1, "%"),
+    "regime.neutral_scaling_mode": _meta("regime.neutral_scaling_mode", "enum", "Regime",
+                                    "Neutral scaling mode",
+                                    "How neutral regime reduces risk: size (halve ticket), slots "
+                                    "(halve concurrent new entries at full ticket), off, or auto "
+                                    "(slots for small accounts, else size).",
+                                    choices=["auto", "size", "slots", "off"]),
 
     # ── Risk ──────────────────────────────────────────────────────────────
     "risk.daily_loss_stop_pct": _meta("risk.daily_loss_stop_pct", "float", "Risk",

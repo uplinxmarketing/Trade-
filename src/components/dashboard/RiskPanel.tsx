@@ -48,6 +48,20 @@ interface BnbSection {
   low?: boolean;
 }
 
+// M1.6 — backend-resolved sizing diagnostics. The per-trade ticket is resolved
+// AFTER regime multipliers here (e.g. neutral_size_mult), which is exactly what
+// the Part K badge — keyed off effective_allocation / max_positions — could not
+// see. May be absent on older backends: guard with optional chaining.
+interface SizingHealthSection {
+  available?: boolean;
+  configured_per_trade?: number;
+  neutral_resolved?: number;    // ticket after the neutral mult (== configured in slots/off)
+  tradeable_min?: number;
+  untradeable_in_neutral?: boolean;
+  neutral_scaling_mode?: 'auto' | 'size' | 'slots' | 'off';
+  note?: string;
+}
+
 interface RiskStatus {
   ts?: string;
   available?: boolean;
@@ -57,6 +71,7 @@ interface RiskStatus {
   correlation?: CorrelationSection;
   slots?: SlotsSection;
   bnb?: BnbSection;
+  sizing_health?: SizingHealthSection;
 }
 
 const POLL_MS = 10_000;
@@ -207,20 +222,66 @@ export function RiskPanel({ baseUrl = '' }: { baseUrl?: string }) {
   const consecPaused = consecPausedUntil > 0 &&
     (consecPausedUntil > 1e12 ? consecPausedUntil : consecPausedUntil * 1000) > Date.now();
 
-  // K2.4 — resolved per-trade budget vs. tradeable minimum. The engine skips
-  // every buy when the per-trade ticket falls under min_position_usdt, so make
-  // it loud instead of silent. Resolved per-trade = effective_allocation spread
-  // across the configured max_positions (the intended slot count); when that is
-  // below the minimum the sizing degrades / no trades execute. Falls back to the
-  // 10 USDT default when the backend doesn't expose min_position_usdt.
+  // M1.6 — sizing health. Prefer the backend's sizing_health, whose values are
+  // resolved AFTER regime multipliers (so it catches "configured $11 × neutral
+  // 0.5 = $5.50 < $10 min"). Fall back to the Part K computation only when the
+  // backend doesn't yet expose sizing_health.
+  //
+  // Legacy K2.4 fallback: resolved per-trade = effective_allocation spread over
+  // the configured max_positions; below min_position_usdt (default 10) => the
+  // engine skips every buy. This misses the regime multiplier, hence the switch.
   const slotAlloc = num(slots.effective_allocation);
   const slotMaxPos = num(slots.max_positions);
   const minTicket = num(slots.min_position_usdt) > 0 ? num(slots.min_position_usdt) : 10;
-  const resolvedPerTrade = slotMaxPos > 0 ? slotAlloc / slotMaxPos : slotAlloc;
-  const perTradeBelowMin = sectionOk(slots) && slotAlloc > 0 && resolvedPerTrade < minTicket;
+  const fallbackResolvedPerTrade = slotMaxPos > 0 ? slotAlloc / slotMaxPos : slotAlloc;
+  const fallbackBelowMin = sectionOk(slots) && slotAlloc > 0 && fallbackResolvedPerTrade < minTicket;
+
+  const sizing = status.sizing_health;
+  const hasSizing = Boolean(sizing) && sizing?.available !== false;
+
+  // Backend-resolved values (with the legacy computation as the fallback source).
+  const configuredPerTrade = hasSizing ? num(sizing!.configured_per_trade) : slotAlloc;
+  const neutralResolved = hasSizing ? num(sizing!.neutral_resolved) : fallbackResolvedPerTrade;
+  const tradeableMin =
+    hasSizing && num(sizing!.tradeable_min) > 0 ? num(sizing!.tradeable_min) : minTicket;
+  const neutralScalingMode = hasSizing ? sizing!.neutral_scaling_mode : undefined;
+  const sizingNote = hasSizing ? (sizing!.note ?? '') : '';
+
+  // Persistent red banner trigger — the backend's authoritative flag. Only from
+  // sizing_health, because the honest note text lives there (M1.6.1 / M1.6.3).
+  const untradeableInNeutral = hasSizing && sizing!.untradeable_in_neutral === true;
+
+  // Red per-trade chip trigger: backend flag OR resolved-below-min when present,
+  // else the legacy computed check.
+  const perTradeBelowMin = hasSizing
+    ? untradeableInNeutral || (neutralResolved > 0 && neutralResolved < tradeableMin)
+    : fallbackBelowMin;
 
   return (
     <div className="space-y-3">
+      {/* M1.6.1 — persistent, honest sizing banner. Red (not amber): neutral-regime
+          entries will NOT execute. Text comes straight from the backend note so
+          the banner and the engine can never disagree. */}
+      {untradeableInNeutral && (
+        <div
+          role="alert"
+          className="flex items-start gap-2 rounded-md border border-loss/40 bg-loss/15 px-3 py-2 text-loss"
+        >
+          <span className="mt-[3px] w-2 h-2 shrink-0 rounded-full bg-loss animate-pulse" />
+          <div className="min-w-0">
+            <p className="text-[10px] font-bold uppercase tracking-wider">
+              Neutral-regime entries blocked
+            </p>
+            <p className="mt-0.5 text-[10px] font-medium leading-snug break-words">
+              {sizingNote ||
+                `Neutral regime resolves the per-trade ticket to $${neutralResolved.toFixed(2)}, ` +
+                `below the $${tradeableMin.toFixed(2)} minimum — switch neutral_scaling_mode to ` +
+                `'slots' or raise allocation.`}
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Status chips row */}
       <div className="flex flex-wrap items-center gap-1.5">
         {/* Daily loss stop */}
@@ -276,15 +337,35 @@ export function RiskPanel({ baseUrl = '' }: { baseUrl?: string }) {
           <Chip tone="green">running {num(slots.effective_slots) || num(slots.max_positions)} slots</Chip>
         )}
 
-        {/* K2.4 — un-tradeable per-trade budget: resolved ticket under the minimum */}
+        {/* M1.6.2 — un-tradeable per-trade budget. When sizing_health is present the
+            values are resolved after regime multipliers (configured → neutral
+            resolved) and the recommendation lives in the banner note above; the
+            chip stays factual and never says "raise trade size". Legacy computed
+            fallback is used only when the backend lacks sizing_health. */}
         {perTradeBelowMin && (
-          <Chip
-            tone="red"
-            title={`Resolved per-trade budget $${resolvedPerTrade.toFixed(2)} is under the tradeable minimum of $${minTicket.toFixed(2)} (min_position_usdt). The bot will skip every buy until the budget is raised.`}
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-loss animate-pulse" />
-            {`per-trade $${resolvedPerTrade.toFixed(2)} — below tradeable minimum — no trades will execute (min $${minTicket.toFixed(2)})`}
-          </Chip>
+          hasSizing ? (
+            <Chip
+              tone="red"
+              title={
+                `Configured per-trade $${configuredPerTrade.toFixed(2)} resolves to ` +
+                `$${neutralResolved.toFixed(2)} in NEUTRAL regime, under the tradeable ` +
+                `minimum of $${tradeableMin.toFixed(2)}` +
+                (neutralScalingMode ? ` (neutral_scaling_mode: ${neutralScalingMode})` : '') +
+                `. Neutral-regime entries will be skipped — see banner above.`
+              }
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-loss animate-pulse" />
+              {`per-trade $${configuredPerTrade.toFixed(2)} → neutral $${neutralResolved.toFixed(2)} < min $${tradeableMin.toFixed(2)} — neutral entries won't execute`}
+            </Chip>
+          ) : (
+            <Chip
+              tone="red"
+              title={`Resolved per-trade budget $${fallbackResolvedPerTrade.toFixed(2)} is under the tradeable minimum of $${minTicket.toFixed(2)} (min_position_usdt). The bot will skip every buy until the budget is raised.`}
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-loss animate-pulse" />
+              {`per-trade $${fallbackResolvedPerTrade.toFixed(2)} — below tradeable minimum — no trades will execute (min $${minTicket.toFixed(2)})`}
+            </Chip>
+          )
         )}
 
         {/* BNB fee balance — hidden unless the fee discount is enabled */}

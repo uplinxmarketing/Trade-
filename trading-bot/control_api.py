@@ -105,6 +105,12 @@ def _deploy_boundary_ts() -> str:
 # diagnostics header so a restart is never mislabelled as a deploy.
 _RESTART_REASON: dict = {}
 
+# M2 — the last 50 engine log lines captured at boot when the restart was
+# UNCLEAN. Folded into the boot report and surfaced by /api/diagnostics so an
+# operator can read exactly what the engine logged immediately before the
+# crash / OOM / unclean restart. Empty on a clean start.
+_CRASH_LOG_LINES: list = []
+
 
 def _restart_reason_str() -> str:
     """One-line render of _RESTART_REASON, e.g. 'unclean (last heartbeat
@@ -394,6 +400,35 @@ async def lifespan(app: FastAPI):
                     database.log_activity(
                         f"restart_reason: {_restart_reason_str()}", "info")
                     steps.append(f"restart_reason ({_restart_reason_str()})")
+                    # M2 — on an UNCLEAN restart, fold the last 50 engine log
+                    # lines into the boot report and stash them for
+                    # /api/diagnostics ("last 50 log lines before the unclean
+                    # restart"). Guarded: an older engine without
+                    # capture_recent_log_lines() no-ops cleanly.
+                    if _RESTART_REASON.get("clean") is False:
+                        try:
+                            _cap = getattr(
+                                trade_engine, "capture_recent_log_lines", None)
+                            _lines = _cap(50) if callable(_cap) else None
+                            if isinstance(_lines, (list, tuple)):
+                                _CRASH_LOG_LINES.clear()
+                                _CRASH_LOG_LINES.extend(str(x) for x in _lines)
+                            _n = len(_CRASH_LOG_LINES)
+                            if _n:
+                                database.log_activity(
+                                    f"UNCLEAN restart — captured last {_n} log "
+                                    f"lines before the restart (see "
+                                    f"/api/diagnostics)", "warn")
+                                for _ln in _CRASH_LOG_LINES:
+                                    print(f"[ControlAPI][crashlog] {_ln}")
+                                steps.append(f"crash_log_captured ({_n} lines)")
+                            elif callable(_cap):
+                                steps.append("crash_log_captured (0 lines)")
+                            else:
+                                steps.append(
+                                    "crash_log_captured (skip: fn absent)")
+                        except Exception as _cap_exc:
+                            _step_failed("crash_log_capture", _cap_exc)
                 else:
                     steps.append("restart_reason (skip: fn absent)")
             except Exception as exc:
@@ -3816,6 +3851,39 @@ def _health_limits_section() -> dict:
         return {"available": False}
 
 
+def _memory_stats_section() -> dict:
+    """M2 — trade_engine.get_memory_stats() → dict ({rss_kb, rss_peak_kb,
+    growth…}), or {"available": False}. Guarded so an older engine no-ops."""
+    try:
+        import trade_engine as _te
+        fn = getattr(_te, "get_memory_stats", None)
+        if not callable(fn):
+            return {"available": False}
+        raw = fn()
+        if not isinstance(raw, dict):
+            return {"available": False}
+        out = dict(raw)
+        out["available"] = True
+        return out
+    except Exception:
+        return {"available": False}
+
+
+def _memory_growth_flagged(mem: dict) -> bool:
+    """M2 — True when the engine's memory stats flag suspicious RSS growth.
+    Tolerant of the exact key the engine uses (growth_flagged / leak_suspected /
+    flagged / growth_warn, or a nested growth.flagged)."""
+    if not isinstance(mem, dict):
+        return False
+    for k in ("growth_flagged", "leak_suspected", "flagged", "growth_warn"):
+        if mem.get(k):
+            return True
+    g = mem.get("growth")
+    if isinstance(g, dict) and g.get("flagged"):
+        return True
+    return False
+
+
 def _health_engine_section() -> dict:
     """trade_engine.get_engine_health() → dict, or {"available": False}."""
     try:
@@ -3999,6 +4067,28 @@ def _compute_health_snapshot() -> dict:
     except Exception:
         pass
 
+    # M2 — WARN RULE C: the engine flagged suspicious RSS growth (possible leak).
+    memory = _memory_stats_section()
+    try:
+        if _memory_growth_flagged(memory):
+            _parts = []
+            for _lbl, _key in (("rss", "rss_kb"), ("peak", "rss_peak_kb")):
+                _v = memory.get(_key)
+                try:
+                    _parts.append(f"{_lbl}={float(_v)/1024:.0f}MB")
+                except (TypeError, ValueError):
+                    pass
+            for _gk in ("growth_kb", "growth_pct", "growth"):
+                if _gk in memory and not isinstance(memory.get(_gk), dict):
+                    _parts.append(f"{_gk}={memory.get(_gk)}")
+                    break
+            warns.append(
+                "Engine memory growth flagged"
+                + (f" ({', '.join(_parts)})" if _parts else "")
+                + " — possible memory leak; watch RSS.")
+    except Exception:
+        pass
+
     status = "red" if causes else ("yellow" if warns else "green")
     return {
         "status": status,
@@ -4007,6 +4097,7 @@ def _compute_health_snapshot() -> dict:
         "data": data,
         "limits": limits,
         "engine": engine,
+        "memory": memory,
         "ts": now,
     }
 
@@ -4190,6 +4281,16 @@ def api_diagnostics():
             "deploy_id":            _DEPLOY_ID,
             "active_threads_count": len(active_threads),
             "active_threads":       active_threads,
+        },
+        # M2 — engine RSS + growth (guarded; {"available": false} on older engines).
+        "memory": _memory_stats_section(),
+        # M2 — restart classification + the last 50 log lines captured at boot
+        # when the restart was unclean (empty on a clean start).
+        "restart": {
+            "reason":          _restart_reason_str(),
+            "detail":          dict(_RESTART_REASON),
+            "unclean":         _RESTART_REASON.get("clean") is False,
+            "crash_log_lines": list(_CRASH_LOG_LINES),
         },
         "issues": {
             "recent":         _te.get_diag_log(limit=25),
@@ -5328,6 +5429,119 @@ _RISK_STATUS_SECTIONS = ("daily", "consecutive", "slippage_vetoes",
                          "correlation", "slots", "bnb")
 
 
+def _resolved_sizing_health() -> dict:
+    """M1.6 — per-trade budget AFTER regime multipliers, flagging a RESOLVED
+    ticket that is genuinely untradeable (below the min-notional floor) so the
+    UI can raise a persistent red banner.
+
+    This is the COMPUTED value the Part K badge (keyed off effective_allocation
+    / max_positions) could not see: the "$5.50 bug" was configured $11 ×
+    regime.neutral_size_mult 0.5 = $5.50 < $10 min — an untradeable computed
+    value, not a stored setting.
+
+    NEVER raises — degrades to {"available": False} so the risk endpoint that
+    embeds it cannot 500.
+    """
+    try:
+        strategy = _load_strategy()
+        sizing = strategy.get("sizing") if isinstance(strategy.get("sizing"), dict) else {}
+
+        # tradeable_min = max(sizing.min_position_usdt, MIN_NOTIONAL_FLOOR).
+        tradeable_min = float(_budget_floor(strategy))
+
+        # Active sizing mode (v2 sizing.mode wins over legacy budget_mode).
+        mode = _effective_budget_mode(strategy)
+
+        # get_risk_status()['slots'] is the risk status this file already
+        # exposes — it carries effective_allocation + max_positions.
+        slots: dict = {}
+        try:
+            import trade_engine as _te
+            _grs = getattr(_te, "get_risk_status", None)
+            _rs = _grs() if callable(_grs) else None
+            if isinstance(_rs, dict) and isinstance(_rs.get("slots"), dict):
+                slots = _rs["slots"]
+        except Exception:
+            slots = {}
+
+        # configured_per_trade: fixed → budget_fixed_usdt; capped/other → the
+        # effective allocation spread over the configured slots (same math the
+        # K badge used).
+        configured_per_trade = None
+        if mode == "fixed":
+            try:
+                configured_per_trade = float(sizing.get(
+                    "budget_fixed_usdt",
+                    strategy.get("budget_fixed_usdt", config.BUDGET_FIXED_USDT)))
+            except (TypeError, ValueError):
+                configured_per_trade = None
+        if configured_per_trade is None:
+            try:
+                alloc = float(slots.get("effective_allocation"))
+            except (TypeError, ValueError):
+                alloc = None
+            try:
+                max_pos = int(slots.get("max_positions") or 0)
+            except (TypeError, ValueError):
+                max_pos = 0
+            if alloc is not None and max_pos > 0:
+                configured_per_trade = alloc / max_pos
+            elif alloc is not None:
+                configured_per_trade = alloc
+
+        # Neutral-regime resolution: the ticket only shrinks when regime scaling
+        # can apply AND neutral_scaling_mode is not "slots"/"off". In "slots"/
+        # "off" neutral cuts the number of NEW entries (or nothing), NOT the
+        # ticket, so neutral_resolved == configured_per_trade.
+        regime = strategy.get("regime") if isinstance(strategy.get("regime"), dict) else {}
+        neutral_scaling_mode = regime.get("neutral_scaling_mode", "auto")
+        regime_enabled = bool(regime.get("enabled", True))
+        try:
+            neutral_mult = float(regime.get("neutral_size_mult", 0.5))
+        except (TypeError, ValueError):
+            neutral_mult = 0.5
+
+        shrinks = regime_enabled and neutral_scaling_mode not in ("slots", "off")
+        if configured_per_trade is None:
+            neutral_resolved = None
+        elif shrinks:
+            neutral_resolved = configured_per_trade * neutral_mult
+        else:
+            neutral_resolved = configured_per_trade
+
+        untradeable = bool(
+            neutral_resolved is not None and neutral_resolved < tradeable_min)
+
+        note = ""
+        if untradeable and configured_per_trade is not None:
+            if shrinks:
+                note = (
+                    f"neutral regime would size ${configured_per_trade:.2f}×"
+                    f"{neutral_mult:g}=${neutral_resolved:.2f} < "
+                    f"${tradeable_min:.2f} min — switch neutral_scaling_mode to "
+                    f"'slots' or raise allocation")
+            else:
+                note = (
+                    f"per-trade budget resolves to ${neutral_resolved:.2f} < "
+                    f"${tradeable_min:.2f} min notional — raise allocation/budget "
+                    f"or lower sizing.min_position_usdt")
+
+        return {
+            "available":              True,
+            "mode":                   mode,
+            "configured_per_trade":   (round(configured_per_trade, 2)
+                                       if configured_per_trade is not None else None),
+            "neutral_resolved":       (round(neutral_resolved, 2)
+                                       if neutral_resolved is not None else None),
+            "tradeable_min":          round(tradeable_min, 2),
+            "untradeable_in_neutral": untradeable,
+            "neutral_scaling_mode":   neutral_scaling_mode,
+            "note":                   note,
+        }
+    except Exception:
+        return {"available": False}
+
+
 def _risk_status_payload() -> dict:
     """Assemble the /api/risk/status body. NEVER raises — every failure mode
     degrades to {"available": false} sections so the endpoint cannot 500."""
@@ -5350,6 +5564,11 @@ def _risk_status_payload() -> dict:
     for section in _RISK_STATUS_SECTIONS:
         val = status.get(section)
         out[section] = val if isinstance(val, dict) else {"available": False}
+    # M1.6 — resolved sizing health (per-trade budget AFTER regime multipliers)
+    # so RiskPanel can raise a persistent red banner when the neutral-regime
+    # ticket resolves below the min notional. Additive — no existing field is
+    # removed.
+    out["sizing_health"] = _resolved_sizing_health()
     return out
 
 
@@ -7678,6 +7897,88 @@ def api_strategy_history(limit: int = 20):
         return {"history": history, "count": len(history)}
     except Exception as e:
         return {"history": [], "count": 0, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/config/audit")
+def api_config_audit(hours: float = 48.0, limit: int = 200):
+    """M1.4 — forensic config-audit: field-level diffs computed between
+    CONSECUTIVE stored strategy.json snapshots, each tagged with the actor and
+    timestamp that produced it.
+
+    Unlike /api/strategy/history (which returns the diff each writer happened to
+    store — sometimes only a patch, not an old→new pair), this recomputes the
+    AUTHORITATIVE old→new diff from the full snapshots via strategy_config
+    .diff_views, so an operator can see exactly which key changed, when, and by
+    whom ("api" / "settings-api" / "budget-api" / "config-api" / "rollback…" /
+    "auto-remove-delisted" / …). Each diff value is [old, new].
+
+    Query: hours (window, default 48; 0 = all history), limit (max change rows,
+    default 200). Never 500s — degrades to an empty change list on failure.
+    """
+    try:
+        hours = max(0.0, float(hours))
+    except (TypeError, ValueError):
+        hours = 48.0
+    try:
+        limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        limit = 200
+    cutoff = time.time() - hours * 3600.0 if hours > 0 else 0.0
+
+    changes: list = []
+    try:
+        # Newest-first metadata (version, ts, actor, config_hash, stored diff).
+        rows = database.get_config_history(limit=500)
+        # Ascending so each version can be diffed against its predecessor.
+        rows_asc = sorted(
+            (r for r in rows if isinstance(r, dict)),
+            key=lambda r: r.get("version") or 0)
+
+        full_cache: dict = {}
+
+        def _full_at(idx: int) -> dict:
+            """Full snapshot for rows_asc[idx] ({} for out-of-range, so the very
+            first version diffs against an empty predecessor). Cached by version
+            so each snapshot is fetched at most once."""
+            if idx < 0 or idx >= len(rows_asc):
+                return {}
+            ver = rows_asc[idx].get("version")
+            if ver is None:
+                return {}
+            if ver in full_cache:
+                return full_cache[ver]
+            rec = database.get_config_version(int(ver))
+            full = rec.get("full") if isinstance(rec, dict) else None
+            full = full if isinstance(full, dict) else {}
+            full_cache[ver] = full
+            return full
+
+        for i, r in enumerate(rows_asc):
+            try:
+                if float(r.get("ts") or 0.0) < cutoff:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            diff = _scfg.diff_views(_full_at(i - 1), _full_at(i))
+            if not diff:
+                # Fall back to the diff the writer stored (may be a bare patch).
+                stored = r.get("diff")
+                if isinstance(stored, dict) and stored:
+                    diff = stored
+            changes.append({
+                "version":     r.get("version"),
+                "ts":          r.get("ts"),
+                "actor":       r.get("actor"),
+                "config_hash": r.get("config_hash"),
+                "diff":        diff,
+            })
+        changes.reverse()   # newest first for the UI
+        if len(changes) > limit:
+            changes = changes[:limit]
+        return {"hours": hours, "count": len(changes), "changes": changes}
+    except Exception as e:
+        return {"hours": hours, "count": 0, "changes": [],
+                "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/api/strategy/rollback")

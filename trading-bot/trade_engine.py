@@ -56,6 +56,30 @@ except Exception:
 log = logging.getLogger(__name__)
 
 
+# ── M2 — crash instrumentation: faulthandler ─────────────────────────────────
+# Always-on, guarded. Dumps a C-level traceback to <data dir>/faulthandler.log
+# on a fatal signal (SIGSEGV/SIGFPE/SIGABRT/SIGBUS/SIGILL) so the NEXT hard
+# crash / OOM-kill is diagnosable (two unclean restarts in ~24h prompted this).
+# Keep the file handle alive at module scope so it is never garbage-collected
+# out from under the C signal handler. Reuses database's resolved data dir.
+_faulthandler_fh = None
+try:
+    import faulthandler as _faulthandler
+    try:
+        _fh_dir = os.path.dirname(database.DB_PATH) or "."
+        _faulthandler_fh = open(os.path.join(_fh_dir, "faulthandler.log"), "a")
+        _faulthandler.enable(file=_faulthandler_fh, all_threads=True)
+    except Exception:
+        # Fall back to stderr if the data dir isn't writable — a fatal-signal
+        # traceback anywhere beats none.
+        try:
+            _faulthandler.enable(all_threads=True)
+        except Exception:
+            pass
+except Exception:
+    pass
+
+
 # ── C §6.4 — Binance rate-limit accounting (binance_limits module) ────────────
 # Wired DEFENSIVELY: the module may land after this file (parallel delivery),
 # so import lazily and degrade to no-ops when unavailable. can_spend defaults
@@ -874,6 +898,18 @@ def _neutral_size_mult() -> float:
         return max(0.0, min(1.0, float(raw.get("neutral_size_mult", 0.5))))
     except Exception:
         return 0.5
+
+
+def _neutral_scaling_mode_cfg() -> str:
+    """M1.2 strategy.regime.neutral_scaling_mode (auto|size|slots|off, default
+    "auto"). The RAW setting; _resolve_neutral_scaling turns "auto" into a
+    concrete mode at entry time."""
+    try:
+        raw = _load_strategy().get("regime", {})
+        mode = str(raw.get("neutral_scaling_mode", "auto")).strip().lower()
+        return mode if mode in ("auto", "size", "slots", "off") else "auto"
+    except Exception:
+        return "auto"
 
 
 def _regime_risk_off_pct_4h() -> float:
@@ -2026,20 +2062,19 @@ def can_execute_buy(coin_cfg: dict, client) -> tuple[bool, str]:
 
 
 def get_budget_for_coin(symbol: str, free_usdt: float) -> float:
-    """Trade size in USDT (see _get_budget_for_coin_base) with §3.3 regime
-    sizing applied: when the BTC regime is 'neutral' the computed budget is
-    multiplied by strategy.regime.neutral_size_mult (default 0.5) — identical
-    in live and paper mode. risk_off never reaches sizing (entries are vetoed
-    upstream by the macro gate / REGIME_risk_off veto); risk_on is unscaled."""
-    base = _get_budget_for_coin_base(symbol, free_usdt)
+    """Trade size in USDT (see _get_budget_for_coin_base) with §3.3/M1.2 regime
+    sizing applied. In NEUTRAL regime the budget is multiplied by
+    strategy.regime.neutral_size_mult ONLY when the resolved neutral_scaling_mode
+    is "size" (legacy). "slots"/"off" keep the FULL ticket — neutral risk is then
+    reduced by capping concurrent new entries + doubling pacing (see
+    _check_buys_from_cache), never by shrinking the ticket below the tradeable
+    minimum (the $5.50<$10 bug). risk_off never reaches sizing (vetoed upstream
+    by the REGIME_risk_off veto); risk_on is unscaled. Identical live + paper."""
     try:
-        if base > 0 and get_btc_regime() == "neutral":
-            mult = _neutral_size_mult()
-            if mult < 1.0:
-                return round(base * mult, 2)
+        return _resolve_entry_budget(symbol, free_usdt)["resolved"]
     except Exception:
-        pass  # sizing must never fail a buy because regime data is missing
-    return base
+        # Sizing must never fail a buy because regime/slot data is missing.
+        return _get_budget_for_coin_base(symbol, free_usdt)
 
 
 def _get_budget_for_coin_base(symbol: str, free_usdt: float) -> float:
@@ -2119,6 +2154,126 @@ def _get_budget_for_coin_base(symbol: str, free_usdt: float) -> float:
         return round(base, 2)
     # For capped mode cap to 90% so a tiny buffer remains for fees.
     return round(min(base, effective_free * 0.9), 2)
+
+
+# ── M1.1/M1.2 — tradeable minimum + neutral-scaling resolution ───────────────
+def _tradeable_min(symbol: Optional[str] = None) -> float:
+    """M1.1 — the true minimum tradeable notional (USDT) after ALL multipliers:
+    max(exchange minNotional for `symbol` if available, sizing.min_position_usdt,
+    10.0). Call with no symbol for account-level checks (config floor only; the
+    exchange minNotional is per-symbol)."""
+    min_notional = 0.0
+    if symbol:
+        try:
+            from exchange_info import get_symbol_filters as _gsf_tm
+            min_notional = float((_gsf_tm(symbol) or {}).get("min_notional", 0.0) or 0.0)
+        except Exception:
+            min_notional = 0.0
+    try:
+        min_pos = float(_sizing_cfg().get("min_position_usdt", 10.0))
+    except Exception:
+        min_pos = 10.0
+    return max(min_notional, min_pos, 10.0)
+
+
+def _resolve_neutral_scaling(cfg: dict, effective_allocation: float,
+                             max_positions: int, tradeable_min: float) -> str:
+    """M1.2 — resolve the concrete neutral-regime scaling mode at entry time.
+
+    `cfg` carries the raw setting under "neutral_scaling_mode"
+    (auto|size|slots|off). "auto" resolves to "slots" for small accounts — when
+    the per-slot allocation can't fund 2× the tradeable minimum, so a ticket
+    multiplier would push notional near/under minNotional — else "size". Returns
+    one of "size" | "slots" | "off" (never "auto")."""
+    raw = str((cfg or {}).get("neutral_scaling_mode", "auto")).strip().lower()
+    if raw in ("size", "slots", "off"):
+        return raw
+    try:
+        if max_positions > 0 and tradeable_min > 0:
+            per_slot = effective_allocation / max_positions
+            if per_slot < 2.0 * tradeable_min:
+                return "slots"
+    except Exception:
+        return "size"
+    return "size"
+
+
+def _resolve_entry_budget(symbol: str, free_usdt: float) -> dict:
+    """M1.1/M1.2 — resolved per-trade budget WITH the full computation chain so
+    the buy path can print an honest, arithmetic skip message.
+
+    Returns {base, mult, mult_label, resolved, mode, regime}. In neutral regime
+    the ticket is multiplied by neutral_size_mult ONLY when the resolved neutral
+    scaling mode is "size"; "slots"/"off" keep the FULL ticket (risk is reduced
+    via slot/pacing limits, not ticket size — so a small ticket never silently
+    dies below minNotional)."""
+    base = _get_budget_for_coin_base(symbol, free_usdt)
+    mult = 1.0
+    mult_label = ""
+    mode = None
+    try:
+        regime = get_btc_regime()
+    except Exception:
+        regime = "neutral"
+    if base > 0 and regime == "neutral":
+        try:
+            _si = effective_slots()
+            mode = _resolve_neutral_scaling(
+                {"neutral_scaling_mode": _neutral_scaling_mode_cfg()},
+                _si["effective_allocation"], _si["max_positions"],
+                _tradeable_min(symbol))
+        except Exception:
+            mode = "off"
+        if mode == "size":
+            m = _neutral_size_mult()
+            if m < 1.0:
+                mult = m
+                mult_label = "regime neutral"
+    return {
+        "base":       round(base, 2),
+        "mult":       mult,
+        "mult_label": mult_label,
+        "resolved":   round(base * mult, 2),
+        "mode":       mode,
+        "regime":     regime,
+    }
+
+
+# M1.2 — transition-only logging of the resolved neutral-scaling decision.
+_last_neutral_mode_logged: Optional[Tuple[str, str]] = None
+_last_neutral_mode_lock = threading.Lock()
+
+
+def _log_neutral_scaling_transition(regime: str, mode: str, slots_info: dict,
+                                    eff_slots: Optional[int] = None) -> None:
+    """M1.2 — log the resolved neutral-scaling decision ONLY when the
+    (regime, mode) pair CHANGES (never per eval)."""
+    global _last_neutral_mode_logged
+    key = (regime, mode)
+    with _last_neutral_mode_lock:
+        if key == _last_neutral_mode_logged:
+            return
+        _last_neutral_mode_logged = key
+    try:
+        if regime == "neutral" and mode == "slots":
+            database.log_activity(
+                f"Neutral scaling: mode=slots — FULL ticket, new-entry slots "
+                f"capped to {eff_slots} of {slots_info.get('effective_slots')}, "
+                f"entry pacing doubled (alloc {slots_info.get('effective_allocation')}).",
+                "info")
+        elif regime == "neutral" and mode == "size":
+            database.log_activity(
+                f"Neutral scaling: mode=size — ticket × {_neutral_size_mult():g} "
+                f"(legacy), floored at the tradeable minimum.", "info")
+        elif regime == "neutral" and mode == "off":
+            database.log_activity(
+                "Neutral scaling: mode=off — full ticket, full slots.", "info")
+        else:
+            database.log_activity(
+                f"Neutral scaling: regime={regime} — no neutral scaling applied.",
+                "info")
+    except Exception:
+        pass
 
 
 # ── Cooldown helpers ────────────────────────────────────────────────────
@@ -5291,6 +5446,107 @@ def _refresh_heartbeat_ts() -> None:
         pass
 
 
+# ── M2 — process RSS sampling (leak / OOM instrumentation) ───────────────────
+# ru_maxrss (peak resident set) is portable and dependency-free; on Linux it is
+# reported in KB. Sampled from the entry heartbeat loop (alongside
+# _refresh_heartbeat_ts) and exposed via get_memory_stats() so control_api can
+# surface memory growth in the boot report after an unclean restart.
+try:
+    import resource as _resource
+except Exception:
+    _resource = None
+
+_rss_lock = threading.Lock()
+_last_rss_kb: int = 0
+_rss_peak_kb: int = 0
+_rss_history: List[Tuple[float, int]] = []   # (ts, kb), newest appended
+_RSS_HISTORY_MAX = 240                        # ~1h at a 15s heartbeat
+_RSS_MIN_SAMPLES = 20                         # need this many before warning
+_RSS_WARN_ABS_KB = 500 * 1024                 # 500 MB absolute floor for a warn
+_RSS_WARN_GROWTH_MULT = 1.5                   # latest > 1.5× first-in-window
+_last_rss_warn_ts: float = 0.0
+_RSS_WARN_THROTTLE_SEC = 1800.0               # warn at most once / 30 min
+
+
+def _sample_rss() -> None:
+    """M2 — sample process RSS (ru_maxrss, KB on Linux) into the rolling history,
+    updating _last_rss_kb / _rss_peak_kb, and WARN on sustained growth across the
+    window (> 1.5× the first sample AND > 500 MB). Never raises."""
+    global _last_rss_kb, _rss_peak_kb, _last_rss_warn_ts
+    if _resource is None:
+        return
+    try:
+        kb = int(_resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:
+        return
+    now = time.time()
+    warn = False
+    first_kb = 0
+    n = 0
+    with _rss_lock:
+        _last_rss_kb = kb
+        if kb > _rss_peak_kb:
+            _rss_peak_kb = kb
+        _rss_history.append((now, kb))
+        if len(_rss_history) > _RSS_HISTORY_MAX:
+            del _rss_history[:len(_rss_history) - _RSS_HISTORY_MAX]
+        n = len(_rss_history)
+        if n >= _RSS_MIN_SAMPLES:
+            first_kb = _rss_history[0][1]
+            if (first_kb > 0 and kb > _RSS_WARN_GROWTH_MULT * first_kb
+                    and kb > _RSS_WARN_ABS_KB
+                    and now - _last_rss_warn_ts >= _RSS_WARN_THROTTLE_SEC):
+                _last_rss_warn_ts = now
+                warn = True
+    if warn:
+        try:
+            database.log_activity(
+                f"MEMORY: RSS grew to {kb // 1024} MB (from {first_kb // 1024} MB "
+                f"over {n} samples) — possible leak; watch for an OOM restart.",
+                "warn")
+        except Exception:
+            pass
+
+
+def get_memory_stats() -> dict:
+    """M2 — public snapshot of process memory for control_api / the boot report.
+    growth_kb_per_hr is a linear estimate over the current rolling window."""
+    with _rss_lock:
+        n = len(_rss_history)
+        rss_kb = _last_rss_kb
+        peak = _rss_peak_kb
+        growth = 0.0
+        if n >= 2:
+            t0, k0 = _rss_history[0]
+            t1, k1 = _rss_history[-1]
+            dt_hr = (t1 - t0) / 3600.0
+            if dt_hr > 0:
+                growth = (k1 - k0) / dt_hr
+    return {
+        "rss_kb":           rss_kb,
+        "rss_peak_kb":      peak,
+        "samples":          n,
+        "growth_kb_per_hr": round(growth, 1),
+    }
+
+
+def capture_recent_log_lines(n: int = 50) -> List[str]:
+    """M2 — the most recent N activity-log rows (oldest→newest) as formatted
+    strings, so control_api can fold them into the boot report after an unclean
+    restart. Reuses database.get_activity_log; never raises."""
+    try:
+        rows = database.get_activity_log(limit=max(1, int(n)))
+    except Exception:
+        return []
+    out: List[str] = []
+    for r in reversed(rows):   # get_activity_log returns newest-first
+        ts = r.get("timestamp", "")
+        lvl = str(r.get("level", "info")).upper()
+        msg = r.get("message", "")
+        out.append(f"[{ts}] {lvl}: {msg}")
+    return out
+
+
 def detect_restart_reason() -> dict:
     """K3.3 — classify this boot as clean vs crash. control_api calls this once at
     boot (after load_risk_latches) and logs the result. Returns
@@ -5348,6 +5604,7 @@ def _entry_heartbeat_loop() -> None:
     while True:
         try:
             _refresh_heartbeat_ts()   # K3.3 — liveness marker for crash detection
+            _sample_rss()             # M2 — RSS sampling for leak/OOM detection
             cfg = _entries_cfg()
             interval = max(1.0, float(cfg.get("eval_heartbeat_sec", 15.0)))
             if not cfg["tick_entries"]:   # tick mode has its own dispatch path
@@ -6532,6 +6789,38 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # max_positions from the root key as before.
     _slots_info = effective_slots()
     max_pos = _slots_info["effective_slots"]
+
+    # ── M1.2 — neutral-regime risk reduction via SLOTS (not ticket size) ──────
+    # Resolve the effective neutral-scaling mode once per scan. In "slots" mode
+    # we do NOT shrink the ticket (get_budget_for_coin keeps full size); instead
+    # we cap concurrent NEW entries (≈half the slots) AND double the entry pacing
+    # so notional stays tradeable. "size" keeps the legacy ticket multiplier;
+    # "off" disables scaling. The decision is logged once per transition.
+    _eff_stagger  = _BUY_STAGGER_SEC
+    _eff_max_buys = _MAX_BUYS_PER_SCAN
+    try:
+        _regime_now = get_btc_regime()
+        if _regime_now == "neutral":
+            _neutral_mode = _resolve_neutral_scaling(
+                {"neutral_scaling_mode": _neutral_scaling_mode_cfg()},
+                _slots_info["effective_allocation"],
+                _slots_info["max_positions"],
+                _tradeable_min(),
+            )
+            if _neutral_mode == "slots" and max_pos > 0:
+                _nmult = _neutral_size_mult()
+                _slot_cap = max(1, min(math.ceil(max_pos * _nmult),
+                                       max(1, max_pos // 2)))
+                max_pos = min(max_pos, _slot_cap)
+                _eff_stagger  = _BUY_STAGGER_SEC * 2.0
+                _eff_max_buys = max(1, _MAX_BUYS_PER_SCAN // 2)
+            _log_neutral_scaling_transition(_regime_now, _neutral_mode,
+                                            _slots_info, max_pos)
+        else:
+            _log_neutral_scaling_transition(_regime_now, "n/a", _slots_info, max_pos)
+    except Exception:
+        pass
+
     with _positions_lock:
         n_open = len(_positions)
     if n_open >= max_pos:
@@ -6793,14 +7082,15 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         except Exception:
             pass
 
-        # ── Stagger gate — max _MAX_BUYS_PER_SCAN buys per cycle ──────────────
-        if _buys_this_scan >= _MAX_BUYS_PER_SCAN:
+        # ── Stagger gate — max _eff_max_buys buys per cycle (M1.2: halved in
+        # neutral "slots" mode; _eff_stagger is likewise doubled there) ────────
+        if _buys_this_scan >= _eff_max_buys:
             database.log_activity(
-                f"Buy scan: capped at {_MAX_BUYS_PER_SCAN} buys this cycle — "
+                f"Buy scan: capped at {_eff_max_buys} buys this cycle — "
                 f"remaining coins evaluated next cycle", "info"
             )
             break
-        if time.time() - _last_buy_ts < _BUY_STAGGER_SEC:
+        if time.time() - _last_buy_ts < _eff_stagger:
             continue  # this slot too soon — try next coin in case it's been longer
 
         # ── Falling knife filter (§3.4a — volatility-scaled) ──────────────────
@@ -6890,10 +7180,41 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # universe — out of scope, documented on _maybe_log_promo_pair).
         _maybe_log_promo_pair(sym)
 
-        budget = get_budget_for_coin(sym, usdt_balance)
+        _budget_info = _resolve_entry_budget(sym, usdt_balance)
+        budget = _budget_info["resolved"]
         if budget <= 0:
             _record_rejection(sym, score, "no_capital", f"usdt={usdt_balance:.2f}")
             database.log_activity(f"{sym}: buy skipped — budget=0 (mode={mode}, usdt={usdt_balance:.2f})", "warn")
+            continue
+
+        # ── M1.1 — sizing floor AFTER all multipliers, with an honest message ──
+        # tradeable_min = max(exchange minNotional, sizing.min_position_usdt, 10).
+        # A shortfall the ENGINE created by multiplying (neutral "size" mode)
+        # prints the full arithmetic chain and NEVER tells the operator to change
+        # a setting; only a RAW-configured shortfall (no multiplier applied) may
+        # point at Settings. K2.3 candidacy-cooldown + 15-min dedupe are kept so
+        # the skip is not re-spammed every heartbeat.
+        _tmin = _tradeable_min(sym)
+        if budget < _tmin:
+            _candidacy_cooldown[sym] = time.time() + _MAKER_ABANDON_COOLDOWN_SEC
+            if _budget_info["mult"] < 1.0:
+                _chain = (f"${_budget_info['base']:.2f} × {_budget_info['mult']:g} "
+                          f"({_budget_info['mult_label']}) = ${budget:.2f}")
+                _record_rejection(sym, score, "min_notional",
+                                  f"{_chain} < ${_tmin:.2f} min notional")
+                _log_skip_dedup(
+                    sym, "budget_below_min_notional",
+                    f"[SKIP] {sym}: {_chain} < ${_tmin:.2f} min notional — skipping "
+                    f"(engine-scaled ticket below tradeable minimum; candidacy "
+                    f"cooldown {_MAKER_ABANDON_COOLDOWN_SEC/60:.0f} min).", "warn")
+            else:
+                _record_rejection(sym, score, "min_notional",
+                                  f"configured=${budget:.2f} < ${_tmin:.2f} min notional")
+                _log_skip_dedup(
+                    sym, "budget_below_min_notional",
+                    f"[SKIP] {sym}: configured trade size ${budget:.2f} < ${_tmin:.2f} "
+                    f"min notional — increase trade size in Settings (candidacy "
+                    f"cooldown {_MAKER_ABANDON_COOLDOWN_SEC/60:.0f} min).", "warn")
             continue
 
         price = prices.get(sym) or cached["price"]
@@ -6969,23 +7290,12 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             database.log_activity(f"{sym}: buy skipped — market closed/delisted (blacklisted this session)", "warn")
             continue
 
-        # Binance minimum notional is $10 for most spot pairs — reject early
-        # so we don't waste an API call and get a cryptic -1013 error.
-        if mode == "live" and budget < 10.0:
-            _record_rejection(sym, score, "min_notional",
-                              f"budget=${budget:.2f} < $10 Binance minimum")
-            # K2.3 — a per-trade budget below the tradeable minimum won't change
-            # for ~15s (until the balance/sizing shifts), so re-evaluating this
-            # symbol every heartbeat only spams the log. Route it into the standard
-            # 5-min candidacy cooldown (same gate maker-abandon/score-fail use) and
-            # emit ONE deduped line. The budget math itself is unchanged.
-            _candidacy_cooldown[sym] = time.time() + _MAKER_ABANDON_COOLDOWN_SEC
-            _log_skip_dedup(
-                sym, "budget_below_min_notional",
-                f"[SKIP] {sym}: buy skipped — budget ${budget:.2f} < $10 Binance "
-                f"minimum notional (increase trade size in Settings) — candidacy "
-                f"cooldown {_MAKER_ABANDON_COOLDOWN_SEC/60:.0f} min.", "warn")
-            continue
+        # Binance minimum notional ($10 for most spot pairs) is now enforced
+        # up-front by the M1.1 sizing floor (resolved_budget < tradeable_min),
+        # which prints the honest computation chain instead of the old
+        # "increase trade size in Settings" message that blamed a config value
+        # the engine itself had shrunk by multiplying. The post-lot-rounding
+        # minNotional guard above still catches lot-step shortfalls.
 
         # ── Atomic claim — BEFORE the slow REST gates below ─────────────────────
         # The fresh re-check + reversal confirmation take multiple seconds. If the
