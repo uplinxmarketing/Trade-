@@ -376,6 +376,125 @@ def _fresh_maker_bid(sym: str):
         return None
 
 
+# ── L (v0.4) — live bid/ask + spread for the taker fallback and friction gate ─
+def _fresh_book(sym: str):
+    """(bid, ask) from the freshest source used for maker pricing — fresh WS
+    bookTicker (<5s) → 2s on-demand cache → on-demand PUBLIC REST bookTicker
+    (gated). (None, None) when every source fails. Mirrors _fresh_maker_bid's
+    ladder so the spread seen here matches the book the maker post priced off."""
+    # 1. Fresh WS bookTicker (held-symbol stream, <5s) — carries bid + ask.
+    try:
+        import data_collector as _dc_bk
+        bt = _dc_bk.book_ticker.get(sym)
+        if bt and (time.time() - float(bt.get("ts", 0) or 0)) <= 5.0:
+            b = float(bt.get("bid") or 0)
+            a = float(bt.get("ask") or 0)
+            if b > 0 and a > 0:
+                return b, a
+    except Exception:
+        pass
+    # 2. Recent on-demand cache (2s TTL) — (bid, ask, ts).
+    ce = _bookticker_cache.get(sym)
+    if ce and (time.time() - ce[2]) <= _BOOKTICKER_CACHE_TTL:
+        if ce[0] > 0 and ce[1] > 0:
+            return ce[0], ce[1]
+    # 3. Universe streaming on → trust the WS book, do not spend REST weight.
+    try:
+        if _entries_cfg().get("bookticker_universe"):
+            return None, None
+    except Exception:
+        pass
+    # 4. On-demand REST fetch, gated through binance_limits.can_spend.
+    try:
+        bl = _get_blimits()
+        if bl is not None and not bl.can_spend(2, critical=True):
+            return None, None
+    except Exception:
+        pass
+    try:
+        bt = binance_direct.get_book_ticker(sym)
+        b = float(bt.get("bidPrice") or 0)
+        a = float(bt.get("askPrice") or 0)
+        _bookticker_cache[sym] = (b, a, time.time())
+        if b > 0 and a > 0:
+            return b, a
+    except Exception:
+        pass
+    return None, None
+
+
+def _spread_pcts(sym: str):
+    """(full_spread_pct, half_spread_pct) over mid from the freshest book, or
+    (None, None) when unavailable. full = (ask-bid)/mid×100; half ≈ the taker
+    cost of crossing a marketable order over mid."""
+    bid, ask = _fresh_book(sym)
+    if not bid or not ask or bid <= 0 or ask <= 0 or ask < bid:
+        return None, None
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return None, None
+    full = (ask - bid) / mid * 100.0
+    return full, full / 2.0
+
+
+# ── L2.2 — 24h quote-volume liquidity source ─────────────────────────────────
+_qv24h_cache: Dict[str, tuple] = {}   # sym -> (qv_usd or None, ts)
+_QV24H_CACHE_TTL = 300.0              # 5 min — 24h volume moves slowly
+# L2.2 — thin liquidity is a stable property (not transient), so a failed
+# liquidity check parks the symbol for a longer cooldown than the 60s candidacy
+# cooldown used for transient re-check failures.
+_LIQUIDITY_COOLDOWN_SEC = 1800.0     # 30 min
+
+
+def _quote_volume_24h_usd(symbol: str):
+    """24h quote volume in USDT for `symbol`, summed from the durable 1m kline
+    store (quote_v column) over the last 24h; falls back to Σ close×base_volume
+    when quote_v is absent (WS-persisted klines store base volume only). Cached
+    5 min. Returns None when no kline data exists at all (caller fails open —
+    a missing liquidity stat must never block a real candidate). No REST weight."""
+    now = time.time()
+    ce = _qv24h_cache.get(symbol)
+    if ce and (now - ce[1]) < _QV24H_CACHE_TTL:
+        return ce[0]
+    qv = None
+    try:
+        start_ms = int((now - 86400.0) * 1000)
+        rows = database.get_klines(symbol, config.CANDLE_TIMEFRAME, start_ms=start_ms)
+        vals = [float(r["quote_v"]) for r in (rows or [])
+                if r.get("quote_v") is not None]
+        if vals:
+            qv = sum(vals)
+        elif rows:
+            approx = [float(r["c"]) * float(r["v"]) for r in rows
+                      if r.get("c") is not None and r.get("v") is not None]
+            if approx:
+                qv = sum(approx)
+    except Exception:
+        qv = None
+    _qv24h_cache[symbol] = (qv, now)
+    return qv
+
+
+def _planned_sl_distance_pct(symbol: str, price: float):
+    """The 1R stop distance (%) the exit geometry WOULD assign to an entry at
+    `price` right now — same clamp/legacy rules as _apply_entry_exit_geometry
+    (which only runs post-fill). Used by the L2.1 friction gate to size friction
+    against the risk budget BEFORE ordering. None when the stop is disabled
+    (legacy mapping) → the gate then fails open."""
+    try:
+        cfg = _exit_cfg()
+    except Exception:
+        return None
+    if price <= 0:
+        return None
+    if cfg["legacy_mode"]:
+        return cfg["sl_min_pct"] if cfg["sl_enabled"] else None
+    atr_pct, _ = _atr_pct_5m_at_entry(symbol, price)
+    if atr_pct is None:
+        return cfg["sl_min_pct"]   # conservative tight stop (matches geometry)
+    return min(max(cfg["k_sl"] * atr_pct, cfg["sl_min_pct"]), cfg["sl_max_pct"])
+
+
 # ── G1a — maker-entry abandon churn control ──────────────────────────────────
 # A symbol whose maker entry abandons repeatedly (no book, taker disabled, etc.)
 # would otherwise re-select every scan and log a warning every ~10s. After
@@ -460,9 +579,11 @@ def _execute_maker_first_buy(sym: str, budget: float,
         PARTIALLY_FILLED at timeout → cancel remainder, keep the filled part.
         Unfilled → cancel + repost, up to entries.max_reposts reposts after
         the initial post.
-      * chase exhausted → one taker market buy iff entries.taker_fallback AND
-        `signal_still_holds()` (quick re-check of the cached engine decision);
-        otherwise abandon (return None — the CALLER releases the _buying claim
+      * chase exhausted → one taker market buy (L1.1) iff `signal_still_holds()`
+        (quick re-check of the cached engine decision) AND EITHER legacy
+        entries.taker_fallback=true (always cross) OR the live full spread% is
+        <= entries.taker_fallback_max_spread_pct (spread-guarded, default 0.05).
+        Otherwise abandon (return None — the CALLER releases the _buying claim
         and records the 'maker_chase_abandoned' rejection).
 
     Paper mode never reaches this function — the existing simulated market-buy
@@ -471,17 +592,55 @@ def _execute_maker_first_buy(sym: str, budget: float,
     Returns the _parse_entry_order dict (fill_price / qty / buy_fee_usdt /
     spent_quote / entry_is_maker) or None on abandonment.
     """
-    cfg = _entries_cfg()
-    chase_sec  = max(0.5, float(cfg["chase_seconds"]))
-    max_reposts = max(0, int(cfg["max_reposts"]))
-    taker_fb   = bool(cfg["taker_fallback"])
+    chase_sec  = max(0.5, float(_entries_cfg()["chase_seconds"]))
+    max_reposts = max(0, int(_entries_cfg()["max_reposts"]))
+
+    # L1.2 — count order_posted exactly once per entry attempt (a chase may
+    # repost several times; the taker fallback may follow a maker post). The
+    # flag ensures the funnel stage is incremented once, not per order.
+    _posted = {"done": False}
+
+    def _mark_posted():
+        if not _posted["done"]:
+            _posted["done"] = True
+            _funnel_incr("order_posted")
 
     def _taker_fallback_buy(why: str):
-        if not taker_fb:
+        # L1.1 — spread-conditional taker fallback. Config is read at time of
+        # use. Two ways to cross instead of abandoning:
+        #   (a) legacy entries.taker_fallback=true  → always cross (old behavior)
+        #   (b) new spread-guarded path (default ON via
+        #       entries.taker_fallback_max_spread_pct=0.05): cross ONLY when the
+        #       live full spread% is <= the ceiling; else abandon.
+        _cfg_fb = _entries_cfg()
+        legacy_fb  = bool(_cfg_fb["taker_fallback"])
+        max_spread = float(_cfg_fb["taker_fallback_max_spread_pct"])
+        if legacy_fb:
+            fb_msg = f"{sym}: maker chase → taker fallback market buy ({why})"
+        elif max_spread > 0:
+            full_sp, half_sp = _spread_pcts(sym)
+            if full_sp is None:
+                database.log_activity(
+                    f"{sym}: maker-first entry abandoned — {why}; live spread "
+                    f"unavailable, spread-guarded taker fallback cannot verify "
+                    f"cost — abandoning", "warn")
+                return None
+            if full_sp > max_spread:
+                database.log_activity(
+                    f"{sym}: maker-first entry abandoned — {why}; spread "
+                    f"{full_sp:.2f}% > {max_spread:.2f}% taker-fallback ceiling "
+                    f"(too wide to cross)", "warn")
+                return None
+            fb_msg = (f"{sym}: maker chase exhausted, spread {full_sp:.2f}% "
+                      f"<= {max_spread:.2f}% — taker fallback filled "
+                      f"(cost ~{half_sp:.3f}% half-spread)")
+        else:
             database.log_activity(
                 f"{sym}: maker-first entry abandoned — {why} "
-                f"(entries.taker_fallback=false)", "warn")
+                f"(entries.taker_fallback=false, "
+                f"taker_fallback_max_spread_pct=0)", "warn")
             return None
+        # Existing safety gate — only cross while the cached decision still holds.
         if signal_still_holds is not None:
             try:
                 if not signal_still_holds():
@@ -491,10 +650,10 @@ def _execute_maker_first_buy(sym: str, budget: float,
                     return None
             except Exception:
                 pass
-        database.log_activity(
-            f"{sym}: maker chase → taker fallback market buy ({why})", "info")
+        database.log_activity(fb_msg, "info")
         result = _market_buy(sym, budget)
         _log_order_result("BUY", sym, 0.0, 0.0, result)
+        _mark_posted()
         return _parse_entry_order(sym, result, 0.0, is_maker=False)
 
     reposts = 0            # reposts AFTER the initial post (-2010 counts too)
@@ -530,6 +689,7 @@ def _execute_maker_first_buy(sym: str, budget: float,
                 continue
             raise
         _log_high_order_count(sym, "maker order posted")
+        _mark_posted()   # L1.2 — first maker post placed (once per attempt)
 
         order_id = int(order.get("orderId", 0) or 0)
         status = order.get("status", "NEW")
@@ -853,6 +1013,18 @@ _LOSS_COOLDOWN_SEC = 1800  # 30 minutes
 #   max_lot_waste_pct       (5.0)   lot-step rounding-waste ceiling (% of budget);
 #                                   below it the buy PROCEEDS with the floored qty
 #                                   (only exchange minNotional is a hard floor).
+# v0.4 Part L — entry-quality keys (READ here at time of use):
+#   taker_fallback_max_spread_pct (0.05) L1.1: when the maker chase is exhausted
+#                                   and legacy taker_fallback is OFF, cross with a
+#                                   MARKET buy anyway IFF the live full spread% is
+#                                   <= this ceiling (0 disables the spread-guarded
+#                                   fallback → abandon as before).
+#   max_friction_of_stop    (15.0)  L2.1: skip an entry when friction
+#                                   (half_spread% + recent avg exit slippage%)
+#                                   exceeds this percent of the planned 1R stop
+#                                   distance (structurally poor entry).
+#   min_quote_volume_24h_usd (20000000) L2.2: skip symbols whose 24h quote
+#                                   volume (USDT) is below this liquidity floor.
 _ENTRIES_DEFAULTS = {
     "eval_heartbeat_sec":     15.0,
     "tick_entries":           False,
@@ -866,6 +1038,9 @@ _ENTRIES_DEFAULTS = {
     "bookticker_universe":    False,
     "maker_abandon_max":      3,
     "max_lot_waste_pct":      5.0,
+    "taker_fallback_max_spread_pct": 0.05,
+    "max_friction_of_stop":   15.0,
+    "min_quote_volume_24h_usd": 20000000.0,
 }
 
 
@@ -3067,6 +3242,74 @@ def get_decision_trace() -> Dict[str, dict]:
         for sym, ent in _decision_trace.items():
             out[sym] = {k: v for k, v in ent.items() if not k.startswith("_")}
     return out
+
+
+# ── L1.2 — entry-funnel stage counters ───────────────────────────────────────
+# Per-UTC-day counts of how many symbol-evaluations reached each buy-pipeline
+# stage, so "coins staying on buy" always decomposes into a named stage instead
+# of silently vanishing. Stages (in funnel order):
+#   ready              → symbol was buy-ready / a candidate this heartbeat
+#   fresh_recheck_pass → passed the fresh re-evaluation before committing
+#   budget_pass        → resolved budget >= tradeable min
+#   order_posted       → a maker/taker order was actually placed
+#   filled             → the entry confirmed (qty > 0)
+# NOTE: budget resolution happens upstream of the fresh re-check in this
+# pipeline, so budget_pass may exceed fresh_recheck_pass — each counter is
+# incremented at the point its own condition is genuinely determined, not
+# forced into strict funnel monotonicity. O(1) per event (a dict increment
+# under a lock); NO per-event rows are persisted. Counters roll over at the
+# UTC-day boundary, keeping the previous day's snapshot for comparison.
+_FUNNEL_STAGES = ("ready", "fresh_recheck_pass", "budget_pass",
+                  "order_posted", "filled")
+_funnel_lock = threading.Lock()
+
+
+def _funnel_utc_day() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+_funnel_counts: Dict[str, int] = {s: 0 for s in _FUNNEL_STAGES}
+_funnel_day: str = _funnel_utc_day()
+_funnel_prev: Dict[str, int] = {s: 0 for s in _FUNNEL_STAGES}
+_funnel_prev_day: Optional[str] = None
+
+
+def _funnel_rollover_locked() -> None:
+    """Roll counters to a new UTC day, snapshotting the finished day into
+    _funnel_prev. Caller holds _funnel_lock."""
+    global _funnel_counts, _funnel_day, _funnel_prev, _funnel_prev_day
+    today = _funnel_utc_day()
+    if today != _funnel_day:
+        _funnel_prev = dict(_funnel_counts)
+        _funnel_prev_day = _funnel_day
+        _funnel_counts = {s: 0 for s in _FUNNEL_STAGES}
+        _funnel_day = today
+
+
+def _funnel_incr(stage: str) -> None:
+    """Increment one entry-funnel stage counter for today (UTC). O(1); an
+    unknown stage is ignored so a typo can never raise on the hot buy path."""
+    with _funnel_lock:
+        if stage not in _funnel_counts:
+            return
+        _funnel_rollover_locked()
+        _funnel_counts[stage] += 1
+
+
+def get_funnel_stats() -> dict:
+    """L1.2 public reader: today's entry-funnel stage counts plus yesterday's
+    snapshot. Shape:
+      {day, ready, fresh_recheck_pass, budget_pass, order_posted, filled,
+       prev_day: {day, ready, fresh_recheck_pass, budget_pass,
+                  order_posted, filled}}"""
+    with _funnel_lock:
+        _funnel_rollover_locked()
+        out: dict = {"day": _funnel_day}
+        out.update({s: _funnel_counts[s] for s in _FUNNEL_STAGES})
+        prev: dict = {"day": _funnel_prev_day}
+        prev.update({s: _funnel_prev.get(s, 0) for s in _FUNNEL_STAGES})
+        out["prev_day"] = prev
+        return out
 
 
 def _record_rejection(symbol: str, score, reason: str, detail: str = ""):
@@ -6934,6 +7177,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # cached-green vs engine-ready-fresh distinction and the DECISION-GAP
         # detector. cached_green mirrors the pre-check's ready test.
         _trace_mark_evaluated(sym, cached.get("score", 0) >= min_sigs)
+        # L1.2 — funnel stage 1: this symbol is buy-ready (cached-green) this
+        # heartbeat. Counted alongside the Part J decision-trace hook.
+        if cached.get("score", 0) >= min_sigs:
+            _funnel_incr("ready")
         # F6: skip coins in the post-fail candidacy cooldown (prevents ~7s churn
         # of a coin the fresh engine re-check just rejected).
         if _in_candidacy_cooldown(sym):
@@ -7216,6 +7463,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     f"min notional — increase trade size in Settings (candidacy "
                     f"cooldown {_MAKER_ABANDON_COOLDOWN_SEC/60:.0f} min).", "warn")
             continue
+        # L1.2 — funnel stage: resolved budget cleared the tradeable minimum.
+        _funnel_incr("budget_pass")
 
         price = prices.get(sym) or cached["price"]
         if not price:
@@ -7277,6 +7526,65 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             continue
         # Within tolerance — proceed and clear any stale oversized-ticket flag.
         _lot_waste_flags.pop(sym, None)
+
+        # ── L2.2 — liquidity floor (cheap check first) ────────────────────────
+        # Skip symbols whose 24h quote volume (USDT) is below the configured
+        # floor: thin books slip badly on both entry and exit. 24h quote volume
+        # is derived from the durable kline store (no REST weight). Unavailable
+        # → fail-open (never block a real candidate on a missing stat), logged
+        # via the deduper. Thinness is a stable property, so a failure routes to
+        # a 30-min cooldown rather than the 60s candidacy cooldown. Config read
+        # at time of use.
+        _qv_floor = float(_entries_cfg().get("min_quote_volume_24h_usd", 0.0))
+        if _qv_floor > 0:
+            _qv = _quote_volume_24h_usd(sym)
+            if _qv is None:
+                _log_skip_dedup(
+                    sym, "liquidity_stat_missing",
+                    f"{sym}: 24h quote volume unavailable (no kline store rows) "
+                    f"— liquidity floor not enforced (fail-open)", "info")
+            elif _qv < _qv_floor:
+                _candidacy_cooldown[sym] = time.time() + _LIQUIDITY_COOLDOWN_SEC
+                _record_rejection(
+                    sym, score, "thin_liquidity",
+                    f"24h quote vol ${_qv/1e6:.1f}M < ${_qv_floor/1e6:.0f}M floor")
+                _log_skip_dedup(
+                    sym, "thin_liquidity",
+                    f"[SKIP] {sym}: 24h quote vol ${_qv/1e6:.1f}M < "
+                    f"${_qv_floor/1e6:.0f}M floor — skipping (thin). Cooldown "
+                    f"{_LIQUIDITY_COOLDOWN_SEC/60:.0f} min.", "warn")
+                continue
+
+        # ── L2.1 — friction gate ──────────────────────────────────────────────
+        # friction = half_spread% + recent avg exit slippage%. When friction eats
+        # more than entries.max_friction_of_stop percent of the planned 1R stop
+        # distance, the entry is structurally poor (round-trip cost swamps the
+        # risk budget) — skip and route to the candidacy cooldown. Missing
+        # slippage history → 0 (never block a symbol's first trade); missing
+        # spread or stop distance → fail-open. Config read at time of use.
+        _fric_cap_pct = float(_entries_cfg().get("max_friction_of_stop", 0.0))
+        if _fric_cap_pct > 0:
+            _full_sp, _half_sp = _spread_pcts(sym)
+            _stop_pct = _planned_sl_distance_pct(sym, price)
+            if _half_sp is not None and _stop_pct and _stop_pct > 0:
+                _slip_bps = _avg_slippage_bps(sym)   # rolling |exit slippage|
+                _slip_pct = (_slip_bps / 100.0) if _slip_bps is not None else 0.0
+                _friction = _half_sp + _slip_pct
+                _stop_budget = _fric_cap_pct / 100.0 * _stop_pct
+                if _friction > _stop_budget:
+                    _candidacy_cooldown[sym] = (
+                        time.time() + _MAKER_ABANDON_COOLDOWN_SEC)
+                    _record_rejection(
+                        sym, score, "high_friction",
+                        f"friction {_friction:.3f}% > {_fric_cap_pct:g}% of "
+                        f"{_stop_pct:.3f}% stop ({_stop_budget:.3f}%)")
+                    _log_skip_dedup(
+                        sym, "high_friction",
+                        f"[SKIP] {sym}: friction {_friction:.2f}% > "
+                        f"{_fric_cap_pct:g}% of {_stop_pct:.2g}% stop "
+                        f"({_stop_budget:.3f}%) — skipping "
+                        f"(structurally poor entry).", "warn")
+                    continue
 
         _client().update_price(sym, price)
 
@@ -7444,6 +7752,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # the entry attempt, and emit ONE deduped INFO line so the operator sees
         # the engine actually tried (the "green but no purchase, no logs" gap).
         _trace_mark_engine_ready(sym)
+        # L1.2 — funnel stage: passed the fresh re-evaluation (engine-ready).
+        _funnel_incr("fresh_recheck_pass")
         _trace_mark_attempt(sym)
         _log_skip_dedup(
             sym, "entry_attempt",
@@ -7498,6 +7808,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 # Live mode: geo-block-safe direct transport; raises in paper fallback.
                 result = _market_buy(sym, budget)
                 _log_order_result("BUY", sym, budget / max(price, 1e-12), price, result)
+                # L1.2 — funnel stage: taker/paper market order placed. (The
+                # maker-first path increments order_posted internally.)
+                _funnel_incr("order_posted")
         except Exception as e:
             _release_buy_claim()
             err_str = str(e)
@@ -7535,6 +7848,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         if qty <= 0:
             _release_buy_claim()
             continue
+        # L1.2 — funnel stage: the entry is confirmed filled (qty > 0), for both
+        # the maker-first and taker/paper paths.
+        _funnel_incr("filled")
 
         if not _use_maker_first:
             # Compute actual buy fee in USDT across all fills.

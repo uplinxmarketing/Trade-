@@ -4166,6 +4166,31 @@ def api_health_data():
         }
 
 
+def _funnel_stats() -> dict:
+    """L1.2 — signal→fill funnel counters from the engine. Guarded via getattr so
+    an older trade_engine (without get_funnel_stats) degrades to
+    {"available": False}. Shape when present:
+    {day, ready, fresh_recheck_pass, budget_pass, order_posted, filled, prev_day}.
+    Cheap — no Binance calls."""
+    try:
+        import trade_engine as _te
+        fn = getattr(_te, "get_funnel_stats", None)
+        if fn is None:
+            return {"available": False}
+        stats = fn()
+        return stats if isinstance(stats, dict) else {"available": False}
+    except Exception as e:
+        return {"available": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/funnel")
+def api_funnel():
+    """L1.2 — signal→fill funnel counters (ready → fresh_recheck_pass →
+    budget_pass → order_posted → filled) for today, plus prev_day. Sourced from
+    trade_engine.get_funnel_stats(); {"available": False} on older engines."""
+    return _funnel_stats()
+
+
 @app.get("/api/diagnostics")
 def api_diagnostics():
     """Comprehensive bot health snapshot. Zero extra Binance calls — all data is in-memory."""
@@ -4282,6 +4307,9 @@ def api_diagnostics():
             "active_threads_count": len(active_threads),
             "active_threads":       active_threads,
         },
+        # L1.2 — signal→fill funnel counters (guarded; {"available": false} on
+        # older engines). Folded here so copy-diagnostics carries it.
+        "funnel": _funnel_stats(),
         # M2 — engine RSS + growth (guarded; {"available": false} on older engines).
         "memory": _memory_stats_section(),
         # M2 — restart classification + the last 50 log lines captured at boot
@@ -7173,6 +7201,12 @@ _backtest_jobs: dict = {}          # job_id -> job dict (insertion-ordered)
 _backtest_jobs_lock = threading.Lock()
 _BACKTEST_KEEP = 5
 
+# ── L3: lever-matrix single-flight guard ────────────────────────────────────
+_lever_matrix_running = False
+_lever_matrix_lock = threading.Lock()
+_lever_matrix_last_run_ts: Optional[float] = None
+_lever_matrix_run_id: Optional[str] = None
+
 
 def _run_backtest_job(job_id: str, start_ms: int, end_ms: int,
                       symbols: list, strategy: dict):
@@ -7291,6 +7325,82 @@ def api_backtest_status(job_id: str):
         return job
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+# ── L3: backtester lever-matrix ─────────────────────────────────────────────
+
+def _run_lever_matrix_job(run_id: str, months: float, symbols: Optional[list]):
+    """Background worker: runs the deterministic lever matrix and persists its
+    report (lever_matrix does the save_setting itself). Clears the running flag
+    on exit no matter what."""
+    global _lever_matrix_running, _lever_matrix_last_run_ts
+    try:
+        import lever_matrix as _lm
+        _lm.run_lever_matrix(months=months, symbols=symbols)
+    except Exception:
+        # Never let a worker crash bubble; the flag reset below is what matters.
+        pass
+    finally:
+        with _lever_matrix_lock:
+            _lever_matrix_running = False
+            _lever_matrix_last_run_ts = time.time()
+
+
+@app.post("/api/backtest/lever-matrix")
+def api_lever_matrix_start(months: float = 3.0, symbols: Optional[str] = None):
+    """L3 — kick a lever-matrix backtest sweep in a BACKGROUND thread (long-
+    running; never blocks the event loop). Returns immediately with the run_id.
+    409 if a run is already in flight; 503 if lever_matrix isn't installed."""
+    global _lever_matrix_running, _lever_matrix_run_id
+    try:
+        import lever_matrix as _lm  # noqa: F401 — presence check only
+    except ImportError:
+        return JSONResponse({"error": "backtester not available"}, status_code=503)
+
+    try:
+        months = max(0.1, min(60.0, float(months)))
+    except (TypeError, ValueError):
+        months = 3.0
+    sym_list: Optional[list] = None
+    if symbols:
+        sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()] or None
+
+    with _lever_matrix_lock:
+        if _lever_matrix_running:
+            return JSONResponse(
+                {"error": "lever-matrix already running",
+                 "run_id": _lever_matrix_run_id},
+                status_code=409)
+        _lever_matrix_running = True
+        _lever_matrix_run_id = uuid.uuid4().hex[:8]
+        run_id = _lever_matrix_run_id
+
+    threading.Thread(
+        target=_run_lever_matrix_job,
+        args=(run_id, months, sym_list),
+        name=f"lever-matrix-{run_id}", daemon=True,
+    ).start()
+    return {"started": True, "run_id": run_id, "months": months,
+            "symbols": sym_list}
+
+
+@app.get("/api/backtest/lever-matrix")
+def api_lever_matrix_report():
+    """L3 — last persisted lever-matrix edge report (settings KV key
+    'backtest_lever_matrix_json'), plus {running, last_run_ts}. Never 500s."""
+    report = None
+    try:
+        raw = database.get_setting("backtest_lever_matrix_json")
+        if raw:
+            report = json.loads(raw)
+    except Exception:
+        report = None
+    with _lever_matrix_lock:
+        running = _lever_matrix_running
+        last_run_ts = _lever_matrix_last_run_ts
+        run_id = _lever_matrix_run_id
+    return {"report": report, "running": running,
+            "last_run_ts": last_run_ts, "run_id": run_id}
 
 
 # ── Expectancy stats ─────────────────────────────────────────────────────────
@@ -7464,6 +7574,108 @@ def api_stats_expectancy(days: int = 30, mode: Optional[str] = None,
         }
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/analytics/sessions")
+def api_analytics_sessions():
+    """L2.3 — session/hour expectancy from ALL closed trades in the DB.
+
+    Buckets every closed trade by its OPEN time (timestamp_buy, UTC):
+      • session — Asia (00:00–07:00), EU (07:00–14:00), US (14:00–24:00)
+      • hour    — 0–23 UTC
+    Per bucket: trade_count, win_rate, expectancy (avg net_profit per trade),
+    avg_slippage_bps (from sell_slippage_pct × 100, exit slippage; null when the
+    column is empty). Honesty rule (I3.2): low_sample=True when trade_count<20.
+    Heavy SQL — sync `def` route so it runs on the threadpool, not the loop."""
+    try:
+        import sqlite3 as _sq
+
+        def _sess(h: int) -> str:
+            if 0 <= h < 7:
+                return "Asia"
+            if 7 <= h < 14:
+                return "EU"
+            return "US"
+
+        conn = _sq.connect(database.DB_PATH)
+        conn.row_factory = _sq.Row
+        try:
+            rows = conn.execute("""
+                SELECT net_profit, sell_slippage_pct, timestamp_buy
+                FROM trades
+                WHERE exit_price IS NOT NULL AND net_profit IS NOT NULL
+                      AND timestamp_buy IS NOT NULL
+            """).fetchall()
+        finally:
+            conn.close()
+
+        # Accumulators: session name / hour int -> running aggregates.
+        sess_acc: dict = {"Asia": [], "EU": [], "US": []}
+        hour_acc: dict = {h: [] for h in range(24)}
+        data_start = None
+        n_total = 0
+        for r in rows:
+            ts = r["timestamp_buy"]
+            if not ts:
+                continue
+            try:
+                hour = int(ts[11:13])
+            except (ValueError, TypeError):
+                continue
+            if hour < 0 or hour > 23:
+                continue
+            n_total += 1
+            if data_start is None or ts < data_start:
+                data_start = ts
+            pnl = float(r["net_profit"] or 0.0)
+            # sell_slippage_pct is a percent → bps = ×100. None when unrecorded.
+            sp = r["sell_slippage_pct"]
+            slip_bps = float(sp) * 100.0 if sp is not None else None
+            rec = (pnl, slip_bps)
+            sess_acc[_sess(hour)].append(rec)
+            hour_acc[hour].append(rec)
+
+        def _summ(recs: list) -> dict:
+            cnt = len(recs)
+            if cnt == 0:
+                return {"trade_count": 0, "win_rate": 0.0, "expectancy": 0.0,
+                        "avg_slippage_bps": None, "low_sample": True}
+            pnls = [p for p, _ in recs]
+            wins = sum(1 for p in pnls if p > 0)
+            slips = [s for _, s in recs if s is not None]
+            return {
+                "trade_count": cnt,
+                "win_rate": round(100.0 * wins / cnt, 1),
+                "expectancy": round(sum(pnls) / cnt, 4),
+                "avg_slippage_bps": (round(sum(slips) / len(slips), 2)
+                                     if slips else None),
+                "low_sample": cnt < _LOW_SAMPLE_N,
+            }
+
+        _ranges = {"Asia": "00:00-07:00", "EU": "07:00-14:00", "US": "14:00-24:00"}
+        sessions = []
+        for name in ("Asia", "EU", "US"):
+            s = _summ(sess_acc[name])
+            s["name"] = name
+            s["utc_range"] = _ranges[name]
+            sessions.append(s)
+
+        hours = []
+        for h in range(24):
+            s = _summ(hour_acc[h])
+            s["hour"] = h
+            hours.append(s)
+
+        return {
+            "sessions": sessions,
+            "hours": hours,
+            "data_start": data_start,
+            "n_total": n_total,
+            "low_sample_n": _LOW_SAMPLE_N,
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}",
+                "sessions": [], "hours": [], "data_start": None, "n_total": 0}
 
 
 @app.get("/api/diagnostics/veto-stats")
