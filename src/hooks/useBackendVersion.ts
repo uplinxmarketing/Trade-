@@ -85,6 +85,23 @@ function parseCommit(data: unknown): string | null {
   return null;
 }
 
+// Tolerantly extract an optional string/timestamp field from a version/health
+// payload. These diagnostics fields (deploy_time, process_start, restart_reason)
+// are added by a parallel backend change and are ABSENT on older backends — the
+// caller must treat every returned value as possibly null and render nothing
+// when missing. Accepts strings and numeric epochs (returned as-is / stringified).
+function parseOptField(data: unknown, keys: string[]): string | null {
+  if (data && typeof data === 'object') {
+    const o = data as Record<string, unknown>;
+    for (const k of keys) {
+      const v = o[k];
+      if (typeof v === 'string' && v.trim()) return v.trim();
+      if (typeof v === 'number' && isFinite(v)) return String(v);
+    }
+  }
+  return null;
+}
+
 // Tolerantly extract a version string from whatever /api/version returns:
 // a bare string, {version}, {app_version}, {backend_version}, etc.
 function parseVersion(data: unknown): string | null {
@@ -107,6 +124,12 @@ export interface BackendVersionState {
   mismatch: boolean;
   /** True when both commits are known and differ. */
   commitMismatch: boolean;
+  /** Authoritative "deployed" timestamp from /api/version, when the backend exposes it (null on older backends). */
+  deployTime: string | null;
+  /** When the current process last started/restarted, from /api/version (null when absent). */
+  processStart: string | null;
+  /** Why the process last restarted, e.g. "deploy", "crash", "oom" (null when absent). */
+  restartReason: string | null;
   /** Asset filename the running server intends to serve (from /api/version/served). */
   servedAsset: string | null;
   /** Asset filename THIS browser bundle was actually served from. */
@@ -132,6 +155,9 @@ export function useBackendVersion(pollIntervalMs = 60_000): BackendVersionState 
   const [backendVersion, setBackendVersion] = useState<string | null>(null);
   const [backendCommit, setBackendCommit] = useState<string | null>(null);
   const [servedAsset, setServedAsset] = useState<string | null>(null);
+  const [deployTime, setDeployTime] = useState<string | null>(null);
+  const [processStart, setProcessStart] = useState<string | null>(null);
+  const [restartReason, setRestartReason] = useState<string | null>(null);
   const currentAsset = useRef<string | null>(currentAssetFilename()).current;
   const mismatchStreak = useRef(0);
 
@@ -151,6 +177,16 @@ export function useBackendVersion(pollIntervalMs = 60_000): BackendVersionState 
       // /api/version now includes the backend git commit — surface it for the footer.
       const verCommit = parseCommit(data);
       if (verCommit) setBackendCommit(verCommit);
+
+      // Optional deploy/restart diagnostics (parallel backend change). Only
+      // update when present so older backends that omit them don't clobber a
+      // previously-seen value with null.
+      const dt = parseOptField(data, ['deploy_time', 'deployed_at', 'deploy_ts']);
+      if (dt) setDeployTime(dt);
+      const ps = parseOptField(data, ['process_start', 'started_at', 'process_start_ts']);
+      if (ps) setProcessStart(ps);
+      const rr = parseOptField(data, ['restart_reason', 'restartReason']);
+      if (rr) setRestartReason(rr);
 
       // Definitive stale-bundle check: ask the server which index asset it
       // serves and compare against the script this page actually loaded. A
@@ -212,6 +248,9 @@ export function useBackendVersion(pollIntervalMs = 60_000): BackendVersionState 
     backendCommit,
     mismatch: (backendVersion != null && backendVersion !== APP_VERSION) || assetMismatch,
     commitMismatch,
+    deployTime,
+    processStart,
+    restartReason,
     servedAsset,
     currentAsset,
     assetMismatch,

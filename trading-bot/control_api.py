@@ -61,6 +61,67 @@ def _read_frontend_version() -> dict:
         except Exception:
             pass
     return {"version": "unknown", "buildTime": "", "commit": ""}
+
+
+# K3.1 — deploy-time boundary for the since_deploy analytics window. This MUST
+# be the BUILD/DEPLOY time, not the process start: a restart mid-session
+# (os.execv on update, crash-restart) re-stamps _PROCESS_START_TS and would
+# otherwise reset the window and hide trades that are already in the DB (today's
+# 7-loss streak read n=0 because the process restarted at 06:59Z after the
+# trades). Sourced from version.json buildTime — a stable build stamp that
+# survives restarts — and falls back to _PROCESS_START_TS only when no build
+# time is readable. Cached after first resolution.
+_DEPLOY_TS_CACHE: Optional[str] = None
+
+
+def _deploy_boundary_ts() -> str:
+    """Resolve the deploy-time boundary as a naive-UTC 'YYYY-MM-DDTHH:MM:SS'
+    string (same shape as _PROCESS_START_TS / the DB timestamp columns, so it
+    compares directly). Prefers version.json buildTime; falls back to the
+    process start when the build stamp is missing/unparseable."""
+    global _DEPLOY_TS_CACHE
+    if _DEPLOY_TS_CACHE is not None:
+        return _DEPLOY_TS_CACHE
+    ts = None
+    try:
+        bt = str((_read_frontend_version() or {}).get("buildTime") or "").strip()
+        if bt:
+            try:
+                _dt = datetime.fromisoformat(bt.replace("Z", "+00:00"))
+            except ValueError:
+                _dt = datetime.strptime(bt[:19], "%Y-%m-%dT%H:%M:%S").replace(
+                    tzinfo=timezone.utc)
+            if _dt.tzinfo is not None:
+                _dt = _dt.astimezone(timezone.utc)
+            ts = _dt.strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        ts = None
+    _DEPLOY_TS_CACHE = ts or _PROCESS_START_TS
+    return _DEPLOY_TS_CACHE
+
+
+# K3.2 — restart classification (clean shutdown vs crash/unclean), populated at
+# boot from trade_engine.detect_restart_reason() and rendered into the
+# diagnostics header so a restart is never mislabelled as a deploy.
+_RESTART_REASON: dict = {}
+
+
+def _restart_reason_str() -> str:
+    """One-line render of _RESTART_REASON, e.g. 'unclean (last heartbeat
+    06:57Z)'. 'unknown' when the engine helper hasn't reported yet."""
+    rr = _RESTART_REASON or {}
+    if not rr:
+        return "unknown"
+    clean = rr.get("clean")
+    base = "clean" if clean is True else "unclean" if clean is False else "unknown"
+    extra = []
+    if rr.get("last_heartbeat_ts"):
+        extra.append(f"last heartbeat {rr.get('last_heartbeat_ts')}")
+    if rr.get("note"):
+        extra.append(str(rr.get("note")))
+    return base + (f" ({'; '.join(extra)})" if extra else "")
+
+
 from fastapi import FastAPI, Response, Body, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -302,6 +363,41 @@ async def lifespan(app: FastAPI):
                     steps.append("risk_latches_reloaded (skip: fn absent)")
             except Exception as exc:
                 _step_failed("risk_latches_reloaded", exc)
+
+            # 3a-K1. Part K (K1) — fail-closed breaker self-check: verify the
+            #     consec-loss pause latch is coherent at boot (a pause that must
+            #     be armed can't silently drop). Guarded so an older trade_engine
+            #     without consec_pause_boot_selfcheck() no-ops cleanly.
+            try:
+                _consec_selfcheck = getattr(
+                    trade_engine, "consec_pause_boot_selfcheck", None)
+                if callable(_consec_selfcheck):
+                    _consec_selfcheck()
+                    steps.append("consec_pause_selfcheck OK")
+                else:
+                    steps.append("consec_pause_selfcheck (skip: fn absent)")
+            except Exception as exc:
+                _step_failed("consec_pause_selfcheck", exc)
+
+            # 3a-K3. Part K (K3.2) — classify why this process started (clean
+            #     shutdown vs crash/unclean) so diagnostics can tell a restart
+            #     from a deploy. Result is logged once and stashed for the
+            #     diagnostics header. Guarded (missing fn = clean no-op).
+            try:
+                _detect_restart = getattr(
+                    trade_engine, "detect_restart_reason", None)
+                if callable(_detect_restart):
+                    _rr = _detect_restart()
+                    if isinstance(_rr, dict):
+                        _RESTART_REASON.clear()
+                        _RESTART_REASON.update(_rr)
+                    database.log_activity(
+                        f"restart_reason: {_restart_reason_str()}", "info")
+                    steps.append(f"restart_reason ({_restart_reason_str()})")
+                else:
+                    steps.append("restart_reason (skip: fn absent)")
+            except Exception as exc:
+                _step_failed("restart_reason", exc)
 
             # 3b. Start REST price refresher for held positions (2s interval —
             #     critical for low-WS-volume coins that can go minutes stale)
@@ -1735,6 +1831,12 @@ def set_budget(amount: float):
     if amount < 1:
         return {"error": "Budget must be >= 1 USDT"}
     s = _load_strategy()
+    # K2.1 — this path also writes budget_fixed_usdt, so it must clear the
+    # min-notional floor too (an unfillable size can never be persisted here).
+    _sb_err, _ = _validate_budget_floor(
+        {**s, "budget_fixed_usdt": amount}, payload={"budget_fixed_usdt": amount})
+    if _sb_err:
+        return JSONResponse(status_code=422, content={"errors": _sb_err})
     coins = s.get("approved_coins", [])
     for coin in coins:
         coin["budget_usdt"] = amount
@@ -1743,6 +1845,12 @@ def set_budget(amount: float):
     # Also set budget_fixed_usdt: get_budget_for_coin sizes trades from it,
     # not from the per-coin budget_usdt field.
     _write_strategy_patch({"approved_coins": coins, "budget_fixed_usdt": amount})
+    # K2.2 — every config-hash-changing write records an audit row so no change
+    # is unexplainable (the "$5.50 with no audit entry" forensics gap).
+    try:
+        database.save_config_version("budget-api", {"budget_fixed_usdt": amount}, _strategy_raw_file())
+    except Exception:
+        pass
     return {"ok": True, "new_budget": amount}
 
 
@@ -1789,15 +1897,66 @@ def _effective_budget_mode(merged: dict) -> str:
     return merged.get("budget_mode", config.BUDGET_MODE)
 
 
-def _validate_budget_floor(merged: dict):
+def _budget_floor_for_symbol(symbol: str, base_floor: float) -> float:
+    """Per-symbol floor = max(base floor, exchange minNotional) when the
+    exchangeInfo filter is reachable; base floor otherwise (fail-open to the
+    min_position_usdt / MIN_NOTIONAL_FLOOR blend so an outage can't disarm the
+    guard)."""
+    try:
+        import exchange_info as _ei
+        f = _ei.get_symbol_filters(symbol) or {}
+        mn = float(f.get("min_notional") or 0.0)
+        if mn > 0:
+            return max(base_floor, mn)
+    except Exception:
+        pass
+    return base_floor
+
+
+def _validate_budget_floor(merged: dict, payload: Optional[dict] = None):
     """Return (errors, warnings) for a merged (current+patch) strategy dict.
     errors block the write (fixed/per-coin per-trade budget below the floor);
-    warnings are advisory (percent/capped resulting size below floor)."""
+    warnings are advisory (percent/capped resulting size below floor).
+
+    K2.1 (the F4 clamp) — when `payload` (the incoming patch) is supplied, ANY
+    fixed/per-coin budget VALUE present in it is validated against the floor
+    REGARDLESS of the active budget mode. The earlier bug (Part F) only checked
+    when the ACTIVE mode was 'fixed', so a bare `budget_fixed_usdt=5.5` submitted
+    while the mode was e.g. 'capped' was accepted and then failed forever at
+    execution once fixed mode was selected. A sub-notional value must be
+    impossible to persist, whatever the active mode."""
     errors: dict = {}
     warnings: list = []
     floor = _budget_floor(merged)
     mode = _effective_budget_mode(merged)
-    if mode == "fixed":
+
+    # K2.1 — payload-aware floor guard: reject a sub-minimum fixed/per-coin
+    # budget VALUE the instant it is submitted, independent of the active mode,
+    # so an unfillable size can never reach strategy.json.
+    if isinstance(payload, dict):
+        if "budget_fixed_usdt" in payload:
+            try:
+                _bf = float(payload["budget_fixed_usdt"])
+                if _bf < floor:
+                    errors["budget_fixed_usdt"] = (
+                        f"budget_fixed_usdt={_bf:.2f} is below the tradeable "
+                        f"minimum {floor:.2f} (min_position_usdt / minNotional)")
+            except (TypeError, ValueError):
+                errors["budget_fixed_usdt"] = "must be a number"
+        _pc_payload = payload.get("budget_per_coin")
+        if isinstance(_pc_payload, dict):
+            for sym, v in _pc_payload.items():
+                _sfloor = _budget_floor_for_symbol(sym, floor)
+                try:
+                    if float(v) < _sfloor:
+                        errors[f"budget_per_coin.{sym}"] = (
+                            f"budget_per_coin.{sym}={float(v):.2f} is below the "
+                            f"tradeable minimum {_sfloor:.2f} "
+                            f"(min_position_usdt / minNotional)")
+                except (TypeError, ValueError):
+                    errors[f"budget_per_coin.{sym}"] = "must be a number"
+
+    if mode == "fixed" and "budget_fixed_usdt" not in errors:
         try:
             bf = float(merged.get("budget_fixed_usdt", config.BUDGET_FIXED_USDT))
             if bf < floor:
@@ -1811,6 +1970,8 @@ def _validate_budget_floor(merged: dict):
         per_coin = merged.get("budget_per_coin", {})
         if isinstance(per_coin, dict):
             for sym, v in per_coin.items():
+                if f"budget_per_coin.{sym}" in errors:
+                    continue
                 try:
                     if float(v) < floor:
                         errors[f"budget_per_coin.{sym}"] = (
@@ -1844,12 +2005,17 @@ def _config_patch(body: dict):
         patch = {k: v for k, v in body.items() if k in allowed_keys}
         if not patch:
             return {"ok": False, "error": "No valid config keys provided"}
-        # F4 — reject a sub-minimum fixed/per-coin budget (422) before writing.
+        # F4 / K2.1 — reject a sub-minimum fixed/per-coin budget (422) before
+        # writing; payload=patch clamps a bare value regardless of active mode.
         _merged_cfg = {**_load_strategy(), **patch}
-        _berr, _bwarn = _validate_budget_floor(_merged_cfg)
+        _berr, _bwarn = _validate_budget_floor(_merged_cfg, payload=patch)
         if _berr:
             return JSONResponse(status_code=422, content={"errors": _berr})
         _write_strategy_patch(patch)
+        try:  # K2.2 — audit row so no config-hash change is unexplainable
+            database.save_config_version("config-api", dict(patch), _strategy_raw_file())
+        except Exception:
+            pass
         _resp = {"ok": True, "updated": list(patch.keys()), "config": patch}
         if _bwarn:
             _resp["warnings"] = _bwarn
@@ -4166,10 +4332,13 @@ def _resolve_range(range_val: str, from_iso: Optional[str], to_iso: Optional[str
         return frm, now_iso, f"{frm} → now (last {rv})", rv
     if rv == "all":
         return None, now_iso, "beginning → now (all history)", "all"
-    # default: since_deploy
-    frm = _PROCESS_START_TS
+    # default: since_deploy — K3.1: the boundary is the BUILD/DEPLOY time, not
+    # the process start, so the window spans restarts and DB trades made before
+    # a mid-session restart are still counted (n=0 bug fix).
+    frm = _deploy_boundary_ts()
+    _restart_hint = "" if frm == _PROCESS_START_TS else f", process_start {_PROCESS_START_TS}"
     return (frm, now_iso,
-            f"{frm} → now (since deploy {_DEPLOY_ID[:8]})", "since_deploy")
+            f"{frm} → now (since deploy {_DEPLOY_ID[:8]}{_restart_hint})", "since_deploy")
 
 
 @app.get("/api/diagnostics/bundle")
@@ -4266,6 +4435,11 @@ def api_diagnostics_bundle(
         v = _read_frontend_version()
         out.write(f"  version={v.get('version')} buildTime={v.get('buildTime')} "
                   f"commit={v.get('commit')} deploy_id={_DEPLOY_ID[:8]}\n")
+        # K3.2 — deploy_time (since_deploy anchor) and process_start are DISTINCT
+        # fields; restart_reason keeps a restart from being read as a deploy.
+        out.write(f"  deploy_time={_deploy_boundary_ts()} "
+                  f"process_start={_PROCESS_START_TS} "
+                  f"restart={_restart_reason_str()}\n")
         out.write(f"  mode={get_mode()} paper_fallback={is_using_paper_fallback()} "
                   f"live_error={get_live_error() or 'none'}\n")
     safe(_ver, "version")
@@ -5517,17 +5691,10 @@ def api_save_settings(req: SettingsRequest):
         if req.budget_per_coin     is not None: patch["budget_per_coin"]    = req.budget_per_coin
         if any(k in patch for k in ("budget_mode", "budget_fixed_usdt", "budget_per_coin")):
             _merged_budget = {**_load_strategy(), **patch}
-            _berr, _bwarn = _validate_budget_floor(_merged_budget)
-            # Also flag an explicitly-set fixed size below the floor even when the
-            # active mode isn't 'fixed' — storing a sub-notional value is the F4
-            # footgun (accepted, then fails forever the moment fixed mode is used).
-            if "budget_fixed_usdt" in patch and "budget_fixed_usdt" not in _berr:
-                _fl = _budget_floor(_merged_budget)
-                if float(patch["budget_fixed_usdt"]) < _fl:
-                    _berr["budget_fixed_usdt"] = (
-                        f"per-trade budget {float(patch['budget_fixed_usdt']):.2f} USDT is "
-                        f"below the minimum {_fl:.2f} USDT (Binance min notional "
-                        f"{MIN_NOTIONAL_FLOOR:.0f})")
+            # K2.1 — payload=patch clamps an explicitly-set fixed/per-coin value
+            # below the floor even when the active mode isn't 'fixed' (the F4
+            # footgun: accepted, then fails forever once fixed mode is used).
+            _berr, _bwarn = _validate_budget_floor(_merged_budget, payload=patch)
             if _berr:
                 return {"ok": False, "error": "invalid budget settings", "errors": _berr}
         # ── Phase 2 §2.6 — exits block (validated; field-level errors, no 500) ──
@@ -5587,10 +5754,14 @@ def api_save_settings(req: SettingsRequest):
         # F4 — reject a sub-minimum fixed/per-coin per-trade budget (422) before
         # writing, so an unfillable size can never be accepted then spam at exec.
         _merged_set = {**_load_strategy(), **patch}
-        _berr, _bwarn = _validate_budget_floor(_merged_set)
+        _berr, _bwarn = _validate_budget_floor(_merged_set, payload=patch)
         if _berr:
             return JSONResponse(status_code=422, content={"errors": _berr})
         _write_strategy_patch(patch)
+        try:  # K2.2 — audit row so no config-hash change is unexplainable
+            database.save_config_version("settings-api", dict(patch), _strategy_raw_file())
+        except Exception:
+            pass
         database.log_activity(
             "Settings updated: " + ", ".join(f"{k}={v}" for k, v in patch.items() if k != "strategy_notes"),
             "info"
@@ -5825,6 +5996,10 @@ def api_backup_import(req: BackupImportRequest):
     if req.strategy:
         try:
             _write_strategy_patch(req.strategy)
+            try:  # K2.2 — audit row so no config-hash change is unexplainable
+                database.save_config_version("backup-import", dict(req.strategy), _strategy_raw_file())
+            except Exception:
+                pass
             imported["strategy"] = True
         except Exception as e:
             return {"ok": False, "error": f"strategy import failed: {e}"}
@@ -6307,6 +6482,18 @@ def api_version(response: Response):
     v["ui_asset"] = info.get("index_asset")
     v["served_asset"] = info.get("index_asset")
     v["deployId"] = _DEPLOY_ID
+    # K3 — the footer distinguishes a DEPLOY from a mere restart. deploy_time is
+    # the build stamp (survives restarts); process_start is this process's boot;
+    # restart_reason flags an unclean/crash restart (from detect_restart_reason()).
+    try:
+        v["deploy_time"] = _deploy_boundary_ts()
+    except Exception:
+        v["deploy_time"] = None
+    v["process_start"] = _PROCESS_START_TS
+    try:
+        v["restart_reason"] = _restart_reason_str()
+    except Exception:
+        v["restart_reason"] = None
     return v
 
 
@@ -6895,8 +7082,10 @@ def api_stats_expectancy(days: int = 30, mode: Optional[str] = None,
     """Expectancy / fee / exit-label breakdown from the trades table.
     Default mode filter = current get_mode(); ?mode=paper|live|all overrides.
 
-    H4.2 — since_deploy=1 pins the window start to the current process start
-    (_PROCESS_START_TS) so "since current deploy" is one click. config_hash is a
+    H4.2 / K3.1 — since_deploy=1 pins the window start to the BUILD/DEPLOY time
+    (_deploy_boundary_ts(), from version.json buildTime), NOT the process start,
+    so the window spans restarts and DB trades made before a mid-session restart
+    are still counted (the n=0 bug). config_hash is a
     best-effort filter: the trades table has no config_hash column (fixed
     schema), so it is only used to LABEL the payload (note when it can't filter).
     The payload is always labelled with the active config_hash and process_start
@@ -6910,7 +7099,10 @@ def api_stats_expectancy(days: int = 30, mode: Optional[str] = None,
             m = (mode or "all").strip().lower()
         _use_deploy = bool(since_deploy)
         if _use_deploy:
-            cutoff = _PROCESS_START_TS
+            # K3.1 — query trades from the DB by timestamp >= the BUILD/DEPLOY
+            # time, spanning any number of restarts. Using _PROCESS_START_TS here
+            # was the n=0 bug: a restart after the trades reset the window.
+            cutoff = _deploy_boundary_ts()
         else:
             cutoff = (datetime.now(timezone.utc) - timedelta(days=days)
                       ).strftime("%Y-%m-%dT%H:%M:%S")
@@ -7024,7 +7216,11 @@ def api_stats_expectancy(days: int = 30, mode: Optional[str] = None,
             "mode": m,
             "trades": n,
             "since_deploy": _use_deploy,
+            # K3.2 — process_start and deploy_time are DISTINCT: a restart moves
+            # process_start but not deploy_time (the since_deploy window anchor).
             "process_start": _PROCESS_START_TS,
+            "deploy_time": _deploy_boundary_ts(),
+            "restart_reason": _restart_reason_str(),
             "config_hash": _active_cfg_hash,
             "config_hash_filter": config_hash,
             "window_start_ts": cutoff,
@@ -7430,7 +7626,9 @@ def api_put_strategy(body: dict = Body(...)):
             _bmerged = {**raw}
             if isinstance(merged.get("sizing"), dict):
                 _bmerged["sizing"] = merged["sizing"]
-            _berr, _ = _validate_budget_floor(_bmerged)
+            # K2.1 — payload=patch also clamps any bare budget_fixed_usdt /
+            # budget_per_coin carried in the same request, regardless of mode.
+            _berr, _ = _validate_budget_floor(_bmerged, payload=patch)
             if _berr:
                 return JSONResponse(status_code=422, content={"errors": _berr})
 

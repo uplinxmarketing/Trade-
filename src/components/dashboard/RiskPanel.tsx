@@ -207,6 +207,18 @@ export function RiskPanel({ baseUrl = '' }: { baseUrl?: string }) {
   const consecPaused = consecPausedUntil > 0 &&
     (consecPausedUntil > 1e12 ? consecPausedUntil : consecPausedUntil * 1000) > Date.now();
 
+  // K2.4 — resolved per-trade budget vs. tradeable minimum. The engine skips
+  // every buy when the per-trade ticket falls under min_position_usdt, so make
+  // it loud instead of silent. Resolved per-trade = effective_allocation spread
+  // across the configured max_positions (the intended slot count); when that is
+  // below the minimum the sizing degrades / no trades execute. Falls back to the
+  // 10 USDT default when the backend doesn't expose min_position_usdt.
+  const slotAlloc = num(slots.effective_allocation);
+  const slotMaxPos = num(slots.max_positions);
+  const minTicket = num(slots.min_position_usdt) > 0 ? num(slots.min_position_usdt) : 10;
+  const resolvedPerTrade = slotMaxPos > 0 ? slotAlloc / slotMaxPos : slotAlloc;
+  const perTradeBelowMin = sectionOk(slots) && slotAlloc > 0 && resolvedPerTrade < minTicket;
+
   return (
     <div className="space-y-3">
       {/* Status chips row */}
@@ -262,6 +274,17 @@ export function RiskPanel({ baseUrl = '' }: { baseUrl?: string }) {
           </Chip>
         ) : (
           <Chip tone="green">running {num(slots.effective_slots) || num(slots.max_positions)} slots</Chip>
+        )}
+
+        {/* K2.4 — un-tradeable per-trade budget: resolved ticket under the minimum */}
+        {perTradeBelowMin && (
+          <Chip
+            tone="red"
+            title={`Resolved per-trade budget $${resolvedPerTrade.toFixed(2)} is under the tradeable minimum of $${minTicket.toFixed(2)} (min_position_usdt). The bot will skip every buy until the budget is raised.`}
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-loss animate-pulse" />
+            {`per-trade $${resolvedPerTrade.toFixed(2)} — below tradeable minimum — no trades will execute (min $${minTicket.toFixed(2)})`}
+          </Chip>
         )}
 
         {/* BNB fee balance — hidden unless the fee discount is enabled */}
