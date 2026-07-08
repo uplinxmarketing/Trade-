@@ -5,6 +5,11 @@ set -e
 cd "$(dirname "$0")"
 
 echo "── Pulling latest main…"
+# The build step below regenerates tracked artifacts (dist/, public/version.json),
+# which leaves the working tree dirty and makes the next `git pull` abort with
+# "local changes would be overwritten". Discard those regenerated artifacts before
+# pulling so the pull always applies cleanly — they are rebuilt again below.
+git checkout -- dist public/version.json 2>/dev/null || true
 git pull origin main
 
 # Rebuild the frontend bundle from source so the served dist/ always matches the
