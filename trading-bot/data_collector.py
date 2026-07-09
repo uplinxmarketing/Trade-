@@ -65,6 +65,15 @@ _ws_health: Dict = {
     "last_disconnect_ts": 0.0,
     "subscribed_coins":   0,
     "resubscribe_count":  0,
+    # ── WS leak diagnostics (task: confirm/refute listener/task stacking on
+    # reconnect). Sampled once per supervision cycle from INSIDE the WS event
+    # loop so asyncio.all_tasks() is valid. A monotonic climb across reconnects
+    # confirms task stacking; duplicate_streams>0 confirms duplicate subs.
+    "asyncio_tasks":      0,     # live tasks on the WS loop this cycle
+    "asyncio_tasks_peak": 0,     # rolling max of the above
+    "active_connections": 0,     # len(_connections) + held feed
+    "total_streams":      0,     # sum of len(c.streams) across all conns
+    "duplicate_streams":  0,     # stream names present on >1 market conn
 }
 
 # In-memory rolling candle buffer — filled by WebSocket kline-close events and
@@ -2251,6 +2260,73 @@ def _revive_dead_connections():
             conn.start()
 
 
+def _sample_ws_leak_health() -> Dict[str, list]:
+    """WS leak diagnostics — sampled once per supervision cycle from INSIDE the
+    WS event loop (so asyncio.all_tasks() is valid). Records into _ws_health:
+
+      asyncio_tasks / asyncio_tasks_peak — live task count + rolling max. If
+        this climbs monotonically across reconnects, listeners/tasks are
+        STACKING (a connection task, or its executor callbacks, not being
+        joined on reconnect). A flat count refutes the stacking theory.
+      active_connections — market shards + the dedicated held feed.
+      total_streams      — sum of len(c.streams) across all connections.
+      duplicate_streams  — count of stream names carried by MORE THAN ONE
+        MARKET connection. The shard invariant is that a stream lives on
+        exactly one market shard, so any duplicate here is a real bug that
+        would inflate msgs/s (the operator's 1076 msgs/s symptom). The held
+        feed (@trade/@bookTicker) is DELIBERATELY separate and is excluded
+        from this check — under entries.bookticker_universe its @bookTicker
+        streams legitimately mirror the market shards' and must not read as a
+        leak.
+
+    Returns {stream_name: [conn_id, …]} for any market-shard duplicates so the
+    caller can WARN and defensively de-dup."""
+    try:
+        n_tasks = len(asyncio.all_tasks())
+    except Exception:
+        n_tasks = 0
+    _ws_health["asyncio_tasks"] = n_tasks
+    if n_tasks > _ws_health.get("asyncio_tasks_peak", 0):
+        _ws_health["asyncio_tasks_peak"] = n_tasks
+
+    all_conns = list(_connections) + ([_held_conn] if _held_conn is not None else [])
+    _ws_health["active_connections"] = len(all_conns)
+    _ws_health["total_streams"] = sum(len(c.streams) for c in all_conns)
+
+    # Duplicate detection over MARKET shards only (see docstring).
+    where: Dict[str, list] = {}
+    for conn in list(_connections):
+        for s in conn.streams:
+            where.setdefault(s, []).append(conn.id)
+    dupes = {s: ids for s, ids in where.items() if len(ids) > 1}
+    _ws_health["duplicate_streams"] = len(dupes)
+    return dupes
+
+
+async def _dedup_market_streams(dupes: Dict[str, list]) -> None:
+    """Defensive de-dup: a stream must live on exactly ONE market connection.
+    For each duplicated stream, keep it on the first (lowest-id) connection and
+    UNSUBSCRIBE it from every other via the existing remove_streams path. Only
+    ever invoked when _sample_ws_leak_health() actually observed a duplicate —
+    a no-op on healthy sharding."""
+    if not dupes:
+        return
+    by_id = {c.id: c for c in list(_connections)}
+    for stream, ids in dupes.items():
+        keep = min(ids)
+        for cid in ids:
+            if cid == keep:
+                continue
+            conn = by_id.get(cid)
+            if conn is None:
+                continue
+            try:
+                await conn.remove_streams([stream])
+            except Exception as e:
+                print(f"[DataCollector] Duplicate-stream de-dup failed for "
+                      f"{stream} on WS#{cid}: {e}")
+
+
 async def _start_websocket_loop():
     """
     WebSocket manager: builds sharded market connections (+ the dedicated
@@ -2316,6 +2392,29 @@ async def _start_websocket_loop():
         now = time.time()
         _update_aggregate_health()
         _revive_dead_connections()
+
+        # ── WS leak diagnostics: sample task/connection/stream counts from
+        # inside this loop every cycle (asyncio.all_tasks() is valid here). A
+        # monotonic asyncio_tasks climb across reconnects confirms task
+        # stacking; duplicate_streams>0 confirms duplicate subscriptions and is
+        # defensively de-dup'd (keep one market shard, UNSUBSCRIBE the rest).
+        try:
+            _dupes = _sample_ws_leak_health()
+            if _dupes:
+                _names = ", ".join(sorted(_dupes)[:20])
+                print(f"[DataCollector] WARN: {len(_dupes)} stream(s) duplicated "
+                      f"across market connections: {_names}")
+                try:
+                    import trade_engine as _te_dup
+                    _te_dup.log_diag_issue(
+                        "websocket", "warn",
+                        f"{len(_dupes)} duplicate market stream(s) detected",
+                        detail=_names)
+                except Exception:
+                    pass
+                await _dedup_market_streams(_dupes)
+        except Exception as e:
+            print(f"[DataCollector] WS leak-health sample error: {e}")
 
         # ── Dedicated held-symbol feed: hook event or 5 s poll
         if _positions_changed.is_set() or now - last_held_check >= _HELD_POLL_SEC:
@@ -2571,6 +2670,13 @@ def get_data_health() -> dict:
                         for s in subscribed) / len(subscribed), 1) if subscribed else 0.0,
         "gap_repairs_24h":            gap_24h,
         "reconnect_attempts_5min":    recon_5m,
+        # ── WS leak diagnostics (sampled in the supervisor loop). A monotonic
+        # asyncio_tasks/asyncio_tasks_peak climb across reconnects CONFIRMS
+        # task stacking; duplicate_streams>0 CONFIRMS duplicate subscriptions.
+        "asyncio_tasks":              _ws_health.get("asyncio_tasks", 0),
+        "asyncio_tasks_peak":         _ws_health.get("asyncio_tasks_peak", 0),
+        "active_connections":         _ws_health.get("active_connections", 0),
+        "duplicate_streams":          _ws_health.get("duplicate_streams", 0),
         "resubscribe_count":          _ws_health.get("resubscribe_count", 0),
         "subscribed_coins":           len(subscribed),
         # F5 — distinct-symbol coverage vs universe, and raw stream count.

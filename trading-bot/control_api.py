@@ -4835,6 +4835,47 @@ def api_diagnostics_bundle(
                       f"held_max_price_age={eng.get('held_max_price_age_sec')}s\n")
     safe(_health, "health")
 
+    # -- Memory / leak diagnostics ------------------------------------------
+    # The whole point of this section: surface the tracemalloc top allocations
+    # (live growth + the snapshot taken right before the last soft-cap restart)
+    # so a leak names itself in the copied bundle, plus the WS task/stream counts
+    # that confirm-or-refute listener stacking.
+    section("MEMORY")
+    def _mem():
+        m = _memory_stats_section()  # trade_engine.get_memory_stats(), guarded
+        if not isinstance(m, dict) or m.get("available") is False:
+            out.write("  (memory stats unavailable)\n")
+        else:
+            out.write(f"  rss_mb={m.get('rss_mb')} peak_mb={m.get('rss_peak_kb') and round(m['rss_peak_kb']/1024,1)} "
+                      f"soft_cap_mb={m.get('soft_cap_mb')} restart_pending={m.get('memory_restart_pending')} "
+                      f"growth_kb_per_hr={m.get('growth_kb_per_hr')} samples={m.get('samples')} "
+                      f"asyncio_tasks={m.get('asyncio_tasks')}\n")
+            top = m.get("tracemalloc_top")
+            if isinstance(top, (list, tuple)) and top:
+                out.write("  TRACEMALLOC top (live growth):\n")
+                for line in list(top)[:10]:
+                    out.write(f"    {line}\n")
+            else:
+                out.write("  TRACEMALLOC top: (none logged yet — needs ~60s uptime)\n")
+            pre = m.get("tracemalloc_pre_restart")
+            if isinstance(pre, dict) and pre.get("top"):
+                out.write(f"  TRACEMALLOC pre-restart snapshot (ts={pre.get('ts')} rss_mb={pre.get('rss_mb')}):\n")
+                for line in list(pre.get("top") or [])[:10]:
+                    out.write(f"    {line}\n")
+        # WS stacking test — from data_collector.get_data_health()
+        try:
+            import data_collector as _dc_mem
+            dh = _dc_mem.get_data_health() if hasattr(_dc_mem, "get_data_health") else {}
+            if isinstance(dh, dict):
+                out.write(f"  ws_asyncio_tasks={dh.get('asyncio_tasks')} "
+                          f"peak={dh.get('asyncio_tasks_peak')} "
+                          f"active_connections={dh.get('active_connections')} "
+                          f"total_streams={dh.get('total_streams')} "
+                          f"duplicate_streams={dh.get('duplicate_streams')}\n")
+        except Exception:
+            pass
+    safe(_mem, "memory")
+
     # -- Bot status ----------------------------------------------------------
     section("STATUS")
     def _stat():
