@@ -8829,6 +8829,193 @@ def api_put_signals_registry(body: dict = Body(...)):
                             content={"errors": {"body": f"{type(e).__name__}: {e}"}})
 
 
+# ── POST/GET /api/gate/preset — one-click minimum-viable entry gate (O1) ──────
+#
+# The bot took only 2 trades in 14h because four entry filters were all at their
+# tightest simultaneously. This applies a single, AUDITED, reversible
+# "minimum-viable entry gate" through the SAME validated write path as
+# PUT /api/strategy — it hot-applies with no restart and records a
+# config_history row (database.save_config_version). Entry loosening is only
+# safe while exits stay tight, so the endpoint refuses to write any exits.* key.
+
+# Preset name → ordered (dotted-key, target). Ordered so before/after and the
+# GET comparison render stably in the UI.
+_GATE_PRESETS: dict = {
+    "minimum_viable": (
+        ("entries.min_score",                     2),
+        ("signal_engine.min_scored",              2),
+        ("signal_engine.roles.T1_ema_short_long", "scored"),
+        ("entries.min_quote_volume_24h_usd",      3000000),
+        ("signal_thresholds.spread_max_pct",      0.30),
+    ),
+}
+
+
+def _gate_values_equal(a, b) -> bool:
+    """Numeric-tolerant equality (2 == 2.0, 3000000 == 3000000.0). Never raises."""
+    try:
+        if isinstance(a, bool) or isinstance(b, bool):
+            return a == b
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return abs(float(a) - float(b)) < 1e-9
+    except Exception:
+        pass
+    return a == b
+
+
+def _gate_live_value(raw: dict, key: str):
+    """Current live value for one of the minimum_viable gate keys, resolved the
+    same way the engine reads it. Never raises (returns None on trouble)."""
+    try:
+        import signal_registry as _sr
+        se = raw.get("signal_engine") if isinstance(raw.get("signal_engine"), dict) else {}
+        if key in ("entries.min_score", "entries.min_quote_volume_24h_usd"):
+            field = key.split(".", 1)[1]
+            return _scfg.current_v2_view(raw, mode=_strategy_v2_mode())["entries"][field]
+        if key == "signal_engine.min_scored":
+            return int(se.get("min_scored", _sr.DEFAULT_SIGNAL_ENGINE["min_scored"]))
+        if key == "signal_engine.roles.T1_ema_short_long":
+            roles = se.get("roles") if isinstance(se.get("roles"), dict) else {}
+            r = roles.get("T1_ema_short_long")
+            return r if r is not None else _sr._default_role_for("T1_ema_short_long")
+        if key == "signal_thresholds.spread_max_pct":
+            return _effective_signal_thresholds(raw).get("spread_max_pct")
+    except Exception:
+        pass
+    return None
+
+
+@app.post("/api/gate/preset")
+def api_gate_preset(name: str = "minimum_viable",
+                    body: dict = Body(default=None)):
+    """O1 — one-click, AUDITED, reversible entry-gate preset. Applies the named
+    patch through the same validated/audited path as PUT /api/strategy (hot, no
+    restart; config_history row). Never 500s: validation failure → 422 field
+    errors, unknown preset → 400 with the known list. Refuses exits.* writes."""
+    try:
+        # `name` may arrive as a query param or inside the JSON body.
+        if isinstance(body, dict) and isinstance(body.get("name"), str) \
+                and body["name"].strip():
+            name = body["name"].strip()
+        targets = _GATE_PRESETS.get(name)
+        if targets is None:
+            return JSONResponse(status_code=400, content={
+                "error": f"unknown preset '{name}'",
+                "known_presets": sorted(_GATE_PRESETS),
+            })
+        tmap = dict(targets)
+
+        guard = _strategy_live_guard(
+            body.get("confirm") if isinstance(body, dict) else None)
+        if guard is not None:
+            return guard
+
+        raw = _strategy_raw_file()
+        # Snapshot the live "before" for every key the preset touches.
+        before = {k: _gate_live_value(raw, k) for k, _ in targets}
+
+        # 1) Typed v2 entries block → the SAME validation PUT /api/strategy runs
+        #    (budget-floor clamp etc. still apply; here only entries is touched).
+        v2_patch = {"entries": {
+            "min_score":                int(tmap["entries.min_score"]),
+            "min_quote_volume_24h_usd": float(tmap["entries.min_quote_volume_24h_usd"]),
+        }}
+        # Invariant: this preset must never carry an exits.* write.
+        if any(str(b) == "exits" or str(b).startswith("exits.") for b in v2_patch):
+            return JSONResponse(status_code=422,
+                                content={"errors": {"exits": "gate preset must not write exits.*"}})
+        merged, errors = _scfg.validate_patch(raw, v2_patch)
+        if errors:
+            return JSONResponse(status_code=422, content={"errors": errors})
+
+        # 2) signal_engine passthrough: merge the T1 role into the EXISTING roles
+        #    dict (don't drop other roles) and set min_scored. entries.min_score
+        #    ⇄ signal_engine.min_scored stays in sync via _apply_alias_sync inside
+        #    _write_strategy_patch (entries.min_score is in the patch).
+        old_se = raw.get("signal_engine") if isinstance(raw.get("signal_engine"), dict) else {}
+        old_th = raw.get("signal_thresholds") if isinstance(raw.get("signal_thresholds"), dict) else {}
+        merged_roles = dict(old_se.get("roles") or {})
+        merged_roles["T1_ema_short_long"] = tmap["signal_engine.roles.T1_ema_short_long"]
+        new_se = {**old_se, "roles": merged_roles,
+                  "min_scored": int(tmap["signal_engine.min_scored"])}
+        # 3) signal_thresholds passthrough: relax E1's spread veto (still a veto,
+        #    just wider). Merge — don't drop other thresholds.
+        new_th = {**old_th,
+                  "spread_max_pct": float(tmap["signal_thresholds.spread_max_pct"])}
+
+        # Write ONLY the blocks we touched — entries is the sole v2 block, so
+        # exits/stop/ATR/rr_ratio/min_profit keys are never written (same
+        # untouched-block behaviour as PUT /api/strategy).
+        file_patch = {
+            "entries":           merged["entries"],
+            "signal_engine":     new_se,
+            "signal_thresholds": new_th,
+            "schema_version":    _scfg.SCHEMA_VERSION,
+        }
+        if any(str(k) == "exits" or str(k).startswith("exits.") for k in file_patch):
+            return JSONResponse(status_code=422,
+                                content={"errors": {"exits": "gate preset must not write exits.*"}})
+        _write_strategy_patch(file_patch)
+
+        new_raw = _strategy_raw_file()
+        after = {k: _gate_live_value(new_raw, k) for k, _ in targets}
+        diff = _scfg.diff_views(
+            {"entries": _scfg.current_v2_view(raw)["entries"],
+             "signal_engine": old_se, "signal_thresholds": old_th},
+            {"entries": _scfg.current_v2_view(new_raw)["entries"],
+             "signal_engine": new_se, "signal_thresholds": new_th})
+        version = database.save_config_version(f"gate-preset:{name}", diff, new_raw)
+        try:
+            database.log_activity(
+                f"Gate preset '{name}' applied via API: "
+                + (", ".join(sorted(diff.keys())[:12]) or "no-op"), "info")
+        except Exception:
+            pass
+        return {
+            "ok":      True,
+            "applied": {"before": before, "after": after},
+            "diff":    diff,
+            "version": version,
+        }
+    except Exception as e:
+        try:
+            database.log_activity(f"Gate preset save error: {e}", "error")
+        except Exception:
+            pass
+        return JSONResponse(status_code=422,
+                            content={"errors": {"config": f"{type(e).__name__}: {e}"}})
+
+
+@app.get("/api/gate/preset")
+def api_gate_preset_status(name: str = "minimum_viable"):
+    """O1 companion — read-only. Lists the available presets and, for the named
+    preset, the current live value vs the target for each key plus an
+    `already_applied` flag. Never 500s."""
+    try:
+        raw = _strategy_raw_file()
+        out = {"presets": sorted(_GATE_PRESETS), "name": name}
+        targets = _GATE_PRESETS.get(name)
+        if targets is None:
+            out["error"] = f"unknown preset '{name}'"
+            out["known_presets"] = sorted(_GATE_PRESETS)
+            return out
+        keys = []
+        already = True
+        for key, target in targets:
+            cur = _gate_live_value(raw, key)
+            same = _gate_values_equal(cur, target)
+            if not same:
+                already = False
+            keys.append({"key": key, "current": cur,
+                         "target": target, "matches": same})
+        out["keys"] = keys
+        out["already_applied"] = already
+        return out
+    except Exception as e:
+        return {"presets": sorted(_GATE_PRESETS), "name": name,
+                "error": f"{type(e).__name__}: {e}"}
+
+
 def start_control_api():
     """Block the main thread on uvicorn — all bot logic starts via lifespan."""
     import pathlib
