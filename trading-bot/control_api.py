@@ -77,11 +77,40 @@ _DEPLOY_TS_CACHE: Optional[str] = None
 def _deploy_boundary_ts() -> str:
     """Resolve the deploy-time boundary as a naive-UTC 'YYYY-MM-DDTHH:MM:SS'
     string (same shape as _PROCESS_START_TS / the DB timestamp columns, so it
-    compares directly). Prefers version.json buildTime; falls back to the
-    process start when the build stamp is missing/unparseable."""
+    compares directly for the since_deploy diagnostics window).
+
+    AUTHORITATIVE source = the RUNNING git commit. On first call we compare the
+    running commit to the last one persisted in the DB: if it changed (a real
+    code deploy) we stamp deploy_ts = now; if it's the SAME commit (a mere
+    restart — OOM/soft-cap/crash), we reuse the stored deploy_ts so "since
+    deploy" correctly spans restarts and does NOT drag in pre-deploy data.
+
+    This is robust to version.json buildTime being stale — e.g. when deploy.sh's
+    best-effort build is skipped (no npm) and the committed hardcoded buildTime
+    survives, which would otherwise anchor the window to a fixed PAST time and
+    silently include older, pre-deploy trades in every bundle. buildTime →
+    process_start are only fallbacks when git/DB are unavailable."""
     global _DEPLOY_TS_CACHE
     if _DEPLOY_TS_CACHE is not None:
         return _DEPLOY_TS_CACHE
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    # 1) Primary: git-commit-anchored deploy stamp persisted in the DB.
+    try:
+        commit = (_running_git_commit() or "").strip()
+        if commit:
+            stored_commit = (database.get_setting("deploy_commit") or "").strip()
+            stored_ts = (database.get_setting("deploy_ts") or "").strip()
+            if stored_commit == commit and stored_ts:
+                _DEPLOY_TS_CACHE = stored_ts            # same code → span restarts
+                return _DEPLOY_TS_CACHE
+            # New (or first-seen) commit → this is the real deploy moment.
+            database.save_setting("deploy_commit", commit)
+            database.save_setting("deploy_ts", now_ts)
+            _DEPLOY_TS_CACHE = now_ts
+            return _DEPLOY_TS_CACHE
+    except Exception:
+        pass
+    # 2) Fallback: version.json buildTime (only if git/DB unavailable).
     ts = None
     try:
         bt = str((_read_frontend_version() or {}).get("buildTime") or "").strip()
@@ -96,6 +125,7 @@ def _deploy_boundary_ts() -> str:
             ts = _dt.strftime("%Y-%m-%dT%H:%M:%S")
     except Exception:
         ts = None
+    # 3) Last resort: process start.
     _DEPLOY_TS_CACHE = ts or _PROCESS_START_TS
     return _DEPLOY_TS_CACHE
 
@@ -4657,7 +4687,8 @@ def api_diagnostics_bundle(
     _now_b = time.time()
     _cached = _BUNDLE_CACHE.get(_cache_key)
     if _cached is not None and (_now_b - _cached["ts"]) < _BUNDLE_CACHE_TTL:
-        return Response(content=_cached["text"], media_type="text/plain")
+        return Response(content=_cached["text"], media_type="text/plain",
+                        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
     import io
     out = io.StringIO()
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -5129,7 +5160,10 @@ def api_diagnostics_bundle(
     out.write("\n===== END OF BUNDLE =====\n")
     _text_b = out.getvalue()
     _BUNDLE_CACHE[_cache_key] = {"text": _text_b, "ts": time.time()}
-    return Response(content=_text_b, media_type="text/plain")
+    # Never let a browser/proxy hand back a stale bundle — every copy must be a
+    # live snapshot (the 5s _BUNDLE_CACHE only collapses double-clicks server-side).
+    return Response(content=_text_b, media_type="text/plain",
+                    headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
 
 
 @app.get("/api/diagnostics/log/text")
