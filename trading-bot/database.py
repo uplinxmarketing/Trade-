@@ -1575,3 +1575,133 @@ def import_trades(trades: list) -> int:
         conn.commit()
         conn.close()
     return inserted
+
+
+# ── Backups (N4) ──────────────────────────────────────────────────────────────
+
+def _backups_dir() -> str:
+    """The backups/ subdir next to DB_PATH (created on demand)."""
+    d = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def backup_db(keep: int = 7) -> dict:
+    """Write a consistent on-disk backup of the SQLite DB at DB_PATH.
+
+    Uses SQLite's online backup API (Connection.backup()) — NOT a raw file copy,
+    which can capture a mid-write DB. The backup streams pages page-by-page while
+    holding only a short-lived shared lock, so it is safe to run against the live
+    DB. The result is verified by re-opening it read-only and running
+    PRAGMA integrity_check; a corrupt backup is deleted and reported as an error.
+    Retention keeps the newest `keep` files in backups/, deleting older ones.
+
+    Returns {"ok", "path", "kept", "bytes", "error"} and never raises.
+    """
+    import time as _t
+    dest_path = None
+    try:
+        keep = max(1, int(keep))
+    except (TypeError, ValueError):
+        keep = 7
+    try:
+        backups_dir = _backups_dir()
+        stamp = _t.strftime("%Y%m%d-%H%M%S", _t.localtime())
+        dest_path = os.path.join(backups_dir, f"bot.db.backup-{stamp}")
+
+        # ── Write the backup via SQLite's safe online backup API ──────────────
+        # Serialize against writers with the same _lock the rest of the module
+        # uses; the backup itself streams pages and does not hold the write lock.
+        with _lock:
+            src = _conn()
+            try:
+                dst = sqlite3.connect(dest_path)
+                try:
+                    src.backup(dst)
+                    # The backup copies the source header (journal_mode=WAL);
+                    # force the backup file to a self-contained rollback DB so
+                    # opening it never spawns -wal/-shm sidecars next to it.
+                    try:
+                        dst.execute("PRAGMA journal_mode=DELETE")
+                    except Exception:
+                        pass
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+
+        # ── Verify the backup is readable and internally consistent ───────────
+        verify = sqlite3.connect(f"file:{dest_path}?mode=ro", uri=True)
+        try:
+            row = verify.execute("PRAGMA integrity_check").fetchone()
+            ok = bool(row) and str(row[0]).lower() == "ok"
+            if ok:
+                # Cheap sanity read on a core table too.
+                verify.execute("SELECT count(*) FROM trades").fetchone()
+        finally:
+            verify.close()
+
+        if not ok:
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+            return {"ok": False, "path": None, "kept": 0, "bytes": 0,
+                    "error": "integrity_check failed on backup"}
+
+        size = os.path.getsize(dest_path)
+
+        # ── Retention: keep the newest `keep` backups, delete older ones ──────
+        kept = 0
+        try:
+            existing = list_backups()  # newest-first
+            for meta in existing[:keep]:
+                kept += 1
+            for meta in existing[keep:]:
+                try:
+                    os.remove(meta["path"])
+                except OSError:
+                    pass
+        except Exception:
+            kept = 1  # at least the file we just wrote
+
+        return {"ok": True, "path": dest_path, "kept": kept,
+                "bytes": int(size), "error": None}
+    except Exception as e:
+        if dest_path:
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+        return {"ok": False, "path": None, "kept": 0, "bytes": 0,
+                "error": f"{type(e).__name__}: {e}"}
+
+
+def list_backups() -> list:
+    """Return existing backup files as {path, size, mtime} dicts, newest-first.
+    Safe to call any time — a missing backups/ dir yields an empty list."""
+    import re as _re
+    _name_re = _re.compile(r"^bot\.db\.backup-\d{8}-\d{6}$")
+    out = []
+    try:
+        backups_dir = os.path.join(
+            os.path.dirname(os.path.abspath(DB_PATH)), "backups")
+        if not os.path.isdir(backups_dir):
+            return []
+        for name in os.listdir(backups_dir):
+            # Match only real backup files — never -wal/-shm/-journal sidecars.
+            if not _name_re.match(name):
+                continue
+            path = os.path.join(backups_dir, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if not os.path.isfile(path):
+                continue
+            out.append({"path": path, "size": int(st.st_size),
+                        "mtime": st.st_mtime})
+        out.sort(key=lambda d: d["mtime"], reverse=True)
+    except Exception:
+        return out
+    return out

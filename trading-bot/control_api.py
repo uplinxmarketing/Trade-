@@ -867,6 +867,18 @@ async def _daily_maintenance_loop():
                         f"fees.per_symbol_overrides", "warn")
         except Exception as e:
             print(f"[Maintenance] fee-override staleness check failed: {e}")
+        # N4 — nightly DB backup (VACUUM INTO timestamped file, keep 7, verify
+        # readable). Mechanics live in database.backup_db() (parallel work); we
+        # only schedule it once per daily maintenance cycle and log the result.
+        try:
+            _bk = getattr(database, "backup_db", None)
+            if callable(_bk):
+                _res = await _aio.to_thread(_bk)
+                print(f"[Maintenance] db backup OK: {_res}")
+            else:
+                print("[Maintenance] db backup skipped (database.backup_db absent)")
+        except Exception as e:
+            print(f"[Maintenance] db backup failed: {e}")
         # Phase 4 §4.5 — BNB fee-balance health check: run once now, then on a
         # lighter hourly tick inside the 24 h maintenance window.
         await _bnb_health_check()
@@ -3364,10 +3376,102 @@ def api_signals_summary(limit: int = 30):
         return {"signals": [], "total_tracked": 0, "ts": now, "error": str(e)}
 
 
+# ── N1 — market-data serving: in-memory snapshot + weight-safe proxy cache ───
+# The UI polls ONE endpoint (/api/market/snapshot) for live price/24h/spread,
+# served entirely from data_collector's in-memory WS state → zero Binance
+# weight. The legacy Binance proxy routes are kept for depth/klines but are now
+# fronted by a short-TTL response cache (and the 24hr fan-out prefers the
+# snapshot) so the UI can never independently blow the weight budget.
+
+_market_snapshot_cache = {"ts": 0.0, "data": None}
+_market_snapshot_lock = threading.Lock()
+_MARKET_SNAPSHOT_TTL = 1.0
+
+# Generic path+params keyed TTL cache for the Binance proxy routes.
+_proxy_cache: dict = {}                    # key -> (expiry_ts, payload)
+_proxy_cache_lock = threading.Lock()
+
+
+def _proxy_cache_get(key: str):
+    now = time.time()
+    with _proxy_cache_lock:
+        ent = _proxy_cache.get(key)
+        if ent and ent[0] > now:
+            return ent[1]
+    return None
+
+
+def _proxy_cache_put(key: str, payload, ttl: float):
+    with _proxy_cache_lock:
+        _proxy_cache[key] = (time.time() + ttl, payload)
+        if len(_proxy_cache) > 512:  # opportunistic prune of expired entries
+            now = time.time()
+            for k in [k for k, v in _proxy_cache.items() if v[0] <= now]:
+                _proxy_cache.pop(k, None)
+    return payload
+
+
+def _snapshot_to_24hr(snapshot: dict, symbol_list: list) -> list:
+    """Translate the get_market_snapshot() shape into the subset of the Binance
+    24hr-ticker shape the UI consumes (symbol, lastPrice, priceChangePercent,
+    quoteVolume). Only symbols present in the snapshot are emitted."""
+    out = []
+    for sym in symbol_list:
+        s = snapshot.get(sym)
+        if not isinstance(s, dict):
+            continue
+        px = s.get("price")
+        pct = s.get("pct_24h")
+        qv = s.get("quote_vol_24h")
+        out.append({
+            "symbol": sym,
+            "lastPrice": (str(px) if px is not None else None),
+            "priceChangePercent": (str(pct) if pct is not None else None),
+            "quoteVolume": (str(qv) if qv is not None else None),
+        })
+    return out
+
+
+@app.get("/api/market/snapshot")
+def api_market_snapshot():
+    """N1 — the ONE endpoint the UI polls for market data (zero Binance weight).
+    Serves data_collector.get_market_snapshot() from in-memory WS state. Shape
+    passthrough: {symbol: {price, pct_24h, spread_pct, quote_vol_24h, ts,
+    age_sec}}. The assembled payload is cached ~1s so rapid polling is free.
+    Degrades to {"available": False} when the collector accessor is absent."""
+    now = time.time()
+    with _market_snapshot_lock:
+        cached = _market_snapshot_cache["data"]
+        if cached is not None and now - _market_snapshot_cache["ts"] < _MARKET_SNAPSHOT_TTL:
+            return cached
+    try:
+        import data_collector as _dc
+        fn = getattr(_dc, "get_market_snapshot", None)
+        if not callable(fn):
+            return {"available": False}
+        raw = fn()
+        if not isinstance(raw, dict):
+            return {"available": False}
+    except Exception:
+        return {"available": False}
+    with _market_snapshot_lock:
+        _market_snapshot_cache["ts"] = now
+        _market_snapshot_cache["data"] = raw
+    return raw
+
+
+_PROXY_24HR_SYMBOL_CAP = 200  # hard cap on the 24hr symbol-list fan-out size
+
+
 @app.get("/api/proxy/binance/ticker/24hr")
 def api_proxy_ticker_24hr(symbols: str = None, symbol: str = None):
     """Chunked proxy for Binance 24hr ticker — avoids 400s from large symbol lists.
     Also accepts a single `symbol` param (MarketStatsBar/OrderBookPanel use it).
+
+    N1: the symbol-list fan-out is now served from the in-memory market snapshot
+    when it covers the request (zero Binance weight); otherwise it falls back to
+    a hard-cached (≥10s) chunked Binance fetch with a capped symbol list, logs a
+    WARN when it actually hits Binance, and best-effort accounts the weight.
 
     Plain def (G4.2): the body does blocking urllib fetches with no awaits, so
     running it as async blocked the event loop — FastAPI now runs it in the
@@ -3376,11 +3480,17 @@ def api_proxy_ticker_24hr(symbols: str = None, symbol: str = None):
     import urllib.parse as _up
     if symbol and not symbols:
         # Single-symbol form: forward as-is; response is a dict, not a list.
+        # Cached ~5s so the OrderBookPanel/MarketStatsBar poll is nearly free.
+        sym_u = symbol.upper()
+        ck = "24hr1:" + sym_u
+        c = _proxy_cache_get(ck)
+        if c is not None:
+            return c
         try:
-            url = f"https://data-api.binance.vision/api/v3/ticker/24hr?symbol={_up.quote(symbol.upper())}"
+            url = f"https://data-api.binance.vision/api/v3/ticker/24hr?symbol={_up.quote(sym_u)}"
             req = _ur.Request(url, headers={"User-Agent": "WolfBot/1.0"})
             with _ur.urlopen(req, timeout=5.0) as r:
-                return json.loads(r.read())
+                return _proxy_cache_put(ck, json.loads(r.read()), 5.0)
         except Exception as e:
             return JSONResponse(status_code=502, content={"error": f"ticker fetch failed: {e}"})
     if not symbols:
@@ -3391,6 +3501,43 @@ def api_proxy_ticker_24hr(symbols: str = None, symbol: str = None):
         return JSONResponse(status_code=400, content={"error": "invalid symbols format"})
     if not isinstance(symbol_list, list):
         return JSONResponse(status_code=400, content={"error": "symbols must be a list"})
+
+    # Cap the fan-out size so a runaway caller can't request thousands of symbols.
+    if len(symbol_list) > _PROXY_24HR_SYMBOL_CAP:
+        symbol_list = symbol_list[:_PROXY_24HR_SYMBOL_CAP]
+
+    # Prefer the in-memory market snapshot: if it covers every requested symbol
+    # we answer with ZERO Binance weight.
+    try:
+        import data_collector as _dc
+        _snap_fn = getattr(_dc, "get_market_snapshot", None)
+        snap = _snap_fn() if callable(_snap_fn) else None
+    except Exception:
+        snap = None
+    if isinstance(snap, dict) and snap:
+        translated = _snapshot_to_24hr(snap, symbol_list)
+        if len(translated) == len(symbol_list):
+            return translated
+
+    # Snapshot didn't cover the request — fall back to Binance, hard-cached
+    # (≥10s) on the full symbol list so repeated polls can't storm the API.
+    cache_key = "24hr:" + json.dumps(symbol_list)
+    cached = _proxy_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        print(f"[Proxy] WARN 24hr symbol-list fan-out HIT Binance for "
+              f"{len(symbol_list)} symbol(s) (snapshot did not cover the request)")
+    except Exception:
+        pass
+    # Best-effort weight accounting so the storm is visible to binance_limits.
+    try:
+        import binance_limits as _bl
+        _sp = getattr(_bl, "spend", None)
+        if callable(_sp):
+            _sp(max(1, (len(symbol_list) + 19) // 20))
+    except Exception:
+        pass
 
     CHUNK_SIZE = 20
     all_results: list = []
@@ -3403,7 +3550,7 @@ def api_proxy_ticker_24hr(symbols: str = None, symbol: str = None):
                 all_results.extend(json.loads(r.read()))
         except Exception:
             continue  # partial results preferred over full failure
-    return all_results
+    return _proxy_cache_put(cache_key, all_results, 10.0)
 
 
 # Which signal_thresholds keys tune which registered signal (used to expose
@@ -3776,10 +3923,26 @@ def api_proxy_binance(path: str, request: Request):
     url = f"https://data-api.binance.vision/api/v3/{path}"
     if qs:
         url += "?" + qs
+    # N1 — short-TTL response cache keyed on the full path+params so the UI can
+    # never independently blow the weight budget (2s for depth, 5s for 24hr,
+    # 3s for everything else). Cached value is the (body_bytes, status) tuple.
+    _p = path.lower()
+    if "depth" in _p:
+        ttl = 2.0
+    elif "ticker/24hr" in _p:
+        ttl = 5.0
+    else:
+        ttl = 3.0
+    cache_key = "gen:" + path + "?" + qs
+    cached = _proxy_cache_get(cache_key)
+    if cached is not None:
+        body, status = cached
+        return Response(content=body, status_code=status, media_type="application/json")
     req = _ur.Request(url, headers={"User-Agent": "WolfBot/1.0"})
     try:
         with _ur.urlopen(req, timeout=5.0) as r:
             body = r.read()
+        _proxy_cache_put(cache_key, (body, 200), ttl)
         return Response(content=body, media_type="application/json")
     except _ue.HTTPError as he:
         body = he.read()
@@ -6629,6 +6792,139 @@ def api_universe_validate():
     except Exception as e:
         return {"valid": [], "invalid": [], "covered": 0, "expected_valid": 0,
                 "exchange_info_available": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/universe")
+def api_universe():
+    """N3.2 — the SINGLE authoritative coin-list endpoint for the UI. Returns
+    every approved symbol WITH per-symbol status:
+        trading | suspended(BREAK) | delisted
+    plus the known successor (rename target) and, when readable, the
+    warming/backfill state. Reuses _validate_universe(); fails open to a plain
+    trading list when exchangeInfo is unavailable. Never 500s."""
+    try:
+        uni = _validate_universe()
+    except Exception as e:
+        return {"symbols": [], "counts": {}, "exchange_info_available": False,
+                "available": False, "error": f"{type(e).__name__}: {e}"}
+    ei_ok = bool(uni.get("exchange_info_available", False))
+    symbols: list = []
+    for sym in uni.get("valid", []) or []:
+        symbols.append({"symbol": sym, "status": "trading",
+                        "successor": None, "raw_status": "TRADING"})
+    for inv in uni.get("invalid", []) or []:
+        kind = inv.get("excluded_kind")
+        status = "suspended(BREAK)" if kind == "break" else "delisted"
+        symbols.append({
+            "symbol":          inv.get("symbol"),
+            "status":          status,
+            "successor":       inv.get("suggested_rename"),
+            "raw_status":      inv.get("status"),
+            "note":            inv.get("note"),
+            "pending_removal": bool(inv.get("pending_removal", False)),
+        })
+    # Warming/backfill state — guarded, accessor may not exist. Best-effort over
+    # a few plausible names; None when unavailable.
+    warming = None
+    try:
+        import backfill as _bf
+        for _name in ("get_warming_state", "warming_state", "get_status",
+                      "get_backfill_state", "get_progress"):
+            _wf = getattr(_bf, _name, None)
+            if callable(_wf):
+                _w = _wf()
+                if isinstance(_w, dict):
+                    warming = _w
+                    break
+    except Exception:
+        warming = None
+    return {
+        "symbols": symbols,
+        "counts": {
+            "trading":   int(uni.get("covered", 0) or 0),
+            "suspended": int(uni.get("break_count", 0) or 0),
+            "delisted":  int(uni.get("delisted_count", 0) or 0),
+            "total":     len(symbols),
+        },
+        "exchange_info_available": ei_ok,
+        "warming": warming,
+        "available": True,
+    }
+
+
+@app.get("/api/diagnostics/lot-waste")
+def api_diagnostics_lot_waste():
+    """N3.1 — surface the G1b per-symbol chronic lot-step waste flags ("ticket
+    too small / oversized for this coin"). Reads trade_engine.get_lot_waste_flags()
+    (guarded), falling back to the readable module state. Never 404/500 — returns
+    an empty-but-valid {"symbols": [], "available": <bool>} when data is absent."""
+    now = time.time()
+    try:
+        import trade_engine as _te
+    except Exception as e:
+        return {"symbols": [], "available": False, "error": f"{type(e).__name__}: {e}"}
+    flags = None
+    available = False
+    try:
+        fn = getattr(_te, "get_lot_waste_flags", None)
+        if callable(fn):
+            flags = fn()
+            available = isinstance(flags, dict)
+    except Exception:
+        flags = None
+    if not isinstance(flags, dict):
+        # Accessor absent or failed — read the module state directly (guarded).
+        raw = getattr(_te, "_lot_waste_flags", None)
+        if isinstance(raw, dict):
+            try:
+                flags = dict(raw)
+                available = True
+            except Exception:
+                flags = {}
+        else:
+            flags = {}
+    out: list = []
+    for sym, v in (flags or {}).items():
+        if not isinstance(v, dict):
+            continue
+        ts = v.get("ts")
+        out.append({
+            "symbol":    sym,
+            "waste_pct": v.get("waste_pct"),
+            "ts":        ts,
+            "age_sec":   (round(now - ts, 1) if isinstance(ts, (int, float)) else None),
+        })
+    out.sort(key=lambda x: -(x["waste_pct"] or 0))
+    max_pct = None
+    try:
+        _ec = getattr(_te, "_entries_cfg", None)
+        if callable(_ec):
+            _cfg = _ec()
+            if isinstance(_cfg, dict):
+                max_pct = _cfg.get("max_lot_waste_pct")
+    except Exception:
+        max_pct = None
+    return {"symbols": out, "count": len(out),
+            "max_lot_waste_pct": max_pct, "available": bool(available)}
+
+
+@app.post("/api/db/backup")
+def api_db_backup():
+    """N4 — manual on-demand DB backup trigger. Delegates to database.backup_db()
+    (VACUUM INTO timestamped file, keep 7, verify readable — mechanics owned by
+    the database module). Returns the backup path/result. 503 when the accessor
+    hasn't landed yet."""
+    try:
+        _bk = getattr(database, "backup_db", None)
+        if not callable(_bk):
+            return JSONResponse(status_code=503, content={
+                "ok": False, "available": False,
+                "error": "database.backup_db not available"})
+        res = _bk()
+        return {"ok": True, "available": True, "result": res}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={
+            "ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
 @app.get("/api/universe/notices")
