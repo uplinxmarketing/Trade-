@@ -3034,7 +3034,8 @@ def recover_orphan_positions() -> dict:
     MUST run before entries are armed (it does — load_positions_from_db precedes
     start_entry_heartbeat / the _entries_armed gate in the boot sequence).
     """
-    result: Dict[str, list] = {"adopted": [], "unmanaged": [], "reprotected": []}
+    result: Dict[str, list] = {"adopted": [], "unmanaged": [], "reprotected": [],
+                               "exited_underwater": []}
     if get_mode() != "live":
         return result
     try:
@@ -3132,7 +3133,8 @@ def recover_orphan_positions() -> dict:
             # P4: recovery must attach a CORRECT stop — never one the market has
             # already passed. entry==current price here, so the ATR stop is
             # normally below price, but guard defensively (ATR/BEP edge cases).
-            _guard_stale_recovery_stop(pos_record, price)
+            # _underwater is True when the intended stop was already past price.
+            _underwater = _guard_stale_recovery_stop(pos_record, price)
             pos_id = database.save_position(pos_record)
             pos_record["id"] = pos_id
             with _positions_lock:
@@ -3144,6 +3146,42 @@ def recover_orphan_positions() -> dict:
                 f"qty={total:.8f} @ ${price:.4f} (~${value:.2f} USDT) — "
                 f"entry price is ESTIMATED (current price used). "
                 f"Adjust stop-loss in dashboard if needed.", "warn")
+
+            # ── R2.1 — intended stop ALREADY underwater at adoption (the BNB
+            # case). Part P clamped it just below price so P1 fires NEXT cycle;
+            # R2 strengthens that: don't hold an unprotected bag for a cycle —
+            # fire an IMMEDIATE protective market exit via the (now-unblocked) P1
+            # protective sell path. Guarded: a failure just logs + escalates via
+            # the H1 stuck path, never crashes boot. Skip the exchange re-protect
+            # below since we're flattening the position right now.
+            if _underwater:
+                try:
+                    dispatched = False
+                    with _selling_lock:
+                        if sym not in _selling:
+                            _selling.add(sym)
+                            _selling_ts[sym] = time.time()
+                            dispatched = True
+                    if dispatched:
+                        # "stop-loss" is a protective reason — floor-exempt, fires
+                        # at market (see _PROTECTIVE_STOP_REASONS / P1.3).
+                        _sell_executor.submit(_execute_sell, pos_record, price, "stop-loss")
+                    result["exited_underwater"].append(sym)
+                    database.log_activity(
+                        f"RECOVERY {sym}: intended stop underwater at adoption — "
+                        f"dispatched IMMEDIATE protective market exit (not held "
+                        f"unprotected for a cycle).", "warn")
+                except Exception as ue:
+                    database.log_activity(
+                        f"RECOVERY {sym}: immediate underwater exit FAILED ({ue}) — "
+                        f"escalating stuck for manual review; position remains "
+                        f"clamped for the P1 next-cycle exit.", "error")
+                    try:
+                        for _ in range(_STUCK_SKIP_THRESHOLD + 1):
+                            _note_sell_skip(sym, "recovery_underwater_exit_failed")
+                    except Exception:
+                        pass
+                continue   # underwater path handled — skip the exchange re-protect
 
             # ── RE-PROTECT before entries arm: attach the exchange-side (maker
             # TP / OCO) exit a normal open places. Geometry above already gives a
@@ -3187,10 +3225,59 @@ def recover_orphan_positions() -> dict:
         lvl = "warn" if (result["adopted"] or result["unmanaged"]) else "info"
         database.log_activity(
             f"Orphan recovery summary: adopted={result['adopted']} "
-            f"reprotected={result['reprotected']} unmanaged={result['unmanaged']}", lvl)
+            f"reprotected={result['reprotected']} "
+            f"exited_underwater={result['exited_underwater']} "
+            f"unmanaged={result['unmanaged']}", lvl)
+    except Exception:
+        pass
+    # ── R2.3 — ONE clear boot line so a crash's position impact is visible.
+    try:
+        n_ad = len(result["adopted"]); m_rp = len(result["reprotected"])
+        k_uw = len(result["exited_underwater"]); u_um = len(result["unmanaged"])
+        database.log_activity(
+            f"RECOVERY: adopted {n_ad} (reprotected {m_rp}, "
+            f"exited-underwater {k_uw}, unmanaged {u_um}) — "
+            f"adopted={result['adopted']} reprotected={result['reprotected']} "
+            f"exited_underwater={result['exited_underwater']} "
+            f"unmanaged={result['unmanaged']}",
+            "warn" if (n_ad or u_um or k_uw) else "info")
+    except Exception:
+        pass
+    # ── R2.4 — every held position must end boot with a protective stop.
+    try:
+        _verify_boot_protection()
     except Exception:
         pass
     return result
+
+
+def _verify_boot_protection() -> None:
+    """R2.4 — after recovery, guarantee EVERY currently-held position ends boot
+    with a protective stop attached (stop_price OR hard_sl_price; be_moved may be
+    False). A position mid-exit (dispatched underwater) is being flattened and is
+    skipped. A held position with NEITHER stop is a live unprotected bag → log
+    CRITICAL and escalate via the H1 stuck path for manual action. Never raises."""
+    try:
+        with _positions_lock:
+            snapshot = list(_positions)
+    except Exception:
+        return
+    for pos in snapshot:
+        try:
+            sym = pos.get("symbol")
+            with _selling_lock:
+                if sym in _selling:      # being flattened right now — not a bag
+                    continue
+            if pos.get("stop_price") or pos.get("hard_sl_price"):
+                continue
+            database.log_activity(
+                f"CRITICAL: {sym} ended boot with NO protective stop "
+                f"(stop_price/hard_sl_price both unset) — escalating stuck for "
+                f"manual review; position is UNPROTECTED.", "critical")
+            for _ in range(_STUCK_SKIP_THRESHOLD + 1):
+                _note_sell_skip(sym, "boot_no_protective_stop")
+        except Exception:
+            pass
 
 
 def load_positions_from_db():
@@ -3418,6 +3505,13 @@ def _load_strategy() -> dict:
     except Exception:
         pass
     return _strategy_cache
+
+
+def _data_cfg() -> dict:
+    """strategy.data.* config block (mtime-cached via _load_strategy so edits
+    hot-reload). Callers read keys like rss_soft_cap_mb / tracemalloc_enabled."""
+    raw = _load_strategy().get("data")
+    return raw if isinstance(raw, dict) else {}
 
 
 # ── Account helpers ────────────────────────────────────────────────────
@@ -6226,6 +6320,158 @@ _RSS_WARN_GROWTH_MULT = 1.5                   # latest > 1.5× first-in-window
 _last_rss_warn_ts: float = 0.0
 _RSS_WARN_THROTTLE_SEC = 1800.0               # warn at most once / 30 min
 
+# ── R1 — tracemalloc leak instrumentation ───────────────────────────────────
+# Started at boot (guarded) so the RSS heartbeat can pinpoint WHERE the process
+# is leaking (the RSS climb 190→590 MB → cgroup OOM). Every ~5 min it snapshots
+# the top allocation sites, logs them, diffs vs the previous snapshot (growth is
+# the real signal) and caches the top-3 for get_memory_stats() / the diagnostics
+# bundle. This is diagnosis, not a fix.
+_tracemalloc_started = False
+_tracemalloc_top: List[str] = []              # latest formatted top-3 sites
+_last_tracemalloc_snap_ts: float = 0.0
+_TRACEMALLOC_SNAP_INTERVAL_SEC = 300.0        # ~5 min
+_tracemalloc_prev_snapshot = None             # previous snapshot for the growth diff
+
+# ── R4 — RSS soft-cap guardrail state (safety net, NOT the leak fix) ─────────
+_memory_restart_pending = False               # exposed via get_memory_stats() for the UI banner
+_rss_over_cap_count = 0                        # consecutive samples over the cap (2-sample grace)
+
+
+def _soft_cap_mb() -> float:
+    """R4 — data.rss_soft_cap_mb (default 800; 0 disables). Never raises."""
+    try:
+        return float(_data_cfg().get("rss_soft_cap_mb", 800) or 0)
+    except Exception:
+        return 800.0
+
+
+def _maybe_start_tracemalloc() -> None:
+    """R1.1 — start tracemalloc at boot when data.tracemalloc_enabled (default
+    True). Small nframe (1) to keep the overhead low. Guarded so a failure NEVER
+    blocks boot; idempotent."""
+    global _tracemalloc_started
+    if _tracemalloc_started:
+        return
+    try:
+        if not bool(_data_cfg().get("tracemalloc_enabled", True)):
+            return
+        import tracemalloc
+        if not tracemalloc.is_tracing():
+            tracemalloc.start(1)   # 1 frame is enough for file:line and cheap
+        _tracemalloc_started = True
+        try:
+            database.log_activity("R1: tracemalloc started (leak instrumentation)", "info")
+        except Exception:
+            pass
+    except Exception:
+        # Instrumentation must never break boot.
+        pass
+
+
+def _sample_tracemalloc() -> None:
+    """R1.2 — every ~5 min take tracemalloc.take_snapshot().statistics('lineno')
+    [:10], log a single INFO 'TRACEMALLOC TOP10' block (file:line size_kb count),
+    diff against the previous snapshot to surface GROWTH, and cache the top-3 in
+    _tracemalloc_top for get_memory_stats(). Never raises."""
+    global _last_tracemalloc_snap_ts, _tracemalloc_prev_snapshot, _tracemalloc_top
+    if not _tracemalloc_started:
+        return
+    now = time.time()
+    if now - _last_tracemalloc_snap_ts < _TRACEMALLOC_SNAP_INTERVAL_SEC:
+        return
+    _last_tracemalloc_snap_ts = now
+    try:
+        import tracemalloc
+        snap = tracemalloc.take_snapshot()
+        stats = snap.statistics('lineno')[:10]
+        lines: List[str] = []
+        for st in stats:
+            try:
+                fr = st.traceback[0]
+                lines.append(f"{fr.filename}:{fr.lineno} {st.size // 1024}KB {st.count}")
+            except Exception:
+                continue
+        # Growth diff vs the previous snapshot — growth is the leak signal.
+        grow: List[str] = []
+        if _tracemalloc_prev_snapshot is not None:
+            try:
+                for d in snap.compare_to(_tracemalloc_prev_snapshot, 'lineno')[:5]:
+                    if d.size_diff <= 0:
+                        continue
+                    fr = d.traceback[0]
+                    grow.append(f"{fr.filename}:{fr.lineno} +{d.size_diff // 1024}KB "
+                                f"(+{d.count_diff})")
+            except Exception:
+                pass
+        _tracemalloc_prev_snapshot = snap
+        _tracemalloc_top = lines[:3]
+        block = "TRACEMALLOC TOP10:\n  " + "\n  ".join(lines)
+        if grow:
+            block += "\nTRACEMALLOC GROWTH (top5 vs prev):\n  " + "\n  ".join(grow)
+        try:
+            log.info(block)
+        except Exception:
+            pass
+        try:
+            # Surface the top-3 in the activity log too so the diagnostics bundle
+            # after a restart shows the leak source without the app logs.
+            database.log_activity("TRACEMALLOC TOP10 — " + " | ".join(lines[:3]), "info")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _check_rss_soft_cap(rss_kb: int) -> None:
+    """R4 — RSS soft-cap guardrail. This is a SAFETY NET, not the leak fix: it
+    converts the unclean cgroup-OOM loop into CLEAN self-restarts that preserve
+    shutdown persistence. When RSS_MB exceeds data.rss_soft_cap_mb (default 800;
+    0 disables) for 2 CONSECUTIVE samples (a grace so a transient spike can't
+    bounce the process), flush the clean-shutdown marker + risk latches and
+    os._exit(0) so systemd restarts us as a clean exit rather than an OOM kill.
+    Never raises (except the intentional process exit)."""
+    global _rss_over_cap_count, _memory_restart_pending
+    cap_mb = _soft_cap_mb()
+    if cap_mb <= 0:                    # disabled — never trigger
+        _rss_over_cap_count = 0
+        return
+    rss_mb = rss_kb // 1024
+    if rss_mb <= cap_mb:
+        _rss_over_cap_count = 0
+        return
+    _rss_over_cap_count += 1
+    if _rss_over_cap_count < 2:        # 2-sample grace against a transient spike
+        return
+    _memory_restart_pending = True     # UI/control_api banner via get_memory_stats()
+    try:
+        database.log_activity(
+            f"MEMORY: RSS {rss_mb}MB > soft cap {int(cap_mb)}MB — restarting cleanly",
+            "critical")
+    except Exception:
+        pass
+    try:
+        log.critical("MEMORY: RSS %dMB > soft cap %dMB — restarting cleanly",
+                     rss_mb, int(cap_mb))
+    except Exception:
+        pass
+    # Graceful self-restart: persist the clean-shutdown marker (Part K) and risk
+    # latches BEFORE exiting so the restart preserves shutdown persistence, then
+    # os._exit(0) — a CLEAN exit systemd restarts, not an OOM kill. os._exit
+    # avoids re-entrant atexit / thread-teardown hangs while memory-starved.
+    try:
+        _write_clean_shutdown_marker()
+    except Exception:
+        pass
+    try:
+        persist_risk_latches()
+    except Exception:
+        pass
+    try:
+        database.log_activity("MEMORY: clean self-restart now (os._exit 0)", "warn")
+    except Exception:
+        pass
+    os._exit(0)
+
 
 def _sample_rss() -> None:
     """M2 — sample process RSS (ru_maxrss, KB on Linux) into the rolling history,
@@ -6265,6 +6511,8 @@ def _sample_rss() -> None:
                 "warn")
         except Exception:
             pass
+    # R4 — soft-cap guardrail (safety net): runs every sample; may os._exit(0).
+    _check_rss_soft_cap(kb)
 
 
 def get_memory_stats() -> dict:
@@ -6284,9 +6532,107 @@ def get_memory_stats() -> dict:
     return {
         "rss_kb":           rss_kb,
         "rss_peak_kb":      peak,
+        "rss_mb":           rss_kb // 1024,
         "samples":          n,
         "growth_kb_per_hr": round(growth, 1),
+        # R4 — soft-cap guardrail state (UI banner / control_api).
+        "soft_cap_mb":            _soft_cap_mb(),
+        "memory_restart_pending": _memory_restart_pending,
+        # R1 — latest tracemalloc top-3 allocation sites (leak source).
+        "tracemalloc_top":        list(_tracemalloc_top),
     }
+
+
+# ── R1.3 — periodic stale per-symbol state sweep ─────────────────────────────
+# Symbols leave the trading universe on rotation, but this file's high-churn
+# per-symbol dicts key by symbol and were never pruned — keys accumulate for the
+# process lifetime (an unbounded contributor to the RSS climb). This sweep drops
+# keys for symbols no longer in _active_universe, NEVER touching a symbol we hold
+# (_positions/_pos_by_symbol) or are mid buy/sell (_buying/_selling). O(dict
+# size), infrequent (~every 3 min). It complements purge_symbol_state (the full
+# per-symbol teardown used on explicit watchlist removal) as a lightweight
+# periodic backstop for keys that leaked past that path.
+_last_state_sweep_ts: float = 0.0
+_STATE_SWEEP_INTERVAL_SEC = 180.0             # ~3 min
+
+
+def _sweep_stale_symbol_state() -> None:
+    """R1.3 — drop per-symbol keys for symbols no longer in the active universe
+    from the churn dicts, and keep _stop_out_ts pruned to its rolling window.
+    Never drops a held (_pos_by_symbol) or in-flight (_buying/_selling) symbol.
+    Never raises."""
+    global _last_state_sweep_ts
+    now = time.time()
+    if now - _last_state_sweep_ts < _STATE_SWEEP_INTERVAL_SEC:
+        return
+    _last_state_sweep_ts = now
+    try:
+        universe = set(_active_universe)
+    except Exception:
+        universe = set()
+    if not universe:
+        # Unknown/empty universe (early boot / scanner not warm) — don't risk
+        # dropping live keys; wait for a populated universe.
+        return
+    # Symbols that must NEVER be swept, regardless of universe membership.
+    keep: set = set(universe)
+    try:
+        with _positions_lock:
+            keep.update(p.get("symbol") for p in _positions)
+    except Exception:
+        pass
+    try:
+        keep.update(_pos_by_symbol.keys())
+    except Exception:
+        pass
+    try:
+        with _buying_lock:
+            keep.update(_buying)
+    except Exception:
+        pass
+    try:
+        with _selling_lock:
+            keep.update(_selling)
+    except Exception:
+        pass
+
+    # Every churn dict named in R1.3. Some are keyed by a plain symbol, some by
+    # a (symbol, reason) tuple — take element 0 for tuples so both prune cleanly.
+    churn_dicts = (
+        _bookticker_cache, _maker_abandon_counts, _lot_waste_flags,
+        _loss_cooldown, _candidacy_cooldown, _buy_ready_since, _ratchet_state,
+        _sell_last_failed_ts, _sell_last_failed_reason, _ghost_check_fails,
+        _last_ws_price_ts, _pos_peaks, _stop_loss_confirmation,
+        _last_abort_log_ts, _sell_trace_log_ts, _last_binance_err_log_ts,
+        _skip_log_dedupe, _shadow_log_dedupe, _near_miss_snap_ts,
+    )
+    dropped = 0
+    for _d in churn_dicts:
+        try:
+            stale = [k for k in list(_d.keys())
+                     if (k[0] if isinstance(k, tuple) else k) not in keep]
+            for k in stale:
+                _d.pop(k, None)
+                dropped += 1
+        except Exception:
+            pass
+
+    # _stop_out_ts is a plain rolling list (not per-symbol) — verify it stays
+    # bounded to its window rather than being appended forever.
+    try:
+        cutoff = now - _STOP_PAUSE_WINDOW_SEC
+        _stop_out_ts[:] = [t for t in _stop_out_ts if t >= cutoff]
+    except Exception:
+        pass
+
+    if dropped:
+        try:
+            database.log_activity(
+                f"state sweep: dropped {dropped} stale per-symbol key(s) for "
+                f"symbols outside the {len(universe)}-symbol universe (mem cleanup)",
+                "info")
+        except Exception:
+            pass
 
 
 def capture_recent_log_lines(n: int = 50) -> List[str]:
@@ -6349,6 +6695,9 @@ def detect_restart_reason() -> dict:
 import atexit as _atexit
 _atexit.register(_write_clean_shutdown_marker)
 
+# R1.1 — start leak instrumentation at module import (guarded; never blocks boot).
+_maybe_start_tracemalloc()
+
 
 # §3.1c(ii) — veto-only heartbeat: every entries.eval_heartbeat_sec (default
 # 15 s) re-run the buy check so an armed setup (5m signals already passing)
@@ -6363,7 +6712,9 @@ def _entry_heartbeat_loop() -> None:
     while True:
         try:
             _refresh_heartbeat_ts()   # K3.3 — liveness marker for crash detection
-            _sample_rss()             # M2 — RSS sampling for leak/OOM detection
+            _sample_rss()             # M2 — RSS sampling (+ R4 soft-cap guardrail)
+            _sample_tracemalloc()     # R1.2 — ~5-min tracemalloc TOP10 leak snapshot
+            _sweep_stale_symbol_state()  # R1.3 — ~3-min stale per-symbol key sweep
             cfg = _entries_cfg()
             interval = max(1.0, float(cfg.get("eval_heartbeat_sec", 15.0)))
             if not cfg["tick_entries"]:   # tick mode has its own dispatch path
