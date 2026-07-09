@@ -96,6 +96,9 @@ export function EntryGatePanel({ baseUrl = '' }: { baseUrl?: string }) {
       const res = await fetch(`${baseUrl}/api/gate/preset?name=minimum_viable`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        // The user already confirmed via the dialog; pass the live-trading token
+        // the audited write path requires when live trading is active.
+        body: JSON.stringify({ confirm: 'LIVE' }),
       });
       const data = await res.json().catch(() => null);
       if (res.status === 422) {
