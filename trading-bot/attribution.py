@@ -39,7 +39,12 @@ JOIN_WINDOW_SEC = 180.0        # trade timestamp_buy ↔ snapshot ts tolerance
 MAX_HOLD_CANDLES = 1_440       # 24h max hold for hypothetical replays
 MAX_REPLAYS = 500              # cap per report run (nightly cost control)
 TRADE_FETCH_LIMIT = 100_000
-SNAPSHOT_FETCH_LIMIT = 20_000
+# Memory: each snapshot carries heavy parsed raw_json + gates_json dicts, and
+# build_edge_report fetches snapshots TWICE (executed + near-misses). At 20_000
+# this materialized ~800k JSON objects at once and spiked RSS mid-warmup,
+# tripping the 800MB soft-cap → restart loop. 2_000 is ample for stable
+# per-signal expectancy and the capped (MAX_REPLAYS) veto replays.
+SNAPSHOT_FETCH_LIMIT = 2_000
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -250,12 +255,18 @@ def build_edge_report(days: int = 7, source: str = "live") -> dict:
     pairs = _joined_trades(trades, snaps_exec)
 
     # ── Per-signal fired vs not-fired expectancy ─────────────────────────────
+    # Memory: reduce each joined pair to (trade, frozenset_of_fired_ids) — the
+    # only per-snapshot data the signal loop needs — then DROP the heavy parsed
+    # snapshot dicts (snaps_exec, pairs) BEFORE fetching the near-miss batch, so
+    # the two big fetches are never fully materialized at the same time.
     signal_ids = set(signal_registry.list_all_signal_ids())
-    fired_sets = []
+    fired_sets: List[Tuple[dict, frozenset]] = []
     for t, s in pairs:
-        f = _fired_ids(s)
+        f = frozenset(_fired_ids(s))
         signal_ids |= f
         fired_sets.append((t, f))
+    n_pairs = len(pairs)
+    del snaps_exec, pairs   # release the executed-snapshot batch before near-miss fetch
 
     signals_report: Dict[str, Any] = {}
     for sig_id in sorted(signal_ids):
@@ -274,16 +285,28 @@ def build_edge_report(days: int = 7, source: str = "live") -> dict:
                                   "lift": lift}
 
     # ── Veto / near-miss saves ───────────────────────────────────────────────
+    # Memory: stream the near-miss batch — for each snapshot keep only the veto
+    # reason plus the two primitives the replay needs (symbol, ts), never the
+    # heavy parsed dict. Track the full blocked count per reason separately, and
+    # cap each retained replay-input list at MAX_REPLAYS (we can never replay
+    # more than that total, so a larger list would only waste memory). The heavy
+    # near_misses batch is released before any replay runs.
     near_misses = database.get_entry_snapshots(since_ts=cutoff, executed=False,
                                                limit=SNAPSHOT_FETCH_LIMIT)
+    blocked_counts: Dict[str, int] = {}
     by_reason: Dict[str, List[dict]] = {}
     for s in near_misses:
-        by_reason.setdefault(_veto_reason(s), []).append(s)
+        reason = _veto_reason(s)
+        blocked_counts[reason] = blocked_counts.get(reason, 0) + 1
+        lst = by_reason.setdefault(reason, [])
+        if len(lst) < MAX_REPLAYS:
+            lst.append({"symbol": s.get("symbol"), "ts": s.get("ts")})
+    del near_misses   # release the near-miss snapshot batch before replays
 
     replays_left = MAX_REPLAYS
     vetoes_report: Dict[str, Any] = {}
-    for reason in sorted(by_reason.keys()):
-        snaps = by_reason[reason]
+    for reason in sorted(blocked_counts.keys()):
+        snaps = by_reason.get(reason, [])
         results = []
         for s in snaps:
             if replays_left <= 0:
@@ -292,7 +315,7 @@ def build_edge_report(days: int = 7, source: str = "live") -> dict:
             replays_left -= 1
             if r is not None:
                 results.append(r)
-        blocked = len(snaps)
+        blocked = blocked_counts[reason]
         if blocked < MIN_SAMPLE:
             vetoes_report[reason] = {"insufficient_data": True, "n": blocked,
                                      "blocked": blocked}
@@ -314,8 +337,8 @@ def build_edge_report(days: int = 7, source: str = "live") -> dict:
         "source": source,
         "signals": signals_report,
         "vetoes": vetoes_report,
-        "joined_trades": len(pairs),
-        "unmatched_trades": len(trades) - len(pairs),
+        "joined_trades": n_pairs,
+        "unmatched_trades": len(trades) - n_pairs,
     }
 
 
