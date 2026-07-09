@@ -832,7 +832,15 @@ async def _daily_maintenance_loop():
     modules (database.prune_klines_from_config / attribution.run_nightly)
     haven't landed yet."""
     import asyncio as _aio
-    await _aio.sleep(60)
+    # Warmup-safe delay before the FIRST maintenance pass. The nightly edge
+    # report (attribution.run_nightly, below) parses up to thousands of DB
+    # snapshots — hundreds of thousands of transient objects that spike RSS.
+    # Running it ~60 s after boot lands squarely in the warmup window (buffers
+    # still backfilling, RSS already climbing), which can trip the 800MB
+    # soft-cap and cause a restart loop. Wait 15 min so the first heavy build
+    # happens well after warmup + backfill complete. The 24 h cadence for
+    # subsequent passes is set by the hourly-tick sleeps at the end of the loop.
+    await _aio.sleep(900)
     while True:
         try:
             _fn = getattr(database, "prune_klines_from_config", None)

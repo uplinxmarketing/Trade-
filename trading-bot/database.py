@@ -642,6 +642,13 @@ def prune_entry_snapshots(retention_days: float) -> int:
                 cur = conn.execute(
                     "DELETE FROM entry_snapshots WHERE ts < ?", (cutoff,))
                 deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                # Hard row cap (like buy_rejections) so the table can't balloon
+                # between daily prunes under heavy rejection volume — this is what
+                # a bulk read (edge report) would otherwise parse into memory.
+                cur2 = conn.execute(
+                    "DELETE FROM entry_snapshots WHERE id NOT IN "
+                    "(SELECT id FROM entry_snapshots ORDER BY id DESC LIMIT 50000)")
+                deleted += cur2.rowcount if cur2.rowcount and cur2.rowcount > 0 else 0
                 conn.commit()
             finally:
                 conn.close()

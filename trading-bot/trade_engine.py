@@ -3451,6 +3451,22 @@ def load_positions_from_db():
     except Exception as e:
         database.log_activity(f"Orphan scan/recovery failed (non-fatal): {e}", "warn")
 
+    # R2/I1 — boot ordering: reconcile/recover orphans → SEED HELD PRICES (with
+    # retry) → arm entries. Proactively seed a fresh REST price for every restored
+    # open position now, BEFORE the entry-arming gate can open, so a restart never
+    # leaves held positions unpriced (their stops would be blind). The _entries_armed
+    # gate re-checks + re-seeds too, so this is best-effort here; failures degrade
+    # (logged) and never crash boot.
+    try:
+        _still_unpriced = _seed_held_prices(reason="boot_restore")
+        if _still_unpriced:
+            database.log_activity(
+                f"[Boot] {len(_still_unpriced)} held positions unpriced after seed "
+                f"(entry-arming gate + held watchdog will keep retrying): "
+                f"{_still_unpriced}", "warn")
+    except Exception as e:
+        database.log_activity(f"Held-price seed at boot failed (non-fatal): {e}", "warn")
+
     # Sync PaperClient coin balances from the restored positions.
     # After a restart, PaperClient loads from saved paper_state, but if that
     # state is out of sync with the positions table (e.g. a partial crash),
@@ -6983,20 +6999,37 @@ _entries_armed_flag: bool = False
 _entries_arm_deadline: Optional[float] = None
 _ENTRY_ARM_GRACE_SEC: float = 120.0   # ~2min fallback so a stuck backfill
 _entries_arm_lock = threading.Lock()  # can't permanently disable trading
+# R2/I1 — hard safety ceiling: even if held prices can NEVER be seeded (persistent
+# REST outage), trading can't stay disabled forever. Past this deadline entries arm
+# LOUDLY with a CRITICAL log flagging the still-unpriced held positions.
+_entries_arm_hard_deadline: Optional[float] = None
+_ENTRY_ARM_HARD_CEILING_SEC: float = 600.0   # 10min absolute cap
+_entries_arm_notready_log_ts: float = 0.0    # throttle the "NOT armed" retry log
 
 
 def _entries_armed() -> bool:
     """I1.2 — arm entries LAST. The buy path stays disarmed until the data layer
     reports get_data_health()['backfill_complete'] is True, or a ~2min grace
     elapses (fallback). Logs the transition once. Held-symbol EXIT monitoring is
-    a separate path and is unaffected by this gate. Once armed, stays armed."""
-    global _entries_armed_flag, _entries_arm_deadline
+    a separate path and is unaffected by this gate. Once armed, stays armed.
+
+    R2/I1 — CRITICAL boot invariant: held-position prices MUST be seeded (a fresh
+    price for EVERY open position) BEFORE entries arm. A restart must never leave
+    open positions unpriced. Neither backfill-complete NOR the grace timeout arms
+    while any held position lacks a fresh price — instead the batched REST held-
+    price seed is retried and arming is withheld. New-buy evaluation stays
+    separately gated per-symbol on backfill_warmup, so 'backfill 0%' alone never
+    blocks arming once held prices are seeded. Only a hard safety ceiling can arm
+    with still-unpriced held positions (and it does so LOUDLY)."""
+    global _entries_armed_flag, _entries_arm_deadline, _entries_arm_hard_deadline
+    global _entries_arm_notready_log_ts
     with _entries_arm_lock:
         if _entries_armed_flag:
             return True
         now = time.time()
         if _entries_arm_deadline is None:
             _entries_arm_deadline = now + _ENTRY_ARM_GRACE_SEC
+            _entries_arm_hard_deadline = now + _ENTRY_ARM_HARD_CEILING_SEC
         complete = False
         pct = None
         try:
@@ -7014,10 +7047,58 @@ def _entries_armed() -> bool:
                         break
         except Exception:
             complete = False
+
+        # ── R2/I1 held-price gate (runs BEFORE any arming decision) ───────────
+        # Every open position must have a fresh price. If not, retry the batched
+        # REST held-price seed and withhold arming — even past the grace timeout.
+        try:
+            unpriced = _held_unpriced_symbols()
+            if unpriced:
+                unpriced = _seed_held_prices(reason="arming_gate")
+        except Exception:
+            # Never let the seed path crash boot. If we can't even confirm held
+            # readiness, be conservative and withhold arming until the hard
+            # ceiling — trading can't wedge forever, but we won't arm blind early.
+            try:
+                unpriced = _held_unpriced_symbols()
+            except Exception:
+                unpriced = ["<unknown>"]
+        if unpriced:
+            if _entries_arm_hard_deadline is not None and now >= _entries_arm_hard_deadline:
+                # Hard safety ceiling — trading can't stay disabled forever, but
+                # arm LOUDLY so it's unmistakable that held stops may be blind.
+                _entries_armed_flag = True
+                try:
+                    database.log_activity(
+                        f"entries armed — HARD SAFETY CEILING; {len(unpriced)} held "
+                        f"positions STILL UNPRICED: {unpriced} — held stops may be "
+                        f"flying blind", "error")
+                except Exception:
+                    pass
+                try:
+                    log_diag_issue(
+                        "price_feed", "error",
+                        "Entries armed with unpriced held positions (hard ceiling)",
+                        detail=f"{unpriced}")
+                except Exception:
+                    pass
+                return True
+            if now - _entries_arm_notready_log_ts >= 10.0:
+                _entries_arm_notready_log_ts = now
+                try:
+                    database.log_activity(
+                        f"entries NOT armed — {len(unpriced)} held positions still "
+                        f"unpriced (retrying)", "warn")
+                except Exception:
+                    pass
+            return False
+
+        # ── Held prices seeded — apply the (unchanged) backfill arming gate ───
         if complete:
             _entries_armed_flag = True
             try:
-                database.log_activity("entries armed — backfill complete", "info")
+                database.log_activity(
+                    "entries armed — backfill complete (held prices seeded)", "info")
             except Exception:
                 pass
             return True
@@ -7026,7 +7107,8 @@ def _entries_armed() -> bool:
             _pct_s = f"{pct:.0f}%" if pct is not None else "unknown"
             try:
                 database.log_activity(
-                    f"entries armed — grace timeout, backfill {_pct_s}", "warn")
+                    f"entries armed — grace timeout, backfill {_pct_s} "
+                    f"(held prices seeded)", "warn")
             except Exception:
                 pass
             return True
@@ -9774,6 +9856,120 @@ def _held_price_ages(held_syms: list) -> Dict[str, float]:
     return ages
 
 
+_HELD_SEED_FRESH_SEC: float = 30.0    # a held price older than this counts as unpriced at boot
+_HELD_SEED_RETRIES: int = 3           # bounded retries for a transient empty REST batch
+_HELD_SEED_BACKOFF: float = 0.5       # base backoff (× attempt) between retries
+
+
+def _held_unpriced_symbols() -> list:
+    """R2/I1 — list of held symbols that do NOT currently have a fresh price.
+    A held position is 'priced' only when a positive price exists (engine _rest_px
+    or data_collector.prices) AND its freshest age is within _HELD_SEED_FRESH_SEC.
+    Empty list ⇒ every open position has a fresh price. Never raises."""
+    try:
+        with _positions_lock:
+            held = list({p.get("symbol") for p in _positions if p.get("symbol")})
+    except Exception:
+        return []
+    if not held:
+        return []
+    try:
+        import data_collector as _dc_u
+        dc_prices = getattr(_dc_u, "prices", None) or {}
+    except Exception:
+        dc_prices = {}
+    ages = _held_price_ages(held)
+    out: list = []
+    for s in held:
+        try:
+            px = float(_rest_px.get(s, 0) or 0)
+        except Exception:
+            px = 0.0
+        if px <= 0:
+            try:
+                px = float(dc_prices.get(s, 0) or 0)
+            except Exception:
+                px = 0.0
+        if px <= 0 or ages.get(s, float("inf")) > _HELD_SEED_FRESH_SEC:
+            out.append(s)
+    return out
+
+
+def _seed_held_prices(reason: str = "boot", retries: int = _HELD_SEED_RETRIES) -> list:
+    """R2/I1 — seed fresh REST prices for every open (held) position, with a
+    bounded retry so a transient empty batch at boot doesn't leave positions
+    blind. ONE batched /ticker/price call per attempt for the still-unpriced
+    held symbols; writes results into _rest_px / _rest_px_sym_ts /
+    _last_ws_price_ts / data_collector.prices so the exit path can price stops.
+
+    Returns the list of held symbols STILL unpriced after all retries (empty on
+    full success). Logs a CRITICAL if any remain. Never raises — a failure
+    degrades (returns the unpriced list) rather than crashing boot."""
+    try:
+        with _positions_lock:
+            held = list({p.get("symbol") for p in _positions if p.get("symbol")})
+    except Exception:
+        return []
+    if not held:
+        return []
+    try:
+        import data_collector as _dc_seed
+        dc_prices = getattr(_dc_seed, "prices", None)
+    except Exception:
+        dc_prices = None
+
+    attempt = 0
+    while True:
+        attempt += 1
+        target = _held_unpriced_symbols()
+        if not target:
+            return []
+        try:
+            fetched = _fetch_batch_prices(target, source="held_seed") or {}
+        except Exception:
+            fetched = {}
+        if fetched:
+            now_ts = time.time()
+            for s, px in fetched.items():
+                try:
+                    if float(px) <= 0:
+                        continue
+                except Exception:
+                    continue
+                _rest_px[s] = px
+                _rest_px_sym_ts[s] = now_ts
+                _last_ws_price_ts[s] = now_ts
+                if dc_prices is not None:
+                    try:
+                        dc_prices[s] = px
+                    except Exception:
+                        pass
+        still = _held_unpriced_symbols()
+        if not still:
+            return []
+        if attempt > retries:
+            # Exhausted bounded retries — held positions remain blind. Log LOUD;
+            # the held watchdog keeps retrying on its normal cadence.
+            try:
+                database.log_activity(
+                    f"[HeldSeed] CRITICAL — {len(still)} held positions UNPRICED "
+                    f"after {attempt} attempts ({reason}): {still}", "error")
+            except Exception:
+                pass
+            try:
+                log_diag_issue(
+                    "price_feed", "error",
+                    f"Held-price seed failed — {len(still)} positions unpriced",
+                    detail=f"{still} ({reason})")
+            except Exception:
+                pass
+            return still
+        try:
+            time.sleep(_HELD_SEED_BACKOFF * attempt)
+        except Exception:
+            pass
+
+
 def _watchdog_fires_24h() -> int:
     """Rolling count of watchdog REST fires in the last 24h (prunes in place)."""
     cutoff = time.time() - 86400.0
@@ -9807,6 +10003,18 @@ def _watchdog_cycle() -> dict:
         # ONE batched call for ALL held symbols (weight 4, critical=True) —
         # routed through _binance_request → binance_limits header recording.
         fetched = _fetch_batch_prices(held_syms, source="held_watchdog")
+        # R2 — a transient empty batch (common at boot) must NOT leave held
+        # positions blind for a whole cycle: retry a few times with short
+        # backoff before giving up. If still empty the caller logs + the loop
+        # keeps retrying on the normal watchdog cadence.
+        _wd_attempt = 0
+        while not fetched and _wd_attempt < _HELD_SEED_RETRIES:
+            _wd_attempt += 1
+            try:
+                time.sleep(_HELD_SEED_BACKOFF * _wd_attempt)
+            except Exception:
+                pass
+            fetched = _fetch_batch_prices(held_syms, source="held_watchdog")
         fired = True
         with _watchdog_lock:
             _watchdog_fire_ts.append(time.time())
