@@ -1084,6 +1084,13 @@ def _record_connect_attempt():
 # In-flight guard so one symbol/interval never runs concurrent repairs.
 _repair_lock = threading.Lock()
 _repair_inflight: set = set()
+# Throttle: under a reconnect storm (e.g. the OOM-restart loop) gap-repair would
+# otherwise re-fetch + re-parse klines for every symbol on every reconnect,
+# churning large transient allocations at _merge_candles. Skip a repair for a
+# (sym, interval) if one ran within this window — the WS stream keeps the buffer
+# current anyway; gap repair only needs to catch a real multi-interval gap.
+_repair_last_ts: Dict[Tuple[str, str], float] = {}
+_REPAIR_MIN_INTERVAL_SEC = 30.0
 
 
 def _gap_repair_range(sym: str, interval: str, start_ms: int, end_ms: int,
@@ -1092,10 +1099,20 @@ def _gap_repair_range(sym: str, interval: str, start_ms: int, end_ms: int,
     limits path and merge it into the buffer (WS entries win). Blocking —
     runs on an executor thread. Counted in gap_repairs_24h."""
     key = (sym, interval)
+    _now_r = time.time()
     with _repair_lock:
         if key in _repair_inflight:
             return
+        # Throttle repeated repairs under reconnect churn (leak/CPU guard).
+        if _now_r - _repair_last_ts.get(key, 0.0) < _REPAIR_MIN_INTERVAL_SEC:
+            return
         _repair_inflight.add(key)
+        _repair_last_ts[key] = _now_r
+        # Bound the throttle map to the covered universe so it can't grow.
+        if len(_repair_last_ts) > 4096:
+            _cutoff = _now_r - 3600.0
+            for _k in [_k for _k, _t in _repair_last_ts.items() if _t < _cutoff]:
+                _repair_last_ts.pop(_k, None)
     try:
         _, step, maxlen = _buffer_meta(interval)
         n = int((end_ms - start_ms) // step) + 1
