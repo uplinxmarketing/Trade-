@@ -3703,6 +3703,7 @@ def _new_trace_entry() -> dict:
         # internal (stripped from the public reader):
         "_ready_since_hb":   0,     # heartbeat the current ready-streak began
         "_was_ready":        False,
+        "_last_touch_hb":    -1,    # heartbeat a fresh attempt/block was stamped
     }
 
 
@@ -3749,6 +3750,7 @@ def _trace_mark_attempt(symbol: str) -> None:
         _decision_trace[symbol] = ent
         ent["last_attempt_ts"] = time.time()
         ent["_ready_since_hb"] = _decision_heartbeat
+        ent["_last_touch_hb"] = _decision_heartbeat
         _decision_gap_warned.pop(symbol, None)
 
 
@@ -3766,6 +3768,7 @@ def _trace_mark_block(symbol: str, reason: str) -> None:
         ent["last_block_ts"] = time.time()
         ent["engine_ready"] = False
         ent["_ready_since_hb"] = _decision_heartbeat
+        ent["_last_touch_hb"] = _decision_heartbeat
         _decision_gap_warned.pop(symbol, None)
 
 
@@ -8338,6 +8341,11 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # Q1 — helpers so the per-symbol loop never leaves a buy-ready candidate
     # without an explicit machine-readable state.
     _items = list(cache_snapshot.items())
+    # Q1 — every symbol evaluated buy-ready (cached-green) THIS pass. The
+    # end-of-pass backstop stamps a catch-all reason on any of these that
+    # reached the end of the loop with neither an attempt nor a fresh block
+    # reason, so the DECISION-GAP tripwire can never fire "no block reason".
+    _ready_syms_pass: set = set()
 
     def _cached_ready(_c) -> bool:
         return bool(_c.get("score", 0) >= min_sigs)
@@ -8382,6 +8390,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # heartbeat. Counted alongside the Part J decision-trace hook.
         if _cached_green:
             _funnel_incr("ready")
+            _ready_syms_pass.add(sym)
         elif not signal_engine_active:
             # O5.1 — legacy path cached-green flipped OFF → reset the confirm-
             # then-fire timer so the window restarts on the next confirmation.
@@ -8549,8 +8558,20 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"Buy scan: capped at {_eff_max_buys} buys this cycle — "
                 f"remaining coins evaluated next cycle", "info"
             )
+            # Q1 — every still-unprocessed ready candidate is deferred by the
+            # per-scan pacing cap, not silently dropped.
+            _reason_pace = (f"waiting: buy pacing cap "
+                            f"({_buys_this_scan}/{_eff_max_buys} this scan)")
+            for _s, _c in _items[_idx:]:
+                if _s in approved and _cached_ready(_c):
+                    _trace_mark_block(_s, _reason_pace)
             break
         if time.time() - _last_buy_ts < _eff_stagger:
+            # Q1 — this slot fired too recently (entry stagger); the deferred
+            # ready candidate is waiting, not a silent gap.
+            if _cached_green:
+                _trace_mark_block(
+                    sym, f"waiting: entry stagger ({_eff_stagger:.0f}s)")
             continue  # this slot too soon — try next coin in case it's been longer
 
         # ── Falling knife filter (§3.4a — volatility-scaled) ──────────────────
@@ -8810,10 +8831,15 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         allowed, reason = can_execute_buy(buy_cfg, _client())
         if not allowed:
             database.log_activity(f"{sym}: buy skipped — {reason}", "info")
+            # Q1 — surface can_execute_buy's reason (min-hold, per-symbol cap,
+            # cooldown, …) in the decision trace so a ready coin blocked here is
+            # never a silent gap.
+            _trace_mark_block(sym, f"blocked: {reason}")
             continue
 
         if sym in _bad_symbols:
             database.log_activity(f"{sym}: buy skipped — market closed/delisted (blacklisted this session)", "warn")
+            _trace_mark_block(sym, "blocked: market closed/delisted (blacklisted)")
             continue
 
         # Binance minimum notional ($10 for most spot pairs) is now enforced
@@ -9296,6 +9322,24 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         with _buying_lock:
             _buying.discard(sym)
             _buying_ts.pop(sym, None)
+
+    # ── Q1 — DECISION-GAP backstop (final safety net) ─────────────────────────
+    # The per-symbol skip sites above stamp SPECIFIC machine-readable reasons,
+    # but the invariant must hold unconditionally: any symbol that was buy-ready
+    # (cached-green) THIS pass and got neither an entry attempt nor a fresh
+    # block reason this heartbeat would otherwise reach the DECISION-GAP
+    # tripwire with "no block reason". Stamp a catch-all so the gap can never be
+    # truly silent. Specific reasons are always preferred — this only fires for
+    # a ready candidate that slipped past every explicit skip site (e.g. a
+    # falling-knife/trend-health veto whose indicator read raised and fell
+    # through, or a future skip added without its own _trace_mark_block).
+    _hb_now = _decision_heartbeat
+    for _rs in _ready_syms_pass:
+        with _decision_trace_lock:
+            _ent_rs = _decision_trace.get(_rs)
+            _touched = bool(_ent_rs) and _ent_rs.get("_last_touch_hb") == _hb_now
+        if not _touched:
+            _trace_mark_block(_rs, "waiting: no attempt this cycle")
 
 
 # ── Inline tick-driven signal refresh ────────────────────────────────────────────
