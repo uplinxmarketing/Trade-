@@ -1119,6 +1119,22 @@ _LOSS_COOLDOWN_SEC = 1800  # 30 minutes
 #                                   distance (structurally poor entry).
 #   min_quote_volume_24h_usd (20000000) L2.2: skip symbols whose 24h quote
 #                                   volume (USDT) is below this liquidity floor.
+# v0.4 Part O5 — near-live buy execution (READ here at time of use):
+#   confirm_seconds         (10.0)  O5.1/O5.3: how long a candidate must HOLD its
+#                                   fresh-re-check-confirmed buy-ready state on
+#                                   the fast re-check path before the entry fires.
+#                                   0 → fire on the first confirmed tick; 300 →
+#                                   require a full candle of held confirmation.
+#                                   It tunes confirm LATENCY only — it never lets
+#                                   a buy skip the fresh re-check gate.
+#   cooldown_recheck_fail_min (1.0) O5.2: candidacy cooldown after a fresh
+#                                   re-check FAIL / near-miss (near-zero — the
+#                                   coin may qualify again next tick; must NOT
+#                                   bench for 30 min).
+#   cooldown_thin_min       (5.0)   O5.2: candidacy cooldown after a thin-
+#                                   liquidity skip (replaces the flat 30 min).
+#   cooldown_spread_min     (5.0)   O5.2: candidacy cooldown after a wide-spread /
+#                                   high-friction skip.
 _ENTRIES_DEFAULTS = {
     "eval_heartbeat_sec":     15.0,
     "tick_entries":           False,
@@ -1135,6 +1151,11 @@ _ENTRIES_DEFAULTS = {
     "taker_fallback_max_spread_pct": 0.05,
     "max_friction_of_stop":   15.0,
     "min_quote_volume_24h_usd": 20000000.0,
+    # v0.4 Part O5 — near-live buy execution
+    "confirm_seconds":            10.0,
+    "cooldown_recheck_fail_min":  1.0,
+    "cooldown_thin_min":          5.0,
+    "cooldown_spread_min":        5.0,
 }
 
 
@@ -1458,8 +1479,10 @@ def _log_skip_dedup(symbol: str, reason: str, message: str,
 
 def _note_candidacy_fail(symbol: str, fresh_score, reason: str = "") -> None:
     """F6: on a fresh re-check FAIL, write the fresh score back to the signal
-    cache (so the fast pre-check stops re-selecting the coin) and arm a 60s
-    candidacy cooldown."""
+    cache (so the fast pre-check stops re-selecting the coin) and arm the
+    reason-specific candidacy cooldown (O5.2: recheck-fail → near-zero, not the
+    old flat 30 min). Also resets the O5.1 confirm-then-fire timer so a failed
+    re-check restarts the confirmation window from the next fresh confirmation."""
     try:
         if fresh_score is not None:
             with _signal_cache_lock:
@@ -1469,7 +1492,10 @@ def _note_candidacy_fail(symbol: str, fresh_score, reason: str = "") -> None:
                     ent["buy_ready"] = False
     except Exception:
         pass
-    _candidacy_cooldown[symbol] = time.time() + _CANDIDACY_COOLDOWN_SEC
+    # O5.1 — a fresh re-check FAIL invalidates any held confirmation.
+    _clear_buy_ready(symbol)
+    # O5.2 — recheck-fail cooldown (config-driven, read at time of use).
+    _candidacy_cooldown[symbol] = time.time() + _cooldown_secs_for("recheck_fail")
 
 
 def _in_candidacy_cooldown(symbol: str) -> bool:
@@ -1481,6 +1507,71 @@ def _in_candidacy_cooldown(symbol: str) -> bool:
         _candidacy_cooldown.pop(symbol, None)
         return False
     return True
+
+
+# ── O5 — near-live buy execution helpers ──────────────────────────────────────
+# Confirm-then-fire (O5.1/O5.3): _buy_ready_since[sym] records WHEN a candidate
+# FIRST became fresh-re-check-confirmed buy-ready (it passed the pre-buy fresh
+# candle re-check inside _check_buys_from_cache). The fast re-check loop and the
+# 15 s heartbeat both flow through the SAME gated buy path; the entry fires only
+# once the candidate has HELD that confirmed state for entries.confirm_seconds.
+# The stamp is cleared on any fresh re-check FAIL (via _note_candidacy_fail),
+# when a legacy cached-green candidate flips back below min_signals, and after a
+# fill — so the confirmation window always restarts from a fresh confirmation.
+_buy_ready_since: Dict[str, float] = {}
+_buy_ready_lock = threading.Lock()
+
+
+def _mark_buy_ready(symbol: str) -> float:
+    """Stamp (once) the moment `symbol` became fresh-re-check-confirmed buy-ready
+    and return that timestamp. Idempotent — repeated calls keep the FIRST stamp
+    so the confirm window measures HELD confirmation, not the latest tick."""
+    now = time.time()
+    with _buy_ready_lock:
+        ts = _buy_ready_since.get(symbol)
+        if ts is None:
+            ts = now
+            _buy_ready_since[symbol] = ts
+        return ts
+
+
+def _clear_buy_ready(symbol: str) -> None:
+    """Reset the confirm-then-fire timer (fresh re-check failed, cached-green
+    flipped off, or the entry filled)."""
+    with _buy_ready_lock:
+        _buy_ready_since.pop(symbol, None)
+
+
+def _has_pending_buy_confirmation() -> bool:
+    """True while at least one symbol is mid-confirmation — the fast re-check
+    loop uses this (alongside a cached-green candidate) as its cheap dispatch
+    gate so it advances timers without re-scoring the whole universe every 2-3s."""
+    with _buy_ready_lock:
+        return bool(_buy_ready_since)
+
+
+def _cooldown_secs_for(reason: str) -> float:
+    """O5.2 — reason-specific candidacy cooldown (seconds), config-driven and
+    read at time of use (hot-reload). Replaces the flat ~30-min bench that parked
+    any skipped coin for ~6 candles:
+      recheck_fail → entries.cooldown_recheck_fail_min (near-zero: the coin may
+                     qualify again next tick, so it must NOT sit 30 min)
+      thin         → entries.cooldown_thin_min   (thin liquidity)
+      spread       → entries.cooldown_spread_min (wide spread / high friction)
+    Maker-abandon and budget cooldowns are intentionally NOT routed here — they
+    keep their existing 5-min value at their own call sites."""
+    cfg = _entries_cfg()
+    r = (reason or "").lower()
+    if r in ("recheck_fail", "fresh_score_below_min", "stale_signals",
+             "near_miss"):
+        return max(0.0, float(cfg.get("cooldown_recheck_fail_min", 1.0))) * 60.0
+    if r in ("thin", "thin_liquidity"):
+        return max(0.0, float(cfg.get("cooldown_thin_min", 5.0))) * 60.0
+    if r in ("spread", "wide_spread", "high_friction", "friction"):
+        return max(0.0, float(cfg.get("cooldown_spread_min", 5.0))) * 60.0
+    # Unknown reason → the historical 60 s transient candidacy cooldown.
+    return _CANDIDACY_COOLDOWN_SEC
+
 
 # ── Phase 1 §1.3 — entry snapshots (executed buys + near-misses) ──────────────
 # Near-miss snapshot throttle: one row per (symbol, reason) per 5 minutes so a
@@ -4784,7 +4875,7 @@ def purge_symbol_state(symbol: str) -> None:
 
     # Plain per-symbol dicts (accessed under the GIL — pop is atomic).
     for _d in (
-        _cooldowns, _loss_cooldown, _candidacy_cooldown,
+        _cooldowns, _loss_cooldown, _candidacy_cooldown, _buy_ready_since,
         _sell_last_failed_ts, _sell_last_failed_reason, _ghost_check_fails,
         _maker_abandon_counts, _lot_waste_flags, _bookticker_cache,
         _rest_px, _rest_px_sym_ts, _last_ws_price_ts, _pos_peaks,
@@ -6033,6 +6124,58 @@ def start_entry_heartbeat() -> None:
     _entry_heartbeat_thread = threading.Thread(
         target=_entry_heartbeat_loop, name="entry-heartbeat", daemon=True)
     _entry_heartbeat_thread.start()
+
+
+# ── O5.1/O5.3 — fast re-check (confirm-then-fire) loop ────────────────────────
+# The veto heartbeat above only re-checks buys every eval_heartbeat_sec (~15 s),
+# so an armed candidate could wait most of a candle before its fresh re-check
+# even ran (the live J1 buy-lag). This loop re-checks the SAME gated buy path on
+# a ~2.5 s cadence — NOT tick-chasing: it merely triggers the identical
+# _dispatch_buy_check / _check_buys_from_cache pipeline sooner, and the fresh
+# re-check + confirm-then-fire gate inside it still decide every entry. To keep
+# CPU sane it dispatches ONLY when there is a cached-green candidate OR a symbol
+# is mid-confirmation (a pending _buy_ready_since timer) — it never re-scores the
+# whole universe just to spin. Indicator computation stays event-driven (Part C);
+# this only re-evaluates the DECISION on already-cached fresh indicators.
+_FAST_RECHECK_SEC = 2.5
+_fast_recheck_thread: Optional[threading.Thread] = None
+
+
+def _fast_recheck_loop() -> None:
+    while True:
+        interval = _FAST_RECHECK_SEC
+        try:
+            cfg = _entries_cfg()
+            # Legacy per-tick mode has its own dispatch; and never run before
+            # entries are armed (same choke point _check_buys_from_cache uses).
+            if not cfg["tick_entries"] and _entries_armed():
+                strat = _load_strategy()
+                _min_sigs = int(strat.get("min_signals", config.MIN_SIGNALS_TO_BUY))
+                with _signal_cache_lock:
+                    _has_green = any(
+                        v.get("score", 0) >= _min_sigs
+                        for v in _signal_cache.values())
+                # Cheap dispatch gate: a cached-green candidate to (re-)confirm,
+                # or a symbol already mid-confirmation whose timer must advance.
+                if _has_green or _has_pending_buy_confirmation():
+                    try:
+                        import data_collector as _dc_fr
+                        _dispatch_buy_check(dict(_dc_fr.prices))
+                    except Exception:
+                        _dispatch_buy_check({})
+        except Exception:
+            interval = _FAST_RECHECK_SEC
+        time.sleep(interval)
+
+
+def start_fast_recheck() -> None:
+    """Start (or restart) the O5.1 fast re-check (confirm-then-fire) thread."""
+    global _fast_recheck_thread
+    if _fast_recheck_thread is not None and _fast_recheck_thread.is_alive():
+        return
+    _fast_recheck_thread = threading.Thread(
+        target=_fast_recheck_loop, name="fast-recheck", daemon=True)
+    _fast_recheck_thread.start()
 
 
 # ── I1 — no scoring/entry on partial buffers; arm entries last ────────────────
@@ -7340,11 +7483,16 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # cached (last-candle) buy-ready verdict. This drives the two-state
         # cached-green vs engine-ready-fresh distinction and the DECISION-GAP
         # detector. cached_green mirrors the pre-check's ready test.
-        _trace_mark_evaluated(sym, cached.get("score", 0) >= min_sigs)
+        _cached_green = cached.get("score", 0) >= min_sigs
+        _trace_mark_evaluated(sym, _cached_green)
         # L1.2 — funnel stage 1: this symbol is buy-ready (cached-green) this
         # heartbeat. Counted alongside the Part J decision-trace hook.
-        if cached.get("score", 0) >= min_sigs:
+        if _cached_green:
             _funnel_incr("ready")
+        elif not signal_engine_active:
+            # O5.1 — legacy path cached-green flipped OFF → reset the confirm-
+            # then-fire timer so the window restarts on the next confirmation.
+            _clear_buy_ready(sym)
         # F6: skip coins in the post-fail candidacy cooldown (prevents ~7s churn
         # of a coin the fresh engine re-check just rejected).
         if _in_candidacy_cooldown(sym):
@@ -7708,7 +7856,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     f"{sym}: 24h quote volume unavailable (no kline store rows) "
                     f"— liquidity floor not enforced (fail-open)", "info")
             elif _qv < _qv_floor:
-                _candidacy_cooldown[sym] = time.time() + _LIQUIDITY_COOLDOWN_SEC
+                # O5.2 — thin-liquidity cooldown (config-driven, read at time of
+                # use; replaces the flat 30-min _LIQUIDITY_COOLDOWN_SEC bench).
+                _thin_cd = _cooldown_secs_for("thin")
+                _candidacy_cooldown[sym] = time.time() + _thin_cd
                 _record_rejection(
                     sym, score, "thin_liquidity",
                     f"24h quote vol ${_qv/1e6:.1f}M < ${_qv_floor/1e6:.0f}M floor")
@@ -7716,7 +7867,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     sym, "thin_liquidity",
                     f"[SKIP] {sym}: 24h quote vol ${_qv/1e6:.1f}M < "
                     f"${_qv_floor/1e6:.0f}M floor — skipping (thin). Cooldown "
-                    f"{_LIQUIDITY_COOLDOWN_SEC/60:.0f} min.", "warn")
+                    f"{_thin_cd/60:.0f} min.", "warn")
                 continue
 
         # ── L2.1 — friction gate ──────────────────────────────────────────────
@@ -7736,8 +7887,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 _friction = _half_sp + _slip_pct
                 _stop_budget = _fric_cap_pct / 100.0 * _stop_pct
                 if _friction > _stop_budget:
+                    # O5.2 — wide-spread / high-friction cooldown (config-driven,
+                    # read at time of use; friction is spread-dominated).
                     _candidacy_cooldown[sym] = (
-                        time.time() + _MAKER_ABANDON_COOLDOWN_SEC)
+                        time.time() + _cooldown_secs_for("high_friction"))
                     _record_rejection(
                         sym, score, "high_friction",
                         f"friction {_friction:.3f}% > {_fric_cap_pct:g}% of "
@@ -7910,6 +8063,33 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 _record_rejection(sym, score, "no_reversal_confirmed", _rev_reason)
                 _release_buy_claim()
                 continue
+
+        # ── O5.1/O5.3 — confirm-then-fire latency gate ────────────────────────
+        # O5.5 DISCIPLINE BOUNDARY: entries.confirm_seconds ONLY tunes how long a
+        # candidate must HOLD its fresh-re-check-confirmed buy-ready state before
+        # the entry fires — it is NOT a switch to buy on a single unconfirmed
+        # cached-green tick. The fresh re-check above (fresh candles + engine/
+        # score re-evaluation) has ALREADY run and PASSED on THIS pass and gates
+        # every fire, so a coin that is cached-green but fails the fresh score
+        # (the XRP "cached green, fresh score 1/3" bug) never reaches this gate.
+        # This gate can only DEFER or RELEASE a fire, never bypass a fresh
+        # confirmation. confirm_seconds=0 → fire on the first confirmed tick;
+        # confirm_seconds=300 → require a full candle of held confirmation.
+        _confirm_sec = max(0.0, float(_entries_cfg().get("confirm_seconds", 10.0)))
+        _ready_since = _mark_buy_ready(sym)   # stamp on the FIRST confirmed pass
+        _held_sec = time.time() - _ready_since
+        if _held_sec < _confirm_sec:
+            # Not held long enough yet — defer. The fast re-check loop (~2.5 s)
+            # will re-run the fresh re-check and fire once the window elapses;
+            # the ready-streak is held (block-marked) so DECISION-GAP doesn't
+            # false-warn, and the claim is released so the next pass can re-claim.
+            _trace_mark_block(sym, "confirming")
+            _log_skip_dedup(
+                sym, "confirming",
+                f"{sym}: buy-ready confirmed — holding {_held_sec:.1f}s/"
+                f"{_confirm_sec:.0f}s before firing (confirm-then-fire).", "info")
+            _release_buy_claim()
+            continue
 
         # J1 — the candidate passed every gate + the fresh re-check; order
         # placement is about to start. Record the fresh engine-ready verdict and
@@ -8115,6 +8295,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         with _positions_lock:
             _positions.append(pos_record)
         _rebuild_pos_index()
+        # O5.1 — entry filled: clear the confirm-then-fire timer so a future
+        # re-entry starts a fresh confirmation window.
+        _clear_buy_ready(sym)
 
         # ── Phase 2 §2.4/§2.5: exchange-side exit order (LIVE only) ───────────
         # Placed AFTER the position is fully created and geometry applied.
@@ -9798,6 +9981,11 @@ async def position_guardian():
         # §3.1c(ii) — veto-recheck heartbeat (restarted here if it ever dies).
         try:
             start_entry_heartbeat()
+        except Exception:
+            pass
+        # O5.1 — fast re-check / confirm-then-fire loop (restarted if it dies).
+        try:
+            start_fast_recheck()
         except Exception:
             pass
         if not (_sell_monitor_thread and _sell_monitor_thread.is_alive()):
