@@ -63,6 +63,7 @@ log = logging.getLogger(__name__)
 # Keep the file handle alive at module scope so it is never garbage-collected
 # out from under the C signal handler. Reuses database's resolved data dir.
 _faulthandler_fh = None
+_faulthandler_wd_fh = None   # N2 — watchdog dump file handle (kept alive at module scope)
 try:
     import faulthandler as _faulthandler
     try:
@@ -76,6 +77,99 @@ try:
             _faulthandler.enable(all_threads=True)
         except Exception:
             pass
+    # N2 — HANG/wedge watchdog: dump ALL thread stacks periodically so a wedge
+    # under concurrent heavy REST (which never raises a fatal signal, so
+    # faulthandler.enable() alone would capture nothing) still leaves a stack
+    # trace. repeat=True keeps re-arming; the timer thread is a daemon. Reuses
+    # the same data-dir resolution as faulthandler.log.
+    try:
+        _fh_dir = os.path.dirname(database.DB_PATH) or "."
+        _faulthandler_wd_fh = open(os.path.join(_fh_dir, "faulthandler_watchdog.log"), "a")
+        _faulthandler.dump_traceback_later(300, repeat=True, file=_faulthandler_wd_fh)
+    except Exception:
+        pass
+except Exception:
+    pass
+
+
+# ── N2 — uncaught-exception hooks (threads + main) ────────────────────────────
+# A background thread dying (or an uncaught main-thread exception) can be silent
+# today: the process just goes and systemd restarts it, leaving no trace. Route
+# BOTH threading.excepthook and sys.excepthook through a logger that records the
+# full traceback via log_activity(..., "error") AND appends it to a crash file,
+# chaining any previously-installed hook so nothing else's handler is lost.
+import sys as _sys
+
+_crash_log_fh = None
+try:
+    _crash_dir = os.path.dirname(database.DB_PATH) or "."
+    _crash_log_fh = open(os.path.join(_crash_dir, "uncaught_crash.log"), "a")
+except Exception:
+    _crash_log_fh = None
+
+_prev_sys_excepthook = getattr(_sys, "excepthook", None)
+try:
+    _prev_threading_excepthook = threading.excepthook
+except Exception:
+    _prev_threading_excepthook = None
+
+
+def _write_crash_file(header: str, tb_text: str) -> None:
+    """Append a traceback to the crash file. Never raises."""
+    try:
+        if _crash_log_fh is not None:
+            _crash_log_fh.write(
+                f"\n===== {header} @ {datetime.now(timezone.utc).isoformat()} =====\n")
+            _crash_log_fh.write(tb_text)
+            _crash_log_fh.write("\n")
+            _crash_log_fh.flush()
+    except Exception:
+        pass
+
+
+def _log_uncaught(header: str, exc_type, exc_value, exc_tb) -> None:
+    """Log an uncaught exception to the activity log (error) + crash file."""
+    try:
+        import traceback as _tb
+        tb_text = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+    except Exception:
+        tb_text = f"{exc_type}: {exc_value}"
+    try:
+        database.log_activity(
+            f"{header}: {getattr(exc_type, '__name__', exc_type)}: {exc_value}", "error")
+    except Exception:
+        pass
+    _write_crash_file(header, tb_text)
+
+
+def _trade_engine_sys_excepthook(exc_type, exc_value, exc_tb):
+    _log_uncaught("UNCAUGHT EXCEPTION (main thread)", exc_type, exc_value, exc_tb)
+    try:
+        if callable(_prev_sys_excepthook):
+            _prev_sys_excepthook(exc_type, exc_value, exc_tb)
+    except Exception:
+        pass
+
+
+def _trade_engine_threading_excepthook(args):
+    thr = getattr(args, "thread", None)
+    name = getattr(thr, "name", "?") if thr is not None else "?"
+    _log_uncaught(
+        f"UNCAUGHT EXCEPTION (thread {name})",
+        args.exc_type, args.exc_value, args.exc_traceback)
+    try:
+        if callable(_prev_threading_excepthook):
+            _prev_threading_excepthook(args)
+    except Exception:
+        pass
+
+
+try:
+    _sys.excepthook = _trade_engine_sys_excepthook
+except Exception:
+    pass
+try:
+    threading.excepthook = _trade_engine_threading_excepthook
 except Exception:
     pass
 
@@ -2648,6 +2742,190 @@ def _has_unclosed_bot_buy(sym: str) -> bool:
         return False  # uncertainty must never fabricate a sellable position
 
 
+# Quote/stable/fiat assets that never have a tradeable <asset>USDT spot pair the
+# bot should adopt/auto-sell (e.g. USDUSDT → -1121 Invalid symbol).
+_NON_TRADEABLE_BASE = (
+    "USDT", "BNB", "BUSD", "USDC", "USD", "FDUSD", "TUSD", "DAI", "USDP",
+    "AEUR", "EUR", "GBP", "TRY", "BRL", "AUD", "UAH", "RUB", "NGN", "ZAR",
+    "PLN", "ARS", "JPY", "MXN", "CZK", "COP",
+)
+
+
+def recover_orphan_positions() -> dict:
+    """N2b — boot risk-integrity: adopt and RE-PROTECT live coins the bot holds on
+    Binance but has no open position record for, BEFORE entry evaluation is armed.
+    A crash must never leave a live coin with no stop.
+
+    For every non-dust base asset with an <asset>USDT pair:
+      • already tracked (open position record) → skip.
+      • balance with a recorded UNCLOSED bot BUY but no open record → ADOPT:
+        recreate the in-memory position from the recorded entry (current price is
+        the safest entry estimate after a DB wipe) and IMMEDIATELY re-attach the
+        SAME exit geometry + (maker/OCO) stop/TP a normal open uses
+        (_apply_entry_exit_geometry + _place_managed_exit).
+      • balance with NO recorded bot buy → LOUD 'UNMANAGED BALANCE' warning; never
+        auto-sold (it is the user's own holding).
+
+    Fail-safe: every asset is processed in its own try/except and the whole scan
+    is best-effort — recovery NEVER crashes boot. A held position that cannot be
+    re-protected is flagged via the H1 stuck-position escalation so the UI
+    surfaces it for manual action.
+
+    Returns {'adopted': [...], 'unmanaged': [...], 'reprotected': [...]}. Safe to
+    call standalone (control_api boot) or in-line from load_positions_from_db;
+    MUST run before entries are armed (it does — load_positions_from_db precedes
+    start_entry_heartbeat / the _entries_armed gate in the boot sequence).
+    """
+    result: Dict[str, list] = {"adopted": [], "unmanaged": [], "reprotected": []}
+    if get_mode() != "live":
+        return result
+    try:
+        acc = _acct()  # geo-block-safe direct transport
+    except Exception as e:
+        database.log_activity(f"Orphan recovery: account fetch failed (non-fatal): {e}", "warn")
+        return result
+
+    with _positions_lock:
+        tracked_symbols = {p["symbol"] for p in _positions}
+    now_ts = datetime.now(timezone.utc).isoformat()
+
+    for b in acc.get("balances", []):
+        try:
+            asset  = b["asset"]
+            free   = float(b["free"])
+            locked = float(b["locked"])
+            total  = free + locked
+            if asset in _NON_TRADEABLE_BASE or total <= 0:
+                continue
+            # Binance Earn wrappers (LDPYTH etc.) are not tradeable spot assets.
+            if asset.startswith("LD"):
+                continue
+            sym = asset + "USDT"
+            if sym in tracked_symbols:
+                continue
+
+            # Current price — cached REST price first, then the public data-api
+            # ticker (geo-block-safe, no signed call needed).
+            price = _rest_px.get(sym, 0) or 0
+            if price <= 0:
+                try:
+                    price = float(_fetch_batch_prices([sym]).get(sym, 0) or 0)
+                except Exception:
+                    pass
+
+            # Only FREE balance is market-sellable; locked qty would -2010.
+            sell_qty = free if free > 0 else total
+            value = sell_qty * price if price > 0 else 0
+
+            # Dust below Binance's ~$10 min notional can't be sold — skip (log
+            # once per process).
+            if price > 0 and value < 10.0:
+                if value >= 1.0 and asset not in _orphan_warned:
+                    _orphan_warned.add(asset)
+                    database.log_activity(
+                        f"Orphan scan: skipping {asset} (~${value:.2f}) — below $10 "
+                        f"min notional, unsellable dust", "info")
+                continue
+
+            # ONLY adopt holdings the bot itself bought. Anything else is the
+            # user's personal holding — fabricating a position would let the sell
+            # monitor liquidate the user's own coins.
+            if not _has_unclosed_bot_buy(sym):
+                if asset not in _orphan_warned:
+                    _orphan_warned.add(asset)
+                    database.log_activity(
+                        f"UNMANAGED BALANCE {asset} (~${value:.2f}) — manual review. "
+                        f"Held on Binance with no recorded bot buy; NOT adopted and "
+                        f"NOT auto-sold.", "warn")
+                result["unmanaged"].append(asset)
+                continue
+
+            if price <= 0 or value <= 1.0:
+                if asset not in _orphan_warned:
+                    _orphan_warned.add(asset)
+                    msg = (f"⚠ ORPHANED COIN: {asset} qty={total:.8f} on Binance "
+                           f"but no price available — sell manually via Binance app.")
+                    print(f"[TradeEngine] {msg}")
+                    database.log_activity(msg, "warn")
+                continue
+
+            # ── ADOPT ────────────────────────────────────────────────────────
+            # Entry is unknown after a DB wipe — current price is the safest
+            # default: the bot monitors from here and exits on TP/SL.
+            exit_target = round(price * _get_breakeven_mult(price, sym), 8)
+            pos_record = {
+                "symbol":       sym,
+                "entry_price":  price,
+                "exit_target":  exit_target,
+                "quantity":     sell_qty,
+                "budget_usdt":  round(value, 2),
+                "buy_fee_usdt": round(value * _fee_rate_for(sym), 6),
+                "timestamp":    now_ts,
+                "mode":         "live",
+            }
+            # Re-attach the SAME exit geometry a normal open computes (§2.1) —
+            # this alone gives the local sell monitor a stop/TP to defend.
+            _apply_entry_exit_geometry(pos_record)
+            pos_id = database.save_position(pos_record)
+            pos_record["id"] = pos_id
+            with _positions_lock:
+                _positions.append(pos_record)
+            tracked_symbols.add(sym)
+            result["adopted"].append(sym)
+            database.log_activity(
+                f"AUTO-RECOVERED orphaned live position: {sym} "
+                f"qty={total:.8f} @ ${price:.4f} (~${value:.2f} USDT) — "
+                f"entry price is ESTIMATED (current price used). "
+                f"Adjust stop-loss in dashboard if needed.", "warn")
+
+            # ── RE-PROTECT before entries arm: attach the exchange-side (maker
+            # TP / OCO) exit a normal open places. Geometry above already gives a
+            # local stop/TP; this adds the exchange backup. Failure to re-protect
+            # a held position is escalated via the H1 stuck-position path.
+            try:
+                has_protection = bool(pos_record.get("stop_price")
+                                      or pos_record.get("tp_price"))
+                _place_managed_exit(pos_record)   # no-op in paper fallback
+                if has_protection:
+                    result["reprotected"].append(sym)
+                    database.log_activity(
+                        f"Re-protected orphan {sym}: stop={pos_record.get('stop_price')} "
+                        f"tp={pos_record.get('tp_price')} re-attached before entries armed",
+                        "info")
+                else:
+                    raise RuntimeError("no stop_price/tp_price after geometry")
+            except Exception as pe:
+                database.log_activity(
+                    f"Orphan {sym}: RE-PROTECTION FAILED ({pe}) — flagging stuck for "
+                    f"manual review; position is adopted but may lack an exchange stop",
+                    "error")
+                try:
+                    for _ in range(_STUCK_SKIP_THRESHOLD + 1):
+                        _note_sell_skip(sym, "orphan_reprotect_failed")
+                except Exception:
+                    pass
+        except Exception as be:
+            # Per-asset fail-safe: one bad balance row never aborts recovery/boot.
+            try:
+                database.log_activity(
+                    f"Orphan recovery: {b.get('asset', '?')} skipped (non-fatal): {be}",
+                    "warn")
+            except Exception:
+                pass
+            continue
+
+    if result["adopted"]:
+        _rebuild_pos_index()
+    try:
+        lvl = "warn" if (result["adopted"] or result["unmanaged"]) else "info"
+        database.log_activity(
+            f"Orphan recovery summary: adopted={result['adopted']} "
+            f"reprotected={result['reprotected']} unmanaged={result['unmanaged']}", lvl)
+    except Exception:
+        pass
+    return result
+
+
 def load_positions_from_db():
     """
     Called on startup.  Restores open positions from SQLite when available,
@@ -2795,129 +3073,15 @@ def load_positions_from_db():
     except Exception as e:
         database.log_activity(f"Supabase snapshot push failed: {e}", "warn")
 
-    # Live mode: scan Binance Spot for coins the bot has no position for.
-    # AUTO-RECOVER orphaned positions so real money is never invisible to the bot.
-    # Positions are lost when the DB is wiped (container restart without a volume)
-    # or when Supabase restore fails. We rebuild records from Binance balances so
-    # the sell monitor immediately tracks them and can exit at take-profit/stop-loss.
-    if get_mode() == "live":
-        try:
-            acc = _acct()  # geo-block-safe direct transport
-            tracked_symbols = {p["symbol"] for p in _positions}
-            recovered_syms = []
-            now_ts = datetime.now(timezone.utc).isoformat()
-
-            for b in acc["balances"]:
-                asset  = b["asset"]
-                free   = float(b["free"])
-                locked = float(b["locked"])
-                total  = free + locked
-                # Skip quote/stable/fiat assets — no <asset>USDT pair exists for
-                # them (e.g. USDUSDT → -1121 Invalid symbol) or they aren't
-                # something the bot should ever auto-sell.
-                if asset in ("USDT", "BNB", "BUSD", "USDC", "USD", "FDUSD", "TUSD",
-                             "DAI", "USDP", "AEUR", "EUR", "GBP", "TRY", "BRL",
-                             "AUD", "UAH", "RUB", "NGN", "ZAR", "PLN", "ARS",
-                             "JPY", "MXN", "CZK", "COP") or total <= 0:
-                    continue
-                # Binance Earn wrappers (LDPYTH etc.) are not tradeable spot
-                # assets — never adopt or warn about them.
-                if asset.startswith("LD"):
-                    continue
-                # Binance Earn wrappers (LDPYTH etc.) are not tradeable spot
-                # assets — never adopt or warn about them.
-                if asset.startswith("LD"):
-                    continue
-                sym = asset + "USDT"
-                if sym in tracked_symbols:
-                    continue
-
-                # Fetch current price — try cached REST price first, then the
-                # public data-api ticker (geo-block-safe, no signed call needed)
-                price = _rest_px.get(sym, 0) or 0
-                if price <= 0:
-                    try:
-                        price = float(_fetch_batch_prices([sym]).get(sym, 0) or 0)
-                    except Exception:
-                        pass
-
-                # Use only free balance — locked qty can't be market-sold and
-                # would cause -2010 "insufficient balance" on Binance.
-                sell_qty = free if free > 0 else total
-                value = sell_qty * price if price > 0 else 0
-
-                # Dust below Binance's ~$10 min notional can't be sold anyway —
-                # skip it (log once per process, not every startup/loop).
-                if price > 0 and value < 10.0:
-                    if value >= 1.0 and asset not in _orphan_warned:
-                        _orphan_warned.add(asset)
-                        database.log_activity(
-                            f"Orphan scan: skipping {asset} (~${value:.2f}) — below $10 "
-                            f"min notional, unsellable dust", "info"
-                        )
-                    continue
-
-                # ONLY adopt holdings the bot itself bought (recorded live BUY
-                # with no closing sell). Anything else is the user's personal
-                # holding — fabricating a position here would let the sell
-                # monitor liquidate the user's own coins.
-                if not _has_unclosed_bot_buy(sym):
-                    if asset not in _orphan_warned:
-                        _orphan_warned.add(asset)
-                        database.log_activity(
-                            f"Orphan scan: {asset} (~${value:.2f}) held on Binance but has "
-                            f"no recorded bot buy — leaving untouched (not a bot position)",
-                            "info"
-                        )
-                    continue
-
-                if price > 0 and value > 1.0:
-                    # Recreate position using current price as estimated entry.
-                    # Entry is unknown after a DB wipe — current price is the safest
-                    # default: the bot will monitor from here and exit on TP/SL.
-                    exit_target = round(price * _get_breakeven_mult(price, sym), 8)
-                    pos_record = {
-                        "symbol":       sym,
-                        "entry_price":  price,
-                        "exit_target":  exit_target,
-                        "quantity":     sell_qty,
-                        "budget_usdt":  round(value, 2),
-                        "buy_fee_usdt": round(value * _fee_rate_for(sym), 6),
-                        "timestamp":    now_ts,
-                        "mode":         "live",
-                    }
-                    _apply_entry_exit_geometry(pos_record)  # Phase 2 §2.1
-                    pos_id = database.save_position(pos_record)
-                    pos_record["id"] = pos_id
-                    with _positions_lock:
-                        _positions.append(pos_record)
-                    tracked_symbols.add(sym)
-                    recovered_syms.append(sym)
-                    msg = (
-                        f"AUTO-RECOVERED orphaned live position: {sym} "
-                        f"qty={total:.8f} @ ${price:.4f} (~${value:.2f} USDT) — "
-                        f"entry price is ESTIMATED (current price used). "
-                        f"Adjust stop-loss in dashboard if needed."
-                    )
-                    print(f"[TradeEngine] {msg}")
-                    database.log_activity(msg, "warn")
-                elif asset not in _orphan_warned:
-                    _orphan_warned.add(asset)
-                    msg = (
-                        f"⚠ ORPHANED COIN: {asset} qty={total:.8f} on Binance "
-                        f"but no price available — sell manually via Binance app."
-                    )
-                    print(f"[TradeEngine] {msg}")
-                    database.log_activity(msg, "warn")
-
-            if recovered_syms:
-                _rebuild_pos_index()
-                database.log_activity(
-                    f"Recovered {len(recovered_syms)} orphaned live position(s) "
-                    f"from Binance balances: {', '.join(recovered_syms)}", "warn"
-                )
-        except Exception as e:
-            database.log_activity(f"Orphan scan/recovery failed (non-fatal): {e}", "warn")
+    # N2b — orphan recovery: adopt & RE-PROTECT any live Binance holding that has
+    # a recorded bot buy but no open position record, BEFORE entries are armed.
+    # Runs in-line here (load_positions_from_db precedes start_entry_heartbeat /
+    # the _entries_armed gate) so a crash never leaves a live coin without a stop.
+    # Fully self-contained + fail-safe — never crashes boot.
+    try:
+        recover_orphan_positions()
+    except Exception as e:
+        database.log_activity(f"Orphan scan/recovery failed (non-fatal): {e}", "warn")
 
     # Sync PaperClient coin balances from the restored positions.
     # After a restart, PaperClient loads from saved paper_state, but if that

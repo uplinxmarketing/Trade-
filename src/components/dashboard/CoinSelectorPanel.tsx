@@ -1,7 +1,9 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useMemo } from 'react';
 import { Star, Search, AlertCircle, Ban, PauseCircle, Loader2 } from 'lucide-react';
 import type { LivePrices } from '@/lib/trading-engine';
 import { useUniverseHealth, type InvalidInfo } from '@/hooks/useUniverseHealth';
+import { useMarketSnapshot } from '@/hooks/useMarketSnapshot';
+import { useUniverse } from '@/hooks/useUniverse';
 
 // I4 — distinguish the two dead-ticker statuses from /api/universe/validate:
 //  - BREAK   → symbol trading is halted; the backend auto-restores it, so this
@@ -35,7 +37,11 @@ const COIN_COLORS: Record<string, string> = {
   BRETT:'#627EEA', '1000SATS':'#F7931A', TIA: '#9D5CFF',
 };
 
-const ALL_USDT_COINS = [
+// N3.2 — offline-dev fallback ONLY. The live coin list is driven by the engine
+// universe (GET /api/universe via useUniverse); this array is used solely when
+// the backend is unavailable, so a delisted ticker here is never surfaced as
+// tradeable while the backend is reachable.
+const FALLBACK_USDT_COINS = [
   // Large-caps
   'BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT',
   'ADAUSDT','AVAXUSDT','DOGEUSDT','DOTUSDT','LINKUSDT',
@@ -61,32 +67,6 @@ interface Props {
 }
 
 const FAV_KEY = 'coin_favorites';
-// Cache valid symbols for 10 minutes to avoid hammering exchange info
-let _validCache: Set<string> | null = null;
-let _validCacheTs = 0;
-
-async function fetchValidSymbols(): Promise<Set<string>> {
-  if (_validCache && Date.now() - _validCacheTs < 10 * 60 * 1000) return _validCache;
-  const bases = ['/api/proxy/binance', '/api/proxy/binance'];
-  for (const base of bases) {
-    try {
-      const resp = await fetch(`${base}/exchangeInfo?permissions=SPOT`, {
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!resp.ok) continue;
-      const data = await resp.json();
-      const valid = new Set<string>(
-        (data.symbols as any[])
-          .filter(s => s.status === 'TRADING' && s.quoteAsset === 'USDT')
-          .map(s => s.symbol as string)
-      );
-      _validCache = valid;
-      _validCacheTs = Date.now();
-      return valid;
-    } catch { /* try next base */ }
-  }
-  return new Set(); // empty = unknown, show all
-}
 
 function CoinRow({
   symbol, price, changePct, isActive, isFav, onSelect, onFav, invalidInfo, ticketTooSmall,
@@ -188,12 +168,26 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
   const [favorites, setFavorites] = useState<Set<string>>(() => {
     try { return new Set(JSON.parse(localStorage.getItem(FAV_KEY) ?? '[]')); } catch { return new Set(); }
   });
-  const [extraPrices, setExtraPrices]   = useState<Record<string, { price: number; changePct: number }>>({});
-  // null = still loading, empty Set = fetch failed (show all), non-empty = validated
-  const [validSymbols, setValidSymbols] = useState<Set<string> | null>(null);
+  // N1 — one local snapshot poll seeds prices/24h% (WebSocket still overrides in
+  // real time). This replaces the old per-list /ticker/24hr?symbols=… storm.
+  const { snapshot } = useMarketSnapshot();
+  // N3.2 — the coin list itself comes from the engine universe.
+  const { symbols: universeSymbols, available: universeAvailable } = useUniverse();
   // Backend-driven watchlist health: delisted/renamed pairs + lot-waste flags,
   // plus backfill readiness so freshly-added coins show a "warming up" badge.
-  const { invalid, lotWaste, warming, ready, backfillPct } = useUniverseHealth();
+  const { invalid: healthInvalid, lotWaste, warming, ready, backfillPct } = useUniverseHealth();
+
+  // Merge universe status into the health-derived invalid map so suspended/
+  // delisted universe symbols render the same badges. /api/universe/validate
+  // stays authoritative when it also flags a symbol.
+  const invalid = useMemo<Record<string, InvalidInfo>>(() => {
+    const merged: Record<string, InvalidInfo> = {};
+    for (const s of universeSymbols) {
+      if (s.status === 'suspended') merged[s.symbol] = { excludedKind: 'break', status: 'BREAK' };
+      else if (s.status === 'delisted') merged[s.symbol] = { excludedKind: 'delisted', suggestedRename: s.successor };
+    }
+    return { ...merged, ...healthInvalid };
+  }, [universeSymbols, healthInvalid]);
 
   // A selected coin is "warming" when it's not delisted/halted, and either the
   // backend explicitly lists it as backfilling, or readiness is known and this
@@ -206,53 +200,17 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
     return ready.size > 0 && !ready.has(u);
   };
 
-  // Fetch valid Binance spot symbols once on mount
-  useEffect(() => {
-    fetchValidSymbols().then(setValidSymbols);
-  }, []);
-
-  // All coins merged and filtered to only those Binance actually trades.
-  // EXCEPTION: never filter out a coin the user has in their watchlist
-  // (selectedCoins) or one the backend flagged delisted/renamed — those must
-  // still render so their "delisted/renamed" badge is visible and pruneable.
+  // N3.2 — coin list driven by the engine universe (GET /api/universe). The
+  // static list is offline-dev fallback only, gated behind universe availability
+  // so a delisted ticker (e.g. MKRUSDT/TONUSDT) is never surfaced as tradeable
+  // while the backend is reachable. Watchlist coins and any backend-flagged
+  // delisted/suspended symbol are always included so their badge stays visible.
   const allCoins = useMemo(() => {
-    const set = new Set([...ALL_USDT_COINS, ...selectedCoins]);
-    const all = [...set];
-    if (!validSymbols || validSymbols.size === 0) return all; // unknown — show all
-    const keep = new Set(selectedCoins.map(c => c.toUpperCase()));
-    return all.filter(c => {
-      const u = c.toUpperCase();
-      return validSymbols.has(c) || keep.has(u) || Boolean(invalid[u]);
-    });
-  }, [selectedCoins, validSymbols, invalid]);
-
-  // Fetch 24hr ticker once when allCoins list is ready (not on every price tick).
-  // WebSocket prices override these values via getPrice() — this is just seed data
-  // for coins that haven't received a WebSocket tick yet.
-  useEffect(() => {
-    if (allCoins.length === 0) return;
-    const bases = ['/api/proxy/binance', '/api/proxy/binance'];
-    const symbols = JSON.stringify(allCoins);
-    const tryFetch = async () => {
-      for (const base of bases) {
-        try {
-          const r = await fetch(
-            `${base}/ticker/24hr?symbols=${encodeURIComponent(symbols)}`,
-            { signal: AbortSignal.timeout(8000) }
-          );
-          if (!r.ok) continue;
-          const data: { symbol: string; lastPrice: string; priceChangePercent: string }[] = await r.json();
-          const map: Record<string, { price: number; changePct: number }> = {};
-          data.forEach(d => {
-            map[d.symbol] = { price: parseFloat(d.lastPrice), changePct: parseFloat(d.priceChangePercent) };
-          });
-          setExtraPrices(map);
-          return;
-        } catch { /* try next base */ }
-      }
-    };
-    tryFetch();
-  }, [allCoins]); // intentionally excludes prices — WebSocket updates handle real-time
+    const base = universeAvailable ? universeSymbols.map(s => s.symbol) : FALLBACK_USDT_COINS;
+    const set = new Set<string>([...base, ...selectedCoins]);
+    for (const k of Object.keys(invalid)) set.add(k);
+    return [...set];
+  }, [universeAvailable, universeSymbols, selectedCoins, invalid]);
 
   const toggleFav = (coin: string) => {
     setFavorites(prev => {
@@ -264,9 +222,12 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
   };
 
   const getPrice = (sym: string) => {
+    // WebSocket ticks win; the local snapshot seeds coins not yet streamed.
     const lp = prices[sym];
     if (lp) return { price: parseFloat(lp.price), changePct: parseFloat(lp.priceChangePercent) };
-    return extraPrices[sym] ?? { price: 0, changePct: 0 };
+    const snap = snapshot[sym.toUpperCase()];
+    if (snap && snap.available) return { price: snap.price, changePct: snap.pct_24h };
+    return { price: 0, changePct: 0 };
   };
 
   const filtered = useMemo(() => {
@@ -324,10 +285,11 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
         <span className="w-12 text-right">24H %</span>
       </div>
 
-      {/* Validation indicator */}
-      {validSymbols === null && (
+      {/* Universe loading indicator — before the engine universe is available,
+          the list falls back to the offline dev set. */}
+      {!universeAvailable && (
         <div className="px-3 py-1 text-[9px] text-muted-foreground flex items-center gap-1 animate-pulse border-b border-border/30">
-          <AlertCircle className="w-2.5 h-2.5" />Validating pairs…
+          <AlertCircle className="w-2.5 h-2.5" />Loading universe…
         </div>
       )}
 
@@ -371,9 +333,9 @@ export default function CoinSelectorPanel({ selectedCoins, activeCoin, onActiveC
 
       {/* Footer */}
       <div className="px-3 py-1.5 border-t border-border/50 text-[9px] text-muted-foreground leading-relaxed">
-        {validSymbols && validSymbols.size > 0
-          ? `${filtered.length} valid pairs · prices live via WebSocket`
-          : 'Prices live via WebSocket'}
+        {universeAvailable
+          ? `${filtered.length} pairs · universe-driven · prices live via WebSocket`
+          : `${filtered.length} pairs · offline fallback · prices live via WebSocket`}
       </div>
     </div>
   );

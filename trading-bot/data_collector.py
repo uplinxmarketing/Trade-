@@ -121,6 +121,14 @@ last_price_ts: Dict[str, float] = {}
 # {symbol: {"bid": float, "bid_qty": float, "ask": float, "ask_qty": float, "ts": float}}
 book_ticker: Dict[str, dict] = {}
 
+# N1 — rolling 24h market stats harvested from @24hrMiniTicker payloads. Lets the
+# UI read price / 24h change % / spread entirely from in-memory WS state via
+# get_market_snapshot() instead of hitting Binance REST ticker/24hr (that
+# per-symbol fan-out was overloading the process). Single-writer (WS event loop),
+# lock-free like prices/book_ticker — readers copy the per-symbol dict.
+# {symbol: {"open_24h", "high_24h", "low_24h", "base_vol_24h", "quote_vol_24h", "ts"}}
+market_stats: Dict[str, dict] = {}
+
 # Callbacks registered by main.py to avoid circular imports
 _price_callback: Optional[Callable[[Dict[str, float]], None]] = None
 _kline_callback: Optional[Callable[[str, list, list], None]]  = None
@@ -226,6 +234,7 @@ def purge_symbol(symbol: str) -> None:
     price_ticks.pop(sym, None)
     price_samples.pop(sym, None)
     _price_sample_ts.pop(sym, None)
+    market_stats.pop(sym, None)
     # Delist/exclusion tracking.
     with _excluded_lock:
         _excluded_symbols.pop(sym, None)
@@ -1659,6 +1668,19 @@ def _handle_ws_message(raw: str):
         last_price_ts[symbol] = now_ts
         _record_sample_and_ticks(symbol, close_price, now_ts)
         client.update_price(symbol, close_price)
+        # N1 — harvest the 24h rollup fields the miniTicker already carries so the
+        # UI can get change%/volume without a REST ticker/24hr call. O(1), no I/O.
+        try:
+            market_stats[symbol] = {
+                "open_24h":      float(data["o"]),
+                "high_24h":      float(data["h"]),
+                "low_24h":       float(data["l"]),
+                "base_vol_24h":  float(data["v"]),
+                "quote_vol_24h": float(data.get("q", 0)),
+                "ts":            now_ts,
+            }
+        except Exception:
+            pass
         try:
             import trade_engine as _te_mt
             _te_mt._last_ws_price_ts[symbol] = now_ts
@@ -2317,6 +2339,70 @@ def held_price_age() -> Dict[str, Optional[float]]:
     for sym in _held_symbols():
         ts = last_price_ts.get(sym, 0.0)
         out[sym] = round(now - ts, 3) if ts else None
+    return out
+
+
+def get_market_snapshot(symbols: list | None = None) -> dict:
+    """N1 — cheap, in-memory market snapshot for the UI. Lets the UI render
+    price / 24h change % / spread for every covered coin WITHOUT calling Binance
+    REST ticker/24hr (that per-symbol fan-out was overloading the process).
+
+    Returns {symbol: {price, pct_24h, spread_pct, quote_vol_24h, ts, age_sec}}.
+    Every field is guarded so a partially-warmed symbol yields nulls, never
+    raises. All reads are from in-memory WS state (prices / book_ticker /
+    market_stats) — safe to poll every few seconds.
+    """
+    now = time.time()
+    if symbols is None:
+        # Default universe = the covered stream set (same set get_data_health
+        # reports as "subscribed"/"covered").
+        syms = sorted({s for c in _connections for s in c.symbols()})
+    else:
+        syms = [str(s).upper() for s in symbols]
+
+    out: Dict[str, dict] = {}
+    for sym in syms:
+        price = prices.get(sym)
+
+        # 24h change % from the miniTicker open, when both are usable.
+        pct_24h = None
+        st = market_stats.get(sym)
+        if price is not None and st:
+            open_24h = st.get("open_24h")
+            if open_24h and open_24h > 0:
+                try:
+                    pct_24h = (price - open_24h) / open_24h * 100.0
+                except Exception:
+                    pct_24h = None
+
+        # Spread % from best bid/ask, when a book quote is present.
+        spread_pct = None
+        bt = book_ticker.get(sym)
+        if bt:
+            try:
+                bid = bt.get("bid")
+                ask = bt.get("ask")
+                if bid and ask:
+                    mid = (bid + ask) / 2.0
+                    if mid > 0:
+                        spread_pct = (ask - bid) / mid * 100.0
+            except Exception:
+                spread_pct = None
+
+        quote_vol_24h = st.get("quote_vol_24h") if st else None
+
+        # Freshest price ts and its age.
+        ts = last_price_ts.get(sym)
+        age_sec = round(now - ts, 3) if ts else None
+
+        out[sym] = {
+            "price":         price,
+            "pct_24h":       pct_24h,
+            "spread_pct":    spread_pct,
+            "quote_vol_24h": quote_vol_24h,
+            "ts":            ts,
+            "age_sec":       age_sec,
+        }
     return out
 
 

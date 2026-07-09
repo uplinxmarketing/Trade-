@@ -77,7 +77,9 @@ const OrderBookPanel = ({ activeCoin, prices }: Props) => {
     fetchDepth();
     fetchStats();
 
-    const depthTimer = setInterval(fetchDepth, 2000);
+    // N1.3 — single viewed symbol only, on a slow poll (never a list fan-out,
+    // never a 2s hammer). Depth + 24h stats refresh every 10s for the one coin.
+    const depthTimer = setInterval(fetchDepth, 10000);
     const statsTimer = setInterval(fetchStats, 10000);
 
     return () => {
