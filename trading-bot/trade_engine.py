@@ -6327,9 +6327,14 @@ _RSS_WARN_THROTTLE_SEC = 1800.0               # warn at most once / 30 min
 # the real signal) and caches the top-3 for get_memory_stats() / the diagnostics
 # bundle. This is diagnosis, not a fix.
 _tracemalloc_started = False
+_tracemalloc_started_ts: float = 0.0          # boot/uptime reference for first-snap timing
 _tracemalloc_top: List[str] = []              # latest formatted top-3 sites
 _last_tracemalloc_snap_ts: float = 0.0
-_TRACEMALLOC_SNAP_INTERVAL_SEC = 300.0        # ~5 min
+# The leak drives RSS to the soft cap (→ self-restart) in ~5 min, so the FIRST
+# snapshot must land well before that: fire at ~60s of uptime, then every ~120s.
+_TRACEMALLOC_FIRST_SNAP_SEC = 60.0            # first snapshot at ~60s uptime
+_TRACEMALLOC_SNAP_INTERVAL_SEC = 120.0        # subsequent snapshots ~every 2 min
+_TRACEMALLOC_PRE_RESTART_KEY = "tracemalloc_pre_restart"  # settings KV for post-restart bundle
 _tracemalloc_prev_snapshot = None             # previous snapshot for the growth diff
 
 # ── R4 — RSS soft-cap guardrail state (safety net, NOT the leak fix) ─────────
@@ -6349,7 +6354,7 @@ def _maybe_start_tracemalloc() -> None:
     """R1.1 — start tracemalloc at boot when data.tracemalloc_enabled (default
     True). Small nframe (1) to keep the overhead low. Guarded so a failure NEVER
     blocks boot; idempotent."""
-    global _tracemalloc_started
+    global _tracemalloc_started, _tracemalloc_started_ts
     if _tracemalloc_started:
         return
     try:
@@ -6359,6 +6364,7 @@ def _maybe_start_tracemalloc() -> None:
         if not tracemalloc.is_tracing():
             tracemalloc.start(1)   # 1 frame is enough for file:line and cheap
         _tracemalloc_started = True
+        _tracemalloc_started_ts = time.time()   # uptime reference for first-snap timing
         try:
             database.log_activity("R1: tracemalloc started (leak instrumentation)", "info")
         except Exception:
@@ -6368,29 +6374,45 @@ def _maybe_start_tracemalloc() -> None:
         pass
 
 
-def _sample_tracemalloc() -> None:
-    """R1.2 — every ~5 min take tracemalloc.take_snapshot().statistics('lineno')
-    [:10], log a single INFO 'TRACEMALLOC TOP10' block (file:line size_kb count),
-    diff against the previous snapshot to surface GROWTH, and cache the top-3 in
-    _tracemalloc_top for get_memory_stats(). Never raises."""
-    global _last_tracemalloc_snap_ts, _tracemalloc_prev_snapshot, _tracemalloc_top
-    if not _tracemalloc_started:
-        return
-    now = time.time()
-    if now - _last_tracemalloc_snap_ts < _TRACEMALLOC_SNAP_INTERVAL_SEC:
-        return
-    _last_tracemalloc_snap_ts = now
+def _tracemalloc_top10_lines(snap) -> List[str]:
+    """Format a tracemalloc snapshot's top-10 'lineno' stats as
+    'file:line size_kb count' strings. Shared by the periodic sampler and the
+    pre-restart dump so both emit identical lines. Never raises."""
+    lines: List[str] = []
     try:
-        import tracemalloc
-        snap = tracemalloc.take_snapshot()
-        stats = snap.statistics('lineno')[:10]
-        lines: List[str] = []
-        for st in stats:
+        for st in snap.statistics('lineno')[:10]:
             try:
                 fr = st.traceback[0]
                 lines.append(f"{fr.filename}:{fr.lineno} {st.size // 1024}KB {st.count}")
             except Exception:
                 continue
+    except Exception:
+        pass
+    return lines
+
+
+def _sample_tracemalloc() -> None:
+    """R1.2 — take tracemalloc.take_snapshot().statistics('lineno')[:10], log a
+    single INFO 'TRACEMALLOC TOP10' block (file:line size_kb count), diff against
+    the previous snapshot to surface GROWTH, and cache the top-3 in
+    _tracemalloc_top for get_memory_stats(). The FIRST snapshot fires at ~60s of
+    uptime and subsequent ones ~every 120s, so the leak source is captured well
+    before the RSS soft-cap self-restart. Never raises."""
+    global _last_tracemalloc_snap_ts, _tracemalloc_prev_snapshot, _tracemalloc_top
+    if not _tracemalloc_started:
+        return
+    now = time.time()
+    if _last_tracemalloc_snap_ts <= 0.0:
+        # First snapshot: wait until ~60s of uptime (not immediately at boot).
+        if now - _tracemalloc_started_ts < _TRACEMALLOC_FIRST_SNAP_SEC:
+            return
+    elif now - _last_tracemalloc_snap_ts < _TRACEMALLOC_SNAP_INTERVAL_SEC:
+        return
+    _last_tracemalloc_snap_ts = now
+    try:
+        import tracemalloc
+        snap = tracemalloc.take_snapshot()
+        lines = _tracemalloc_top10_lines(snap)
         # Growth diff vs the previous snapshot — growth is the leak signal.
         grow: List[str] = []
         if _tracemalloc_prev_snapshot is not None:
@@ -6419,6 +6441,41 @@ def _sample_tracemalloc() -> None:
         except Exception:
             pass
     except Exception:
+        pass
+
+
+def _dump_tracemalloc_pre_restart(rss_mb: int) -> None:
+    """R4/R1 — force a final tracemalloc snapshot on the soft-cap self-restart
+    path, BEFORE os._exit(0). Logs 'TRACEMALLOC TOP10 (pre-restart)' with the
+    top-10 'file:line size_kb count' lines and persists the top-3 to the settings
+    KV under _TRACEMALLOC_PRE_RESTART_KEY (JSON {ts, rss_mb, top:[...]}) so
+    control_api can surface what was leaking right before the process died in a
+    diagnostics bundle pulled AFTER the restart. Fully guarded (tracemalloc may be
+    disabled) — never raises, never blocks the restart."""
+    try:
+        import tracemalloc
+        if not tracemalloc.is_tracing():
+            return
+        lines = _tracemalloc_top10_lines(tracemalloc.take_snapshot())
+        if not lines:
+            return
+        try:
+            log.critical("TRACEMALLOC TOP10 (pre-restart):\n  " + "\n  ".join(lines))
+        except Exception:
+            pass
+        try:
+            database.log_activity(
+                "TRACEMALLOC TOP10 (pre-restart) — " + " | ".join(lines[:3]), "critical")
+        except Exception:
+            pass
+        try:
+            database.save_setting(
+                _TRACEMALLOC_PRE_RESTART_KEY,
+                _json.dumps({"ts": time.time(), "rss_mb": rss_mb, "top": lines[:3]}))
+        except Exception:
+            pass
+    except Exception:
+        # Instrumentation must NEVER block the restart.
         pass
 
 
@@ -6466,6 +6523,9 @@ def _check_rss_soft_cap(rss_kb: int) -> None:
         persist_risk_latches()
     except Exception:
         pass
+    # Capture the leak source IMMEDIATELY before exiting — this is the whole point:
+    # the operator pulls a bundle post-restart and sees what was leaking at death.
+    _dump_tracemalloc_pre_restart(rss_mb)
     try:
         database.log_activity("MEMORY: clean self-restart now (os._exit 0)", "warn")
     except Exception:
@@ -6515,6 +6575,28 @@ def _sample_rss() -> None:
     _check_rss_soft_cap(kb)
 
 
+def _read_tracemalloc_pre_restart():
+    """Read back the last pre-restart tracemalloc snapshot from the settings KV
+    (JSON {ts, rss_mb, top:[...]}). Returns None if absent/unparseable. Guarded."""
+    try:
+        raw = database.get_setting(_TRACEMALLOC_PRE_RESTART_KEY)
+        if not raw:
+            return None
+        return _json.loads(raw)
+    except Exception:
+        return None
+
+
+def _best_effort_task_count():
+    """Best-effort count of asyncio tasks in THIS thread's running loop. Returns
+    None when there is no running loop here (the common case for this thread) —
+    the authoritative count is sampled elsewhere. Never raises."""
+    try:
+        return len(asyncio.all_tasks())
+    except Exception:
+        return None
+
+
 def get_memory_stats() -> dict:
     """M2 — public snapshot of process memory for control_api / the boot report.
     growth_kb_per_hr is a linear estimate over the current rolling window."""
@@ -6540,6 +6622,13 @@ def get_memory_stats() -> dict:
         "memory_restart_pending": _memory_restart_pending,
         # R1 — latest tracemalloc top-3 allocation sites (leak source).
         "tracemalloc_top":        list(_tracemalloc_top),
+        # R1/R4 — last pre-restart snapshot (read back from settings KV, guarded)
+        # so live growth AND the leak state at the last self-restart are visible
+        # in one place. None when no restart has been recorded yet.
+        "tracemalloc_pre_restart": _read_tracemalloc_pre_restart(),
+        # Best-effort task count from THIS thread — raises if no running loop here
+        # (authoritative count is sampled by data_collector from the WS loop).
+        "asyncio_tasks":          _best_effort_task_count(),
     }
 
 
