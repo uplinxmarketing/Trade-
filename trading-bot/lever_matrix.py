@@ -41,6 +41,42 @@ LEVERS (Tier-2, per spec)
                         sub-candle LIVE-timing knob — see O5.3 note below]
     confirm_slow_60s  — entries.confirm_seconds := 60 (hold 60s ready)    [UNSUPPORTED:
                         sub-candle LIVE-timing knob — see O5.3 note below]
+    p8_v1_current_plus_ratchet — live baseline WITH the profit-ratchet ON
+                        (live default): −k_sl·ATR stop + rr_ratio target      [supported
+                        as the baseline-equivalent; the RATCHET LAYER ITSELF is
+                        NOT simulated in replay — see P8 note below]
+    p8_v3_hybrid_wider_stop    — deep-copy base, exits.k_sl := 1.8 (mid of the
+                        1.6–2.0 range) to reduce noise stop-outs on majors;
+                        target kept                                           [supported;
+                        a real, replayable A/B — k_sl IS read by the backtester]
+
+P8 — STOP-POLICY DEBATE, settled by data (three-way V1/V2/V3)
+    The operator wants the stop policy decided by replay, not opinion. Three
+    variants + two columns (max_drawdown, worst_single_trade) are the whole point:
+      * V1 (p8_v1_current_plus_ratchet): the current live baseline with the
+        profit-ratchet ON. HONEST LIMIT — the ratchet is a LIVE-only exit layer
+        (added to trade_engine, NOT backtest). backtest.py's EXIT_DEFAULTS has no
+        ratchet_* keys and exit_config() only reads EXIT_DEFAULTS keys, so
+        exits.ratchet_enabled / ratchet_activate_r / ratchet_activate_usdt /
+        ratchet_k_atr / ratchet_giveback_pct are ALL INERT in replay; the exit
+        loop's position['ratchet'] field is initialized but never updated. So this
+        variant measures exactly the live −k_sl·ATR stop + rr_ratio·SL target
+        behavior WITHOUT the ratchet — run as the baseline-equivalent so the
+        stop/target IS measured, with the ratchet's replay-inertness stated in a
+        per-run note. The ratchet must be A/B'd LIVE, not here.
+      * V2 (operator no-stop method): this is EXACTLY the pre-existing
+        manual_method_no_stop lever above (near-filterless entry + ~+0.3% target,
+        NO stop, losers held until TP or the end-of-window force-close). It is NOT
+        re-added under a P8 key — the three-way V1/V2/V3 comparison is completed by
+        reading manual_method_no_stop's row as V2 (its worst_single_trade is the
+        deep-loss tail of 'hold until it recovers').
+      * V3 (p8_v3_hybrid_wider_stop): a REAL, replayable A/B — widen the ATR stop
+        to k_sl := 1.8 to cut noise stop-outs on majors, keep the target. k_sl is
+        in EXIT_DEFAULTS and drives sl_distance = clamp(k_sl×ATR%, sl_min_pct,
+        sl_max_pct), so this genuinely changes the replayed stop.
+    worst_single_trade (+ its _R proxy) and max_drawdown appear for EVERY variant:
+    they quantify what 'hold until recovery' costs on the days a coin does not
+    recover.
 
 O5.3 — A/B confirm_seconds (why it is UNSUPPORTED in replay)
     entries.confirm_seconds is a LIVE execution-timing knob: a buy-ready
@@ -303,6 +339,44 @@ def _confirm_slow_60s(s: dict) -> dict:
     return s
 
 
+def _p8_v1_current_plus_ratchet(s: dict) -> dict:
+    """P8 V1 — the current live baseline WITH the profit-ratchet ON (the live
+    default). Sets the live ratchet keys explicitly so the intent is on the
+    record: exits.ratchet_enabled := True, ratchet_activate_r := 0.4,
+    ratchet_activate_usdt := 0.02, ratchet_k_atr := 0.6, ratchet_giveback_pct
+    := 50.
+
+    HONEST LIMIT: the profit-ratchet is a LIVE-only exit layer (trade_engine).
+    backtest.py does NOT simulate it — EXIT_DEFAULTS has no ratchet_* keys and
+    exit_config() only reads EXIT_DEFAULTS keys, so every ratchet_* set here is
+    INERT in replay (the exit loop's position['ratchet'] field is initialized
+    but never updated). So in REPLAY this variant measures exactly the live
+    −k_sl·ATR stop + rr_ratio·SL target behavior WITHOUT the ratchet layer. It
+    is still run as the baseline-equivalent so the stop/target behavior IS
+    measured; the ratchet's replay-inertness is surfaced in the per-run note."""
+    exits = _ensure_dict(s, "exits")
+    exits["ratchet_enabled"] = True
+    exits["ratchet_activate_r"] = 0.4
+    exits["ratchet_activate_usdt"] = 0.02
+    exits["ratchet_k_atr"] = 0.6
+    exits["ratchet_giveback_pct"] = 50
+    return s
+
+
+def _p8_v3_hybrid_wider_stop(s: dict) -> dict:
+    """P8 V3 — hybrid: widen the ATR stop to reduce noise stop-outs on majors,
+    keep the target. exits.k_sl := 1.8 (mid of the operator's 1.6–2.0 range).
+
+    Supported/replayable: k_sl IS read by the backtester (EXIT_DEFAULTS['k_sl'];
+    sl_distance = clamp(k_sl × ATR%, sl_min_pct, sl_max_pct)), so this genuinely
+    widens the replayed protective stop — a real A/B vs baseline. Setting the
+    exits block keeps the non-legacy exit path (the rr_ratio·SL target is kept
+    untouched)."""
+    exits = _ensure_dict(s, "exits")
+    exits["k_sl"] = 1.8
+    return s
+
+
 LEVERS: List[dict] = [
     {
         "key": "t2_mandatory",
@@ -426,6 +500,41 @@ LEVERS: List[dict] = [
                               "indistinguishable in replay — this must be A/B'd "
                               "live, not in the backtester (see O5.3).",
     },
+    {
+        "key": "p8_v1_current_plus_ratchet",
+        "label": "P8 V1 — current + profit-ratchet (live default)",
+        "description": "The current live baseline with the profit-ratchet ON "
+                       "(exits.ratchet_enabled := True, activate_r 0.4, "
+                       "activate_usdt 0.02, k_atr 0.6, giveback 50%). Run as the "
+                       "baseline-equivalent so the −k_sl·ATR stop + rr_ratio "
+                       "target IS measured; the ratchet layer itself is live-only "
+                       "and inert in replay.",
+        "transform": _p8_v1_current_plus_ratchet,
+        "supported": True,
+        "run_note": "p8_v1_current_plus_ratchet: the profit-ratchet is a LIVE-only "
+                    "exit layer (trade_engine). backtest.py does NOT simulate it — "
+                    "EXIT_DEFAULTS has no ratchet_* keys and exit_config() reads "
+                    "only EXIT_DEFAULTS keys, so exits.ratchet_* are INERT here "
+                    "(the exit loop's position['ratchet'] is initialized, never "
+                    "updated). This row reflects the −1R (k_sl·ATR) stop + 1.6R "
+                    "(rr_ratio) target WITHOUT the ratchet; A/B the ratchet LIVE.",
+    },
+    {
+        "key": "p8_v3_hybrid_wider_stop",
+        "label": "P8 V3 — hybrid (wider stop, k_sl = 1.8)",
+        "description": "Deep-copy of the live baseline with the ATR stop widened "
+                       "to exits.k_sl := 1.8 (mid of the 1.6–2.0 range) to reduce "
+                       "noise stop-outs on majors; the target is kept. A real, "
+                       "replayable A/B vs baseline.",
+        "transform": _p8_v3_hybrid_wider_stop,
+        "supported": True,
+        "run_note": "p8_v3_hybrid_wider_stop: k_sl := 1.8 IS read by the "
+                    "backtester (sl_distance = clamp(k_sl×ATR%, sl_min_pct, "
+                    "sl_max_pct)), so this genuinely widens the replayed stop — a "
+                    "faithful A/B. V2 of the P8 stop-policy debate is the existing "
+                    "manual_method_no_stop variant (operator no-stop method); read "
+                    "its row as V2 to complete the three-way V1/V2/V3 comparison.",
+    },
 ]
 
 # Sensible combinations of already-supported single levers.
@@ -525,12 +634,42 @@ def _r_metrics(result: dict) -> tuple:
     return avg_win_R, avg_loss_R
 
 
+def _worst_single_trade(result: dict) -> tuple:
+    """The single most-negative realized trade in run_backtest's trades list —
+    the whole point of the P8 stop-policy debate: what 'hold until it recovers'
+    costs on the days a coin does NOT recover. Returns
+    (worst_net_pnl, worst_R): worst_net_pnl is min(net_pnl) over all trades and
+    worst_R is THAT trade's return per entry notional (net_pnl / (qty×entry_px)),
+    the same proxy _r_metrics uses since run_backtest records no per-trade stop
+    distance. (0.0, 0.0) when there are no trades. _compute_stats does NOT emit
+    this, so it is computed here from the trades list."""
+    trades = result.get("trades") if isinstance(result, dict) else None
+    worst_pnl: Optional[float] = None
+    worst_r = 0.0
+    for t in (trades or []):
+        try:
+            net = float(t["net_pnl"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if worst_pnl is None or net < worst_pnl:
+            worst_pnl = net
+            try:
+                notional = float(t["qty"]) * float(t["entry_px"])
+                worst_r = (net / notional) if notional > 0 else 0.0
+            except (KeyError, TypeError, ValueError):
+                worst_r = 0.0
+    if worst_pnl is None:
+        return 0.0, 0.0
+    return round(worst_pnl, 8), round(worst_r, 8)
+
+
 def _stats_row(variant: str, label: str, description: str,
                result: dict) -> dict:
     """Project backtest.run_backtest's stats into the compact per-variant row."""
     stats = result.get("stats", {}) if isinstance(result, dict) else {}
     tc = int(stats.get("trades", 0) or 0)
     avg_win_R, avg_loss_R = _r_metrics(result)
+    worst_single_trade, worst_single_trade_R = _worst_single_trade(result)
     return {
         "variant": variant,
         "label": label,
@@ -538,6 +677,8 @@ def _stats_row(variant: str, label: str, description: str,
         "expectancy": stats.get("expectancy_per_trade", 0.0),
         "profit_factor": stats.get("profit_factor"),
         "max_drawdown": stats.get("max_drawdown", 0.0),
+        "worst_single_trade": worst_single_trade,
+        "worst_single_trade_R": worst_single_trade_R,
         "trades": tc,
         "trade_count": tc,
         "win_rate": stats.get("win_rate", 0.0),

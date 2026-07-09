@@ -1021,6 +1021,33 @@ def _min_profit_usdt() -> float:
         return 0.01
 
 
+# ── P1: the min_profit_usdt floor is a PROFIT-TAKING guard ONLY ───────────────
+# Live safety-inversion bug: a breakeven-stop (stop moved to BEP at +1R) was
+# rejected by the pre-sell profit gate because a flat exit could not clear the
+# 0.01 USDT minimum, so it never sold and price rode back down to the real -1R
+# stop — converting a scratch into a full loss. The floor must apply to
+# take-profit and profit-ratchet exits ONLY. Every PROTECTIVE / risk exit
+# (stop-loss, hard-stop, breakeven-stop, trailing stop, force, delist, reconcile,
+# ghost, recycler, manual) MUST execute at market REGARDLESS of the floor.
+_PROFIT_TAKING_EXIT_REASONS = frozenset({"take-profit", "profit-ratchet"})
+
+# Known protective / risk exit reasons — the floor is EXEMPT for these. Kept
+# explicit so the P1.3 regression assertion can detect a future edit that
+# accidentally classifies a protective stop as profit-taking.
+_PROTECTIVE_STOP_REASONS = frozenset({
+    "stop-loss", "hard-stop-loss", "breakeven-stop", "trail", "smart-hold-trail",
+    "oco-sl", "force-sell", "manual", "user-initiated", "auto-recycle",
+    "delist", "ghost", "below-breakeven", "slippage-loss", "reconcile",
+})
+
+
+def _is_profit_taking_exit(reason: str) -> bool:
+    """True when `reason` is a profit-taking exit the min_profit_usdt floor
+    applies to (take-profit, profit-ratchet). Every other reason is a
+    protective / risk exit that MUST fire at market regardless of the floor."""
+    return str(reason or "").strip().lower() in _PROFIT_TAKING_EXIT_REASONS
+
+
 def compute_real_breakeven_price(pos: dict, min_profit: Optional[float] = None) -> float:
     """Return the REAL price at which selling pos would net at least min_profit USDT.
 
@@ -1416,6 +1443,141 @@ def _min_hold_sec() -> float:
     except Exception:
         return _MIN_HOLD_SEC
 
+
+# ── P2: ATR-based profit-ratchet trailing stop ────────────────────────────────
+# Locks gains once a trade is meaningfully green (between the BE-move and the
+# +rr_ratio TP target). Config keys live in strategy.json exits.* — they are NOT
+# in backtest.EXIT_DEFAULTS, so _exit_cfg() does not surface them; read the raw
+# exits block directly (hot-reloadable via _load_strategy's mtime cache).
+def _ratchet_cfg() -> dict:
+    """Effective profit-ratchet config, read live at time of use."""
+    try:
+        exits = _load_strategy().get("exits", {}) or {}
+    except Exception:
+        exits = {}
+
+    def _f(key, default):
+        try:
+            return float(exits.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _b(key, default):
+        val = exits.get(key, default)
+        try:
+            return bool(val)
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "enabled":       _b("ratchet_enabled", True),
+        "activate_r":    _f("ratchet_activate_r", 0.4),
+        "activate_usdt": _f("ratchet_activate_usdt", 0.02),
+        "k_atr":         _f("ratchet_k_atr", 0.6),
+        "giveback_pct":  _f("ratchet_giveback_pct", 50.0),
+    }
+
+
+# Per-symbol profit-ratchet state — {armed, peak_price, peak_profit}. Cleared on
+# close (the _execute_sell finally, like _pos_peaks) and in purge_symbol_state so
+# a re-opened position never inherits a stale high-water mark.
+_ratchet_state: Dict[str, dict] = {}
+
+
+def _unrealized_net_profit(pos: dict, price: float, symbol: str):
+    """Net unrealized profit (USDT) if pos were market-sold at `price` NOW —
+    identical math to _profitable_sell_check (deployed capital + taker fee)."""
+    try:
+        entry   = float(pos.get("entry_price") or pos.get("avg_entry_price") or 0)
+        qty     = float(pos.get("quantity") or 0)
+        buy_fee = float(pos.get("buy_fee_usdt") or 0)
+        if entry <= 0 or qty <= 0 or price <= 0:
+            return None
+        gross_quote  = price * qty
+        net_returned = gross_quote - gross_quote * _fee_rate_for(symbol)
+        return net_returned - (qty * entry + buy_fee)
+    except Exception:
+        return None
+
+
+def _evaluate_ratchet(pos: dict, sym: str, price: float, entry: float,
+                      now: float, cfg: dict) -> bool:
+    """P2 profit-ratchet. Maintains per-symbol arm/peak state and returns True
+    when the ratchet should fire a 'profit-ratchet' exit.
+
+    Semantics (all numbers read from config at time of use, hot-reload):
+      • Activation — arm once unrealized profit >= ratchet_activate_r × 1R (the
+        position's OWN planned stop distance, scales per coin) OR >=
+        ratchet_activate_usdt. Once armed, stays armed.
+      • Peak — track highest price AND highest unrealized profit since arming.
+      • ATR trail — ratchet stop = peak_price − ratchet_k_atr × ATR(price units).
+      • Give-back cap — also exit if profit <= (1 − giveback_pct/100) × peak_profit.
+        Whichever (ATR trail or give-back) triggers first fires the exit.
+      • Profit floor — the ratchet only ever exits IN PROFIT: if the current exit
+        would net < min_profit_usdt, HOLD (the protective stop from P1 is the
+        backstop). Ratchet = profit-taking → floor applies.
+    """
+    rc = _ratchet_cfg()
+    if not rc["enabled"]:
+        _ratchet_state.pop(sym, None)
+        return False
+
+    profit = _unrealized_net_profit(pos, price, sym)
+    if profit is None:
+        return False
+
+    qty     = float(pos.get("quantity") or 0)
+    sl_dist = pos.get("sl_distance_pct")
+    # 1R in USDT from the position's own planned stop distance.
+    r_usdt = (qty * entry * float(sl_dist) / 100.0
+              if (sl_dist and qty > 0 and entry > 0) else None)
+
+    st = _ratchet_state.get(sym)
+    if st is None:
+        st = {"armed": False, "peak_price": price, "peak_profit": profit}
+        _ratchet_state[sym] = st
+
+    # ── Activation ────────────────────────────────────────────────────────────
+    if not st["armed"]:
+        armed = False
+        if r_usdt and r_usdt > 0 and profit >= rc["activate_r"] * r_usdt:
+            armed = True          # preferred R form (scales per coin)
+        elif profit >= rc["activate_usdt"]:
+            armed = True
+        if not armed:
+            return False
+        st["armed"] = True
+        st["peak_price"]  = price
+        st["peak_profit"] = profit
+
+    # ── Peak tracking since activation ────────────────────────────────────────
+    if price > st["peak_price"]:
+        st["peak_price"] = price
+    if profit > st["peak_profit"]:
+        st["peak_profit"] = profit
+    peak_price  = st["peak_price"]
+    peak_profit = st["peak_profit"]
+
+    # ── ATR trail (ATR converted to price units for this symbol) ──────────────
+    atr_pct = (pos.get("atr_pct_at_entry") or sl_dist or cfg.get("sl_min_pct") or 0.0)
+    atr_price = entry * float(atr_pct) / 100.0 if atr_pct else 0.0
+    ratchet_stop = peak_price - rc["k_atr"] * atr_price
+    trail_hit = atr_price > 0 and price <= ratchet_stop
+
+    # ── Give-back cap ─────────────────────────────────────────────────────────
+    giveback_floor = (1.0 - rc["giveback_pct"] / 100.0) * peak_profit
+    giveback_hit = peak_profit > 0 and profit <= giveback_floor
+
+    if not (trail_hit or giveback_hit):
+        return False
+
+    # ── Profit floor — the ratchet only ever exits IN PROFIT ─────────────────
+    # If a pullback would drop the exit below the floor, HOLD; the protective
+    # stop (P1, now unblocked) is the backstop.
+    if profit < _min_profit_usdt():
+        return False
+    return True
+
 # Per-symbol throttle for SELL_TRACE diagnostic log (1 per 60s per symbol)
 _sell_trace_log_ts: Dict[str, float] = {}
 
@@ -1686,6 +1848,7 @@ _EXIT_LABEL_MAP = {
     "trail":           "trail",
     "smart-hold-trail": "trail",
     "breakeven-stop":  "breakeven",   # F1: faded back to BEP after the BE-move armed
+    "profit-ratchet":  "ratchet",     # P2: ATR profit-ratchet trailing stop
     "auto-recycle":    "recycler",
     "force-sell":      "force",
     "manual":          "manual",
@@ -2953,10 +3116,19 @@ def recover_orphan_positions() -> dict:
                 "buy_fee_usdt": round(value * _fee_rate_for(sym), 6),
                 "timestamp":    now_ts,
                 "mode":         "live",
+                # P4: orphan-recovered holdings are tagged 'recovered' (origin is
+                # never None — a None origin is the BNB tagging bug).
+                "origin":       "recovered",
+                # P3: explicit bool from birth.
+                "be_moved":     False,
             }
             # Re-attach the SAME exit geometry a normal open computes (§2.1) —
             # this alone gives the local sell monitor a stop/TP to defend.
             _apply_entry_exit_geometry(pos_record)
+            # P4: recovery must attach a CORRECT stop — never one the market has
+            # already passed. entry==current price here, so the ATR stop is
+            # normally below price, but guard defensively (ATR/BEP edge cases).
+            _guard_stale_recovery_stop(pos_record, price)
             pos_id = database.save_position(pos_record)
             pos_record["id"] = pos_id
             with _positions_lock:
@@ -3148,6 +3320,20 @@ def load_positions_from_db():
         try:
             if not _pos_geo.get("tp_price"):
                 _apply_entry_exit_geometry(_pos_geo, log_open=False)  # restore: no OPEN log
+            # P3/P4: the positions table is fixed-column, so be_moved and origin
+            # never survive a restart. Guarantee both are set (be_moved an
+            # explicit bool, origin never None) — a restored position whose
+            # origin metadata was lost is tagged 'recovered'.
+            _pos_geo.setdefault("be_moved", False)
+            if not _pos_geo.get("origin"):
+                _pos_geo["origin"] = "recovered"
+            # P4: a stop recomputed from the ORIGINAL (higher) entry can land
+            # above the current price — an already-blown stop (the BNB case).
+            # Clamp it just below the live price so the protective exit (P1) can
+            # fire instead of holding forever above a dead stop.
+            _cur_px = _rest_px.get(_pos_geo.get("symbol"), 0) or 0
+            if _cur_px > 0:
+                _guard_stale_recovery_stop(_pos_geo, _cur_px)
         except Exception:
             pass  # geometry restore must never break startup
 
@@ -4880,6 +5066,7 @@ def purge_symbol_state(symbol: str) -> None:
         _maker_abandon_counts, _lot_waste_flags, _bookticker_cache,
         _rest_px, _rest_px_sym_ts, _last_ws_price_ts, _pos_peaks,
         _stop_loss_confirmation, _slippage_cache, _slippage_vetoed,
+        _ratchet_state,
     ):
         try:
             _d.pop(symbol, None)
@@ -5388,6 +5575,12 @@ def _apply_entry_exit_geometry(pos: dict, log_open: bool = True) -> None:
         pos["tp_price"] = tp
         pos["hard_sl_price"] = (entry * (1.0 - cfg["hard_sl_pct"] / 100.0)
                                 if cfg.get("hard_sl_pct") else None)
+        # P3: be_moved is an explicit bool from birth — NEVER None. It flips True
+        # ONLY in _evaluate_exit_decision when the breakeven move actually
+        # executes AND the stored stop_price is promoted to BEP. setdefault so a
+        # position that already armed the BE-move (geometry re-applied on a live
+        # pos) is never reset to False.
+        pos.setdefault("be_moved", False)
         # F1.1 instrumentation — store the full planned geometry on the pos so
         # the exit path can compute realized_r and the OPEN log records intent.
         pos["bep"] = bep if bep > 0 else None
@@ -5414,6 +5607,50 @@ def _apply_entry_exit_geometry(pos: dict, log_open: bool = True) -> None:
                            f"{pos.get('symbol')}: entry exit-geometry failed: {_ge}")
         except Exception:
             pass
+
+
+# P4: how far below current price a clamped stale recovery stop is placed.
+_STALE_STOP_BUFFER_PCT = 0.1
+
+
+def _guard_stale_recovery_stop(pos: dict, price: float) -> bool:
+    """P4 — never leave a recovered/restored position with a stop the market has
+    ALREADY passed. Long-only geometry: a stop at/above the current price is an
+    already-blown stop (BNB showed a stop above current price). Rather than sit
+    forever above a dead stop, clamp it to JUST below the current price and flag
+    it so the protective path (P1, now unblocked) exits at market the moment
+    price ticks down. Also clamps an already-passed hard stop. Returns True when
+    anything was clamped. Best-effort — never raises."""
+    try:
+        price = float(price or 0)
+        if price <= 0:
+            return False
+        clamped = False
+        _buf = price * (1.0 - _STALE_STOP_BUFFER_PCT / 100.0)
+        stop = pos.get("stop_price")
+        if stop is not None and float(stop) >= price:
+            if pos.get("orig_stop_price") is None:
+                pos["orig_stop_price"] = stop      # preserve the intended level
+            pos["stop_price"] = _buf
+            pos["stale_stop_clamped"] = True
+            clamped = True
+        hard = pos.get("hard_sl_price")
+        if hard is not None and float(hard) >= price:
+            pos["hard_sl_price"] = _buf
+            pos["stale_stop_clamped"] = True
+            clamped = True
+        if clamped:
+            try:
+                database.log_activity(
+                    f"P4 {pos.get('symbol')}: recomputed stop was at/above current "
+                    f"price ${price:.6f} (already blown) — clamped to ${_buf:.6f} "
+                    f"just below price so the protective exit can fire; not left "
+                    f"stale above the market.", "warn")
+            except Exception:
+                pass
+        return clamped
+    except Exception:
+        return False
 
 
 def _five_m_state(symbol: str, prev: dict) -> tuple:
@@ -6662,6 +6899,9 @@ def _execute_sell(pos: dict, price: float, reason: str):
         # later position re-opened on the same symbol doesn't inherit a stale
         # high-water mark and instantly trip its trailing stop.
         _pos_peaks.pop(sym, None)
+        # P2: clear the per-symbol profit-ratchet high-water mark for the same
+        # reason — a re-opened position must arm the ratchet from scratch.
+        _ratchet_state.pop(sym, None)
 
 
 def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str, mode: str, now: str):
@@ -6713,17 +6953,39 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
 
     _is_paper = (mode != "live")
     pos["_sell_gate_start_ts"] = time.time()
-    # FINAL SAFETY GATE — never lose money on a take-profit sell.
-    # Stop-loss and force-sell bypass this check (they're meant to fire even at a loss).
-    # auto-recycle bypasses too: the recycler explicitly frees capital from positions
-    # >3% underwater — the profit gate would veto every one of its sells otherwise.
-    if reason not in ("stop-loss", "hard-stop-loss", "force-sell", "manual", "user-initiated", "auto-recycle"):
+    # ── FINAL SAFETY GATE (P1) — the min_profit_usdt floor is a PROFIT-TAKING
+    # guard ONLY. It applies to take-profit and profit-ratchet exits. EVERY
+    # protective / risk exit (stop-loss, hard-stop, breakeven-stop, trailing
+    # stop, force, delist, reconcile, ghost, recycler, manual) executes at market
+    # REGARDLESS of the floor. Previously a breakeven-stop that could not clear
+    # the 0.01 USDT minimum was vetoed and HELD — price then rode back to the
+    # real -1R stop and a scratch became a full loss (the UNI/BNB inversion).
+    _profit_take = _is_profit_taking_exit(reason)
+    # P1.3 regression assertion: the profit-taking and protective-stop sets MUST
+    # stay disjoint. If a future edit ever classifies a protective stop as
+    # profit-taking, a breakeven/ATR/hard stop could be blocked by the floor
+    # again — that is the exact safety-inversion bug. Scream on the CRITICAL path
+    # and force PROTECTIVE handling (never gate it, never silently hold).
+    if _profit_take and reason in _PROTECTIVE_STOP_REASONS:
+        try:
+            database.log_activity(
+                f"CRITICAL P1 REGRESSION {sym}: protective exit '{reason}' is "
+                f"classified as profit-taking — the min_profit_usdt floor would "
+                f"BLOCK a protective stop. Bypassing the floor and selling at "
+                f"market so the stop can never be inverted into a full loss.",
+                "error")
+        except Exception:
+            pass
+        _profit_take = False
+    if _profit_take:
         # force_fresh=True: _profitable_sell_check fetches a fresh REST price for this
         # symbol RIGHT NOW before evaluating. This prevents a stale price from passing
         # the check while the actual Binance fill comes back at a lower level.
         if not _profitable_sell_check(pos, price, force_fresh=True):
             # Price is not profitable even at the freshest REST quote.
-            # Abort — position stays open, next tick re-evaluates.
+            # Abort — position stays open, next tick re-evaluates. This can ONLY
+            # be a profit-taking exit (take-profit / profit-ratchet); protective
+            # stops never reach here.
             _now_abort = time.time()
             if _now_abort - _last_abort_log_ts.get(sym, 0) >= _ABORT_LOG_THROTTLE_SEC:
                 _last_abort_log_ts[sym] = _now_abort
@@ -8225,10 +8487,13 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _eff_tp_mult = _bep_mult_buy
         exit_target = round(fill_price * _eff_tp_mult, 8)
         _pos_peaks.pop(sym, None)
+        _ratchet_state.pop(sym, None)   # fresh position — no stale ratchet peak
         _buy_slippage_pct = ((fill_price - price) / price * 100) if price > 0 else None
         pos_record = {
             "symbol":             sym,
             "entry_price":        fill_price,
+            # P3: be_moved is an explicit bool from entry — never None.
+            "be_moved":           False,
             # B Step 4 — origin tag: this buy was decided by the automated
             # scanner (vs. a user-initiated/manual buy). Lives in the in-memory
             # position dict + activity log only: the positions and trades
@@ -8585,6 +8850,14 @@ def _evaluate_exit_decision(pos: dict, sym: str, price: float,
             return ("breakeven-stop" if be_hit else "stop-loss"), crossed
         return None, crossed
     _stop_loss_confirmation.pop(sym, None)
+
+    # ── P2 profit-ratchet (exit ordering: hard → protective → RATCHET → tp) ───
+    # Reached only when price is above the protective stop and below tp_price —
+    # the green-but-pre-target region. Locks gains via an ATR trail / give-back
+    # cap, and only ever exits in profit (min_profit_usdt floor applies; a
+    # sub-floor pullback holds and defers to the protective stop above).
+    if _evaluate_ratchet(pos, sym, price, entry, now, cfg):
+        return "profit-ratchet", crossed
     return None, crossed
 
 
