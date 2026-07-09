@@ -22,6 +22,13 @@ LEVERS (Tier-2, per spec)
     t2_mandatory      — signal role T2_ema50_15m_slope := "mandatory"   [supported]
     min_score_4       — entries.min_score + signal_engine.min_scored := 4 [supported]
     risk_off_stricter — regime.risk_off_pct_4h := -0.5 (stricter)        [supported]
+    loose_gate        — the O1 minimum-viable gate (min_score 2, T1 scored,
+                        qv floor 3M, spread_max 0.30)                    [supported;
+                        two knobs inert in replay — see O4 note below]
+    manual_method_with_stop — near-filterless entry + ~+0.3% take-profit,
+                        current ATR stop KEPT                            [supported]
+    manual_method_no_stop   — same, but NO hard stop (losers held until TP
+                        or end-of-window force-close → tail realized)    [supported]
     time_stop_30m     — exit flat theses after 30m below +0.5R           [UNSUPPORTED:
                         the current backtester has no time-stop parameter — see
                         backtest.py exit rules — so this lever is reported as
@@ -30,6 +37,41 @@ LEVERS (Tier-2, per spec)
                         TM1_bad_hour reads the wall clock and is in
                         backtest._NON_REPLAYABLE_SIGNALS (excluded from replay
                         decisions), so it can't be exercised by the backtester]
+
+O4 — LOOSE GATE + MANUAL-METHOD VARIANTS (judged on the SAME 3-month data)
+    loose_gate replays the exact O1 minimum-viable gate the live preset applies
+    so the matrix predicts what loosening does before/after it is turned on.
+    HONEST CAVEAT: two of its four knobs are inert in this replay —
+    entries.min_quote_volume_24h_usd is a LIVE-only entry filter (read in
+    trade_engine, never in backtest) and signal_thresholds.spread_max_pct feeds
+    E1_spread_too_wide, which is non-replayable (backtest._NON_REPLAYABLE_SIGNALS).
+    The two that DO bite (min_score/min_scored := 2, T1_ema_short_long := scored)
+    are replayed faithfully. The lever still runs; the inertness is surfaced as a
+    per-run note, not hidden.
+
+    The manual-method variants model how the operator historically traded:
+    almost no entry filter, sell fast at a small fixed profit (~+0.3%), and HOLD
+    losers until they recover (rarely stopped out). Both are modeled so the true
+    cost of "hold until it recovers" (the rare deep loss) is MEASURED:
+      * manual_method_with_stop — near-filterless entry (min_score 1, vetoes off,
+        bb/5m structural gates off) + ~+0.3% take-profit via the non-legacy exits
+        block (rr_ratio := 0 neutralizes the ATR-scaled R-multiple TP, so the TP
+        collapses to its breakeven floor tp_buffer_pct := 0.3 ≈ +0.3% above BEP;
+        k_trail := 0 sells immediately at target). The CURRENT ATR stop is KEPT
+        (k_sl/sl_min_pct/sl_max_pct untouched → non-legacy sl_enabled stays true).
+      * manual_method_no_stop — same entry + ~+0.3% target, but NO stop. The only
+        way the backtester can disable the stop is the LEGACY exit mapping
+        (drop the exits block + stop_loss_enabled := False → sl_enabled False,
+        hard_sl None; take_profit_pct := 0.3 is the fixed-TP path). The backtester
+        has NO N-bar time-exit parameter, so a held loser exits only at TP or at
+        the end-of-window force-close (backtest_end) — which realizes the deep-loss
+        tail in the stats. That terminal realization (not a literal time-stop) is
+        why this variant is reported as supported; the caveat is noted per run.
+    A true risk-multiple avg_win_R/avg_loss_R is not computable from run_backtest's
+    trades (no per-trade stop distance is recorded), so those two fields are a
+    return-per-entry-notional proxy (net_pnl / (qty×entry_px)) computed from the
+    trades list — which is exactly what surfaces the manual tail (avg_loss_R goes
+    sharply negative for no_stop as held losers close at backtest_end).
 
 CLI
     python lever_matrix.py --months 3 --symbols approved
@@ -116,6 +158,97 @@ def _risk_off_stricter(s: dict) -> dict:
     return s
 
 
+def _loose_gate(s: dict) -> dict:
+    """The O1 minimum-viable ("loose") gate the live preset applies. Sets the
+    four knobs exactly; note that in REPLAY only two bite (min_score/min_scored
+    and the T1 role) — see the module docstring / the per-run note attached to
+    this lever. Reported honestly, not silently."""
+    entries = _ensure_dict(s, "entries")
+    entries["min_score"] = 2
+    entries["min_quote_volume_24h_usd"] = 3_000_000   # live-only filter (inert in replay)
+    se = _ensure_dict(s, "signal_engine")
+    se["min_scored"] = 2
+    roles = _ensure_dict(se, "roles")
+    roles["T1_ema_short_long"] = "scored"
+    st = _ensure_dict(s, "signal_thresholds")
+    st["spread_max_pct"] = 0.30                        # feeds E1 (non-replayable)
+    return s
+
+
+# Signals promoted to "scored" (near-filterless) and demoted to "off" (no veto)
+# for the manual-method variants. E1/TM1 are handled by the backtester's
+# non-replayable exclusion regardless; REGIME_risk_off is set off here but the
+# backtester ALSO applies a hard risk_off macro gate that cannot be removed
+# (documented — a genuinely protective gate baked into the sim).
+_MANUAL_SCORED = (
+    "T1_ema_short_long", "M3_macd_rising", "V1_volume_above_average",
+    "V2_obv_rising", "M4_micro_pullback", "R1_reversal_confirmed",
+    "T2_ema50_15m_slope",
+)
+_MANUAL_OFF = (
+    "P2_bb_upper_touch_5m", "REGIME_risk_off", "X1_atr_untradeable",
+    "E1_spread_too_wide",
+)
+
+
+def _manual_entry(s: dict) -> dict:
+    """Shared 'almost no entry filter' side of the manual-method variants:
+    min_score/min_scored := 1, every signal → scored, every veto → off, and the
+    backtester's structural entry gates (bb-gate, 5m-veto) disabled so entries
+    are near-filterless (falling-knife + the hard risk_off macro gate remain —
+    genuinely protective and not role-removable)."""
+    entries = _ensure_dict(s, "entries")
+    entries["min_score"] = 1
+    se = _ensure_dict(s, "signal_engine")
+    se["min_scored"] = 1
+    roles = _ensure_dict(se, "roles")
+    for sig in _MANUAL_SCORED:
+        roles[sig] = "scored"
+    for sig in _MANUAL_OFF:
+        roles[sig] = "off"
+    bt = _ensure_dict(s, "backtest")
+    bt["bb_gate_enabled"] = False
+    bt["use_5m_veto"] = False
+    return s
+
+
+def _manual_method_with_stop(s: dict) -> dict:
+    """Manual method WITH the current ATR stop kept. Near-filterless entry, a
+    small ~+0.3% take-profit, and the existing ATR stop untouched.
+
+    TP knob (non-legacy exits block, so sl_enabled stays true → ATR stop kept):
+      * rr_ratio := 0        neutralizes the ATR-scaled R-multiple TP so the TP
+                             collapses to its breakeven floor,
+      * tp_buffer_pct := 0.3 sells ~+0.3% above breakeven (a genuine small profit),
+      * k_trail := 0         sells immediately at target (no trailing ride)."""
+    s = _manual_entry(s)
+    exits = _ensure_dict(s, "exits")   # presence forces the non-legacy path
+    exits["rr_ratio"] = 0.0
+    exits["tp_buffer_pct"] = 0.3
+    exits["k_trail"] = 0.0
+    return s
+
+
+def _manual_method_no_stop(s: dict) -> dict:
+    """Manual method with NO stop — losers are HELD until they recover. Same
+    near-filterless entry + ~+0.3% target, but the stop is disabled.
+
+    The ONLY way the backtester can disable the stop is the LEGACY exit mapping
+    (exit_config): no 'exits' block + legacy keys. stop_loss_enabled := False →
+    sl_enabled False (no protective stop) and hard_sl None; take_profit_pct :=
+    0.3 is the fixed-TP path (immediate sell at +0.3%). There is NO N-bar
+    time-exit parameter, so a held loser exits only at TP or at the end-of-window
+    force-close (backtest_end) — which REALIZES the deep-loss tail in the stats
+    (that terminal realization, not a literal time-stop, is why this is
+    supported)."""
+    s = _manual_entry(s)
+    s.pop("exits", None)                 # drop any exits block → legacy mapping
+    s["stop_loss_enabled"] = False       # → sl_enabled False (no stop at all)
+    s["take_profit_enabled"] = True
+    s["take_profit_pct"] = 0.3           # fixed +0.3% target (legacy fixed-TP path)
+    return s
+
+
 def _time_stop_30m(s: dict) -> dict:
     """Would enable a 30-minute time-stop for flat theses (below +0.5R). The
     current backtester exposes no time-stop parameter, so this is a no-op and the
@@ -154,6 +287,51 @@ LEVERS: List[dict] = [
                        "entries are vetoed sooner in a falling market.",
         "transform": _risk_off_stricter,
         "supported": True,
+    },
+    {
+        "key": "loose_gate",
+        "label": "loose gate (O1 minimum-viable)",
+        "description": "The exact O1 minimum-viable gate the live preset applies: "
+                       "min_score/min_scored := 2, T1_ema_short_long := scored, "
+                       "qv floor 3M, spread_max 0.30 — predicts the effect of "
+                       "loosening before/after it is turned on.",
+        "transform": _loose_gate,
+        "supported": True,
+        "run_note": "loose_gate: min_quote_volume_24h_usd (3M) is a LIVE-only entry "
+                    "filter (unread by the backtester) and spread_max_pct (0.30) "
+                    "feeds the non-replayable E1 veto — both are INERT in this "
+                    "replay; only min_score/min_scored := 2 and T1 := scored bite.",
+    },
+    {
+        "key": "manual_method_with_stop",
+        "label": "manual method (+0.3% TP, ATR stop kept)",
+        "description": "Operator's historical style: near-filterless entry "
+                       "(min_score 1, vetoes off, bb/5m gates off), sell fast at "
+                       "~+0.3% (rr_ratio 0 + tp_buffer_pct 0.3, k_trail 0), with "
+                       "the CURRENT ATR stop kept.",
+        "transform": _manual_method_with_stop,
+        "supported": True,
+        "run_note": "manual_method_with_stop: ~+0.3% TP is tp_buffer_pct := 0.3 "
+                    "above breakeven (rr_ratio := 0 disables the ATR-scaled TP; "
+                    "k_trail := 0 sells at target). ATR stop kept (non-legacy "
+                    "sl_enabled). The hard risk_off macro gate still applies.",
+    },
+    {
+        "key": "manual_method_no_stop",
+        "label": "manual method (+0.3% TP, NO stop)",
+        "description": "Same near-filterless entry + ~+0.3% target, but NO stop — "
+                       "losers are HELD until they recover. Models the true cost "
+                       "of 'hold until it recovers': the deep-loss tail is realized "
+                       "at the end-of-window force-close.",
+        "transform": _manual_method_no_stop,
+        "supported": True,
+        "run_note": "manual_method_no_stop: stop disabled via the LEGACY exit "
+                    "mapping (stop_loss_enabled := False → sl_enabled False, "
+                    "hard_sl None; take_profit_pct := 0.3). No N-bar time-exit "
+                    "exists, so held losers realize at TP or the end-of-window "
+                    "backtest_end force-close — measuring the deep-loss tail. "
+                    "Expect few trades (capital locked in bagholds) → low "
+                    "confidence, and a sharply negative avg_loss_R.",
     },
     {
         "key": "time_stop_30m",
@@ -246,11 +424,39 @@ def _ensure_klines(symbols: List[str], months: float,
 
 # ── Single-run helper ────────────────────────────────────────────────────────
 
+def _r_metrics(result: dict) -> tuple:
+    """avg_win_R / avg_loss_R from run_backtest's trades list.
+
+    run_backtest does NOT record a per-trade stop distance, so a TRUE
+    risk-multiple is not computable here; these are the closest proxy the trades
+    list supports — the average net return per entry NOTIONAL
+    (net_pnl / (qty × entry_px)) over winning / losing trades. It is exactly what
+    surfaces the manual-method tail: avg_loss_R plunges for manual_method_no_stop
+    when held losers finally close at the end-of-window force-close.
+    Win/loss split mirrors backtest._compute_stats (net_pnl > 0 → win)."""
+    trades = result.get("trades") if isinstance(result, dict) else None
+    wins_r: List[float] = []
+    losses_r: List[float] = []
+    for t in (trades or []):
+        try:
+            notional = float(t["qty"]) * float(t["entry_px"])
+            net = float(t["net_pnl"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if notional <= 0:
+            continue
+        (wins_r if net > 0 else losses_r).append(net / notional)
+    avg_win_R = round(sum(wins_r) / len(wins_r), 8) if wins_r else 0.0
+    avg_loss_R = round(sum(losses_r) / len(losses_r), 8) if losses_r else 0.0
+    return avg_win_R, avg_loss_R
+
+
 def _stats_row(variant: str, label: str, description: str,
                result: dict) -> dict:
     """Project backtest.run_backtest's stats into the compact per-variant row."""
     stats = result.get("stats", {}) if isinstance(result, dict) else {}
     tc = int(stats.get("trades", 0) or 0)
+    avg_win_R, avg_loss_R = _r_metrics(result)
     return {
         "variant": variant,
         "label": label,
@@ -258,8 +464,13 @@ def _stats_row(variant: str, label: str, description: str,
         "expectancy": stats.get("expectancy_per_trade", 0.0),
         "profit_factor": stats.get("profit_factor"),
         "max_drawdown": stats.get("max_drawdown", 0.0),
+        "trades": tc,
         "trade_count": tc,
         "win_rate": stats.get("win_rate", 0.0),
+        "avg_win_R": avg_win_R,
+        "avg_loss_R": avg_loss_R,
+        "avg_win": stats.get("avg_win", 0.0),
+        "avg_loss": stats.get("avg_loss", 0.0),
         "net_pnl": stats.get("net_pnl", 0.0),
         "confidence": ("low" if tc < _LOW_CONFIDENCE_TRADES else "ok"),
         "confidence_note": (
@@ -372,6 +583,8 @@ def run_lever_matrix(months: float = 3.0,
                            variant_strategy, start_ms, end_ms, syms, notes)
         if row is not None:
             variants.append(row)
+            if lever.get("run_note"):
+                notes.append(lever["run_note"])
 
     # Combinations of supported levers.
     for combo in _COMBOS:

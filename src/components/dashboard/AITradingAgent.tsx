@@ -22,6 +22,7 @@ import { BacktestPanel } from './BacktestPanel';
 import { LeverMatrixPanel } from './LeverMatrixPanel';
 import { RiskPanel } from './RiskPanel';
 import { StrategySettingsPanel } from './StrategySettingsPanel';
+import { EntryGatePanel } from './EntryGatePanel';
 import { SignalsEditorPanel } from './SignalsEditorPanel';
 import { ConfigHistoryPanel } from './ConfigHistoryPanel';
 import UniverseNoticesBanner from './UniverseNoticesBanner';
@@ -1775,7 +1776,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
           </button>
           {showStrategySettings && (
-            <div className="px-4 pb-4">
+            <div className="px-4 pb-4 space-y-3">
+              {/* Part O1 — one-click entry-gate opener (independent of the schema
+                  editor below so it still shows if the strategy schema fails). */}
+              <EntryGatePanel baseUrl={botUrl} />
               <StrategySettingsPanel baseUrl={botUrl} />
             </div>
           )}
