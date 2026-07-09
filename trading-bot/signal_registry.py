@@ -33,41 +33,62 @@ log = logging.getLogger(__name__)
 # str/int/float/bool primitives here so no reference into the json-parsed
 # strategy/signal-config graph is ever retained.
 
-# Per-signal firing tracker (rolling window). Cap kept modest: readers
-# (get_signal_fire_rates) filter by a TIME window anyway, so a huge count cap
-# only wastes memory.
-_signal_fire_history: dict = {}
+# Per-signal firing tracker — v0.4 memory-leak fix: BOUNDED AGGREGATE COUNTERS,
+# not a per-event history. The old design appended one (ts, fired) tuple PER
+# EVALUATION PER SIGNAL to a deque; at ~2000 evals/min × 15 signals that grew
+# ~300k retained objects before OOM. Signal evaluation is now stateless per
+# cycle: each evaluation only increments an integer counter in the current
+# minute bucket. Memory is O(signals × minutes-in-window) — a hard plateau,
+# evicted by time — never O(events). {minute_epoch: {signal_id: {ev, fired}}}.
+_SIGNAL_FIRE_WINDOW_MIN = 1440              # keep at most 24h of minute buckets
+_signal_fire_buckets: "dict[int, dict]" = {}
 _signal_fire_lock = _threading.Lock()
-_SIGNAL_HISTORY_MAX_PER_SIGNAL = 5000
 
-# Per-coin evaluation history. Written ~once per evaluation per symbol; a small
-# rolling cap is plenty for get_coin_trace's recent-snapshot view.
+# Per-coin evaluation history. Written ~once per evaluation per symbol; stores
+# ONLY plain primitives (no parsed-config references) and a small rolling cap.
 _coin_evaluation_history: dict = {}
 _coin_eval_lock = _threading.Lock()
 _COIN_EVAL_MAX_PER_SYMBOL = 60
 
 
 def record_signal_fire(signal_id: str, fired: bool) -> None:
-    now = time.time()
+    """O(1), stateless: bump the current minute bucket's counters and evict old
+    buckets. Retains counts, never per-event objects."""
+    minute = int(time.time() // 60)
     with _signal_fire_lock:
-        if signal_id not in _signal_fire_history:
-            _signal_fire_history[signal_id] = collections.deque(maxlen=_SIGNAL_HISTORY_MAX_PER_SIGNAL)
-        _signal_fire_history[signal_id].append((now, fired))
+        bucket = _signal_fire_buckets.setdefault(minute, {})
+        ent = bucket.setdefault(signal_id, {"ev": 0, "fired": 0})
+        ent["ev"] += 1
+        if fired:
+            ent["fired"] += 1
+        # Prune buckets older than the window (dict stays <= 1440 keys).
+        if len(_signal_fire_buckets) > _SIGNAL_FIRE_WINDOW_MIN:
+            cutoff = minute - _SIGNAL_FIRE_WINDOW_MIN
+            for m in [m for m in _signal_fire_buckets if m <= cutoff]:
+                del _signal_fire_buckets[m]
 
 
 def get_signal_fire_rates(window_hours: float = 1.0) -> dict:
-    now = time.time()
-    cutoff = now - (window_hours * 3600)
-    result = {}
+    """Sum the minute-bucket counters within the requested window."""
+    cutoff_min = int(time.time() // 60) - int(window_hours * 60)
+    agg: "dict[str, dict]" = {}
     with _signal_fire_lock:
-        for sig_id, history in _signal_fire_history.items():
-            in_window = [(ts, f) for ts, f in history if ts >= cutoff]
-            if not in_window:
-                result[sig_id] = {"evaluations": 0, "fires": 0, "fire_rate_pct": 0.0, "window_hours": window_hours}
+        for minute, bucket in _signal_fire_buckets.items():
+            if minute < cutoff_min:
                 continue
-            total = len(in_window)
-            fires = sum(1 for _, f in in_window if f)
-            result[sig_id] = {"evaluations": total, "fires": fires, "fire_rate_pct": round(fires / total * 100, 2), "window_hours": window_hours}
+            for sig_id, ent in bucket.items():
+                a = agg.setdefault(sig_id, {"ev": 0, "fired": 0})
+                a["ev"] += ent["ev"]
+                a["fired"] += ent["fired"]
+    result = {}
+    for sig_id, a in agg.items():
+        total, fires = a["ev"], a["fired"]
+        result[sig_id] = {
+            "evaluations": total,
+            "fires": fires,
+            "fire_rate_pct": round(fires / total * 100, 2) if total else 0.0,
+            "window_hours": window_hours,
+        }
     return result
 
 
