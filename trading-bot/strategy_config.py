@@ -87,6 +87,11 @@ class EntriesConfig(BaseModel):
     cooldown_recheck_fail_min: float = Field(1.0, ge=0.0, le=60.0)
     cooldown_thin_min:      float = Field(5.0, ge=0.0, le=240.0)
     cooldown_spread_min:    float = Field(5.0, ge=0.0, le=240.0)
+    # Q1 — when slots are free and candidates are fresh-confirmed buy-ready, fire
+    # the highest-scoring one immediately instead of holding it for confirm_seconds
+    # (which was stranding ready coins while slots sat open). Marginal/subsequent
+    # candidates still serve the confirm window.
+    instant_fire_when_slots_free: bool = True
 
 
 class ExitsConfig(BaseModel):
@@ -329,6 +334,11 @@ SCHEMA: Dict[str, dict] = {
                                          "Cooldown: wide spread",
                                          "Candidacy cooldown after a wide-spread skip.",
                                          0.0, 240.0, 1.0, "min"),
+    "entries.instant_fire_when_slots_free": _meta("entries.instant_fire_when_slots_free", "bool", "Entries",
+                                         "Instant fire when slots free",
+                                         "When slots are open and candidates are confirmed buy-ready, fire "
+                                         "the highest-scoring one immediately instead of holding it for "
+                                         "confirm_seconds."),
 
     # ── Exits ─────────────────────────────────────────────────────────────
     "exits.k_sl": _meta("exits.k_sl", "float", "Exits", "SL ATR multiple (k_sl)",

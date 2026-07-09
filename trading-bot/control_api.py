@@ -5692,7 +5692,17 @@ def _resolved_sizing_health() -> dict:
         except (TypeError, ValueError):
             neutral_mult = 0.5
 
-        shrinks = regime_enabled and neutral_scaling_mode not in ("slots", "off")
+        # Q2 — resolve "auto" EXACTLY as the engine's _resolve_neutral_scaling does
+        # (auto → "slots" for small accounts where the per-slot allocation can't
+        # fund 2× the tradeable minimum, else "size"). Without this, "auto" was
+        # treated as a shrink-mode and produced a FALSE "$5.50 < min" warning even
+        # though the engine actually keeps the full ticket in slots mode.
+        effective_neutral_mode = str(neutral_scaling_mode or "auto").strip().lower()
+        if effective_neutral_mode == "auto":
+            per_slot = (configured_per_trade if configured_per_trade is not None else 0.0)
+            effective_neutral_mode = "slots" if (per_slot > 0 and per_slot < 2.0 * tradeable_min) else "size"
+
+        shrinks = regime_enabled and effective_neutral_mode == "size"
         if configured_per_trade is None:
             neutral_resolved = None
         elif shrinks:
@@ -8402,9 +8412,12 @@ def api_strategy_history(limit: int = 20):
     try:
         limit = max(1, min(int(limit), 200))
         history = database.get_config_history(limit=limit)
-        return {"history": history, "count": len(history)}
+        # Q3 — the UI reads `versions`; keep `history` for back-compat. The
+        # key-name mismatch (not a missing endpoint) was why the panel showed
+        # "Config history unavailable — endpoint not deployed yet".
+        return {"history": history, "versions": history, "count": len(history)}
     except Exception as e:
-        return {"history": [], "count": 0, "error": f"{type(e).__name__}: {e}"}
+        return {"history": [], "versions": [], "count": 0, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.get("/api/config/audit")
