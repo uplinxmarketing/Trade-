@@ -26,6 +26,7 @@ import { EntryGatePanel } from './EntryGatePanel';
 import { SignalsEditorPanel } from './SignalsEditorPanel';
 import { ConfigHistoryPanel } from './ConfigHistoryPanel';
 import UniverseNoticesBanner from './UniverseNoticesBanner';
+import { MemoryRestartBanner } from './DataHealthPanel';
 import { useUniverseHealth } from '@/hooks/useUniverseHealth';
 import { resolveCoinStatus, type CoinLifecycle } from '@/lib/coin-status';
 
@@ -1191,6 +1192,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
       {/* I4 — auto-remove notices: tell the operator when the universe changed
           under them (delisted → successor), with one-click "Add successor". */}
       <UniverseNoticesBanner selectedCoins={selectedCoins} onAddSuccessor={handleAddSuccessor} />
+
+      {/* R4.1 — loud red banner when RSS crossed the soft cap and a clean
+          self-restart is imminent, so an OOM-style restart is never a surprise. */}
+      <MemoryRestartBanner />
 
       {/* Stats row */}
       <div className="grid grid-cols-4 divide-x divide-border border-b border-border">

@@ -2088,6 +2088,66 @@ def _held_symbols() -> list:
         return []
 
 
+# R1.3 — per-symbol WS-state sweep. Every per-symbol map below gains a key the
+# first time a symbol streams (prices/last_price_ts/book_ticker/market_stats/
+# price_ticks/price_samples/_price_sample_ts) or backfills (ws_candles*). When a
+# symbol LEAVES the covered universe (watchlist removal, rotation, delist) its
+# streams stop but these keys were never dropped unless purge_symbol() happened
+# to be called — so churn slowly grew every map forever. The periodic sweep
+# drops keys for symbols that are no longer covered by any stream and not held,
+# coordinating by only ever removing keys ABSENT from the live stream+held set.
+_STALE_SWEEP_SEC = 300.0   # prune orphaned per-symbol state every 5 min
+
+
+def _covered_symbol_set() -> set:
+    """The keep-set: every symbol we currently stream or hold. Union of all
+    market-shard symbols, the dedicated held-feed symbols, the held-position
+    symbols, and _current_coins (intended coverage — protects symbols during a
+    transient reconnect where no connection momentarily carries them)."""
+    keep = {s for c in _connections for s in c.symbols()}
+    if _held_conn is not None:
+        keep |= _held_conn.symbols()
+    keep |= set(_current_coins)
+    try:
+        keep |= set(_held_symbols())
+    except Exception:
+        pass
+    return keep
+
+
+def _sweep_stale_symbol_state() -> int:
+    """R1.3 — drop every per-symbol cache/buffer entry for symbols no longer in
+    the stream+held universe. A held or covered symbol is NEVER dropped: the
+    keep-set is derived from the live connection/position state, so only keys
+    absent from it are removed. Candle buffers are mutated under _buffers_lock
+    (same as the WS/backfill paths); the lock-free price maps are single-key
+    pops that lock-free readers tolerate (a missing key reads as no data)."""
+    keep = _covered_symbol_set()
+    tracked = (set(prices) | set(last_price_ts) | set(book_ticker)
+               | set(market_stats) | set(price_ticks) | set(price_samples)
+               | set(_price_sample_ts) | set(ws_candles) | set(ws_candles_5m)
+               | set(ws_candles_15m))
+    stale = [s for s in tracked if s not in keep]
+    if not stale:
+        return 0
+    with _buffers_lock:
+        for s in stale:
+            ws_candles.pop(s, None)
+            ws_candles_5m.pop(s, None)
+            ws_candles_15m.pop(s, None)
+    for s in stale:
+        prices.pop(s, None)
+        last_price_ts.pop(s, None)
+        book_ticker.pop(s, None)
+        market_stats.pop(s, None)
+        price_ticks.pop(s, None)
+        price_samples.pop(s, None)
+        _price_sample_ts.pop(s, None)
+    print(f"[DataCollector] Swept per-symbol WS state for {len(stale)} "
+          f"uncovered symbol(s): {', '.join(sorted(stale)[:20])}")
+    return len(stale)
+
+
 async def _sync_held_connection():
     """§6.4 d: DEDICATED connection for held-symbol exit feeds (@trade +
     @bookTicker) so market chatter can't queue ahead of exit ticks. Rebuilt
@@ -2242,6 +2302,7 @@ async def _start_websocket_loop():
     last_held_check   = time.time()
     last_rotate_check = time.time()
     last_reconcile    = time.time()
+    last_sweep        = time.time()
     last_subs_apply   = 0.0
     watch_change_pending = False
     # G1a — track the bookTicker-universe flag; a flip rebuilds all market
@@ -2326,6 +2387,17 @@ async def _start_websocket_loop():
                 await _reconcile_coverage()
             except Exception as e:
                 print(f"[DataCollector] Coverage reconcile error: {e}")
+
+        # ── R1.3 — prune orphaned per-symbol WS state (prices/book/tick/
+        # sample/stats caches + candle buffers) for symbols that have left the
+        # covered/held universe, so watchlist churn / rotation can't grow every
+        # per-symbol map without bound. Held & covered symbols are never dropped.
+        if now - last_sweep >= _STALE_SWEEP_SEC:
+            last_sweep = now
+            try:
+                _sweep_stale_symbol_state()
+            except Exception as e:
+                print(f"[DataCollector] Stale-state sweep error: {e}")
 
 
 # ── Health / freshness exports (§6.3, §6.5) ──────────────────────────────────

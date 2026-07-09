@@ -163,6 +163,14 @@ class DataConfig(BaseModel):
     # I4 — three-tier auto-management of the approved_coins watchlist.
     auto_remove_delisted:        bool = True   # remove confirmed-delisted coins
     auto_replace_with_successor: bool = False  # also auto-add the renamed successor
+    # R4 — memory-safety guardrail. When process RSS crosses the soft cap, warn
+    # loudly (CRITICAL + UI banner) and gracefully self-restart (flush + clean
+    # shutdown marker + exit 0) so an OOM kill becomes a clean restart. 0 disables.
+    rss_soft_cap_mb:             float = Field(800.0, ge=0.0, le=8192.0)
+    # R1 — enable tracemalloc + log the top allocations in the heartbeat so a leak
+    # source is visible in the diagnostics bundle. Small overhead; leave on until
+    # the leak is fixed, then it can be turned off.
+    tracemalloc_enabled:         bool = True
 
 
 class StrategyConfig(BaseModel):
@@ -466,6 +474,15 @@ SCHEMA: Dict[str, dict] = {
                                        "it is confirmed delisted (absent from exchangeInfo / known "
                                        "delisted) across two consecutive validation passes. A held "
                                        "coin is never removed while it has an open position or order."),
+    "data.rss_soft_cap_mb": _meta("data.rss_soft_cap_mb", "float", "Data",
+                                  "RSS soft cap (MB)",
+                                  "When process memory crosses this, warn (CRITICAL + UI banner) and "
+                                  "gracefully self-restart so an OOM kill becomes a clean restart. 0 disables.",
+                                  0.0, 8192.0, 50.0, "MB"),
+    "data.tracemalloc_enabled": _meta("data.tracemalloc_enabled", "bool", "Data",
+                                  "Tracemalloc leak trace",
+                                  "Enable tracemalloc and log the top memory allocations in the heartbeat "
+                                  "so a leak source shows up in diagnostics."),
     "data.auto_replace_with_successor": _meta("data.auto_replace_with_successor", "bool", "Data",
                                               "Auto-add rename successor",
                                               "When a removed coin has a known rename successor that "

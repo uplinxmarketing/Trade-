@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
+import { AlertTriangle, X } from 'lucide-react';
 
 // ── Types (GET /api/health/data) ───────────────────────────────────────────
 
@@ -59,6 +60,19 @@ export interface HealthEngineSection {
   held_symbols?: number;
 }
 
+// R4.1 — memory pressure section from trade_engine.get_memory_stats(). Key
+// names may vary across backend revisions, so every field is optional and read
+// defensively (see readMemory). Absent entirely on older backends.
+export interface HealthMemorySection {
+  available?: boolean;
+  rss_mb?: number;
+  rss_kb?: number;
+  soft_cap_mb?: number;
+  memory_restart_pending?: boolean;
+  growth_flagged?: boolean;
+  leak_suspected?: boolean;
+}
+
 export interface DataHealth {
   status: 'green' | 'red';
   causes: string[];
@@ -66,6 +80,41 @@ export interface DataHealth {
   data?: HealthDataSection;
   limits?: HealthLimitsSection;
   engine?: HealthEngineSection;
+  memory?: HealthMemorySection;
+}
+
+// R4.1 — normalized view of the memory section. Returns null when the backend
+// ships no `memory` block (older backend), so callers render nothing.
+export interface MemoryInfo {
+  rssMb: number | null;
+  softCapMb: number | null;
+  restartPending: boolean;
+  growthFlagged: boolean;
+}
+
+export function readMemory(health: DataHealth | null): MemoryInfo | null {
+  if (!health) return null;
+  const raw = (health as { memory?: unknown }).memory;
+  if (!raw || typeof raw !== 'object') return null;
+  const o = raw as Record<string, unknown>;
+  const num = (v: unknown): number | null =>
+    typeof v === 'number' && isFinite(v) ? v : null;
+
+  // RSS may arrive as MB or KB — prefer explicit MB, else convert KB.
+  let rssMb = num(o.rss_mb);
+  if (rssMb == null) {
+    const kb = num(o.rss_kb);
+    if (kb != null) rssMb = kb / 1024;
+  }
+  let softCapMb = num(o.soft_cap_mb);
+  if (softCapMb == null) {
+    const capKb = num(o.soft_cap_kb);
+    if (capKb != null) softCapMb = capKb / 1024;
+  }
+  const restartPending = o.memory_restart_pending === true;
+  const growthFlagged = o.growth_flagged === true || o.leak_suspected === true;
+
+  return { rssMb, softCapMb, restartPending, growthFlagged };
 }
 
 const POLL_MS = 5000;
@@ -119,6 +168,10 @@ function fmtPct(pct: number | null | undefined): string {
 
 function fmtNum(n: number | null | undefined): string {
   return n == null ? '—' : n.toLocaleString();
+}
+
+function fmtMb(n: number | null | undefined): string {
+  return n == null ? '—' : `${n.toFixed(0)} MB`;
 }
 
 function sectionAvailable(s: { available?: boolean } | null | undefined): boolean {
@@ -212,6 +265,7 @@ export function DataHealthPanelView({ health, error, stale = false }: {
   }
 
   const green = health.status === 'green' && !stale;
+  const mem = readMemory(health);
   const d = health.data ?? {};
   const l = health.limits ?? {};
   const e = health.engine ?? {};
@@ -377,6 +431,37 @@ export function DataHealthPanelView({ health, error, stale = false }: {
           </p>
         )}
       </HealthSection>
+
+      {/* Memory (R4.1) — only when the backend ships a memory section. Surfaces
+          current RSS vs soft cap, a red line when a self-restart is imminent,
+          and a softer amber note when growth is merely flagged. */}
+      {mem && (
+        <HealthSection title="Memory" available={true}>
+          <div className="grid grid-cols-2 gap-1">
+            <Tile
+              label="RSS"
+              value={fmtMb(mem.rssMb)}
+              valueClass={
+                mem.restartPending ? 'text-loss'
+                  : mem.growthFlagged ? 'text-amber-400'
+                    : 'text-foreground'
+              }
+              sub={mem.softCapMb != null ? `cap ${fmtMb(mem.softCapMb)}` : undefined}
+            />
+            <Tile label="Soft cap" value={fmtMb(mem.softCapMb)} />
+          </div>
+          {mem.restartPending && (
+            <p className="text-[9px] text-loss font-semibold break-words">
+              Memory high{mem.rssMb != null ? ` (RSS ${fmtMb(mem.rssMb)})` : ''} — clean self-restart imminent to reclaim memory
+            </p>
+          )}
+          {!mem.restartPending && mem.growthFlagged && (
+            <p className="text-[9px] text-amber-400 break-words">
+              memory growth detected ({fmtMb(mem.rssMb)}{mem.softCapMb != null ? ` / cap ${fmtMb(mem.softCapMb)}` : ''})
+            </p>
+          )}
+        </HealthSection>
+      )}
     </div>
   );
 }
@@ -389,6 +474,46 @@ export function DataHealthPanel({ baseUrl = '' }: { baseUrl?: string }) {
     <div className="space-y-2">
       <p className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Data Health</p>
       <DataHealthPanelView health={health} error={error} stale={stale} />
+    </div>
+  );
+}
+
+// ── R4.1 — Memory restart banner (self-polling, dismissible) ───────────────
+// A loud red banner shown at the top of the dashboard when RSS has crossed the
+// soft cap and a clean self-restart is imminent, so an OOM-style restart is
+// never a surprise. Renders nothing when: no `memory` section (older backend),
+// feed stale, restart not pending, or the operator dismissed it. Mirrors the
+// UniverseNoticesBanner "removed" (loud) styling.
+export function MemoryRestartBanner({ baseUrl = '' }: { baseUrl?: string }) {
+  const { health, stale } = useDataHealth(baseUrl);
+  const [dismissed, setDismissed] = useState(false);
+  const mem = readMemory(health);
+
+  if (stale || !mem || !mem.restartPending || dismissed) return null;
+
+  return (
+    <div className="px-3 py-2">
+      <div className="rounded border border-loss/60 bg-loss/15 text-loss px-3 py-2 flex items-start gap-2">
+        <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 animate-pulse" />
+        <div className="flex-1 min-w-0">
+          <p className="text-[11px] font-bold leading-tight">
+            Memory high{mem.rssMb != null ? ` (RSS ${fmtMb(mem.rssMb)})` : ''} — bot will restart cleanly shortly to reclaim memory.
+          </p>
+          {mem.softCapMb != null && (
+            <p className="text-[9px] opacity-80 mt-0.5">
+              soft cap {fmtMb(mem.softCapMb)} · a clean self-restart avoids an abrupt OOM kill
+            </p>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={() => setDismissed(true)}
+          className="opacity-70 hover:opacity-100 shrink-0"
+          title="Dismiss"
+        >
+          <X className="w-3 h-3" />
+        </button>
+      </div>
     </div>
   );
 }
