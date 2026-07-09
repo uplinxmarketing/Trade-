@@ -108,6 +108,15 @@ class ExitsConfig(BaseModel):
     oco_skip_rescue_sec:       float = Field(3.0, ge=1.0, le=30.0)
     sl_confirm_ticks:          int   = Field(2, ge=1, le=10)
     min_hold_sec:              float = Field(10.0, ge=0.0, le=120.0)
+    # P2 — ATR-based profit-ratchet trailing stop: the missing layer between the
+    # breakeven move and the +rr_ratio target. Arms once a trade is meaningfully
+    # green, then locks profit before it round-trips. All four are UI-tunable and
+    # backtester levers; defaults are starting points, not claims.
+    ratchet_enabled:           bool  = True
+    ratchet_activate_r:        float = Field(0.4, ge=0.0, le=5.0)   # arm at ≥ this R of profit
+    ratchet_activate_usdt:     float = Field(0.02, ge=0.0, le=100.0)  # OR ≥ this $ profit
+    ratchet_k_atr:             float = Field(0.6, ge=0.05, le=5.0)  # trail = peak − k×ATR (per-coin)
+    ratchet_giveback_pct:      float = Field(50.0, ge=1.0, le=100.0)  # exit if profit gives back ≥ this % of peak
 
     @model_validator(mode="after")
     def _check_sl_bounds(self):
@@ -368,6 +377,26 @@ SCHEMA: Dict[str, dict] = {
     "exits.min_hold_sec": _meta("exits.min_hold_sec", "float", "Exits", "Min hold (s)",
                                 "Never exit (except hard SL) within this many seconds of entry.",
                                 0.0, 120.0, 1, "s"),
+    "exits.ratchet_enabled": _meta("exits.ratchet_enabled", "bool", "Exits", "Profit ratchet",
+                                "Lock in profit before it round-trips: trail an ATR-based stop once a "
+                                "trade is meaningfully green (sits between breakeven and the target)."),
+    "exits.ratchet_activate_r": _meta("exits.ratchet_activate_r", "float", "Exits",
+                                "Ratchet activate (R)",
+                                "Arm the profit ratchet once unrealized profit reaches this many R.",
+                                0.0, 5.0, 0.1, "R"),
+    "exits.ratchet_activate_usdt": _meta("exits.ratchet_activate_usdt", "float", "Exits",
+                                "Ratchet activate ($)",
+                                "OR arm the ratchet at this many USDT of unrealized profit (whichever first).",
+                                0.0, 100.0, 0.01, "USDT"),
+    "exits.ratchet_k_atr": _meta("exits.ratchet_k_atr", "float", "Exits", "Ratchet trail (×ATR)",
+                                "Trailing distance = peak − this × ATR (per-coin, so majors trail tight "
+                                "and volatile alts trail wide automatically).",
+                                0.05, 5.0, 0.05, "×ATR"),
+    "exits.ratchet_giveback_pct": _meta("exits.ratchet_giveback_pct", "float", "Exits",
+                                "Ratchet give-back cap (%)",
+                                "Also exit if unrealized profit falls to this % of its peak (whichever "
+                                "fires first with the ATR trail).",
+                                1.0, 100.0, 1.0, "%"),
 
     # ── Regime ────────────────────────────────────────────────────────────
     "regime.enabled": _meta("regime.enabled", "bool", "Regime", "Regime filter",
