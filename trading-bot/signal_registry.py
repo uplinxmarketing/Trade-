@@ -25,15 +25,26 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-# Per-signal firing tracker (rolling window)
+# NOTE (v0.4 memory-leak fix): the two histories below are LIVE in-memory
+# rolling traces bounded ONLY by these per-key caps + a time-window filter on
+# read. They are independent of DB retention/pruning — the OOM leak was
+# unbounded in-memory retention (heavy parsed-config objects held in these
+# deques) that DB pruning never touched. Keep caps small and store ONLY plain
+# str/int/float/bool primitives here so no reference into the json-parsed
+# strategy/signal-config graph is ever retained.
+
+# Per-signal firing tracker (rolling window). Cap kept modest: readers
+# (get_signal_fire_rates) filter by a TIME window anyway, so a huge count cap
+# only wastes memory.
 _signal_fire_history: dict = {}
 _signal_fire_lock = _threading.Lock()
-_SIGNAL_HISTORY_MAX_PER_SIGNAL = 50000
+_SIGNAL_HISTORY_MAX_PER_SIGNAL = 5000
 
-# Per-coin evaluation history
+# Per-coin evaluation history. Written ~once per evaluation per symbol; a small
+# rolling cap is plenty for get_coin_trace's recent-snapshot view.
 _coin_evaluation_history: dict = {}
 _coin_eval_lock = _threading.Lock()
-_COIN_EVAL_MAX_PER_SYMBOL = 500
+_COIN_EVAL_MAX_PER_SYMBOL = 60
 
 
 def record_signal_fire(signal_id: str, fired: bool) -> None:
@@ -107,21 +118,59 @@ def get_signal_telemetry() -> dict:
     return {"window_hours": _TELEMETRY_WINDOW_HOURS, "signals": signals}
 
 
+def _summarize_results(results: Any) -> str:
+    """Collapse a [(signal_id, fired_bool), ...] list into a compact plain-string
+    summary like 'T1=1,M3=0'. Returns primitives only — never retains a
+    reference into the original (possibly json-parsed-config-backed) objects.
+    """
+    parts: List[str] = []
+    try:
+        for item in (results or []):
+            # Each item is normally a (signal_id, fired) tuple; be defensive.
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                sig_id, fired = item[0], item[1]
+                parts.append(f"{str(sig_id)}={1 if fired else 0}")
+            else:
+                parts.append(str(item))
+    except Exception:
+        return ""
+    return ",".join(parts)
+
+
 def record_coin_evaluation(symbol: str, evaluation: dict) -> None:
+    """Append a LIGHTWEIGHT trace record for `symbol`.
+
+    v0.4 leak fix: we deliberately do NOT store the heavy nested
+    mandatory_results / scored_results / veto_results lists, nor the raw
+    fired_signals list — those objects hold references into the json-parsed
+    strategy/signal config and were the retained structures behind the OOM.
+    Instead we normalize everything to plain str/int/float/bool primitives and
+    store compact string summaries + counts, which is all get_coin_trace needs.
+    """
     now = time.time()
+    fired_signals = [str(s) for s in (evaluation.get("fired_signals") or [])]
+    mandatory_results = evaluation.get("mandatory_results") or []
+    scored_results = evaluation.get("scored_results") or []
+    veto_results = evaluation.get("veto_results") or []
+    record = {
+        "ts": now,
+        "score": int(evaluation.get("score", 0) or 0),
+        "allowed": bool(evaluation.get("allowed", False)),
+        "reason": str(evaluation.get("reason", "")),
+        "fired_signals": fired_signals,                     # plain strings only
+        "fired_count": len(fired_signals),
+        "mandatory_count": len(mandatory_results),
+        "scored_count": len(scored_results),
+        "veto_count": len(veto_results),
+        # Compact plain-string summaries in place of the heavy nested lists.
+        "mandatory_summary": _summarize_results(mandatory_results),
+        "scored_summary": _summarize_results(scored_results),
+        "veto_summary": _summarize_results(veto_results),
+    }
     with _coin_eval_lock:
         if symbol not in _coin_evaluation_history:
             _coin_evaluation_history[symbol] = collections.deque(maxlen=_COIN_EVAL_MAX_PER_SYMBOL)
-        _coin_evaluation_history[symbol].append({
-            "ts": now,
-            "fired_signals": evaluation.get("fired_signals", []),
-            "score": evaluation.get("score", 0),
-            "allowed": evaluation.get("allowed", False),
-            "reason": evaluation.get("reason", ""),
-            "mandatory_results": evaluation.get("mandatory_results", []),
-            "scored_results": evaluation.get("scored_results", []),
-            "veto_results": evaluation.get("veto_results", []),
-        })
+        _coin_evaluation_history[symbol].append(record)
 
 
 def get_coin_trace(symbol: str, hours: float = 1.0) -> dict:

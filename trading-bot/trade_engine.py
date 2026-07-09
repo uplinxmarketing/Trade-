@@ -6352,8 +6352,10 @@ def _soft_cap_mb() -> float:
 
 def _maybe_start_tracemalloc() -> None:
     """R1.1 — start tracemalloc at boot when data.tracemalloc_enabled (default
-    True). Small nframe (1) to keep the overhead low. Guarded so a failure NEVER
-    blocks boot; idempotent."""
+    True). nframe=8 (v0.4) so each allocation carries its caller stack: the raw
+    leak site is a stdlib line (json/decoder.py) that a 1-frame trace can't
+    attribute, so 8 frames let the top-3 dump name the WolfBot line that RETAINS
+    the parsed object. Guarded so a failure NEVER blocks boot; idempotent."""
     global _tracemalloc_started, _tracemalloc_started_ts
     if _tracemalloc_started:
         return
@@ -6362,7 +6364,7 @@ def _maybe_start_tracemalloc() -> None:
             return
         import tracemalloc
         if not tracemalloc.is_tracing():
-            tracemalloc.start(1)   # 1 frame is enough for file:line and cheap
+            tracemalloc.start(8)   # 8 frames: capture the caller stack, not just file:line
         _tracemalloc_started = True
         _tracemalloc_started_ts = time.time()   # uptime reference for first-snap timing
         try:
@@ -6389,6 +6391,25 @@ def _tracemalloc_top10_lines(snap) -> List[str]:
     except Exception:
         pass
     return lines
+
+
+def _tracemalloc_top3_tracebacks(snap) -> List[str]:
+    """R1 (v0.4) — full multi-frame tracebacks for the top-3 allocation sites via
+    snap.statistics('traceback'). tracemalloc runs with nframe=8, so each block's
+    stat.traceback.format() names the WolfBot line that RETAINS the parsed object
+    (not just the stdlib json/decoder.py allocation line a 1-frame trace shows).
+    Only the top-3 are formatted to keep the sampler cheap. Never raises."""
+    blocks: List[str] = []
+    try:
+        for st in snap.statistics('traceback')[:3]:
+            try:
+                tb = "\n    ".join(st.traceback.format())
+                blocks.append(f"{st.size // 1024}KB {st.count} blocks:\n    {tb}")
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return blocks
 
 
 def _sample_tracemalloc() -> None:
@@ -6430,6 +6451,11 @@ def _sample_tracemalloc() -> None:
         block = "TRACEMALLOC TOP10:\n  " + "\n  ".join(lines)
         if grow:
             block += "\nTRACEMALLOC GROWTH (top5 vs prev):\n  " + "\n  ".join(grow)
+        # v0.4 — full caller stack for the top-3 sites so a WolfBot line that
+        # retains the parsed JSON is named (nframe=8). Only top-3 to stay cheap.
+        tb3 = _tracemalloc_top3_tracebacks(snap)
+        if tb3:
+            block += "\nTRACEMALLOC TRACEBACK (top3):\n  " + "\n  ".join(tb3)
         try:
             log.info(block)
         except Exception:
@@ -6456,11 +6482,17 @@ def _dump_tracemalloc_pre_restart(rss_mb: int) -> None:
         import tracemalloc
         if not tracemalloc.is_tracing():
             return
-        lines = _tracemalloc_top10_lines(tracemalloc.take_snapshot())
+        snap = tracemalloc.take_snapshot()
+        lines = _tracemalloc_top10_lines(snap)
         if not lines:
             return
+        block = "TRACEMALLOC TOP10 (pre-restart):\n  " + "\n  ".join(lines)
+        # v0.4 — full caller stack for the top-3 sites at death (nframe=8).
+        tb3 = _tracemalloc_top3_tracebacks(snap)
+        if tb3:
+            block += "\nTRACEMALLOC TRACEBACK (top3, pre-restart):\n  " + "\n  ".join(tb3)
         try:
-            log.critical("TRACEMALLOC TOP10 (pre-restart):\n  " + "\n  ".join(lines))
+            log.critical(block)
         except Exception:
             pass
         try:
@@ -6597,6 +6629,23 @@ def _best_effort_task_count():
         return None
 
 
+def _ws_loop_task_count():
+    """v0.4 — authoritative asyncio task count from data_collector's WS loop.
+    get_memory_stats() runs on the entry-heartbeat thread, which has NO asyncio
+    loop, so a local asyncio.all_tasks() here is empty/None. data_collector samples
+    the real WS-loop task count into _ws_health["asyncio_tasks"]; pull that (guarded
+    lazy import). Falls back to the local best-effort count only when the ws_health
+    value is absent. Never raises."""
+    try:
+        import data_collector as _dc_wt
+        n = getattr(_dc_wt, "_ws_health", {}).get("asyncio_tasks")
+        if n is not None:
+            return n
+    except Exception:
+        pass
+    return _best_effort_task_count()
+
+
 def get_memory_stats() -> dict:
     """M2 — public snapshot of process memory for control_api / the boot report.
     growth_kb_per_hr is a linear estimate over the current rolling window."""
@@ -6604,19 +6653,24 @@ def get_memory_stats() -> dict:
         n = len(_rss_history)
         rss_kb = _last_rss_kb
         peak = _rss_peak_kb
-        growth = 0.0
+        growth = 0
         if n >= 2:
             t0, k0 = _rss_history[0]
             t1, k1 = _rss_history[-1]
-            dt_hr = (t1 - t0) / 3600.0
-            if dt_hr > 0:
-                growth = (k1 - k0) / dt_hr
+            dt = t1 - t0
+            # Need a meaningful window: over < ~60s the extrapolation to KB/hr
+            # blows up into the garbage huge number we saw. Report 0 until the
+            # history spans a real window, then clamp so a transient RSS jump
+            # can't emit an absurd rate.
+            if dt >= 60.0:
+                rate = (k1 - k0) / (dt / 3600.0)
+                growth = int(max(-10_000_000, min(10_000_000, rate)))
     return {
         "rss_kb":           rss_kb,
         "rss_peak_kb":      peak,
         "rss_mb":           rss_kb // 1024,
         "samples":          n,
-        "growth_kb_per_hr": round(growth, 1),
+        "growth_kb_per_hr": growth,
         # R4 — soft-cap guardrail state (UI banner / control_api).
         "soft_cap_mb":            _soft_cap_mb(),
         "memory_restart_pending": _memory_restart_pending,
@@ -6626,9 +6680,10 @@ def get_memory_stats() -> dict:
         # so live growth AND the leak state at the last self-restart are visible
         # in one place. None when no restart has been recorded yet.
         "tracemalloc_pre_restart": _read_tracemalloc_pre_restart(),
-        # Best-effort task count from THIS thread — raises if no running loop here
-        # (authoritative count is sampled by data_collector from the WS loop).
-        "asyncio_tasks":          _best_effort_task_count(),
+        # Authoritative WS-loop task count sampled by data_collector into
+        # _ws_health (this thread has no asyncio loop of its own); falls back to
+        # the local best-effort count only when that value is absent.
+        "asyncio_tasks":          _ws_loop_task_count(),
     }
 
 
