@@ -75,6 +75,18 @@ class EntriesConfig(BaseModel):
     # L2 Tier 1 — liquidity floor: skip symbols whose 24h quote volume (USDT) is
     # below this. Thin coins are where spread vetoes and slippage cluster.
     min_quote_volume_24h_usd: float = Field(20_000_000.0, ge=0.0, le=10_000_000_000.0)
+    # O5.3 — a candidate must hold buy-ready across live ticks for this many
+    # seconds, then fire immediately (confirm-then-fire). 0 = pure live/tick;
+    # up to a full 300s candle = max discipline. Filters intra-candle flickers
+    # without the minutes-long heartbeat lag. Never a switch to raw tick-buying —
+    # the fresh re-check still gates; this is only how long confirmation takes.
+    confirm_seconds:        float = Field(10.0, ge=0.0, le=300.0)
+    # O5.2 — reason-specific candidacy cooldowns (minutes), replacing the flat
+    # 30-min bench. A near-miss fresh re-check must not sideline a coin that may
+    # qualify on the next tick; thin-liquidity/spread are stable so keep ~5 min.
+    cooldown_recheck_fail_min: float = Field(1.0, ge=0.0, le=60.0)
+    cooldown_thin_min:      float = Field(5.0, ge=0.0, le=240.0)
+    cooldown_spread_min:    float = Field(5.0, ge=0.0, le=240.0)
 
 
 class ExitsConfig(BaseModel):
@@ -289,6 +301,25 @@ SCHEMA: Dict[str, dict] = {
                                          "Liquidity floor: skip symbols whose 24h quote volume (USDT) is "
                                          "below this.",
                                          0.0, 10_000_000_000.0, 1_000_000.0, "USDT"),
+    "entries.confirm_seconds": _meta("entries.confirm_seconds", "float", "Entries",
+                                         "Confirm seconds",
+                                         "A buy-ready candidate must hold across live ticks for this many "
+                                         "seconds, then fires immediately. 0 = live/tick, 300 = full candle.",
+                                         0.0, 300.0, 1.0, "s"),
+    "entries.cooldown_recheck_fail_min": _meta("entries.cooldown_recheck_fail_min", "float", "Entries",
+                                         "Cooldown: re-check miss",
+                                         "Candidacy cooldown after a fresh re-check just missed (keep near "
+                                         "zero — the coin may qualify on the next tick).",
+                                         0.0, 60.0, 0.5, "min"),
+    "entries.cooldown_thin_min": _meta("entries.cooldown_thin_min", "float", "Entries",
+                                         "Cooldown: thin liquidity",
+                                         "Candidacy cooldown after a thin-volume skip (the condition is "
+                                         "stable, so a modest bench is fine).",
+                                         0.0, 240.0, 1.0, "min"),
+    "entries.cooldown_spread_min": _meta("entries.cooldown_spread_min", "float", "Entries",
+                                         "Cooldown: wide spread",
+                                         "Candidacy cooldown after a wide-spread skip.",
+                                         0.0, 240.0, 1.0, "min"),
 
     # ── Exits ─────────────────────────────────────────────────────────────
     "exits.k_sl": _meta("exits.k_sl", "float", "Exits", "SL ATR multiple (k_sl)",

@@ -37,6 +37,27 @@ LEVERS (Tier-2, per spec)
                         TM1_bad_hour reads the wall clock and is in
                         backtest._NON_REPLAYABLE_SIGNALS (excluded from replay
                         decisions), so it can't be exercised by the backtester]
+    confirm_fast_0s   — entries.confirm_seconds := 0 (fire immediately)   [UNSUPPORTED:
+                        sub-candle LIVE-timing knob — see O5.3 note below]
+    confirm_slow_60s  — entries.confirm_seconds := 60 (hold 60s ready)    [UNSUPPORTED:
+                        sub-candle LIVE-timing knob — see O5.3 note below]
+
+O5.3 — A/B confirm_seconds (why it is UNSUPPORTED in replay)
+    entries.confirm_seconds is a LIVE execution-timing knob: a buy-ready
+    candidate must HOLD buy-ready across live ticks for N seconds before the
+    order fires. It is a SUB-candle concept measured in seconds of wall-clock
+    tick cadence (entries.eval_heartbeat_sec), which backtest.py marks
+    "live-only (tick cadence); unused in replay". run_backtest evaluates entries
+    on candle CLOSES only (5m closes by default — the 1m close landing on a
+    5-minute boundary — or every 1m close under the legacy entries.tick_entries
+    escape hatch; see backtest.py §3.1 / the entry-evaluation block) and fills at
+    the next candle's open. There is NO intra-candle / sub-candle tick model, and
+    entries_config never even reads confirm_seconds (it is absent from
+    ENTRIES_DEFAULTS). So every confirm_seconds value between 0 and one candle
+    (0–300s on the 5m default bar) collapses to the SAME "fire at the close that
+    made the candidate buy-ready" decision — the A/B is indistinguishable in
+    replay. Rather than fake a difference, both variants are added and reported as
+    unsupported: confirm_seconds must be A/B'd LIVE, not in the backtester.
 
 O4 — LOOSE GATE + MANUAL-METHOD VARIANTS (judged on the SAME 3-month data)
     loose_gate replays the exact O1 minimum-viable gate the live preset applies
@@ -263,6 +284,25 @@ def _tm1_hours(s: dict) -> dict:
     return s
 
 
+def _confirm_fast_0s(s: dict) -> dict:
+    """O5.3 A/B — would set entries.confirm_seconds := 0 (fire the moment a
+    candidate is buy-ready). confirm_seconds is a SUB-candle live-execution
+    timing knob (hold buy-ready across live ticks for N seconds); run_backtest
+    evaluates on candle close only and never reads confirm_seconds, so 0s is
+    indistinguishable from any other 0–300s value in replay. No-op; the lever is
+    flagged unsupported — reported, not silently skipped."""
+    return s
+
+
+def _confirm_slow_60s(s: dict) -> dict:
+    """O5.3 A/B — would set entries.confirm_seconds := 60 (require the candidate
+    to hold buy-ready for 60 live seconds before firing). Same sub-candle
+    live-timing concept: run_backtest fires at candle close with no intra-candle
+    tick model, so 60s collapses to the same replay decision as 0s. No-op;
+    flagged unsupported — reported, not silently skipped."""
+    return s
+
+
 LEVERS: List[dict] = [
     {
         "key": "t2_mandatory",
@@ -351,6 +391,40 @@ LEVERS: List[dict] = [
         "unsupported_reason": "TM1_bad_hour reads the wall clock and is excluded "
                               "from replay decisions (backtest._NON_REPLAYABLE_"
                               "SIGNALS) — cannot be simulated.",
+    },
+    {
+        "key": "confirm_fast_0s",
+        "label": "confirm_seconds = 0 (fast entry)",
+        "description": "O5.3 A/B: fire the entry immediately once a candidate is "
+                       "buy-ready (entries.confirm_seconds := 0) instead of the "
+                       "default hold window.",
+        "transform": _confirm_fast_0s,
+        "supported": False,
+        "unsupported_reason": "confirm_seconds is a sub-candle live-execution "
+                              "timing knob (a candidate must hold buy-ready across "
+                              "live ticks for N seconds before firing); "
+                              "run_backtest evaluates on candle close only (no "
+                              "intra-candle tick model) and never reads "
+                              "confirm_seconds, so 0–300s confirm windows are "
+                              "indistinguishable in replay — this must be A/B'd "
+                              "live, not in the backtester (see O5.3).",
+    },
+    {
+        "key": "confirm_slow_60s",
+        "label": "confirm_seconds = 60 (slow entry)",
+        "description": "O5.3 A/B: require the candidate to hold buy-ready for 60 "
+                       "live seconds before firing (entries.confirm_seconds := 60) "
+                       "— a slower, more-confirmed entry.",
+        "transform": _confirm_slow_60s,
+        "supported": False,
+        "unsupported_reason": "confirm_seconds is a sub-candle live-execution "
+                              "timing knob (a candidate must hold buy-ready across "
+                              "live ticks for N seconds before firing); "
+                              "run_backtest evaluates on candle close only (no "
+                              "intra-candle tick model) and never reads "
+                              "confirm_seconds, so 0–300s confirm windows are "
+                              "indistinguishable in replay — this must be A/B'd "
+                              "live, not in the backtester (see O5.3).",
     },
 ]
 
