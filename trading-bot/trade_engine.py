@@ -1183,6 +1183,10 @@ _ENTRIES_DEFAULTS = {
     "cooldown_recheck_fail_min":  1.0,
     "cooldown_thin_min":          5.0,
     "cooldown_spread_min":        5.0,
+    # v0.4 Part Q1 — when slots are free, fire the highest-scoring ready
+    # candidate immediately instead of stranding it in the confirm_seconds hold
+    # (the pydantic schema addition is handled separately; read defensively).
+    "instant_fire_when_slots_free": True,
 }
 
 
@@ -3780,6 +3784,26 @@ def _record_rejection(symbol: str, score, reason: str, detail: str = ""):
     # J1 — feed the per-symbol decision trace with the existing reason string
     # (global "(all)" rejections are ignored — they aren't per-symbol blocks).
     _trace_mark_block(symbol, reason)
+
+def _mark_ready_no_slot(strategy: dict, k: int, n: int) -> None:
+    """Q1 — when the buy check returns early at capacity (before the per-symbol
+    loop), every currently buy-ready candidate would otherwise be left with NO
+    attempt and NO block reason → a silent DECISION-GAP. Stamp each ready coin
+    with an explicit machine-readable 'waiting: no free slot (k/n)' block so the
+    capacity throttle always shows a state. Never raises on the hot path."""
+    try:
+        min_sigs = int(strategy.get("min_signals", config.MIN_SIGNALS_TO_BUY))
+        approved = {c["symbol"] for c in strategy.get("approved_coins", [])
+                    if c.get("approved")}
+        with _signal_cache_lock:
+            snap = dict(_signal_cache)
+        reason = f"waiting: no free slot ({k}/{n})"
+        for s, v in snap.items():
+            if s in approved and v.get("score", 0) >= min_sigs:
+                _trace_mark_block(s, reason)
+    except Exception:
+        pass
+
 
 def get_rejection_stats() -> dict:
     with _rejection_lock:
@@ -7651,6 +7675,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 f"waiting for an exit before opening new trades",
                 "info",
             )
+        # Q1 — mark every buy-ready candidate 'no free slot' so this early return
+        # never leaves a ready coin with no attempt AND no block reason.
+        _mark_ready_no_slot(strategy, n_open, max_pos)
         return  # already at capacity — buys resume automatically after a sell
 
     # Enforce configurable min_signals threshold (overrides config.MIN_SIGNALS_TO_BUY)
@@ -7731,12 +7758,39 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     global _decision_heartbeat
     _decision_heartbeat += 1
 
-    for sym, cached in cache_snapshot.items():
+    # Q1 — helpers so the per-symbol loop never leaves a buy-ready candidate
+    # without an explicit machine-readable state.
+    _items = list(cache_snapshot.items())
+
+    def _cached_ready(_c) -> bool:
+        return bool(_c.get("score", 0) >= min_sigs)
+
+    def _mark_rest_no_slot(_from_idx: int, _k: int, _n: int) -> None:
+        # Capacity hit mid-loop → every still-unprocessed ready candidate gets an
+        # explicit 'no free slot' block instead of a silent gap.
+        _reason = f"waiting: no free slot ({_k}/{_n})"
+        for _s, _c in _items[_from_idx:]:
+            if _s in approved and _cached_ready(_c):
+                _trace_mark_block(_s, _reason)
+
+    def _top_ready_symbol() -> Optional[str]:
+        # Highest cached-score approved buy-ready candidate this pass (ties: first
+        # in iteration). Used by instant_fire_when_slots_free.
+        _best_s, _best_sc = None, -1
+        for _s, _c in _items:
+            if _s in approved and _cached_ready(_c):
+                _sc = int(_c.get("score", 0))
+                if _sc > _best_sc:
+                    _best_sc, _best_s = _sc, _s
+        return _best_s
+
+    for _idx, (sym, cached) in enumerate(_items):
         # Re-check capacity before every individual buy — the pre-loop check only
         # guards the entry; without this, all ready coins buy in sequence and blow
         # past the configured max_positions limit.
         with _positions_lock:
             if len(_positions) >= max_pos:
+                _mark_rest_no_slot(_idx, len(_positions), max_pos)
                 break
 
         if sym not in approved:
@@ -7789,6 +7843,11 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _record_rejection(sym, cached["score"], "btc_red_entry_limit",
                               f"{_corr['entries_5min']} entries in 5min "
                               f"(limit {_corr['limit']}, BTC 5m red)")
+            # Q1 — surface the friendly waiting-state in the per-symbol trace
+            # (overrides the taxonomy reason _record_rejection just stamped).
+            _trace_mark_block(
+                sym, f"waiting: correlation cap "
+                     f"({_corr['entries_5min']}/{_corr['limit']})")
             continue
 
         with _positions_lock:
@@ -7806,6 +7865,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # the already_held continue above and are monitored on the sell path).
         if not _entry_backfill_ready(sym):
             _note_backfill_warmup(sym)
+            # Q1 — a cached-green coin still warming up is a state, not a gap.
+            if _cached_green:
+                _trace_mark_block(sym, "waiting: backfill warmup")
             continue
 
         # ── Extract signal snapshot for this symbol ────────────────────────────
@@ -8199,6 +8261,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             if sym in _buying:
                 database.log_activity(f"{sym}: buy skipped — concurrent buy already in flight", "info")
                 _record_rejection(sym, score, "in_progress_buy")
+                # Q1 — queued behind a single-flight claim on THIS symbol.
+                _trace_mark_block(sym, "waiting: buy in-flight")
                 continue
             _buying.add(sym)
             _buying_ts[sym] = _now_b
@@ -8214,14 +8278,18 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # in-flight claims as reserved slots keeps concurrent scans from
         # collectively exceeding max_positions.
         with _positions_lock:
+            _n_pos_now = len(_positions)
             _held_now = any(p["symbol"] == sym for p in _positions)
-            _at_capacity_now = (len(_positions) + _other_buying) >= max_pos
+            _at_capacity_now = (_n_pos_now + _other_buying) >= max_pos
         if _held_now:
             _release_buy_claim()
             _record_rejection(sym, score, "already_held")
             continue
         if _at_capacity_now:
             _release_buy_claim()
+            # Q1 — a slot filled (or was reserved by another in-flight claim)
+            # while this scan looped; the queued ready candidates aren't a gap.
+            _mark_rest_no_slot(_idx, _n_pos_now + _other_buying, max_pos)
             break
 
         # ── Fresh signal re-check before committing ────────────────────────────
@@ -8306,6 +8374,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         f"[SKIP] {sym}: price moved {(_live_price - price)/price*100:.2f}% "
                         f"since cache (${price:.4f} → ${_live_price:.4f}) — skipping", "warn"
                     )
+                    # Q1 — price-drift skip is a state, not a silent gap.
+                    _record_rejection(sym, score, "price_moved",
+                                      f"{(_live_price - price)/price*100:.2f}% since cache")
                     _release_buy_claim()
                     continue
                 price = _live_price
@@ -8340,18 +8411,34 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         _confirm_sec = max(0.0, float(_entries_cfg().get("confirm_seconds", 10.0)))
         _ready_since = _mark_buy_ready(sym)   # stamp on the FIRST confirmed pass
         _held_sec = time.time() - _ready_since
-        if _held_sec < _confirm_sec:
+        # Q1 — instant-fire-when-slots-free: reaching this gate means we already
+        # passed the _at_capacity_now check, so at least one slot is free right
+        # now. When the flag is on, the HIGHEST-SCORING ready candidate skips the
+        # confirm hold and fires immediately (all safety gates + the fresh
+        # re-check above have ALREADY passed on this pass); the confirm_seconds
+        # hold is reserved for marginal / subsequent candidates so a burst of
+        # ready coins never all strand behind the timer while slots sit open.
+        _instant_ok = bool(_entries_cfg().get("instant_fire_when_slots_free", True))
+        _instant_fire = _instant_ok and (_top_ready_symbol() == sym)
+        if _held_sec < _confirm_sec and not _instant_fire:
             # Not held long enough yet — defer. The fast re-check loop (~2.5 s)
             # will re-run the fresh re-check and fire once the window elapses;
-            # the ready-streak is held (block-marked) so DECISION-GAP doesn't
-            # false-warn, and the claim is released so the next pass can re-claim.
-            _trace_mark_block(sym, "confirming")
+            # the ready-streak is held (block-marked with elapsed/target so it
+            # reads as an explicit 'confirming' state, never a silent gap) and
+            # the claim is released so the next pass can re-claim.
+            _trace_mark_block(sym, f"confirming ({_held_sec:.0f}s/{_confirm_sec:.0f}s)")
             _log_skip_dedup(
                 sym, "confirming",
                 f"{sym}: buy-ready confirmed — holding {_held_sec:.1f}s/"
                 f"{_confirm_sec:.0f}s before firing (confirm-then-fire).", "info")
             _release_buy_claim()
             continue
+        if _instant_fire and _held_sec < _confirm_sec:
+            _log_skip_dedup(
+                sym, "instant_fire",
+                f"{sym}: instant-fire — free slot + top ready candidate "
+                f"(score={cached.get('score', 0)}), skipping confirm hold "
+                f"({_held_sec:.1f}s/{_confirm_sec:.0f}s).", "info")
 
         # J1 — the candidate passed every gate + the fresh re-check; order
         # placement is about to start. Record the fresh engine-ready verdict and
