@@ -29,6 +29,7 @@ import UniverseNoticesBanner from './UniverseNoticesBanner';
 import { MemoryRestartBanner } from './DataHealthPanel';
 import { useUniverseHealth } from '@/hooks/useUniverseHealth';
 import { resolveCoinStatus, type CoinLifecycle } from '@/lib/coin-status';
+import { useEvScores, isUnavailable, scoreColor, pctOf, type EvScore } from '@/hooks/useEv';
 
 // ── Simple 4-signal analyser (no API key, Binance public data only) ────────────────────
 const BIN = '/api/proxy/binance';
@@ -180,6 +181,40 @@ function placeholderBadge(lifecycle: CoinLifecycle, successor?: string, backfill
         title: 'Selected and warm — no signal-cache entry yet this scan cycle.',
       };
   }
+}
+
+// S-2 — WolfScore cell for the Market Signals table. Renders the live 0-100
+// score colour-coded red→amber→green. A coin without a score never shows blank:
+//  · endpoint unavailable            → muted "—"
+//  · gated out (hard_gate)           → muted "gated: friction" / "gated: spread"
+//  · in universe but no score yet    → muted "warming"
+function WolfScoreCell({ pct, score, unavailable }: {
+  pct: number | null; score?: EvScore; unavailable: boolean;
+}) {
+  if (pct != null) {
+    return (
+      <span
+        className="text-[10px] font-mono font-bold text-center tabular-nums"
+        style={{ color: scoreColor(pct) }}
+        title={`WolfScore ${pct.toFixed(0)}/100`}
+      >
+        {Math.round(pct)}
+      </span>
+    );
+  }
+  if (unavailable) {
+    return <span className="text-[9px] text-muted-foreground/50 text-center" title="WolfScore endpoint unavailable">—</span>;
+  }
+  const gate = score?.hard_gate;
+  const text = gate ? `gated: ${gate}` : 'warming';
+  return (
+    <span
+      className="text-[7px] text-muted-foreground/70 text-center truncate leading-tight"
+      title={gate ? `Hard-gated out (${gate}) — excluded from buys regardless of score.` : 'In the universe but no WolfScore yet this cycle.'}
+    >
+      {text}
+    </span>
+  );
 }
 
 // Safe numeric price from the WebSocket ticker map (entries are objects, not numbers).
@@ -500,6 +535,19 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     // real row (operator runs ~100 coins). Coins still without an entry are
     // rendered below as status placeholders so the list always shows all N.
     useDataFetcher(`${botUrl}/api/signals-summary?limit=250`, 5000, { signals: [] as any[], total_tracked: 0 }, isServerMode);
+
+  // S-2 — WolfScore: live 0-100 win-probability score per coin, merged into the
+  // Market Signals table as the leading (sortable) column. Degrades to "—" when
+  // /api/ev/scores is unavailable (older backend / 404).
+  const { data: evScoresData, notFound: evNotFound } = useEvScores(botUrl);
+  const evUnavailable = isUnavailable(evScoresData, evNotFound);
+  const evScoresMap = evScoresData?.scores ?? {};
+  const scoreFor = useCallback((sym: string): { pct: number | null; score: EvScore | undefined } => {
+    const s = evScoresMap[sym] ?? evScoresMap[sym?.toUpperCase?.() ?? sym];
+    return { pct: pctOf(s), score: s };
+  }, [evScoresMap]);
+  // Sort direction for the WolfScore column; default = highest score first.
+  const [wolfSort, setWolfSort] = useState<'desc' | 'asc'>('desc');
 
   // I4 — universe health drives placeholder status for selected coins that have
   // no signal-cache entry yet, and readiness for the "warming up" state.
@@ -1922,11 +1970,33 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             coin: real rows for coins with a signal-cache entry, plus status
             placeholder rows for the rest so the operator always sees all N. */}
         {(isServerMode && signalRegistry.length > 0 && (signalsData.signals.length > 0 || selectedCoins.length > 0)) ? (() => {
-          const cols = `4.5rem ${signalRegistry.map(() => '1fr').join(' ')} 2.5rem 3rem`;
+          // S-2 — WolfScore is the leading column, before COIN.
+          const cols = `2.5rem 4.5rem ${signalRegistry.map(() => '1fr').join(' ')} 2.5rem 3rem`;
           const present = new Set(
             signalsData.signals.map((s: any) => String(s.symbol ?? '').toUpperCase())
           );
           const missing = selectedCoins.filter(c => !present.has(c.toUpperCase()));
+          // S-2 — merge live signal rows + placeholder rows into ONE list sorted
+          // by WolfScore (default highest-first), so the whole table sorts by the
+          // leading column. Coins without a score sink to the bottom.
+          type SigRow =
+            | { kind: 'live'; sym: string; sig: any; pct: number | null; score?: EvScore }
+            | { kind: 'missing'; sym: string; pct: number | null; score?: EvScore };
+          const wolfRows: SigRow[] = [
+            ...signalsData.signals.map((sig: any): SigRow => {
+              const sym = String(sig.symbol ?? '');
+              const { pct, score } = scoreFor(sym);
+              return { kind: 'live', sym, sig, pct, score };
+            }),
+            ...missing.map((sym: string): SigRow => {
+              const { pct, score } = scoreFor(sym);
+              return { kind: 'missing', sym, pct, score };
+            }),
+          ];
+          wolfRows.sort((a, b) => {
+            const av = a.pct ?? -1, bv = b.pct ?? -1;
+            return wolfSort === 'desc' ? bv - av : av - bv;
+          });
           // J1 — only surface the decision-trace legend when the backend actually
           // ships the new per-symbol fields (graceful degradation on older bots).
           const anyTrace = signalsData.signals.some((s: any) =>
@@ -1937,6 +2007,13 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
             <div className="space-y-0 overflow-x-auto">
               {/* Header */}
               <div className="grid pb-1 border-b border-border/60" style={{gridTemplateColumns: cols}}>
+                <button
+                  onClick={() => setWolfSort(s => (s === 'desc' ? 'asc' : 'desc'))}
+                  className="flex items-center justify-center gap-0.5 text-[8px] text-muted-foreground font-semibold hover:text-foreground transition-colors"
+                  title="WolfScore — live 0-100 win-probability. Click to sort."
+                >
+                  WOLF{wolfSort === 'desc' ? ' ▼' : ' ▲'}
+                </button>
                 <span className="text-[8px] text-muted-foreground font-semibold">COIN</span>
                 {signalRegistry.map(reg => (
                   <span key={reg.id} className="text-[8px] text-muted-foreground text-center" title={`${reg.description} [${reg.role}]`}>
@@ -1962,7 +2039,33 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 </div>
               )}
               <AnimatePresence mode="popLayout">
-              {signalsData.signals.map((sig: any) => {
+              {wolfRows.map((row) => {
+                // Placeholder rows — selected coins without a signal-cache entry.
+                // Never silently drop a selected coin; they sort by WolfScore too.
+                if (row.kind === 'missing') {
+                  const sym = row.sym;
+                  const st = resolveCoinStatus(sym, universeInputs);
+                  const badge = placeholderBadge(st.lifecycle, st.successor, st.backfillPct);
+                  return (
+                    <div key={`ph-${sym}`}
+                      className="grid items-center py-0.5 border-b border-border/20 last:border-0"
+                      style={{gridTemplateColumns: cols}}>
+                      <div className="flex justify-center min-w-0">
+                        <WolfScoreCell pct={row.pct} score={row.score} unavailable={evUnavailable} />
+                      </div>
+                      <span className="text-[9px] font-mono font-semibold truncate text-muted-foreground">
+                        {sym.replace('USDT','')}
+                      </span>
+                      <span
+                        style={{gridColumn: '3 / -1'}}
+                        className={`text-[8px] font-semibold px-1 py-px rounded justify-self-start ${badge.cls}`}
+                        title={badge.title}>
+                        {badge.text}
+                      </span>
+                    </div>
+                  );
+                }
+                const sig = row.sig;
                 const results = sig.signal_results ?? {};
                 const allowed = sig.buy_allowed;
                 const reason  = sig.buy_reason ?? '';
@@ -2031,6 +2134,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                     transition={{ layout: { duration: 0.5, ease: 'easeInOut' }, opacity: { duration: 0.2 } }}
                     className="border-b border-border/20 last:border-0">
                     <div className="grid items-center py-0.5" style={{gridTemplateColumns: cols}}>
+                    <div className="flex justify-center min-w-0">
+                      <WolfScoreCell pct={row.pct} score={row.score} unavailable={evUnavailable} />
+                    </div>
                     <span className="text-[9px] font-mono font-semibold truncate">{sig.symbol?.replace('USDT','')}</span>
                     {signalRegistry.map(reg => {
                       const r = results[reg.id];
@@ -2076,27 +2182,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 );
               })}
               </AnimatePresence>
-              {/* Placeholder rows — selected coins without a signal-cache entry.
-                  Never silently drop a selected coin from the list. */}
-              {missing.map(sym => {
-                const st = resolveCoinStatus(sym, universeInputs);
-                const badge = placeholderBadge(st.lifecycle, st.successor, st.backfillPct);
-                return (
-                  <div key={`ph-${sym}`}
-                    className="grid items-center py-0.5 border-b border-border/20 last:border-0"
-                    style={{gridTemplateColumns: cols}}>
-                    <span className="text-[9px] font-mono font-semibold truncate text-muted-foreground">
-                      {sym.replace('USDT','')}
-                    </span>
-                    <span
-                      style={{gridColumn: '2 / -1'}}
-                      className={`text-[8px] font-semibold px-1 py-px rounded justify-self-start ${badge.cls}`}
-                      title={badge.title}>
-                      {badge.text}
-                    </span>
-                  </div>
-                );
-              })}
               {/* Truthful count so the operator can confirm all N render. */}
               <div className="pt-1 text-[8px] text-muted-foreground">
                 {signalsData.signals.length} live · {missing.length} awaiting · {selectedCoins.length} selected

@@ -99,6 +99,14 @@ class EntriesConfig(BaseModel):
     # only); the floor is ignored anyway until the model is trained (S4 guardrail).
     ev_ranking_enabled:     bool  = True
     min_win_probability:    float = Field(0.0, ge=0.0, le=1.0)
+    # Part S-2 — WolfScore adaptive buy floor (0-100 scale). A candidate must clear
+    # BOTH the absolute floor AND the distribution rule (p75 of live scores, or
+    # mean+k·stdev). In a downtrend where nothing decouples the best score fails the
+    # floor → hold cash; in recovery scores rise back over it → re-engage. Both are
+    # ignored (display-only) until the model is trained on ≥ ev_min_clean_trades.
+    min_win_probability_floor: float = Field(55.0, ge=0.0, le=100.0)
+    ev_floor_mode:          Literal["p75", "p60", "p90", "meanstd", "off"] = "p75"
+    ev_floor_meanstd_k:     float = Field(0.5, ge=0.0, le=3.0)
 
 
 class ExitsConfig(BaseModel):
@@ -371,6 +379,20 @@ SCHEMA: Dict[str, dict] = {
                                          "Only buy if modeled P(win) ≥ this (0-1). Smarter replacement for "
                                          "min_score. Ignored until the model is trained. 0 = floor off.",
                                          0.0, 1.0, 0.01, ""),
+    "entries.min_win_probability_floor": _meta("entries.min_win_probability_floor", "float", "Entries",
+                                         "WolfScore absolute floor",
+                                         "Absolute WolfScore (0-100) a coin must clear to be bought — the "
+                                         "safety net so nothing terrible is bought. Ignored until trained.",
+                                         0.0, 100.0, 1.0, ""),
+    "entries.ev_floor_mode": _meta("entries.ev_floor_mode", "enum", "Entries",
+                                         "WolfScore floor distribution rule",
+                                         "Percentile of live candidate scores the top coin must also clear "
+                                         "(p75), or mean+k·stdev, or off (absolute floor only).",
+                                         choices=["p75", "p60", "p90", "meanstd", "off"]),
+    "entries.ev_floor_meanstd_k": _meta("entries.ev_floor_meanstd_k", "float", "Entries",
+                                         "WolfScore floor mean+k·stdev",
+                                         "k for the mean+k·stdev distribution rule (when ev_floor_mode=meanstd).",
+                                         0.0, 3.0, 0.1, ""),
 
     # ── Exits ─────────────────────────────────────────────────────────────
     "exits.k_sl": _meta("exits.k_sl", "float", "Exits", "SL ATR multiple (k_sl)",

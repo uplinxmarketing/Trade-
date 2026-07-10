@@ -1203,6 +1203,17 @@ _ENTRIES_DEFAULTS = {
     # display/advisory only and never blocks a buy. Both are read defensively.
     "ev_ranking_enabled":         True,
     "min_win_probability":        0.0,
+    # WolfBot v0.5 Part S-2 — WolfScore v3 buy SELECTION. The buy floor is
+    # regime-aware: a candidate must clear BOTH the absolute floor AND the
+    # distribution rule. min_win_probability_floor is the ABSOLUTE 0-100 floor;
+    # ev_floor_mode selects the distribution rule ('p75' | 'meanstd' | 'off');
+    # ev_floor_meanstd_k scales the stdev term in 'meanstd'. The floor only GATES
+    # a real buy when the active model is trained AND past the clean-trade
+    # guardrail (ev_model.model_status()['floor_active']); otherwise advisory.
+    # NOTE: ev_floor_mode is a STRING — read it directly from strategy.entries
+    # (not via _entries_cfg, whose numeric coercion would reject a string).
+    "min_win_probability_floor":  55.0,
+    "ev_floor_meanstd_k":         0.5,
 }
 
 
@@ -1827,10 +1838,250 @@ def _ev_floor_active() -> bool:
         return False
 
 
+# ── WolfBot v0.5 Part S-2 — WolfScore v3 sub-metric inputs + scoring ──────────
+# WolfScore replaces the generic EV score for buy SELECTION. Everything here is
+# guarded so a scoring failure NEVER affects the buy beyond falling back to the
+# pre-existing first-ready / raw-score behavior. The 8 sub-metrics are built from
+# what the engine already computes for a symbol; any feed we can't source yet is
+# OMITTED (compute_submetrics then degrades that sub-metric to 0/neutral — we
+# never fabricate a value).
+
+_btc_roc1h_cache: Dict[str, Any] = {"ts": 0.0, "val": None}
+_BTC_ROC1H_TTL_SEC = 60.0
+
+
+def _btc_roc_1h_frac() -> Optional[float]:
+    """BTC's last-closed 1h ROC as a FRACTION (+0.01 = +1%), for WolfScore's
+    regime tilt (ev_model.regime_tilt expects a fraction, not %). Reuses the
+    existing 1h-kline fetch; cached 60s. None on any failure → tilt degrades to 0
+    (neutral). 1h (not 15m) is deliberate — the tilt formula assumes 1h ROC."""
+    now = time.time()
+    c = _btc_roc1h_cache
+    if c["val"] is not None and (now - c["ts"]) < _BTC_ROC1H_TTL_SEC:
+        return c["val"]
+    val = None
+    try:
+        kl = _fetch_btc_1h_klines()
+        closes = [float(k["close"]) for k in (kl or []) if k.get("close") is not None]
+        if len(closes) >= 2 and closes[-2] > 0:
+            val = (closes[-1] - closes[-2]) / closes[-2]
+    except Exception:
+        val = None
+    c["ts"] = now
+    c["val"] = val
+    return val
+
+
+def _wolf_roc_15m(cached: dict) -> Optional[float]:
+    """15m ROC as a FRACTION from the freshest 5m klines (3 intervals = 15m).
+    None when fewer than 4 closes are cached. Used for both R (per-coin) and the
+    cohort median."""
+    try:
+        k5 = (cached or {}).get("klines_5m") or []
+        closes = [float(c["close"]) for c in k5
+                  if isinstance(c, dict) and c.get("close") is not None]
+        if len(closes) >= 4 and closes[-4] > 0:
+            return (closes[-1] - closes[-4]) / closes[-4]
+    except Exception:
+        pass
+    return None
+
+
+def _wolf_inputs(sym: str, cached: dict) -> dict:
+    """Assemble the WolfScore v3 sub-metric inputs for `sym` from what the engine
+    already computes (5m klines + cached ATR% + live book / slippage / planned
+    stop). Every key is OPTIONAL — an unavailable feed is OMITTED and
+    compute_submetrics degrades that sub-metric to 0/neutral (we never fabricate).
+
+    Real inputs today:
+      T  ema9, ema21, atr_pct           (EMA9/21 from 5m closes; ATR% cached)
+      M  macd_hist, rolling_max_abs_hist_20 (MACD hist; needs >=35 closes)
+      R  roc_15m                        (this coin's 15m ROC; cohort median from caller)
+      W  p_mid, vwap_15m                (15m VWAP over 3×5m candles vs mid price)
+      V  vol_5m, avg_vol_20             (last 5m volume vs 20-bar average)
+      X  atr_pct, atr_target, atr_halfwidth (tradeable ATR band the engine gates on)
+      F  half_spread_pct, avg_slippage_pct, planned_stop_pct (highest-weight term)
+    Degrades to neutral: C (taker CVD buy/sell split is NOT streamed → omitted)."""
+    inp: dict = {}
+    cached = cached or {}
+    price = cached.get("price")
+    k5 = cached.get("klines_5m") or []
+    closes = [float(c["close"]) for c in k5
+              if isinstance(c, dict) and c.get("close") is not None]
+    vols = [float(c["volume"]) for c in k5
+            if isinstance(c, dict) and c.get("volume") is not None]
+
+    # ATR% (cached, as a percent) → feeds both T (normalizer) and X.
+    atr_pct = cached.get("atr_pct")
+    if atr_pct is not None:
+        try:
+            inp["atr_pct"] = float(atr_pct)
+        except (TypeError, ValueError):
+            pass
+
+    # T — EMA9 / EMA21 on 5m closes (gap normalized by ATR% inside the model).
+    try:
+        if len(closes) >= 21:
+            e9 = indicators.calc_ema(closes, 9)
+            e21 = indicators.calc_ema(closes, 21)
+            if e9 and e9[-1] is not None:
+                inp["ema9"] = e9[-1]
+            if e21 and e21[-1] is not None:
+                inp["ema21"] = e21[-1]
+    except Exception:
+        pass
+
+    # M — MACD histogram + rolling max |hist| over the last 20. calc_macd needs
+    # >=35 closes (26 slow + 9 signal); the 5m cache holds only ~30, so fall back
+    # to the deeper 1m buffer when it carries enough history. Both are scale-
+    # invariant (normalized by their own rolling max) so the timeframe mix is OK.
+    try:
+        m_closes = closes if len(closes) >= 35 else None
+        if m_closes is None:
+            k1 = cached.get("klines_1m") or []
+            c1 = [float(c["close"]) for c in k1
+                  if isinstance(c, dict) and c.get("close") is not None]
+            if len(c1) >= 35:
+                m_closes = c1
+        if m_closes:
+            _, _, hist = indicators.calc_macd(m_closes)
+            hvals = [h for h in hist if h is not None]
+            if hvals:
+                inp["macd_hist"] = hvals[-1]
+                inp["rolling_max_abs_hist_20"] = max(abs(h) for h in hvals[-20:])
+    except Exception:
+        pass
+
+    # R — this coin's 15m ROC (caller supplies the cohort median for decoupling).
+    _roc = _wolf_roc_15m(cached)
+    if _roc is not None:
+        inp["roc_15m"] = _roc
+
+    # W — anti-chasing VWAP room: 15m VWAP (typical price × volume over the last
+    # 3×5m candles) vs the mid (last price). Omitted when volume is all zero.
+    try:
+        if price and len(k5) >= 3:
+            num = 0.0
+            den = 0.0
+            for c in k5[-3:]:
+                if not isinstance(c, dict) or c.get("close") is None:
+                    continue
+                cl = float(c["close"])
+                tp = (float(c.get("high", cl) or cl)
+                      + float(c.get("low", cl) or cl) + cl) / 3.0
+                v = float(c.get("volume", 0.0) or 0.0)
+                num += tp * v
+                den += v
+            if den > 0:
+                inp["vwap_15m"] = num / den
+                inp["p_mid"] = float(price)
+    except Exception:
+        pass
+
+    # V — volume confirmation: last 5m volume vs its 20-bar average.
+    try:
+        if vols:
+            inp["vol_5m"] = vols[-1]
+            _avg_src = vols[-20:]
+            if _avg_src:
+                inp["avg_vol_20"] = sum(_avg_src) / len(_avg_src)
+    except Exception:
+        pass
+
+    # X — volatility fitness: tent centred on the middle of the tradeable ATR
+    # band the engine already gates on (config.ATR_MIN_PCT..ATR_MAX_PCT are
+    # fractions; convert to percent to match cached atr_pct).
+    try:
+        _lo = float(config.ATR_MIN_PCT) * 100.0
+        _hi = float(config.ATR_MAX_PCT) * 100.0
+        inp["atr_target"] = (_lo + _hi) / 2.0
+        inp["atr_halfwidth"] = max((_hi - _lo) / 2.0, 1e-6)
+    except Exception:
+        pass
+
+    # F — friction (highest-weight term): (half-spread% + recent avg exit
+    # slippage%) / planned 1R stop distance%. All three are real engine values.
+    try:
+        _full, _half = _spread_pcts(sym)
+        if _half is not None:
+            inp["half_spread_pct"] = _half
+    except Exception:
+        pass
+    try:
+        _slip_bps = _avg_slippage_bps(sym)
+        if _slip_bps is not None:
+            inp["avg_slippage_pct"] = _slip_bps / 100.0
+    except Exception:
+        pass
+    try:
+        if price:
+            _stop = _planned_sl_distance_pct(sym, float(price))
+            if _stop:
+                inp["planned_stop_pct"] = _stop
+    except Exception:
+        pass
+
+    return inp
+
+
+def _wolf_score_cached(sym: str, cached: dict, cohort: dict, tilt: float) -> Optional[dict]:
+    """Guarded WolfScore v3 for a signal-cache entry:
+    compute_submetrics → wolfscore. Returns the full decomposition dict
+    (pct, submetrics, families, regime, regime_tilt, hard_gate, top_reasons,
+    trained, version) or None on any failure / when ev_model is unavailable."""
+    if ev_model is None:
+        return None
+    try:
+        sub = ev_model.compute_submetrics(_wolf_inputs(sym, cached), cohort or {})
+        return ev_model.wolfscore(sub, float(tilt or 0.0))
+    except Exception:
+        return None
+
+
+def _wolf_cohort_from(items) -> dict:
+    """Cohort context for R (decoupling): median 15m ROC across the given
+    (sym, cached) candidates. Empty → {} (R degrades to neutral)."""
+    rocs = []
+    for _it in items:
+        try:
+            _c = _it[1]
+        except Exception:
+            continue
+        r = _wolf_roc_15m(_c)
+        if r is not None:
+            rocs.append(r)
+    if not rocs:
+        return {}
+    s = sorted(rocs)
+    m = len(s)
+    med = s[m // 2] if m % 2 else (s[m // 2 - 1] + s[m // 2]) / 2.0
+    return {"median_roc_15m": med}
+
+
+def _wolf_adaptive_floor(pcts, abs_floor: float, mode: str, k: float) -> Optional[dict]:
+    """ev_model.adaptive_floor with an explicit 'off' short-circuit (only the
+    absolute floor applies). None on failure → floor becomes inactive."""
+    if ev_model is None:
+        return None
+    try:
+        if str(mode) == "off":
+            return {"threshold": round(float(abs_floor), 2),
+                    "abs_floor": float(abs_floor),
+                    "dist_threshold": round(float(abs_floor), 2),
+                    "mode": "off", "n": len(list(pcts))}
+        return ev_model.adaptive_floor(list(pcts), abs_floor=float(abs_floor),
+                                       mode=str(mode), k=float(k))
+    except Exception:
+        return None
+
+
 def get_live_ev_scores() -> dict:
-    """S5 data feed for control_api: per currently-tracked symbol, the latest EV
-    score computed on demand from _signal_cache. Shape:
-      {symbol: {pct, probability, trained, version, top_reasons}}
+    """S5 data feed for control_api / UI: per currently-tracked symbol, the latest
+    WolfScore v3 computed on demand from _signal_cache, plus a top-level '__meta__'
+    entry carrying the regime tilt and the adaptive-floor threshold so the UI can
+    draw the score distribution and the floor line. Per-symbol shape:
+      {pct, submetrics, families, regime, regime_tilt, top_reasons, trained,
+       version, hard_gate}
     O(universe); guarded so a scoring failure yields an empty/partial map rather
     than raising. Returns {} when ev_model is unavailable."""
     if ev_model is None:
@@ -1840,46 +2091,72 @@ def get_live_ev_scores() -> dict:
             snap = dict(_signal_cache)
     except Exception:
         return {}
+    try:
+        tilt = ev_model.regime_tilt(_btc_roc_1h_frac())
+    except Exception:
+        tilt = 0.0
+    cohort = _wolf_cohort_from(list(snap.items()))
     out: Dict[str, dict] = {}
+    pcts: List[float] = []
     for _sym, _cached in snap.items():
-        _s = _ev_score_cached(_cached)
-        if not _s:
+        _ws = _wolf_score_cached(_sym, _cached, cohort, tilt)
+        if not _ws:
             continue
         out[_sym] = {
-            "pct":         _s.get("pct"),
-            "probability": _s.get("probability"),
-            "trained":     _s.get("trained"),
-            "version":     _s.get("version"),
-            "top_reasons": _s.get("top_reasons", []),
+            "pct":         _ws.get("pct"),
+            "submetrics":  _ws.get("submetrics"),
+            "families":    _ws.get("families"),
+            "regime":      _ws.get("regime"),
+            "regime_tilt": _ws.get("regime_tilt"),
+            "top_reasons": _ws.get("top_reasons", []),
+            "trained":     _ws.get("trained"),
+            "version":     _ws.get("version"),
+            "hard_gate":   _ws.get("hard_gate"),
         }
+        if _ws.get("hard_gate") is None and _ws.get("pct") is not None:
+            try:
+                pcts.append(float(_ws["pct"]))
+            except (TypeError, ValueError):
+                pass
+    try:
+        _cfg = _entries_cfg()
+        _abs = float(_cfg.get("min_win_probability_floor", 55.0) or 55.0)
+        _k = float(_cfg.get("ev_floor_meanstd_k", 0.5) or 0.5)
+        _mode = str((_load_strategy().get("entries") or {}).get("ev_floor_mode", "p75") or "p75")
+    except Exception:
+        _abs, _k, _mode = 55.0, 0.5, "p75"
+    _t = float(tilt or 0.0)
+    out["__meta__"] = {
+        "regime_tilt":    round(_t, 4),
+        "regime":         "up" if _t > 0.15 else "down" if _t < -0.15 else "side",
+        "adaptive_floor": _wolf_adaptive_floor(pcts, _abs, _mode, _k),
+        "floor_active":   _ev_floor_active(),
+    }
     return out
 
 
 def _save_ev_training_sample_safe(symbol: str, pos: dict, realized_r: float) -> None:
-    """Write ONE live EV training sample when a position closes (read-only on the
-    exit path — never touches the exit decision). Uses the feature snapshot
-    captured at entry (pos['ev_features']); for older positions without it, falls
-    back to extracting features from the position's buy_signals_snapshot. Fully
-    guarded — save_training_sample is added by a parallel change, so a missing
-    attribute or any error is swallowed."""
+    """Write ONE live WolfScore training sample when a position closes (read-only
+    on the exit path — the exit decision / timing / price are UNCHANGED; only the
+    label payload is written here). Persists the WolfScore SUBMETRICS + regime
+    tilt captured at entry so ev_model.train_wolfscore can consume the row:
+      features = {"submetrics": {...T,M,R,C,W,V,X,F...}, "regime_tilt": float}
+    Fully guarded — save_training_sample is added by a parallel change, so a
+    missing attribute or any error is swallowed."""
     if database is None:
         return
     _save = getattr(database, "save_training_sample", None)
     if not callable(_save):
         return
     try:
-        feats = pos.get("ev_features")
-        if not isinstance(feats, dict) or not feats:
-            feats = {}
-            if ev_model is not None:
-                _snap = pos.get("buy_signals_snapshot")
-                if isinstance(_snap, dict) and _snap:
-                    try:
-                        feats = ev_model.extract_features(_snap)
-                    except Exception:
-                        feats = {}
+        _sub = pos.get("ev_submetrics")
+        _tilt = pos.get("ev_regime_tilt")
+        feats = {
+            "submetrics":  _sub if isinstance(_sub, dict) else {},
+            "regime_tilt": float(_tilt) if _tilt is not None else 0.0,
+        }
         label = 1 if realized_r > 0 else 0
-        _save("live", symbol, feats or {}, label, realized_r)
+        _save("live", symbol, feats, label, realized_r)
     except Exception:
         pass
 
@@ -8551,36 +8828,61 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     def _cached_ready(_c) -> bool:
         return bool(_c.get("score", 0) >= min_sigs)
 
-    # ── WolfBot v0.5 Part S2 — EV-based buy SELECTION ─────────────────────────
-    # Score every approved, cached-ready candidate ONCE this pass (guarded) and,
-    # when entries.ev_ranking_enabled, process eligible coins in DESCENDING win-
-    # probability order (buy the 72% before the 51%). This ONLY reorders the
-    # iteration among already-eligible coins and feeds the probability floor; every
-    # existing veto/gate below is unchanged and still authoritative. A scoring
-    # failure (or ev_model missing) leaves _ev_scores empty → today's raw-score /
-    # first-ready behavior. Ranking never lets a coin skip a gate.
+    # ── WolfBot v0.5 Part S-2 — WolfScore v3 buy SELECTION ────────────────────
+    # Score every approved, cached-ready candidate ONCE this pass (guarded) with
+    # WolfScore v3 and, when entries.ev_ranking_enabled, process eligible coins in
+    # DESCENDING WolfScore order (buy the 72 before the 51). This ONLY reorders the
+    # iteration among already-eligible coins and feeds the friction hard-gate +
+    # adaptive floor below; every existing veto/gate is unchanged and still
+    # authoritative — the score never overrides a veto. A scoring failure (or
+    # ev_model missing) leaves _wolf_scores empty → today's raw-score / first-ready
+    # behavior. Ranking never lets a coin skip a gate.
+    #
+    # Cohort context (R = decoupling needs the basket median 15m ROC) and the BTC
+    # 1h regime tilt are computed ONCE per cycle and passed to every candidate.
     _entries_cfg_s2 = _entries_cfg()
-    _ev_ranking_on  = bool(_entries_cfg_s2.get("ev_ranking_enabled", True))
-    _ev_min_prob    = float(_entries_cfg_s2.get("min_win_probability", 0.0) or 0.0)
-    _ev_scores: Dict[str, dict] = {}
+    _ev_ranking_on   = bool(_entries_cfg_s2.get("ev_ranking_enabled", True))
+    _wolf_abs_floor  = float(_entries_cfg_s2.get("min_win_probability_floor", 55.0) or 55.0)
+    _wolf_floor_k    = float(_entries_cfg_s2.get("ev_floor_meanstd_k", 0.5) or 0.5)
+    try:
+        _wolf_floor_mode = str((_load_strategy().get("entries") or {})
+                               .get("ev_floor_mode", "p75") or "p75")
+    except Exception:
+        _wolf_floor_mode = "p75"
+    _wolf_scores: Dict[str, dict] = {}
+    _wolf_cohort: Dict[str, Any] = {}
+    _wolf_tilt = 0.0
+    _wolf_af: Optional[dict] = None
     if ev_model is not None:
-        for _s, _c in _items:
-            if _s in approved and _cached_ready(_c):
-                _sc = _ev_score_cached(_c)
-                if _sc:
-                    _ev_scores[_s] = _sc
-    # Floor may GATE a real buy only when trained AND past the ≥300 clean-trade
-    # guardrail; otherwise it is display/advisory (never blocks). Evaluated once.
-    _ev_floor_on = bool(_ev_min_prob > 0 and ev_model is not None and _ev_floor_active())
-    if _ev_ranking_on and _ev_scores:
-        # Eligible candidates first, DESCENDING EV probability, ties by DESCENDING
-        # raw score; symbols without an EV score fall to the tail (key = -1 prob).
-        def _ev_rank_key(_it):
+        try:
+            _wolf_tilt = ev_model.regime_tilt(_btc_roc_1h_frac())
+        except Exception:
+            _wolf_tilt = 0.0
+        _cand_items = [(_s, _c) for _s, _c in _items
+                       if _s in approved and _cached_ready(_c)]
+        _wolf_cohort = _wolf_cohort_from(_cand_items)   # median 15m ROC of the pass
+        for _s, _c in _cand_items:
+            _ws = _wolf_score_cached(_s, _c, _wolf_cohort, _wolf_tilt)
+            if _ws:
+                _wolf_scores[_s] = _ws
+        # Adaptive floor over THIS pass's live scores (friction hard-gated ones
+        # score 0 and are excluded so they don't drag the distribution down).
+        _live_pcts = [float(_v.get("pct")) for _v in _wolf_scores.values()
+                      if _v.get("hard_gate") is None and _v.get("pct") is not None]
+        _wolf_af = _wolf_adaptive_floor(_live_pcts, _wolf_abs_floor,
+                                        _wolf_floor_mode, _wolf_floor_k)
+    # The floor may GATE a real buy only when the active model is trained AND past
+    # the ≥300 clean-trade guardrail; otherwise it is advisory (never blocks).
+    _ev_floor_on = bool(ev_model is not None and _ev_floor_active())
+    if _ev_ranking_on and _wolf_scores:
+        # Eligible candidates first, DESCENDING WolfScore pct, ties by DESCENDING
+        # raw signal score; symbols without a WolfScore fall to the tail (-1 pct).
+        def _wolf_rank_key(_it):
             _s, _c = _it
-            _e = _ev_scores.get(_s)
-            _p = float(_e.get("probability", 0.0)) if _e else -1.0
+            _e = _wolf_scores.get(_s)
+            _p = float(_e.get("pct", -1.0)) if _e else -1.0
             return (_p, float(_c.get("score", 0) or 0))
-        _items = sorted(_items, key=_ev_rank_key, reverse=True)
+        _items = sorted(_items, key=_wolf_rank_key, reverse=True)
 
     def _mark_rest_no_slot(_from_idx: int, _k: int, _n: int) -> None:
         # Capacity hit mid-loop → every still-unprocessed ready candidate gets an
@@ -8591,16 +8893,16 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 _trace_mark_block(_s, _reason)
 
     def _top_ready_symbol() -> Optional[str]:
-        # WolfBot v0.5 Part S2 — highest-EV approved buy-ready candidate this pass
-        # (instant-fire now picks the best win-probability, not the highest raw
-        # score). Falls back to highest raw score, then first-in-iteration, when EV
-        # scoring is unavailable (all _p == -1 → pure raw-score ranking = today's
-        # behavior). Used by instant_fire_when_slots_free.
+        # WolfBot v0.5 Part S-2 — highest-WolfScore approved buy-ready candidate
+        # this pass (instant-fire picks the best win-probability, not the highest
+        # raw score). Falls back to highest raw score, then first-in-iteration,
+        # when WolfScore is unavailable (all _p == -1 → pure raw-score ranking =
+        # today's behavior). Used by instant_fire_when_slots_free.
         _best_s, _best_key = None, None
         for _s, _c in _items:
             if _s in approved and _cached_ready(_c):
-                _e = _ev_scores.get(_s)
-                _p = float(_e.get("probability", 0.0)) if _e else -1.0
+                _e = _wolf_scores.get(_s)
+                _p = float(_e.get("pct", -1.0)) if _e else -1.0
                 _key = (_p, int(_c.get("score", 0)))
                 if _best_key is None or _key > _best_key:
                     _best_key, _best_s = _key, _s
@@ -8693,31 +8995,44 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 _trace_mark_block(sym, "waiting: backfill warmup")
             continue
 
-        # ── WolfBot v0.5 Part S2 — EV probability floor ───────────────────────
-        # Among already-eligible candidates, skip one whose EV win-probability is
-        # below entries.min_win_probability. This GATES a real buy ONLY when the
-        # active model is trained AND past the ≥300 clean-trade guardrail
-        # (_ev_floor_on); when the model is untrained or below the guardrail the
-        # floor is DISPLAY-ONLY — traced as advisory but the buy still proceeds.
-        # It never overrides a veto/safety gate (those already ran above); it only
-        # removes a marginal coin from the allowed set. Guarded: no EV score → no
-        # floor action (today's behavior).
-        if _ev_min_prob > 0 and ev_model is not None:
-            _ev_here = _ev_scores.get(sym) or _ev_score_cached(cached)
-            if _ev_here is not None:
-                _p_here = float(_ev_here.get("probability", 0.0) or 0.0)
-                if _p_here < _ev_min_prob:
-                    _floor_msg = (f"win prob {_p_here * 100:.0f}% < floor "
-                                  f"{_ev_min_prob * 100:.0f}%")
+        # ── WolfBot v0.5 Part S-2 — WolfScore friction hard-gate + floor ──────
+        # Two WolfScore checks among already-eligible candidates (both AFTER every
+        # veto/safety gate above — the score NEVER overrides a veto):
+        #   1) Friction HARD gate: F>0.5 (round-trip cost > half the 1R stop) →
+        #      hard_gate=='friction' → always skip (structurally poor entry).
+        #   2) Adaptive floor: skip a candidate whose WolfScore pct is below the
+        #      regime-aware threshold (absolute floor AND the p75/meanstd rule).
+        #      GATES a real buy ONLY when the model is trained AND past the ≥300
+        #      clean-trade guardrail (_ev_floor_on); otherwise advisory — the buy
+        #      still proceeds. Guarded: no WolfScore → no floor action.
+        if ev_model is not None:
+            _ws_here = _wolf_scores.get(sym)
+            if _ws_here is None:
+                _ws_here = _wolf_score_cached(sym, cached, _wolf_cohort, _wolf_tilt)
+            if _ws_here is not None:
+                # 1) Friction hard gate — always authoritative.
+                if _ws_here.get("hard_gate") == "friction":
+                    _record_rejection(sym, cached.get("score", 0),
+                                      "high_friction", "WolfScore friction >50% of stop")
+                    _trace_mark_block(sym, "blocked: friction >50% of stop")
+                    continue
+                # 2) Adaptive floor over this pass's WolfScore distribution.
+                _pct_here = float(_ws_here.get("pct", 0.0) or 0.0)
+                _thr = float(_wolf_af.get("threshold")) if isinstance(_wolf_af, dict) \
+                    and _wolf_af.get("threshold") is not None else None
+                if _thr is not None and _pct_here < _thr:
+                    _floor_msg = f"WolfScore {_pct_here:.0f} < floor {_thr:.0f}"
                     if _ev_floor_on:
                         _record_rejection(sym, cached.get("score", 0),
                                           "ev_prob_floor", _floor_msg)
                         _trace_mark_block(sym, f"blocked: {_floor_msg}")
                         continue
                     # Untrained / below guardrail → advisory only; allow the buy.
+                    _trace_mark_block(
+                        sym, f"waiting: below WolfScore floor {_thr:.0f} (advisory)")
                     _log_skip_dedup(
                         sym, "ev_floor_advisory",
-                        f"{sym}: EV floor advisory — {_floor_msg} "
+                        f"{sym}: WolfScore floor advisory — {_floor_msg} "
                         f"(model untrained or below the clean-trade guardrail; "
                         f"buy allowed).", "info")
 
@@ -9494,19 +9809,20 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 "engine_enabled":  bool(strategy.get("signal_engine", {}).get("enabled", False)),
             }),
         }
-        # ── WolfBot v0.5 Part S2 — capture the EV feature snapshot at entry ────
-        # Additive in-memory fields (save_position ignores unknown keys). Used to
-        # write the LIVE training label when this position closes — does NOT
-        # affect sizing/exit/geometry in any way. Guarded so a scoring failure can
-        # never break the buy.
+        # ── WolfBot v0.5 Part S-2 — capture the WolfScore snapshot at entry ────
+        # Additive in-memory fields (save_position ignores unknown keys). The
+        # SUBMETRICS + regime tilt are persisted as the training-label payload when
+        # this position closes (_save_ev_training_sample_safe) so train_wolfscore
+        # can consume the row. Does NOT affect sizing/exit/geometry in any way.
+        # Guarded so a scoring failure can never break the buy.
         if ev_model is not None:
             try:
-                _ev_entry = _ev_scores.get(sym) or _ev_score_cached(cached)
-                pos_record["ev_features"] = ev_model.extract_features(
-                    _ev_raw_from_cache(cached))
-                if _ev_entry is not None:
-                    pos_record["ev_score"] = _ev_entry.get("pct")
-                    pos_record["ev_probability"] = _ev_entry.get("probability")
+                _ws_entry = _wolf_scores.get(sym) or _wolf_score_cached(
+                    sym, cached, _wolf_cohort, _wolf_tilt)
+                if _ws_entry is not None:
+                    pos_record["ev_submetrics"]  = _ws_entry.get("submetrics")
+                    pos_record["ev_regime_tilt"] = _ws_entry.get("regime_tilt")
+                    pos_record["ev_score"]       = _ws_entry.get("pct")
             except Exception:
                 pass
         # Phase 2 §2.1/§2.2 — ATR stop / TP / hard-SL geometry, stored on the
