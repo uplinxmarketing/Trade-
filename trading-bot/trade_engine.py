@@ -2750,6 +2750,14 @@ def reset_claude_errors() -> None:
         _binance_health["claude_disabled_until"] = 0.0
 
 
+# Per-stage scan timing (diagnosis instrumentation). Updated each buy-check pass;
+# surfaced in _signal_scanner_health["stage_ms"] and /api/diagnostics/entry-report.
+_scan_stage_ms: Dict[str, Any] = {
+    "wolfscore_ms": 0.0, "gate_loop_ms": 0.0, "buy_check_ms": 0.0,
+    "n_scored": 0, "updated_ts": 0.0,
+}
+
+
 # ── Signal scanner health ──────────────────────────────────────────────────────
 _signal_scanner_health: Dict = {
     "last_refresh_ts":  0.0,
@@ -8887,6 +8895,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     _wolf_cohort: Dict[str, Any] = {}
     _wolf_tilt = 0.0
     _wolf_af: Optional[dict] = None
+    _t_wolf0 = time.perf_counter()   # ── scan instrumentation: WolfScore stage
+    _n_scored = 0
     if ev_model is not None:
         try:
             _wolf_tilt = ev_model.regime_tilt(_btc_roc_1h_frac())
@@ -8894,17 +8904,22 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _wolf_tilt = 0.0
         _cand_items = [(_s, _c) for _s, _c in _items
                        if _s in approved and _cached_ready(_c)]
-        _wolf_cohort = _wolf_cohort_from(_cand_items)   # median 15m ROC of the pass
+        _wolf_cohort = _wolf_cohort_from(_cand_items)   # median 15m ROC of the pass (ONCE)
         for _s, _c in _cand_items:
             _ws = _wolf_score_cached(_s, _c, _wolf_cohort, _wolf_tilt)
             if _ws:
                 _wolf_scores[_s] = _ws
+        _n_scored = len(_cand_items)
         # Adaptive floor over THIS pass's live scores (friction hard-gated ones
         # score 0 and are excluded so they don't drag the distribution down).
         _live_pcts = [float(_v.get("pct")) for _v in _wolf_scores.values()
                       if _v.get("hard_gate") is None and _v.get("pct") is not None]
         _wolf_af = _wolf_adaptive_floor(_live_pcts, _wolf_abs_floor,
                                         _wolf_floor_mode, _wolf_floor_k)
+    _wolf_stage_ms = round((time.perf_counter() - _t_wolf0) * 1000.0, 1)
+    _scan_stage_ms["wolfscore_ms"] = _wolf_stage_ms
+    _scan_stage_ms["n_scored"] = _n_scored
+    _t_gate0 = time.perf_counter()   # ── gate/veto loop stage starts below
     # The floor GATES a real buy when the active model is trained AND past the ≥300
     # clean-trade guardrail — OR when the operator has explicitly opted into the
     # "proven-slice" go-live (entries.ev_floor_live_untrained): gate live at the
@@ -11930,12 +11945,29 @@ async def signal_scanner(prices: dict):
                 except Exception:
                     pass
             loop = asyncio.get_running_loop()
+            _t_maint = time.perf_counter()
             if _legacy:
                 await _refresh_signal_cache()
             else:
                 await loop.run_in_executor(None, _ws_first_maintenance)
+            _maint_ms = round((time.perf_counter() - _t_maint) * 1000.0, 1)
             # Trigger buy checks right after refreshing — don't wait for WebSocket
+            _t_bc = time.perf_counter()
             await loop.run_in_executor(None, _check_buys_from_cache, dict(prices))
+            _bc_ms = round((time.perf_counter() - _t_bc) * 1000.0, 1)
+            # Per-stage scan breakdown (diagnosis): maintenance + buy-check, and the
+            # WolfScore sub-stage (captured inside _check_buys_from_cache). gate_loop
+            # ≈ buy_check − wolfscore. Surfaced in _signal_scanner_health["stage_ms"].
+            try:
+                _wolf_ms = float(_scan_stage_ms.get("wolfscore_ms", 0.0))
+                _scan_stage_ms["maint_ms"]      = _maint_ms
+                _scan_stage_ms["buy_check_ms"]  = _bc_ms
+                _scan_stage_ms["gate_loop_ms"]  = round(max(0.0, _bc_ms - _wolf_ms), 1)
+                _scan_stage_ms["total_ms"]      = round(_maint_ms + _bc_ms, 1)
+                _scan_stage_ms["updated_ts"]    = time.time()
+                _signal_scanner_health["stage_ms"] = dict(_scan_stage_ms)
+            except Exception:
+                pass
         except Exception as e:
             print(f"[SignalScanner] Unexpected error: {e}")
             log_diag_issue(
