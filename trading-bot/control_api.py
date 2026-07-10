@@ -881,6 +881,21 @@ async def _daily_maintenance_loop():
                 print(f"[Maintenance] eval prune: {pruned}")
         except Exception as e:
             print(f"[Maintenance] eval prune failed: {e}")
+        # Part S3.5 — prune the EV training_samples store by retention (the 100k
+        # hard-cap bounds it on write; this drops genuinely stale samples too).
+        try:
+            _fn = getattr(database, "prune_training_samples", None)
+            if _fn is not None:
+                _tr_ret = 180.0
+                try:
+                    _tr_ret = float((_load_strategy().get("data") or {})
+                                    .get("kline_retention_days", 180.0))
+                except Exception:
+                    pass
+                _tp = await _aio.to_thread(_fn, _tr_ret)
+                print(f"[Maintenance] training_samples prune: {_tp} (retention {_tr_ret}d)")
+        except Exception as e:
+            print(f"[Maintenance] training_samples prune failed: {e}")
         # Part G (G2) — re-validate approved_coins against exchangeInfo daily;
         # record (never remove) any symbol no longer TRADING. Fails open.
         try:

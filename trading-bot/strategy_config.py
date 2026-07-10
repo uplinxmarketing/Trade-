@@ -183,6 +183,9 @@ class DataConfig(BaseModel):
     # read-only, writing labeled outcomes (mode=paper_shadow) to the training set.
     # NOT slot-limited → far more clean data/day than live for the EV model.
     paper_shadow_enabled:        bool = True
+    # Part S4.3 — minimum clean labeled trades before the EV win-probability model
+    # is allowed to gate real buys (below this the floor is display-only/advisory).
+    ev_min_clean_trades:         int  = Field(300, ge=20, le=100000)
 
 
 class StrategyConfig(BaseModel):
@@ -508,6 +511,11 @@ SCHEMA: Dict[str, dict] = {
                                   "Paper-shadow data engine",
                                   "Run the risk-free paper-shadow evaluator alongside live to generate "
                                   "labeled training data for the EV model (no real orders)."),
+    "data.ev_min_clean_trades": _meta("data.ev_min_clean_trades", "int", "Data",
+                                  "EV model: min clean trades",
+                                  "Minimum labeled trades before the win-probability model may gate real "
+                                  "buys. Below this the floor is display-only.",
+                                  20, 100000, 10, ""),
     "data.auto_replace_with_successor": _meta("data.auto_replace_with_successor", "bool", "Data",
                                               "Auto-add rename successor",
                                               "When a removed coin has a known rename successor that "

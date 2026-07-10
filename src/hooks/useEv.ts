@@ -48,6 +48,8 @@ export interface EvScoresPayload {
 
 // ── Model / versions ───────────────────────────────────────────────────────
 
+export interface EvWeight { feature: string; weight: number; }
+
 export interface EvModelStatus {
   version?: string | number;
   trained?: boolean;
@@ -56,6 +58,7 @@ export interface EvModelStatus {
   floor_active?: boolean;
   running?: boolean;
   note?: string;
+  weights?: EvWeight[];   // S4.4 — active per-signal learned weights (sorted)
   [k: string]: unknown;
 }
 
