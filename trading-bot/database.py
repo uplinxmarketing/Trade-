@@ -1868,10 +1868,19 @@ def prune_training_samples_to_cap(cap: int = None) -> int:
             conn = _conn()
             try:
                 conn.execute(_TRAINING_SAMPLES_DDL)
+                # Efficient id-threshold delete (uses the PK index): find the id of
+                # the (n+1)th-newest row and drop everything at/below it. This is
+                # O(log n) to locate + a ranged delete — vastly faster than
+                # `NOT IN (subquery)`, which scanned the whole table and could hold
+                # the DB lock long enough to make the backend unreachable at boot.
+                row = conn.execute(
+                    "SELECT id FROM training_samples ORDER BY id DESC LIMIT 1 OFFSET ?",
+                    (n,)).fetchone()
+                if row is None:
+                    return 0  # fewer than n rows — nothing to trim
+                cutoff_id = row[0]
                 cur = conn.execute(
-                    "DELETE FROM training_samples WHERE id NOT IN "
-                    "(SELECT id FROM training_samples ORDER BY id DESC LIMIT ?)",
-                    (n,))
+                    "DELETE FROM training_samples WHERE id <= ?", (cutoff_id,))
                 deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
                 conn.commit()
             finally:
@@ -2245,10 +2254,15 @@ def prune_paper_trades_to_cap(cap: int = None) -> int:
             conn = _conn()
             try:
                 conn.execute(_PAPER_TRADES_DDL)
+                # Efficient id-threshold delete (see prune_training_samples_to_cap).
+                row = conn.execute(
+                    "SELECT id FROM paper_trades ORDER BY id DESC LIMIT 1 OFFSET ?",
+                    (n,)).fetchone()
+                if row is None:
+                    return 0
+                cutoff_id = row[0]
                 cur = conn.execute(
-                    "DELETE FROM paper_trades WHERE id NOT IN "
-                    "(SELECT id FROM paper_trades ORDER BY id DESC LIMIT ?)",
-                    (n,))
+                    "DELETE FROM paper_trades WHERE id <= ?", (cutoff_id,))
                 deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
                 conn.commit()
             finally:

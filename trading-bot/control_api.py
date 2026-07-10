@@ -761,18 +761,26 @@ async def lifespan(app: FastAPI):
             steps.append(f"async tasks launched ({len(_spawned)}/6: {', '.join(_spawned) or 'none'})")
 
             # 7a-b. Immediate rolling-window trim at boot — shrink any pre-existing
-            #     large paper/training tables to the 3000-row cap NOW (the daily
-            #     loop only runs after a warmup delay). Keeps the DB tiny + UI fast
-            #     right after deploy.
+            #     large paper/training tables to the 3000-row cap. Runs in a
+            #     FIRE-AND-FORGET daemon thread so it NEVER blocks boot or the DB
+            #     lock on the critical path (an awaited multi-100k-row delete could
+            #     make the backend unreachable at startup). The delete itself is an
+            #     indexed id-threshold trim (fast).
             try:
-                for _trim_name in ("prune_training_samples_to_cap",
-                                   "prune_paper_trades_to_cap"):
-                    _tf = getattr(database, _trim_name, None)
-                    if _tf is not None:
-                        _removed = await asyncio.to_thread(_tf)
-                        if _removed:
-                            print(f"[Boot] {_trim_name}: trimmed {_removed} rows")
-                steps.append("rolling_window_trim OK")
+                def _boot_rolling_trim():
+                    for _trim_name in ("prune_training_samples_to_cap",
+                                       "prune_paper_trades_to_cap"):
+                        try:
+                            _tf = getattr(database, _trim_name, None)
+                            if _tf is not None:
+                                _removed = _tf()
+                                if _removed:
+                                    print(f"[Boot] {_trim_name}: trimmed {_removed} rows")
+                        except Exception as _te:
+                            print(f"[Boot] {_trim_name} failed: {_te}")
+                threading.Thread(target=_boot_rolling_trim,
+                                 name="boot-rolling-trim", daemon=True).start()
+                steps.append("rolling_window_trim spawned")
             except Exception as exc:
                 _step_failed("rolling_window_trim", exc)
 
