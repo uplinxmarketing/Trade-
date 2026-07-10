@@ -123,6 +123,17 @@ class EntriesConfig(BaseModel):
     # rely purely on the learned wu_W weight once a model is trained.
     up_extension_veto:      bool  = True
     up_extension_w_thr:     float = Field(0.0, ge=-1.0, le=1.0)
+    # Go-live (S-4 proven-slice): gate LIVE buys at the WolfScore floor even while
+    # the model is untrained. Legitimate only because it's the raw-data-proven ≥55
+    # cliff PAIRED with the up-regime restriction below (the safe subset). Off by
+    # default; the operator opts in for the evidence-backed go-live.
+    ev_floor_live_untrained: bool = False
+    # Go-live regime restriction. Up-regime is the proven loss source (paper: 26%
+    # win, −1.00R). 'veto' = no live up-regime entries; 'min_score' = only if
+    # WolfScore ≥ live_up_regime_min_pct; 'allow' = no restriction (set this once a
+    # trained model proves up-regime is fixed). Paper-shadow is never restricted.
+    live_up_regime_mode:    Literal["veto", "min_score", "allow"] = "veto"
+    live_up_regime_min_pct: float = Field(70.0, ge=0.0, le=100.0)
 
 
 class ExitsConfig(BaseModel):
@@ -448,6 +459,22 @@ SCHEMA: Dict[str, dict] = {
                                          "WolfScore W at/below which an up-regime coin is vetoed as extended. "
                                          "0 = at/above VWAP required; more negative = allow more extension.",
                                          -1.0, 1.0, 0.05, ""),
+    "entries.ev_floor_live_untrained": _meta("entries.ev_floor_live_untrained", "bool", "Entries",
+                                         "Gate live at floor (untrained)",
+                                         "Go-live on the proven slice: gate LIVE buys at the WolfScore floor "
+                                         "even before the model is trained. Safe only paired with the up-regime "
+                                         "restriction — it's the raw-data-proven ≥55 cliff, not model trust."),
+    "entries.live_up_regime_mode": _meta("entries.live_up_regime_mode", "enum", "Entries",
+                                         "Live up-regime restriction",
+                                         "veto = no live entries in the up regime (the proven loss source); "
+                                         "min_score = only if WolfScore ≥ the up-regime minimum; allow = no "
+                                         "restriction (set once a trained model proves up-regime is fixed).",
+                                         choices=["veto", "min_score", "allow"]),
+    "entries.live_up_regime_min_pct": _meta("entries.live_up_regime_min_pct", "float", "Entries",
+                                         "Live up-regime min WolfScore",
+                                         "When live_up_regime_mode=min_score, the WolfScore an up-regime coin "
+                                         "must clear to be entered live.",
+                                         0.0, 100.0, 1.0, ""),
 
     # ── Exits ─────────────────────────────────────────────────────────────
     "exits.k_sl": _meta("exits.k_sl", "float", "Exits", "SL ATR multiple (k_sl)",

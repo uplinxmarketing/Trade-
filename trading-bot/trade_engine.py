@@ -8901,9 +8901,21 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                       if _v.get("hard_gate") is None and _v.get("pct") is not None]
         _wolf_af = _wolf_adaptive_floor(_live_pcts, _wolf_abs_floor,
                                         _wolf_floor_mode, _wolf_floor_k)
-    # The floor may GATE a real buy only when the active model is trained AND past
-    # the ≥300 clean-trade guardrail; otherwise it is advisory (never blocks).
-    _ev_floor_on = bool(ev_model is not None and _ev_floor_active())
+    # The floor GATES a real buy when the active model is trained AND past the ≥300
+    # clean-trade guardrail — OR when the operator has explicitly opted into the
+    # "proven-slice" go-live (entries.ev_floor_live_untrained): gate live at the
+    # raw-data cliff (≥ min_win_probability_floor, absolute mode) even while the
+    # model is untrained, because that cliff is proven by the paper data and is
+    # here PAIRED with the up-regime restriction below (the safe subset).
+    _ev_floor_live_untrained = bool(_entries_cfg_s2.get("ev_floor_live_untrained", False))
+    _ev_floor_on = bool(ev_model is not None
+                        and (_ev_floor_active() or _ev_floor_live_untrained))
+    # Go-live regime restriction — up-regime is the proven loss source (paper: 26%
+    # win, −1.00R). Until a trained model proves it fixed, live entries in the up
+    # regime are vetoed (mode='veto') or held to a higher score (mode='min_score').
+    # Paper-shadow is UNAFFECTED (it keeps sampling every regime for training).
+    _live_up_mode = str(_entries_cfg_s2.get("live_up_regime_mode", "veto") or "veto")
+    _live_up_min_pct = float(_entries_cfg_s2.get("live_up_regime_min_pct", 70.0) or 70.0)
     if _ev_ranking_on and _wolf_scores:
         # Eligible candidates first, DESCENDING WolfScore pct, ties by DESCENDING
         # raw signal score; symbols without a WolfScore fall to the tail (-1 pct).
@@ -9055,6 +9067,26 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                                       "up_extension", "extended vs VWAP in uptrend (anti-chase)")
                     _trace_mark_block(sym, "blocked: extended vs VWAP in uptrend")
                     continue
+                # 1c) Go-live regime restriction — up-regime is the proven loss
+                # source (paper: 26% win, −1.00R). Until a trained model proves it
+                # fixed, LIVE up-regime entries are vetoed (or held to a higher
+                # score). Applies to live selection only; paper-shadow still samples
+                # every regime. mode='allow' disables it.
+                if _ws_here.get("regime") == "up" and _live_up_mode != "allow":
+                    _pct_up = float(_ws_here.get("pct", 0.0) or 0.0)
+                    if _live_up_mode == "min_score" and _pct_up >= _live_up_min_pct:
+                        pass  # strong enough to allow limited up-regime exposure
+                    else:
+                        _reason_up = ("up_regime_paused" if _live_up_mode == "veto"
+                                      else "up_regime_below_min")
+                        _detail_up = (f"up-regime live entries paused"
+                                      if _live_up_mode == "veto"
+                                      else f"WolfScore {_pct_up:.0f} < up-regime min "
+                                           f"{_live_up_min_pct:.0f}")
+                        _record_rejection(sym, cached.get("score", 0),
+                                          _reason_up, _detail_up)
+                        _trace_mark_block(sym, f"blocked: {_detail_up}")
+                        continue
                 # 2) Adaptive floor over this pass's WolfScore distribution.
                 _pct_here = float(_ws_here.get("pct", 0.0) or 0.0)
                 _thr = float(_wolf_af.get("threshold")) if isinstance(_wolf_af, dict) \
