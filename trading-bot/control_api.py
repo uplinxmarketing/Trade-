@@ -400,6 +400,21 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("risk_latches_reloaded", exc)
 
+            # Part S3 — start the paper-shadow data generator (risk-free, its own
+            #     guarded daemon thread; gated on data.paper_shadow_enabled). It
+            #     never touches live orders/state; a failure here can't affect the
+            #     live bot. Optional module → clean no-op if absent.
+            try:
+                import paper_shadow as _ps
+                _ps_start = getattr(_ps, "start", None)
+                if callable(_ps_start):
+                    _ps_start()
+                    steps.append("paper_shadow_started")
+                else:
+                    steps.append("paper_shadow_started (skip: fn absent)")
+            except Exception as exc:
+                _step_failed("paper_shadow_start", exc)
+
             # 3a-K1. Part K (K1) — fail-closed breaker self-check: verify the
             #     consec-loss pause latch is coherent at boot (a pause that must
             #     be armed can't silently drop). Guarded so an older trade_engine
@@ -5146,6 +5161,61 @@ def api_diagnostics_bundle(
                       f"{r.get('source', '?')}: {str(r.get('message', ''))[:160]}\n")
     safe(_diag, "diag")
 
+    # -- EV model (S5) --------------------------------------------------------
+    section("EV MODEL")
+    def _ev_bundle():
+        import ev_model as _ev
+        st = _ev.model_status()
+        out.write(f"  version={st.get('version')} trained={st.get('trained')} "
+                  f"n_trades={st.get('n_trades')} "
+                  f"floor_active={st.get('floor_active')} "
+                  f"min_clean={st.get('min_clean')}\n")
+        try:
+            counts = database.count_training_samples() or {}
+            out.write(f"  samples: total={counts.get('total')} "
+                      f"live={counts.get('live')} "
+                      f"paper_shadow={counts.get('paper_shadow')} "
+                      f"wins={counts.get('wins')}\n")
+        except Exception:
+            out.write("  samples: [unavailable]\n")
+        # Top-5 current live scores.
+        scores = {}
+        try:
+            import trade_engine as _te
+            fn = getattr(_te, "get_live_ev_scores", None)
+            if callable(fn):
+                raw = fn()
+                if isinstance(raw, dict):
+                    scores = raw
+        except Exception:
+            scores = {}
+        if scores:
+            ranked = sorted(
+                scores.items(),
+                key=lambda kv: float((kv[1] or {}).get("pct", 0.0) or 0.0),
+                reverse=True)[:5]
+            out.write("  top scores: " + ", ".join(
+                f"{s}={float((d or {}).get('pct', 0.0) or 0.0):.1f}%"
+                for s, d in ranked) + "\n")
+        else:
+            out.write("  top scores: none\n")
+        # Live vs paper expectancy.
+        lv = _ev_live_expectancy()
+        out.write(f"  live expectancy={lv.get('expectancy')} "
+                  f"win_rate={lv.get('win_rate')}% n={lv.get('n')}\n")
+        try:
+            import paper_shadow as _ps
+            pfn = getattr(_ps, "get_paper_stats", None)
+            ps = pfn() if callable(pfn) else {}
+            if isinstance(ps, dict) and ps:
+                out.write(f"  paper_shadow expectancy={ps.get('expectancy')} "
+                          f"win_rate={ps.get('win_rate')} n={ps.get('n')}\n")
+            else:
+                out.write("  paper_shadow: [unavailable]\n")
+        except Exception:
+            out.write("  paper_shadow: [unavailable]\n")
+    safe(_ev_bundle, "ev_model")
+
     # -- Config snapshot ----------------------------------------------------------
     section("CONFIG (resolved key settings)")
     def _cfg():
@@ -7790,6 +7860,243 @@ def api_lever_matrix_report():
         run_id = _lever_matrix_run_id
     return {"report": report, "running": running,
             "last_run_ts": last_run_ts, "run_id": run_id}
+
+
+# ── S4/S5: EV-model API ──────────────────────────────────────────────────────
+# All EV modules are OPTIONAL — every import is guarded and endpoints never 500.
+_ev_train_running = False
+_ev_train_lock = threading.Lock()
+_ev_train_run_id: Optional[str] = None
+_ev_train_last: Optional[dict] = None      # last training result/report
+_ev_train_last_ts: Optional[float] = None
+
+
+def _ev_live_expectancy() -> dict:
+    """LIVE expectancy summary reusing the existing expectancy analytics
+    (api_stats_expectancy over mode='live', since deploy). Guarded → zeros."""
+    zeros = {"expectancy": 0.0, "win_rate": 0.0, "avg_win_r": 0.0,
+             "avg_loss_r": 0.0, "n": 0}
+    try:
+        stats = api_stats_expectancy(days=3650, mode="live", since_deploy=0)
+        if not isinstance(stats, dict) or stats.get("error"):
+            return dict(zeros)
+        return {
+            "expectancy": stats.get("expectancy_per_trade", 0.0),
+            "win_rate":   stats.get("win_rate", 0.0),
+            "avg_win_r":  stats.get("avg_win", 0.0),
+            "avg_loss_r": stats.get("avg_loss", 0.0),
+            "n":          stats.get("trades", 0),
+        }
+    except Exception:
+        return dict(zeros)
+
+
+@app.get("/api/ev/scores")
+def api_ev_scores():
+    """S5 — watchlist EV scores + ranking. Scores sourced from
+    trade_engine.get_live_ev_scores() (guarded → {}); ranking is symbols sorted
+    by pct desc; next_buy is the top-ranked symbol (or null). Never 500s."""
+    try:
+        model = {}
+        try:
+            import ev_model as _ev
+            fn = getattr(_ev, "model_status", None)
+            if callable(fn):
+                model = fn()
+        except Exception:
+            model = {}
+
+        scores = {}
+        try:
+            import trade_engine as _te
+            fn = getattr(_te, "get_live_ev_scores", None)
+            if callable(fn):
+                raw = fn()
+                if isinstance(raw, dict):
+                    scores = raw
+        except Exception:
+            scores = {}
+
+        def _pct(v):
+            try:
+                return float((v or {}).get("pct", 0.0) or 0.0)
+            except Exception:
+                return 0.0
+
+        ranking = sorted(scores.keys(), key=lambda s: _pct(scores.get(s)),
+                         reverse=True)
+        next_buy = ranking[0] if ranking else None
+        return {"model": model, "scores": scores, "ranking": ranking,
+                "next_buy": next_buy}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/ev/model")
+def api_ev_model():
+    """S5 — EV model status + saved versions + training-sample counts."""
+    try:
+        status, versions = {}, []
+        try:
+            import ev_model as _ev
+            _st = getattr(_ev, "model_status", None)
+            if callable(_st):
+                status = _st()
+            _lv = getattr(_ev, "list_versions", None)
+            if callable(_lv):
+                versions = _lv()
+        except Exception:
+            pass
+        counts = {}
+        try:
+            fn = getattr(database, "count_training_samples", None)
+            if callable(fn):
+                counts = fn()
+        except Exception:
+            counts = {}
+        return {"status": status, "versions": versions, "counts": counts}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _run_ev_train_job(run_id: str):
+    """Background worker — trains a new EV weight-version off live+paper_shadow
+    training samples and saves (does NOT activate) it. Clears the running flag on
+    exit no matter what. Never runs on the event loop."""
+    global _ev_train_running, _ev_train_last, _ev_train_last_ts
+    result: dict = {"ok": False, "run_id": run_id}
+    try:
+        import ev_model as _ev
+        samples = []
+        try:
+            fn = getattr(database, "get_training_samples", None)
+            if callable(fn):
+                rows = fn(limit=100000, modes=["live", "paper_shadow"]) or []
+                samples = [{"features": r.get("features"), "label": r.get("label")}
+                           for r in rows if isinstance(r, dict)]
+        except Exception:
+            samples = []
+        res = _ev.train(samples)
+        if isinstance(res, dict):
+            result = dict(res)
+            result["run_id"] = run_id
+            result["n_samples"] = len(samples)
+            if res.get("ok") and isinstance(res.get("model"), dict):
+                try:
+                    vid = _ev.save_version(res["model"])
+                    result["saved_version"] = vid
+                except Exception as e:
+                    result["save_error"] = f"{type(e).__name__}: {e}"
+    except Exception as e:
+        result = {"ok": False, "run_id": run_id,
+                  "error": f"{type(e).__name__}: {e}"}
+    finally:
+        with _ev_train_lock:
+            _ev_train_running = False
+            # Drop the (large) model dict from the stored report — keep it thin.
+            result.pop("model", None)
+            _ev_train_last = result
+            _ev_train_last_ts = time.time()
+
+
+@app.post("/api/ev/train")
+def api_ev_train_start():
+    """S5 — kick an EV retrain in a BACKGROUND thread (single-flight; never
+    blocks the loop). Returns {started, run_id} immediately. 409 if a run is
+    already in flight; 503 if ev_model isn't installed."""
+    global _ev_train_running, _ev_train_run_id
+    try:
+        import ev_model as _ev  # noqa: F401 — presence check only
+        if getattr(_ev, "train", None) is None:
+            return JSONResponse({"error": "ev_model.train not available"},
+                                status_code=503)
+    except ImportError:
+        return JSONResponse({"error": "ev_model not available"}, status_code=503)
+
+    with _ev_train_lock:
+        if _ev_train_running:
+            return JSONResponse(
+                {"error": "ev training already running",
+                 "run_id": _ev_train_run_id}, status_code=409)
+        _ev_train_running = True
+        _ev_train_run_id = uuid.uuid4().hex[:8]
+        run_id = _ev_train_run_id
+
+    threading.Thread(target=_run_ev_train_job, args=(run_id,),
+                     name=f"ev-train-{run_id}", daemon=True).start()
+    return {"started": True, "run_id": run_id}
+
+
+@app.get("/api/ev/train")
+def api_ev_train_report():
+    """S5 — last EV training result/report + the running flag. Never 500s."""
+    with _ev_train_lock:
+        running = _ev_train_running
+        run_id = _ev_train_run_id
+        last = _ev_train_last
+        last_ts = _ev_train_last_ts
+    return {"running": running, "run_id": run_id,
+            "last": last, "last_run_ts": last_ts}
+
+
+@app.post("/api/ev/activate")
+def api_ev_activate(body: dict = Body(default={})):
+    """S5 — activate a stored EV weight-version. Body: {version, confirm?}.
+    Never auto-activates. Honours the live-trading confirm guard (confirm:'LIVE'
+    required while live trading is active). Audited: records a config_history row
+    via database.save_config_version (guarded). 503 if ev_model missing."""
+    try:
+        body = body or {}
+        version = body.get("version")
+        if not version or not isinstance(version, str):
+            return JSONResponse({"error": "version is required"},
+                                status_code=422)
+        try:
+            import ev_model as _ev
+            if getattr(_ev, "activate_version", None) is None:
+                return JSONResponse({"error": "ev_model.activate_version "
+                                     "not available"}, status_code=503)
+        except ImportError:
+            return JSONResponse({"error": "ev_model not available"},
+                                status_code=503)
+
+        guard = _strategy_live_guard(body.get("confirm"))
+        if guard is not None:
+            return guard
+
+        result = _ev.activate_version(version, actor="ev-activate")
+
+        # Audit: record a config_history row (best-effort, never blocks).
+        try:
+            fn = getattr(database, "save_config_version", None)
+            if callable(fn):
+                fn(f"ev-activate:{version}",
+                   {"ev_model_active": version}, _strategy_raw_file())
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/ev/expectancy")
+def api_ev_expectancy():
+    """S5 — LIVE vs paper-shadow expectancy side by side. `live` reuses the
+    existing expectancy analytics; `paper_shadow` from paper_shadow.get_paper_stats()
+    (guarded → {}). Never 500s."""
+    try:
+        live = _ev_live_expectancy()
+        paper = {}
+        try:
+            import paper_shadow as _ps
+            fn = getattr(_ps, "get_paper_stats", None)
+            if callable(fn):
+                paper = fn()
+        except Exception:
+            paper = {}
+        return {"live": live, "paper_shadow": paper}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 # ── Expectancy stats ─────────────────────────────────────────────────────────

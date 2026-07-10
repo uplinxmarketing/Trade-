@@ -317,6 +317,21 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_entry_snapshots_ts     ON entry_snapshots(ts);
             CREATE INDEX IF NOT EXISTS idx_entry_snapshots_symbol ON entry_snapshots(symbol);
+
+            -- Part S — unified EV training-data store. Both live and
+            -- paper-shadow entry paths write labeled outcomes here; the EV
+            -- retrainer (ev_model.py) reads them. Hard-capped to 100k rows.
+            CREATE TABLE IF NOT EXISTS training_samples (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts           REAL,
+                mode         TEXT,
+                symbol       TEXT,
+                features_json TEXT,
+                label        INTEGER,
+                realized_r   REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_training_samples_ts   ON training_samples(ts);
+            CREATE INDEX IF NOT EXISTS idx_training_samples_mode ON training_samples(mode);
         """)
 
         # ── Schema migrations for existing databases ─────────────────────────
@@ -1683,6 +1698,163 @@ def backup_db(keep: int = 7) -> dict:
         return {"ok": False, "path": None, "kept": 0, "bytes": 0,
                 "error": f"{type(e).__name__}: {e}"}
 
+
+# ── Training samples (Part S — unified EV training-data store) ────────────────
+#
+# The EV scoring model (ev_model.py) trains on labeled entry outcomes from BOTH
+# live and paper-shadow trades. Both modes write here via save_training_sample;
+# the retrainer reads via get_training_samples. All helpers are CREATE-safe,
+# guarded, and never raise — a training-store failure must never break a trade.
+
+_TRAINING_SAMPLES_CAP = 100000
+
+_TRAINING_SAMPLES_DDL = """CREATE TABLE IF NOT EXISTS training_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, mode TEXT, symbol TEXT,
+    features_json TEXT, label INTEGER, realized_r REAL)"""
+
+
+def save_training_sample(mode, symbol, features, label, realized_r, ts=None) -> None:
+    """Store one labeled entry outcome for EV model training.
+
+    `mode` is 'live' or 'paper_shadow'. `features` is a dict, JSON-serialised
+    (non-serialisable values become str). `label` is 1 (win / positive realized
+    R) or 0 (loss). `realized_r` is a float and may be None. `ts` defaults to
+    time.time(). CREATE-safe, guarded, never raises. On write the table is
+    hard-capped to the newest 100_000 rows so it can't grow unbounded."""
+    import time as _t
+    if ts is None:
+        ts = _t.time()
+    try:
+        features_json = json.dumps(features if features is not None else {}, default=str)
+    except Exception:
+        features_json = "{}"
+    try:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute(_TRAINING_SAMPLES_DDL)
+                conn.execute("""
+                    INSERT INTO training_samples
+                        (ts, mode, symbol, features_json, label, realized_r)
+                    VALUES (?,?,?,?,?,?)
+                """, (float(ts), mode, symbol, features_json,
+                      int(bool(label)), _num(realized_r)))
+                # Hard row cap (same pattern as buy_rejections/entry_snapshots).
+                conn.execute(
+                    "DELETE FROM training_samples WHERE id NOT IN "
+                    "(SELECT id FROM training_samples ORDER BY id DESC LIMIT ?)",
+                    (_TRAINING_SAMPLES_CAP,))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as e:
+        print(f"[Database] save_training_sample failed: {e}")
+
+
+def get_training_samples(limit: int = 20000, modes=None) -> List[dict]:
+    """Return training samples newest-first as
+    [{ts, mode, symbol, features(dict), label, realized_r}].
+
+    `features` is parsed from features_json (unparseable → {}). `modes` is an
+    optional list to filter on (e.g. ['live'] or ['live','paper_shadow']).
+    Bounded by `limit`. Guarded → [] on error."""
+    where = ["1=1"]
+    params: list = []
+    if modes:
+        placeholders = ",".join(["?"] * len(modes))
+        where.append(f"mode IN ({placeholders})")
+        params.extend(list(modes))
+    params.append(int(limit))
+    try:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute(_TRAINING_SAMPLES_DDL)
+                rows = conn.execute(f"""
+                    SELECT ts, mode, symbol, features_json, label, realized_r
+                    FROM training_samples
+                    WHERE {' AND '.join(where)}
+                    ORDER BY id DESC LIMIT ?
+                """, params).fetchall()
+            finally:
+                conn.close()
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["features"] = json.loads(d.pop("features_json") or "{}")
+        except Exception:
+            d.pop("features_json", None)
+            d["features"] = {}
+        out.append(d)
+    return out
+
+
+def count_training_samples(modes=None) -> dict:
+    """Return {"total", "live", "paper_shadow", "wins"} counts for the
+    UI/guardrail. `modes` optionally restricts `total` to the given modes; the
+    per-mode and wins counts are always reported. Guarded → zeros on error."""
+    zeros = {"total": 0, "live": 0, "paper_shadow": 0, "wins": 0}
+    where = ["1=1"]
+    params: list = []
+    if modes:
+        placeholders = ",".join(["?"] * len(modes))
+        where.append(f"mode IN ({placeholders})")
+        params.extend(list(modes))
+    try:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute(_TRAINING_SAMPLES_DDL)
+                row = conn.execute(f"""
+                    SELECT
+                        COUNT(*)                                                AS total,
+                        SUM(CASE WHEN mode='live'         THEN 1 ELSE 0 END)   AS live,
+                        SUM(CASE WHEN mode='paper_shadow' THEN 1 ELSE 0 END)   AS paper_shadow,
+                        SUM(CASE WHEN label=1             THEN 1 ELSE 0 END)   AS wins
+                    FROM training_samples
+                    WHERE {' AND '.join(where)}
+                """, params).fetchone()
+            finally:
+                conn.close()
+    except Exception:
+        return dict(zeros)
+    if not row:
+        return dict(zeros)
+    return {
+        "total":        int(row["total"]        or 0),
+        "live":         int(row["live"]         or 0),
+        "paper_shadow": int(row["paper_shadow"] or 0),
+        "wins":         int(row["wins"]         or 0),
+    }
+
+
+def prune_training_samples(retention_days: float) -> int:
+    """Delete training_samples with ts older than now - retention_days (ts is
+    epoch seconds). CREATE-safe, guarded. Returns rows deleted (0 on error).
+    The daily maintenance loop calls this."""
+    import time as _t
+    cutoff = _t.time() - float(retention_days) * 86400.0
+    try:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute(_TRAINING_SAMPLES_DDL)
+                cur = conn.execute(
+                    "DELETE FROM training_samples WHERE ts < ?", (cutoff,))
+                deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                conn.commit()
+            finally:
+                conn.close()
+        return deleted
+    except Exception as e:
+        print(f"[Database] prune_training_samples failed: {e}")
+        return 0
+
+
+# ── Backups (N4) — list helper ────────────────────────────────────────────────
 
 def list_backups() -> list:
     """Return existing backup files as {path, size, mtime} dicts, newest-first.

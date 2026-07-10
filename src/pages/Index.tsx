@@ -16,6 +16,7 @@ import ReportDashboard from '@/components/dashboard/ReportDashboard';
 import OrderBookPanel from '@/components/dashboard/OrderBookPanel';
 import FuturesAgent from '@/components/dashboard/FuturesAgent';
 import { FunnelPanel } from '@/components/dashboard/FunnelPanel';
+import { EvScorePanel } from '@/components/dashboard/EvScorePanel';
 import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
@@ -244,6 +245,9 @@ const Index = () => {
 
             {/* Entry Funnel — L1.2: today's ready→recheck→budget→posted→filled */}
             <FunnelPanel baseUrl={API_BASE} />
+
+            {/* EV win-probability scores — S5: per-coin scores, ranking, expectancy, model */}
+            <EvScorePanel baseUrl={API_BASE} />
 
             {/* Futures Paper-Trading Agent */}
             <FuturesAgent />
