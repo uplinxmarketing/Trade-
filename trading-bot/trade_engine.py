@@ -40,6 +40,14 @@ import connection
 from connection import get_mode
 import binance_direct
 
+# WolfBot v0.5 Part S — EV buy-scoring engine. Guarded import: every ev_model
+# call in the buy path is individually try/guarded so a missing or broken module
+# degrades gracefully to the pre-EV behavior (highest raw score, first-ready).
+try:
+    import ev_model
+except Exception:  # pragma: no cover
+    ev_model = None  # type: ignore
+
 # Phase 2 §2.4/§2.5 — exchange-side exit-order managers (maker TP / OCO).
 # Guarded import: the engine must keep trading on pure local monitoring if
 # the module is missing or fails to import.
@@ -1187,6 +1195,14 @@ _ENTRIES_DEFAULTS = {
     # candidate immediately instead of stranding it in the confirm_seconds hold
     # (the pydantic schema addition is handled separately; read defensively).
     "instant_fire_when_slots_free": True,
+    # WolfBot v0.5 Part S2 — EV-based buy SELECTION. When enabled, already-
+    # eligible ready candidates are processed in DESCENDING win-probability order
+    # (buy the 72% before the 51%). min_win_probability is a probability FLOOR
+    # (0-1) that only gates a real buy when the active model is trained AND has
+    # ≥300 clean trades (ev_model.model_status()['floor_active']); otherwise it is
+    # display/advisory only and never blocks a buy. Both are read defensively.
+    "ev_ranking_enabled":         True,
+    "min_win_probability":        0.0,
 }
 
 
@@ -1769,6 +1785,105 @@ def _snapshot_raw_from_cache(cached: dict, price) -> dict:
     }
 
 
+# ── WolfBot v0.5 Part S2 — EV buy-scoring helpers ─────────────────────────────
+# All ev_model access flows through these guards so a scoring failure NEVER
+# affects the buy decision beyond falling back to today's ordering/gating.
+
+def _ev_raw_from_cache(cached: dict) -> dict:
+    """Richest raw signal dict for EV scoring, from a signal-cache entry. Reuses
+    the entry-snapshot builder (so EV features match what the snapshot records)
+    and adds the magnitude aliases ev_model recognizes when they're present."""
+    cached = cached or {}
+    raw = _snapshot_raw_from_cache(cached, cached.get("price"))
+    if raw.get("rsi_val") is not None:
+        raw.setdefault("rsi_value", raw["rsi_val"])
+    for _k in ("atr_pct", "spread_pct", "vol_ratio", "ema_gap_pct",
+               "macd_hist", "obv_slope", "near_low_pct", "volume_ratio"):
+        _v = cached.get(_k)
+        if _v is not None:
+            raw[_k] = _v
+    return raw
+
+
+def _ev_score_cached(cached: dict) -> Optional[dict]:
+    """Guarded ev_model.score() from a signal-cache entry. None on any failure or
+    when the module is unavailable — callers must degrade to raw-score behavior."""
+    if ev_model is None:
+        return None
+    try:
+        return ev_model.score(_ev_raw_from_cache(cached))
+    except Exception:
+        return None
+
+
+def _ev_floor_active() -> bool:
+    """True only when the active model is trained AND ≥ the clean-trade guardrail
+    (S4). Below this the probability floor is DISPLAY-ONLY (never gates a buy)."""
+    if ev_model is None:
+        return False
+    try:
+        return bool(ev_model.model_status().get("floor_active", False))
+    except Exception:
+        return False
+
+
+def get_live_ev_scores() -> dict:
+    """S5 data feed for control_api: per currently-tracked symbol, the latest EV
+    score computed on demand from _signal_cache. Shape:
+      {symbol: {pct, probability, trained, version, top_reasons}}
+    O(universe); guarded so a scoring failure yields an empty/partial map rather
+    than raising. Returns {} when ev_model is unavailable."""
+    if ev_model is None:
+        return {}
+    try:
+        with _signal_cache_lock:
+            snap = dict(_signal_cache)
+    except Exception:
+        return {}
+    out: Dict[str, dict] = {}
+    for _sym, _cached in snap.items():
+        _s = _ev_score_cached(_cached)
+        if not _s:
+            continue
+        out[_sym] = {
+            "pct":         _s.get("pct"),
+            "probability": _s.get("probability"),
+            "trained":     _s.get("trained"),
+            "version":     _s.get("version"),
+            "top_reasons": _s.get("top_reasons", []),
+        }
+    return out
+
+
+def _save_ev_training_sample_safe(symbol: str, pos: dict, realized_r: float) -> None:
+    """Write ONE live EV training sample when a position closes (read-only on the
+    exit path — never touches the exit decision). Uses the feature snapshot
+    captured at entry (pos['ev_features']); for older positions without it, falls
+    back to extracting features from the position's buy_signals_snapshot. Fully
+    guarded — save_training_sample is added by a parallel change, so a missing
+    attribute or any error is swallowed."""
+    if database is None:
+        return
+    _save = getattr(database, "save_training_sample", None)
+    if not callable(_save):
+        return
+    try:
+        feats = pos.get("ev_features")
+        if not isinstance(feats, dict) or not feats:
+            feats = {}
+            if ev_model is not None:
+                _snap = pos.get("buy_signals_snapshot")
+                if isinstance(_snap, dict) and _snap:
+                    try:
+                        feats = ev_model.extract_features(_snap)
+                    except Exception:
+                        feats = {}
+        label = 1 if realized_r > 0 else 0
+        _save("live", symbol, feats or {}, label, realized_r)
+    except Exception:
+        pass
+
+
 def _save_entry_snapshot_safe(symbol: str, origin: str, executed: bool, price,
                               raw: dict, gates: dict) -> None:
     """database.save_entry_snapshot wrapper — snapshots must NEVER break a buy."""
@@ -2077,12 +2192,19 @@ _exit_r_stats_lock = threading.Lock()
 
 
 def _record_exit_r(sym: str, entry: float, exit_px: float,
-                   sl_dist_pct, planned_rr, label: str) -> None:
+                   sl_dist_pct, planned_rr, label: str,
+                   pos: Optional[dict] = None) -> None:
     """Compute signed realized_r for a close and log/store it (F1.1).
 
     realized_r = (exit_px − entry) / (entry × sl_distance_pct/100) — how many
     R-multiples the exit landed at, signed. Losers cap near −1R (stop), a
-    BEP scratch is ~0R, a clean TP is ≈ planned_rr, a trailed runner ≥ that."""
+    BEP scratch is ~0R, a clean TP is ≈ planned_rr, a trailed runner ≥ that.
+
+    WolfBot v0.5 Part S2 — READ-ONLY EV training hook: when `pos` is provided and
+    realized_r is computable, write ONE live training sample (features + win/loss
+    label + realized_r). This is purely additive at the existing close point — it
+    does NOT read/alter the exit decision, label, price, or timing; a failure is
+    swallowed so it can never affect the close."""
     try:
         entry = float(entry or 0)
         exit_px = float(exit_px or 0)
@@ -2090,6 +2212,9 @@ def _record_exit_r(sym: str, entry: float, exit_px: float,
         realized_r = None
         if entry > 0 and sl_dist > 0:
             realized_r = (exit_px - entry) / (entry * sl_dist / 100.0)
+        # ── Part S2 — live training label (guarded, additive, non-authoritative)
+        if pos is not None and realized_r is not None:
+            _save_ev_training_sample_safe(sym, pos, realized_r)
         prr = None
         try:
             prr = float(planned_rr) if planned_rr is not None else None
@@ -8021,7 +8146,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     # F1.1: realized_r vs planned_rr for this close (activity log + R-stats ring).
     _record_exit_r(sym, pos.get("entry_price"), fill_price,
                    pos.get("sl_distance_pct"), pos.get("planned_rr"),
-                   _exit_label_for(reason))
+                   _exit_label_for(reason), pos=pos)
     # F7: every close MUST carry an explicit exit_label. _exit_label_for never
     # returns empty, but assert loudly + default to 'unknown' so an unlabeled
     # exit can never silently reach the DB (6-of-16 unlabeled diagnostic).
@@ -8400,6 +8525,37 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     def _cached_ready(_c) -> bool:
         return bool(_c.get("score", 0) >= min_sigs)
 
+    # ── WolfBot v0.5 Part S2 — EV-based buy SELECTION ─────────────────────────
+    # Score every approved, cached-ready candidate ONCE this pass (guarded) and,
+    # when entries.ev_ranking_enabled, process eligible coins in DESCENDING win-
+    # probability order (buy the 72% before the 51%). This ONLY reorders the
+    # iteration among already-eligible coins and feeds the probability floor; every
+    # existing veto/gate below is unchanged and still authoritative. A scoring
+    # failure (or ev_model missing) leaves _ev_scores empty → today's raw-score /
+    # first-ready behavior. Ranking never lets a coin skip a gate.
+    _entries_cfg_s2 = _entries_cfg()
+    _ev_ranking_on  = bool(_entries_cfg_s2.get("ev_ranking_enabled", True))
+    _ev_min_prob    = float(_entries_cfg_s2.get("min_win_probability", 0.0) or 0.0)
+    _ev_scores: Dict[str, dict] = {}
+    if ev_model is not None:
+        for _s, _c in _items:
+            if _s in approved and _cached_ready(_c):
+                _sc = _ev_score_cached(_c)
+                if _sc:
+                    _ev_scores[_s] = _sc
+    # Floor may GATE a real buy only when trained AND past the ≥300 clean-trade
+    # guardrail; otherwise it is display/advisory (never blocks). Evaluated once.
+    _ev_floor_on = bool(_ev_min_prob > 0 and ev_model is not None and _ev_floor_active())
+    if _ev_ranking_on and _ev_scores:
+        # Eligible candidates first, DESCENDING EV probability, ties by DESCENDING
+        # raw score; symbols without an EV score fall to the tail (key = -1 prob).
+        def _ev_rank_key(_it):
+            _s, _c = _it
+            _e = _ev_scores.get(_s)
+            _p = float(_e.get("probability", 0.0)) if _e else -1.0
+            return (_p, float(_c.get("score", 0) or 0))
+        _items = sorted(_items, key=_ev_rank_key, reverse=True)
+
     def _mark_rest_no_slot(_from_idx: int, _k: int, _n: int) -> None:
         # Capacity hit mid-loop → every still-unprocessed ready candidate gets an
         # explicit 'no free slot' block instead of a silent gap.
@@ -8409,14 +8565,19 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 _trace_mark_block(_s, _reason)
 
     def _top_ready_symbol() -> Optional[str]:
-        # Highest cached-score approved buy-ready candidate this pass (ties: first
-        # in iteration). Used by instant_fire_when_slots_free.
-        _best_s, _best_sc = None, -1
+        # WolfBot v0.5 Part S2 — highest-EV approved buy-ready candidate this pass
+        # (instant-fire now picks the best win-probability, not the highest raw
+        # score). Falls back to highest raw score, then first-in-iteration, when EV
+        # scoring is unavailable (all _p == -1 → pure raw-score ranking = today's
+        # behavior). Used by instant_fire_when_slots_free.
+        _best_s, _best_key = None, None
         for _s, _c in _items:
             if _s in approved and _cached_ready(_c):
-                _sc = int(_c.get("score", 0))
-                if _sc > _best_sc:
-                    _best_sc, _best_s = _sc, _s
+                _e = _ev_scores.get(_s)
+                _p = float(_e.get("probability", 0.0)) if _e else -1.0
+                _key = (_p, int(_c.get("score", 0)))
+                if _best_key is None or _key > _best_key:
+                    _best_key, _best_s = _key, _s
         return _best_s
 
     for _idx, (sym, cached) in enumerate(_items):
@@ -8505,6 +8666,34 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             if _cached_green:
                 _trace_mark_block(sym, "waiting: backfill warmup")
             continue
+
+        # ── WolfBot v0.5 Part S2 — EV probability floor ───────────────────────
+        # Among already-eligible candidates, skip one whose EV win-probability is
+        # below entries.min_win_probability. This GATES a real buy ONLY when the
+        # active model is trained AND past the ≥300 clean-trade guardrail
+        # (_ev_floor_on); when the model is untrained or below the guardrail the
+        # floor is DISPLAY-ONLY — traced as advisory but the buy still proceeds.
+        # It never overrides a veto/safety gate (those already ran above); it only
+        # removes a marginal coin from the allowed set. Guarded: no EV score → no
+        # floor action (today's behavior).
+        if _ev_min_prob > 0 and ev_model is not None:
+            _ev_here = _ev_scores.get(sym) or _ev_score_cached(cached)
+            if _ev_here is not None:
+                _p_here = float(_ev_here.get("probability", 0.0) or 0.0)
+                if _p_here < _ev_min_prob:
+                    _floor_msg = (f"win prob {_p_here * 100:.0f}% < floor "
+                                  f"{_ev_min_prob * 100:.0f}%")
+                    if _ev_floor_on:
+                        _record_rejection(sym, cached.get("score", 0),
+                                          "ev_prob_floor", _floor_msg)
+                        _trace_mark_block(sym, f"blocked: {_floor_msg}")
+                        continue
+                    # Untrained / below guardrail → advisory only; allow the buy.
+                    _log_skip_dedup(
+                        sym, "ev_floor_advisory",
+                        f"{sym}: EV floor advisory — {_floor_msg} "
+                        f"(model untrained or below the clean-trade guardrail; "
+                        f"buy allowed).", "info")
 
         # ── Extract signal snapshot for this symbol ────────────────────────────
         sigs    = cached.get("signals", {})
@@ -9279,6 +9468,21 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 "engine_enabled":  bool(strategy.get("signal_engine", {}).get("enabled", False)),
             }),
         }
+        # ── WolfBot v0.5 Part S2 — capture the EV feature snapshot at entry ────
+        # Additive in-memory fields (save_position ignores unknown keys). Used to
+        # write the LIVE training label when this position closes — does NOT
+        # affect sizing/exit/geometry in any way. Guarded so a scoring failure can
+        # never break the buy.
+        if ev_model is not None:
+            try:
+                _ev_entry = _ev_scores.get(sym) or _ev_score_cached(cached)
+                pos_record["ev_features"] = ev_model.extract_features(
+                    _ev_raw_from_cache(cached))
+                if _ev_entry is not None:
+                    pos_record["ev_score"] = _ev_entry.get("pct")
+                    pos_record["ev_probability"] = _ev_entry.get("probability")
+            except Exception:
+                pass
         # Phase 2 §2.1/§2.2 — ATR stop / TP / hard-SL geometry, stored on the
         # position dict (in-memory; the positions table is fixed-column and
         # save_position ignores unknown keys — load_positions_from_db
@@ -10493,7 +10697,7 @@ def _finalize_managed_exit(pos: dict, sym: str, exit_price: float, reason: str,
     }
     # F1.1: realized_r for the managed (exchange-side) close.
     _record_exit_r(sym, entry_px, exit_price, pos.get("sl_distance_pct"),
-                   pos.get("planned_rr"), exit_label)
+                   pos.get("planned_rr"), exit_label, pos=pos)
     # F7: managed exits must also carry an explicit label.
     if not exit_label:
         log_diag_issue("unlabeled_exit", "warn",

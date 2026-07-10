@@ -92,6 +92,13 @@ class EntriesConfig(BaseModel):
     # (which was stranding ready coins while slots sat open). Marginal/subsequent
     # candidates still serve the confirm window.
     instant_fire_when_slots_free: bool = True
+    # Part S — EV buy-scoring: rank ready coins by modeled win-probability and buy
+    # the highest first (only reorders/gates coins already past vetoes+gates; never
+    # overrides a block). min_win_probability is the smarter replacement for the
+    # blunt min_score — buy only if modeled P(win) ≥ this. 0 = floor off (display
+    # only); the floor is ignored anyway until the model is trained (S4 guardrail).
+    ev_ranking_enabled:     bool  = True
+    min_win_probability:    float = Field(0.0, ge=0.0, le=1.0)
 
 
 class ExitsConfig(BaseModel):
@@ -171,6 +178,11 @@ class DataConfig(BaseModel):
     # source is visible in the diagnostics bundle. Small overhead; leave on until
     # the leak is fixed, then it can be turned off.
     tracemalloc_enabled:         bool = True
+    # Part S3 — run the paper-shadow evaluator in parallel with live: same signals
+    # + universe, modeled fills (no real orders), reusing the live exit machinery
+    # read-only, writing labeled outcomes (mode=paper_shadow) to the training set.
+    # NOT slot-limited → far more clean data/day than live for the EV model.
+    paper_shadow_enabled:        bool = True
 
 
 class StrategyConfig(BaseModel):
@@ -347,6 +359,15 @@ SCHEMA: Dict[str, dict] = {
                                          "When slots are open and candidates are confirmed buy-ready, fire "
                                          "the highest-scoring one immediately instead of holding it for "
                                          "confirm_seconds."),
+    "entries.ev_ranking_enabled": _meta("entries.ev_ranking_enabled", "bool", "Entries",
+                                         "EV ranking (best-first)",
+                                         "Rank ready coins by modeled win-probability and buy the highest "
+                                         "first. Only reorders coins already past vetoes/gates."),
+    "entries.min_win_probability": _meta("entries.min_win_probability", "float", "Entries",
+                                         "Min win probability",
+                                         "Only buy if modeled P(win) ≥ this (0-1). Smarter replacement for "
+                                         "min_score. Ignored until the model is trained. 0 = floor off.",
+                                         0.0, 1.0, 0.01, ""),
 
     # ── Exits ─────────────────────────────────────────────────────────────
     "exits.k_sl": _meta("exits.k_sl", "float", "Exits", "SL ATR multiple (k_sl)",
@@ -483,6 +504,10 @@ SCHEMA: Dict[str, dict] = {
                                   "Tracemalloc leak trace",
                                   "Enable tracemalloc and log the top memory allocations in the heartbeat "
                                   "so a leak source shows up in diagnostics."),
+    "data.paper_shadow_enabled": _meta("data.paper_shadow_enabled", "bool", "Data",
+                                  "Paper-shadow data engine",
+                                  "Run the risk-free paper-shadow evaluator alongside live to generate "
+                                  "labeled training data for the EV model (no real orders)."),
     "data.auto_replace_with_successor": _meta("data.auto_replace_with_successor", "bool", "Data",
                                               "Auto-add rename successor",
                                               "When a removed coin has a known rename successor that "
