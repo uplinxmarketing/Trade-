@@ -417,6 +417,17 @@ def _signal_spread_too_wide(symbol: str, data: dict, strategy: dict) -> Tuple[bo
     """E1 VETO: fired=True when bid-ask spread exceeds threshold (inverted: True = block)."""
     now = time.time()
     threshold = float(strategy.get("signal_thresholds", {}).get("spread_max_pct", 0.15))
+    # S3-6 — maker-first entries post at the bid and never pay the spread, so the
+    # E1 veto is over-conservative for them (it was hard-vetoing top coins ~75% of
+    # the time). When maker_first is on AND taker fallback is off, relax the ceiling
+    # to entries.spread_max_pct_maker. If taker fallback is enabled the fill can pay
+    # the spread, so keep the strict threshold.
+    _entries = strategy.get("entries") if isinstance(strategy.get("entries"), dict) else {}
+    if bool(_entries.get("maker_first", True)) and not bool(_entries.get("taker_fallback", False)):
+        try:
+            threshold = float(_entries.get("spread_max_pct_maker", 0.5))
+        except (TypeError, ValueError):
+            pass
     cached = _spread_sr_cache.get(symbol)
     if cached and (now - cached["ts"]) < _SPREAD_CACHE_TTL:
         return cached["spread_pct"] > threshold, cached["spread_pct"]
