@@ -21,12 +21,50 @@ export interface EvReason {
   points: number;
 }
 
+// ── WolfScore v3 sub-structure ──────────────────────────────────────────────
+// The eight named sub-metrics (T,M,R,C,W,V,X,F). Values are signed point
+// contributions to the composite score; any letter may be absent on older
+// backends, so the map is Partial.
+export type SubMetricKey = 'T' | 'M' | 'R' | 'C' | 'W' | 'V' | 'X' | 'F';
+export type EvSubMetrics = Partial<Record<SubMetricKey, number>>;
+
+// The four score families the sub-metrics roll up into.
+export interface EvFamilies {
+  momentum?: number;
+  defensive?: number;
+  base?: number;
+  residual?: number;
+}
+
+export type RegimeState = 'up' | 'down' | 'side';
+
 export interface EvScore {
   pct?: number;               // 0-100 win-probability score
   probability?: number;       // 0-1 raw probability (fallback for pct)
   trained?: boolean;
   version?: string | number;
   top_reasons?: EvReason[];
+  // WolfScore v3 additions (all optional — guard defensively):
+  submetrics?: EvSubMetrics;      // {T:+18, R:+22, C:+14, W:+12, F:-gate, …}
+  families?: EvFamilies;          // rolled-up family contributions
+  regime?: RegimeState | string;  // per-coin regime state
+  regime_tilt?: number;           // per-coin regime tilt applied
+  hard_gate?: string | null;      // e.g. 'friction' | 'spread' when gated out
+}
+
+// Market-wide regime summary (from /api/ev/scores.regime).
+export interface EvRegime {
+  state?: RegimeState;            // 'up' | 'down' | 'side'
+  tilt?: number;                  // signed tilt magnitude
+  dominant_family?: string;       // which family the regime favours
+}
+
+// Adaptive win-probability floor (from /api/ev/scores.floor).
+export interface EvFloor {
+  threshold?: number;            // live floor a coin must clear (0-100 or 0-1)
+  abs_floor?: number;            // hard absolute minimum
+  dist_threshold?: number;       // distribution-relative component
+  mode?: string;                 // 'fixed' | 'meanstd' | …
 }
 
 export interface EvModelBadge {
@@ -44,6 +82,10 @@ export interface EvScoresPayload {
   scores?: Record<string, EvScore>;
   ranking?: string[];
   next_buy?: string | null;
+  // WolfScore v3 additions (guard defensively):
+  regime?: EvRegime;
+  floor?: EvFloor;
+  distribution?: number[];       // live score distribution (pct values)
 }
 
 // ── Model / versions ───────────────────────────────────────────────────────
@@ -231,6 +273,37 @@ export function scoreColor(pct: number | null | undefined): string {
   // 0 → hue 0 (red), 100 → hue 140 (green)
   const hue = (clamped / 100) * 140;
   return `hsl(${hue.toFixed(0)} 72% 50%)`;
+}
+
+// Human labels for the eight sub-metrics (tooltips / breakdowns).
+export const SUBMETRIC_LABELS: Record<SubMetricKey, string> = {
+  T: 'Trend',
+  M: 'Momentum',
+  R: 'Decoupling',
+  C: 'Confluence',
+  W: 'VWAP-room',
+  V: 'Volume',
+  X: 'Extra',
+  F: 'Friction',
+};
+
+export const FAMILY_LABELS: Record<string, string> = {
+  momentum: 'momentum',
+  defensive: 'decoupling (R) + VWAP-room (W)',
+  base: 'base signals',
+  residual: 'residual edge',
+};
+
+export const REGIME_LABELS: Record<RegimeState, string> = {
+  up: 'UPTREND',
+  down: 'DOWNTREND',
+  side: 'RANGE',
+};
+
+// Normalise a possibly-0-1 threshold/pct onto the 0-100 axis used by the UI.
+export function toPct100(v: number | null | undefined): number | null {
+  if (v == null || !isFinite(v)) return null;
+  return v <= 1 ? v * 100 : v;
 }
 
 export function pctOf(s: EvScore | undefined): number | null {

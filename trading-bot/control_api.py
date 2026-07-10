@@ -5206,17 +5206,23 @@ def api_diagnostics_bundle(
                       f"wins={counts.get('wins')}\n")
         except Exception:
             out.write("  samples: [unavailable]\n")
-        # Top-5 current live scores.
-        scores = {}
+        # WolfScore-v3 live feed: regime, adaptive floor, top-5 scores.
+        bundle = _ev_live_scores_bundle()
+        scores = bundle.get("scores", {}) or {}
+        rg = bundle.get("regime", {}) or {}
+        out.write(f"  regime: state={rg.get('state')} "
+                  f"tilt={rg.get('tilt')} "
+                  f"dominant_family={rg.get('dominant_family')}\n")
+        fl = bundle.get("floor", {}) or {}
+        dist = bundle.get("distribution", []) or []
+        thr = fl.get("threshold")
         try:
-            import trade_engine as _te
-            fn = getattr(_te, "get_live_ev_scores", None)
-            if callable(fn):
-                raw = fn()
-                if isinstance(raw, dict):
-                    scores = raw
+            n_clear = sum(1 for p in dist if thr is not None and float(p) >= float(thr))
         except Exception:
-            scores = {}
+            n_clear = 0
+        out.write(f"  floor: threshold={thr} abs_floor={fl.get('abs_floor')} "
+                  f"dist_threshold={fl.get('dist_threshold')} mode={fl.get('mode')} "
+                  f"clearing={n_clear}/{len(dist)}\n")
         if scores:
             ranked = sorted(
                 scores.items(),
@@ -7920,11 +7926,140 @@ def _ev_live_expectancy() -> dict:
         return dict(zeros)
 
 
+def _ev_pct(v) -> float:
+    """pct off a per-symbol score dict, robust to None/missing."""
+    try:
+        return float((v or {}).get("pct", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _ev_live_scores_bundle() -> dict:
+    """WolfScore-v3 live feed from trade_engine.get_live_ev_scores(), normalized.
+
+    The v3 feed now carries a top-level regime/tilt + adaptive-floor threshold
+    alongside the per-symbol WolfScores. This tolerates both the wrapped v3
+    shape ({scores, regime, floor}) and the legacy flat {SYM: {...}} map, and
+    always returns a stable bundle:
+        {scores: {SYM:{...}}, regime: {state, tilt, dominant_family},
+         floor: {threshold, abs_floor, dist_threshold, mode}, distribution: [pct]}
+    Fully guarded — never raises."""
+    scores: dict = {}
+    regime_in: dict = {}
+    floor: dict = {}
+    raw = None
+    try:
+        import trade_engine as _te
+        fn = getattr(_te, "get_live_ev_scores", None)
+        if callable(fn):
+            raw = fn()
+    except Exception:
+        raw = None
+
+    if isinstance(raw, dict):
+        inner = raw.get("scores")
+        if isinstance(inner, dict):
+            # wrapped v3 shape
+            scores = {k: v for k, v in inner.items() if isinstance(v, dict)}
+            if isinstance(raw.get("regime"), dict):
+                regime_in = dict(raw["regime"])
+            if isinstance(raw.get("floor"), dict):
+                floor = dict(raw["floor"])
+            if regime_in.get("tilt") is None and raw.get("tilt") is not None:
+                regime_in["tilt"] = raw.get("tilt")
+        else:
+            # flat map — per-symbol score dicts + an optional '__meta__' entry
+            # carrying the authoritative regime tilt + adaptive-floor threshold.
+            scores = {k: v for k, v in raw.items()
+                      if k != "__meta__" and isinstance(v, dict)
+                      and ("pct" in v or "score" in v)}
+            meta = raw.get("__meta__")
+            if isinstance(meta, dict):
+                if meta.get("regime_tilt") is not None:
+                    regime_in["tilt"] = meta.get("regime_tilt")
+                if meta.get("regime") is not None:
+                    regime_in["state"] = meta.get("regime")
+                if isinstance(meta.get("adaptive_floor"), dict):
+                    floor = dict(meta["adaptive_floor"])
+                if meta.get("floor_active") is not None:
+                    floor["floor_active"] = bool(meta.get("floor_active"))
+
+    distribution: list = []
+    for v in scores.values():
+        try:
+            distribution.append(float(v.get("pct", 0.0) or 0.0))
+        except Exception:
+            pass
+
+    # --- regime: state + tilt + dominant family ---------------------------
+    tilt = None
+    try:
+        if regime_in.get("tilt") is not None:
+            tilt = float(regime_in.get("tilt"))
+    except Exception:
+        tilt = None
+    if tilt is None:
+        for v in scores.values():
+            rt = v.get("regime_tilt")
+            if rt is not None:
+                try:
+                    tilt = float(rt)
+                    break
+                except Exception:
+                    pass
+    tilt = tilt if tilt is not None else 0.0
+
+    state = regime_in.get("state")
+    if state not in ("up", "down", "side"):
+        for v in scores.values():
+            rs = v.get("regime")
+            if rs in ("up", "down", "side"):
+                state = rs
+                break
+    if state not in ("up", "down", "side"):
+        state = "up" if tilt > 0.15 else "down" if tilt < -0.15 else "side"
+
+    dom = regime_in.get("dominant_family")
+    if dom not in ("momentum", "defensive", "both"):
+        mom = dfn = 0.0
+        for v in scores.values():
+            fam = v.get("families") or {}
+            try:
+                mom += float(fam.get("momentum", 0.0) or 0.0)
+                dfn += float(fam.get("defensive", 0.0) or 0.0)
+            except Exception:
+                pass
+        spread = 0.15 * max(1.0, abs(mom) + abs(dfn))
+        if abs(mom - dfn) < spread:
+            dom = "both"
+        else:
+            dom = "momentum" if mom >= dfn else "defensive"
+
+    regime = {"state": state, "tilt": round(tilt, 4), "dominant_family": dom}
+
+    # --- adaptive floor: use the feed's if present, else compute ----------
+    if not floor:
+        try:
+            import ev_model as _ev
+            afn = getattr(_ev, "adaptive_floor", None)
+            if callable(afn):
+                floor = afn(distribution)
+        except Exception:
+            floor = {}
+    if not isinstance(floor, dict):
+        floor = {}
+
+    return {"scores": scores, "regime": regime, "floor": floor,
+            "distribution": distribution}
+
+
 @app.get("/api/ev/scores")
 def api_ev_scores():
-    """S5 — watchlist EV scores + ranking. Scores sourced from
-    trade_engine.get_live_ev_scores() (guarded → {}); ranking is symbols sorted
-    by pct desc; next_buy is the top-ranked symbol (or null). Never 500s."""
+    """S5 — WolfScore-v3 watchlist feed for the UI: the WolfScore-first column,
+    the regime panel, and the score distribution. Scores + regime + adaptive
+    floor are sourced from trade_engine.get_live_ev_scores() (guarded → {}).
+    ranking = symbols by pct desc; next_buy = top-ranked symbol (or null);
+    distribution = the list of pct values. Never 500s."""
     try:
         model = {}
         try:
@@ -7935,28 +8070,15 @@ def api_ev_scores():
         except Exception:
             model = {}
 
-        scores = {}
-        try:
-            import trade_engine as _te
-            fn = getattr(_te, "get_live_ev_scores", None)
-            if callable(fn):
-                raw = fn()
-                if isinstance(raw, dict):
-                    scores = raw
-        except Exception:
-            scores = {}
-
-        def _pct(v):
-            try:
-                return float((v or {}).get("pct", 0.0) or 0.0)
-            except Exception:
-                return 0.0
-
-        ranking = sorted(scores.keys(), key=lambda s: _pct(scores.get(s)),
+        bundle = _ev_live_scores_bundle()
+        scores = bundle.get("scores", {}) or {}
+        ranking = sorted(scores.keys(), key=lambda s: _ev_pct(scores.get(s)),
                          reverse=True)
         next_buy = ranking[0] if ranking else None
         return {"model": model, "scores": scores, "ranking": ranking,
-                "next_buy": next_buy}
+                "next_buy": next_buy, "regime": bundle.get("regime", {}),
+                "floor": bundle.get("floor", {}),
+                "distribution": bundle.get("distribution", [])}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -8001,11 +8123,25 @@ def _run_ev_train_job(run_id: str):
             fn = getattr(database, "get_training_samples", None)
             if callable(fn):
                 rows = fn(limit=100000, modes=["live", "paper_shadow"]) or []
-                samples = [{"features": r.get("features"), "label": r.get("label")}
-                           for r in rows if isinstance(r, dict)]
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    feats = r.get("features") if isinstance(r.get("features"), dict) else {}
+                    # WolfScore-v3 rows carry submetrics + regime_tilt in features;
+                    # if a row lacks submetrics, train_wolfscore recomputes from the
+                    # raw features itself — pass them through so it can.
+                    samples.append({
+                        "submetrics":  feats.get("submetrics"),
+                        "regime_tilt": feats.get("regime_tilt", 0.0),
+                        "features":    feats,
+                        "cohort":      feats.get("cohort"),
+                        "label":       r.get("label"),
+                    })
         except Exception:
             samples = []
-        res = _ev.train(samples)
+        # WolfScore-v3 trainer (regime-gated logistic fit), not the generic train.
+        _trainer = getattr(_ev, "train_wolfscore", None) or getattr(_ev, "train")
+        res = _trainer(samples)
         if isinstance(res, dict):
             result = dict(res)
             result["run_id"] = run_id
@@ -8036,8 +8172,9 @@ def api_ev_train_start():
     global _ev_train_running, _ev_train_run_id
     try:
         import ev_model as _ev  # noqa: F401 — presence check only
-        if getattr(_ev, "train", None) is None:
-            return JSONResponse({"error": "ev_model.train not available"},
+        if getattr(_ev, "train_wolfscore", None) is None \
+                and getattr(_ev, "train", None) is None:
+            return JSONResponse({"error": "ev_model trainer not available"},
                                 status_code=503)
     except ImportError:
         return JSONResponse({"error": "ev_model not available"}, status_code=503)

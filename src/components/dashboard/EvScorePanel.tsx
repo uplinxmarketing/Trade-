@@ -2,10 +2,15 @@ import { useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, ArrowUpDown, Trophy, Target } from 'lucide-react';
 import {
   useEvScores, isUnavailable, scoreColor, pctOf,
-  type EvScore, type EvReason,
+  SUBMETRIC_LABELS, type SubMetricKey,
+  type EvScore, type EvReason, type EvFamilies,
 } from '@/hooks/useEv';
 import { EvExpectancyCard } from '@/components/dashboard/EvExpectancyCard';
 import { EvModelPanel } from '@/components/dashboard/EvModelPanel';
+import { RegimePanel } from '@/components/dashboard/RegimePanel';
+
+const SUBMETRIC_ORDER: SubMetricKey[] = ['T', 'M', 'R', 'C', 'W', 'V', 'X', 'F'];
+const FAMILY_ORDER: Array<keyof EvFamilies> = ['momentum', 'defensive', 'base', 'residual'];
 
 // ── WolfBot S5 — EV win-probability score panel ────────────────────────────
 // The main ask: every ready coin's 0-100% win-probability score, colour-coded
@@ -63,13 +68,68 @@ function ReasonBreakdown({ score }: { score: EvScore }) {
     .sort((a, b) => Math.abs(b.points) - Math.abs(a.points));
   const pct = pctOf(score);
 
+  // WolfScore v3 — sub-metric contributions (T +18, R +22, …) shown as chips.
+  const submetrics = score.submetrics ?? {};
+  const subEntries = SUBMETRIC_ORDER
+    .map(k => ({ k, v: submetrics[k] }))
+    .filter((e): e is { k: SubMetricKey; v: number } => typeof e.v === 'number' && isFinite(e.v));
+
+  const families = score.families ?? {};
+  const famEntries = FAMILY_ORDER
+    .map(k => ({ k, v: families[k] }))
+    .filter((e): e is { k: keyof EvFamilies; v: number } => typeof e.v === 'number' && isFinite(e.v));
+
   return (
     <div className="px-3 py-2 bg-muted/10 border-t border-border/40 space-y-1.5">
-      <div className="flex items-center gap-2 text-[9px] text-muted-foreground">
+      <div className="flex items-center gap-2 text-[9px] text-muted-foreground flex-wrap">
         <span>score <span className="font-mono font-bold" style={{ color: scoreColor(pct) }}>{fmtPct(pct)}</span></span>
-        {score.version != null && <span>· model v{score.version}</span>}
-        <span>· {score.trained ? 'trained' : 'untrained'}</span>
+        {score.version != null && <span>· weights v{score.version}</span>}
+        <span
+          className={`· inline-flex items-center px-1 rounded text-[8px] font-semibold ${
+            score.trained ? 'text-gain bg-gain/10' : 'text-warn bg-warn/10'
+          }`}
+        >
+          {score.trained ? 'trained' : 'untrained'}
+        </span>
+        {score.regime_tilt != null && isFinite(score.regime_tilt) && (
+          <span>· regime tilt <span className="font-mono">{score.regime_tilt >= 0 ? '+' : '−'}{Math.abs(score.regime_tilt).toFixed(2)}</span></span>
+        )}
+        {score.hard_gate && (
+          <span className="inline-flex items-center px-1 rounded text-[8px] font-semibold text-loss bg-loss/10">
+            gated: {score.hard_gate}
+          </span>
+        )}
       </div>
+
+      {/* Sub-metric contribution chips */}
+      {subEntries.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {subEntries.map(({ k, v }) => (
+            <span
+              key={k}
+              className={`inline-flex items-center gap-0.5 px-1 py-0.5 rounded border text-[9px] font-mono ${
+                v >= 0 ? 'border-gain/30 bg-gain/5 text-gain' : 'border-loss/30 bg-loss/5 text-loss'
+              }`}
+              title={SUBMETRIC_LABELS[k]}
+            >
+              <span className="font-bold">{k}</span>
+              <span>{fmtPoints(v)}</span>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Family roll-up */}
+      {famEntries.length > 0 && (
+        <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[8px] text-muted-foreground">
+          {famEntries.map(({ k, v }) => (
+            <span key={k}>
+              {k}: <span className={`font-mono font-semibold ${v >= 0 ? 'text-gain' : 'text-loss'}`}>{fmtPoints(v)}</span>
+            </span>
+          ))}
+        </div>
+      )}
+
       {reasons.length === 0 ? (
         <p className="text-[9px] text-muted-foreground/70 italic">No contribution breakdown available.</p>
       ) : (
@@ -260,6 +320,9 @@ export function EvScorePanel({ baseUrl = '' }: { baseUrl?: string }) {
           <ScoreTable scores={scores} />
 
           <RankingView ranking={ranking} scores={scores} nextBuy={data?.next_buy} />
+
+          {/* WolfScore v3 — regime + adaptive-floor distribution */}
+          <RegimePanel regime={data?.regime} floor={data?.floor} distribution={data?.distribution} />
         </>
       )}
 

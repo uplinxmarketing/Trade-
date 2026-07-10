@@ -439,6 +439,340 @@ def active_weights() -> List[Dict[str, Any]]:
     return rows
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Part S-2 — WolfScore v3: spot-computable, regime-GATING buy-success score.
+# 8 bounded sub-metrics (T,M,R,C,W,V,X,F) → regime-gated families → calibrated
+# 0-100 probability. Weights are LEARNED (train_wolfscore) via the same versioned
+# /activated flow; INTERIM weights are transparent priors until ≥300 clean trades.
+# Scenario-tested: uptrend picks momentum, downtrend picks the decoupled coin.
+# ═════════════════════════════════════════════════════════════════════════════
+WOLF_SUBMETRICS = ["T", "M", "R", "C", "W", "V", "X", "F"]
+
+# INTERIM_UNTRAINED weights (framework-run only; data overwrites them). F heaviest
+# — cost is the top killer on $11 tickets; R highest in the defensive family
+# because decoupling is the point of downtrend selection.
+WOLF_INTERIM: Dict[str, Any] = {
+    "version": "wolf-interim-v3",
+    "kind":    "wolfscore_v3",
+    "trained": False,
+    "n_trades": 0,
+    "created": "2026-07-10T12:00:00",
+    "note":    "WolfScore v3 transparent priors — NOT a validated probability",
+    "weights": {
+        "b0":   -1.0,
+        "wm_T":  1.6, "wm_M": 1.4,          # momentum family
+        "wd_R":  1.8, "wd_W": 1.4,          # defensive family (R = decoupling)
+        "w_C":   1.1, "w_V": 0.7, "w_X": 0.5, "w_F": 3.5,
+    },
+}
+
+
+def _clip(x: float, lo: float, hi: float) -> float:
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return 0.0
+    return lo if x < lo else hi if x > hi else x
+
+
+def regime_tilt(btc_roc_1h_frac: Optional[float]) -> float:
+    """Flaw #1 fix: tanh(60 × ROC_frac) so a 1% BTC move gives ±0.54, not ~0.03.
+    1h ROC (not 15m) to reduce noise. ∈ [-1, +1]. Missing → 0 (neutral)."""
+    if btc_roc_1h_frac is None:
+        return 0.0
+    try:
+        return math.tanh(60.0 * float(btc_roc_1h_frac))
+    except Exception:
+        return 0.0
+
+
+def compute_submetrics(inp: Dict[str, Any], cohort: Optional[Dict[str, Any]] = None
+                       ) -> Dict[str, float]:
+    """The 8 bounded WolfScore sub-metrics, all spot-computable (streamed trades +
+    1m/5m klines + miniTicker — NO OI / premium / L2 depth). Every input is
+    optional; a missing feed degrades that sub-metric to 0/neutral, never raises.
+
+    Expected inp keys (all optional):
+      ema9, ema21, atr_pct, macd_hist, rolling_max_abs_hist_20, roc_15m,
+      taker_buy_vol_5m, taker_sell_vol_5m, total_vol_5m, p_mid, vwap_15m,
+      vol_5m, avg_vol_20, atr_target, atr_halfwidth, half_spread_pct,
+      avg_slippage_pct, planned_stop_pct.
+    cohort: {"median_roc_15m": float} — basket median of ROC_15m for R (decoupling).
+    """
+    g = inp.get
+    cohort = cohort or {}
+    eps = 1e-9
+
+    # T — trend alignment: EMA gap normalized by the coin's own ATR%.
+    ema9, ema21 = g("ema9"), g("ema21")
+    atr_pct = g("atr_pct")
+    T = 0.0
+    try:
+        if ema9 is not None and ema21 and float(ema21) != 0 and atr_pct:
+            atr_norm = max(float(atr_pct), 0.05)  # avoid divide-by-tiny
+            T = _clip(((float(ema9) - float(ema21)) / float(ema21) * 100.0) / atr_norm, -1, 1)
+    except Exception:
+        T = 0.0
+
+    # M — momentum: macd_hist normalized by its rolling max |hist| (20).
+    M = 0.0
+    try:
+        mh, rmax = g("macd_hist"), g("rolling_max_abs_hist_20")
+        if mh is not None and rmax and float(rmax) > eps:
+            M = _clip(float(mh) / float(rmax), -1, 1)
+    except Exception:
+        M = 0.0
+
+    # R — cohort-relative strength (DECOUPLING): this coin's 15m ROC vs basket MEDIAN.
+    R = 0.0
+    try:
+        roc = g("roc_15m")
+        med = cohort.get("median_roc_15m")
+        if roc is not None and med is not None:
+            R = math.tanh(8.0 * (float(roc) - float(med)))
+    except Exception:
+        R = 0.0
+
+    # C — CVD pressure: taker buy vs sell over 5m (real order-flow, single term).
+    C = 0.0
+    try:
+        tb, ts, tot = g("taker_buy_vol_5m"), g("taker_sell_vol_5m"), g("total_vol_5m")
+        denom = None
+        if tot is not None and float(tot) > eps:
+            denom = float(tot)
+        elif tb is not None and ts is not None and (float(tb) + float(ts)) > eps:
+            denom = float(tb) + float(ts)
+        if denom and tb is not None and ts is not None:
+            C = _clip((float(tb) - float(ts)) / (denom + eps), -1, 1)
+    except Exception:
+        C = 0.0
+
+    # W — VWAP room (ANTI-CHASING): near VWAP → +1; far above → negative.
+    W = 0.0
+    try:
+        pmid, vwap = g("p_mid"), g("vwap_15m")
+        if pmid is not None and vwap and float(vwap) != 0:
+            W = _clip(1.0 - 4.0 * abs(float(pmid) - float(vwap)) / float(vwap), -1, 1)
+    except Exception:
+        W = 0.0
+
+    # V — volume confirmation: vol_5m / avg_vol_20, mapped to [0,1].
+    V = 0.0
+    try:
+        v5, va = g("vol_5m"), g("avg_vol_20")
+        if v5 is not None and va and float(va) > eps:
+            V = _clip(float(v5) / float(va) - 1.0, 0, 2) / 2.0
+    except Exception:
+        V = 0.0
+
+    # X — volatility fitness: tent peaking at the middle of the tradeable ATR band.
+    X = 0.0
+    try:
+        if atr_pct is not None:
+            tgt = float(g("atr_target") or 1.0)
+            hw = float(g("atr_halfwidth") or 1.0) or 1.0
+            X = _clip(1.0 - abs(float(atr_pct) - tgt) / hw, 0, 1)
+    except Exception:
+        X = 0.0
+
+    # F — friction: (half-spread + recent avg slippage) / planned stop distance.
+    F = 0.0
+    try:
+        hs = float(g("half_spread_pct") or 0.0)
+        sl = float(g("avg_slippage_pct") or 0.0)
+        stop = float(g("planned_stop_pct") or 0.0)
+        if stop > eps:
+            F = _clip((hs + sl) / stop, 0, 1)
+    except Exception:
+        F = 0.0
+
+    return {"T": T, "M": M, "R": R, "C": C, "W": W, "V": V, "X": X, "F": F}
+
+
+def get_active_wolf_model() -> Dict[str, Any]:
+    """Active WolfScore weight-set (hot, 10s TTL). Falls back to the interim v3
+    priors. Reuses the same DB-active model when it's a wolfscore_v3 kind."""
+    m = get_active_model()
+    if isinstance(m, dict) and m.get("kind") == "wolfscore_v3" and isinstance(m.get("weights"), dict):
+        return m
+    return WOLF_INTERIM
+
+
+def wolfscore(sub: Dict[str, float], tilt: float,
+              model: Optional[dict] = None) -> Dict[str, Any]:
+    """Layer-2 regime-GATING score. Returns 0-100 calibrated probability + full
+    decomposition. Flaw #2: F>0.5 is a HARD gate (score 0). Flaw #3: the regime
+    tilt GATES which input families count (not just an additive dim), so downtrend
+    flips selection toward the decoupled coin."""
+    m = model or get_active_wolf_model()
+    w = m.get("weights", WOLF_INTERIM["weights"])
+    T, M, R = sub.get("T", 0.0), sub.get("M", 0.0), sub.get("R", 0.0)
+    C, W, V = sub.get("C", 0.0), sub.get("W", 0.0), sub.get("V", 0.0)
+    X, F = sub.get("X", 0.0), sub.get("F", 0.0)
+
+    # Flaw #2 — friction hard gate.
+    if F > 0.5:
+        return {"score": 0.0, "pct": 0.0, "z": None, "hard_gate": "friction",
+                "regime_tilt": round(tilt, 4), "submetrics": sub,
+                "families": {"momentum": 0.0, "defensive": 0.0, "base": 0.0, "residual": 0.0},
+                "contributions": {}, "top_reasons": [{"feature": "F", "points": -999}],
+                "trained": bool(m.get("trained", False)), "version": m.get("version", "wolf-interim-v3")}
+
+    up = max(0.0, tilt)
+    dn = max(0.0, -tilt)
+    neutral = 1.0 - abs(tilt)
+
+    mom_core = w.get("wm_T", 1.6) * T + w.get("wm_M", 1.4) * M
+    def_core = w.get("wd_R", 1.8) * R + w.get("wd_W", 1.4) * W
+
+    momentum_family = (up + 0.5 * neutral) * mom_core
+    defensive_family = (dn + 0.5 * neutral) * def_core
+    base = (w.get("w_C", 1.1) * C + w.get("w_V", 0.7) * V
+            + w.get("w_X", 0.5) * X - w.get("w_F", 3.5) * F)
+    residual = 0.3 * def_core * up - 0.3 * mom_core * dn
+
+    z = w.get("b0", -1.0) + momentum_family + defensive_family + base + residual
+    p = _sigmoid(z)
+
+    contributions = {
+        "T": round(w.get("wm_T", 1.6) * T * (up + 0.5 * neutral), 3),
+        "M": round(w.get("wm_M", 1.4) * M * (up + 0.5 * neutral), 3),
+        "R": round(w.get("wd_R", 1.8) * R * (dn + 0.5 * neutral), 3),
+        "W": round(w.get("wd_W", 1.4) * W * (dn + 0.5 * neutral), 3),
+        "C": round(w.get("w_C", 1.1) * C, 3),
+        "V": round(w.get("w_V", 0.7) * V, 3),
+        "X": round(w.get("w_X", 0.5) * X, 3),
+        "F": round(-w.get("w_F", 3.5) * F, 3),
+    }
+    top = sorted(contributions.items(), key=lambda kv: abs(kv[1]), reverse=True)[:6]
+    return {
+        "score": round(p * 100.0, 1), "pct": round(p * 100.0, 1),
+        "probability": round(p, 4), "z": round(z, 4), "hard_gate": None,
+        "regime_tilt": round(tilt, 4),
+        "regime": "up" if tilt > 0.15 else "down" if tilt < -0.15 else "side",
+        "submetrics": {k: round(v, 4) for k, v in sub.items()},
+        "families": {"momentum": round(momentum_family, 3),
+                     "defensive": round(defensive_family, 3),
+                     "base": round(base, 3), "residual": round(residual, 3)},
+        "contributions": contributions,
+        "top_reasons": [{"feature": k, "points": v} for k, v in top],
+        "trained": bool(m.get("trained", False)),
+        "version": m.get("version", "wolf-interim-v3"),
+        "n_trades": int(m.get("n_trades", 0) or 0),
+    }
+
+
+def _wolf_derived_features(sub: Dict[str, float], tilt: float) -> List[float]:
+    """The regime-gating score is LINEAR in the 9 weights once each weight's gate
+    is folded into a derived feature. Order matches WOLF_WEIGHT_ORDER."""
+    up = max(0.0, tilt); dn = max(0.0, -tilt); neutral = 1.0 - abs(tilt)
+    T, M = sub.get("T", 0.0), sub.get("M", 0.0)
+    R, W = sub.get("R", 0.0), sub.get("W", 0.0)
+    gm = up + 0.5 * neutral       # momentum-family gate
+    gd = dn + 0.5 * neutral       # defensive-family gate
+    return [
+        T * (gm - 0.3 * dn),      # wm_T (also in −0.3·mom_core·dn)
+        M * (gm - 0.3 * dn),      # wm_M
+        R * (gd + 0.3 * up),      # wd_R (also in +0.3·def_core·up)
+        W * (gd + 0.3 * up),      # wd_W
+        sub.get("C", 0.0),        # w_C
+        sub.get("V", 0.0),        # w_V
+        sub.get("X", 0.0),        # w_X
+        -sub.get("F", 0.0),       # w_F (enters negatively)
+    ]
+
+
+WOLF_WEIGHT_ORDER = ["wm_T", "wm_M", "wd_R", "wd_W", "w_C", "w_V", "w_X", "w_F"]
+
+
+def train_wolfscore(samples: List[dict], min_clean: Optional[int] = None) -> Dict[str, Any]:
+    """Fit the 9 WolfScore weights via logistic regression on stored (submetrics,
+    regime_tilt, label) rows. Each sample: {"submetrics": {...}, "regime_tilt":
+    float, "label": 0/1}. Friction-gated samples (F>0.5) are dropped (they'd be
+    hard-rejected in production). Returns a wolfscore_v3 model version (NOT
+    activated) + a held-out calibration report."""
+    if min_clean is None:
+        min_clean = config_min_clean()
+    rows: List[Tuple[List[float], int]] = []
+    for s in samples or []:
+        if not isinstance(s, dict) or "label" not in s:
+            continue
+        sub = s.get("submetrics") if isinstance(s.get("submetrics"), dict) else None
+        if sub is None:
+            # tolerate rows that stored raw inputs → recompute submetrics
+            sub = compute_submetrics(s.get("features") or s.get("raw") or {}, s.get("cohort"))
+        if float(sub.get("F", 0.0)) > 0.5:
+            continue
+        tilt = float(s.get("regime_tilt", 0.0) or 0.0)
+        try:
+            label = 1 if int(s["label"]) > 0 else 0
+        except Exception:
+            continue
+        rows.append((_wolf_derived_features(sub, tilt), label))
+
+    n = len(rows)
+    if n < max(20, int(min_clean)):
+        return {"ok": False, "trained": False, "n": n, "min_clean": int(min_clean),
+                "error": f"insufficient clean samples ({n} < {min_clean})"}
+    cut = int(n * 0.8)
+    Xtr = [x for x, _ in rows[:cut]]; ytr = [y for _, y in rows[:cut]]
+    w, b = _fit_logistic(Xtr, ytr)
+    weights = {"b0": round(b, 6)}
+    for i, name in enumerate(WOLF_WEIGHT_ORDER):
+        weights[name] = round(w[i], 6)
+
+    def _calib(rws):
+        if not rws:
+            return {"n": 0}
+        correct = pos = 0; brier = 0.0
+        for x, lbl in rws:
+            p = _sigmoid(b + sum(w[i] * x[i] for i in range(len(x))))
+            brier += (p - lbl) ** 2
+            if (p >= 0.5) == (lbl == 1):
+                correct += 1
+            pos += lbl
+        k = len(rws)
+        return {"n": k, "accuracy": round(correct / k, 4),
+                "win_rate": round(pos / k, 4), "brier": round(brier / k, 4)}
+
+    model = {
+        "version": f"wolf-trained-{int(time.time())}", "kind": "wolfscore_v3",
+        "trained": True, "weights": weights, "n_trades": n,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+        "note": "fitted WolfScore v3 weights on live+paper outcomes",
+        "report": {"n_total": n, "n_train": cut, "n_test": n - cut,
+                   "in_sample": _calib(rows[:cut]), "held_out": _calib(rows[cut:])},
+    }
+    return {"ok": True, "trained": True, "model": model, "report": model["report"]}
+
+
+def adaptive_floor(scores: List[float], abs_floor: float = 55.0,
+                   mode: str = "p75", k: float = 0.5) -> Dict[str, Any]:
+    """The buy floor is regime-aware / percentile-based, not a static number.
+    A candidate must clear BOTH the absolute floor AND the distribution rule
+    (p75, or mean+k·stdev). In a downtrend where nothing decouples, even the best
+    score fails the absolute floor → hold cash; in recovery scores rise back over
+    it → re-engage automatically. Returns the effective threshold."""
+    vals = [float(s) for s in (scores or []) if s is not None]
+    dist_thr = abs_floor
+    if vals:
+        if mode == "meanstd":
+            mean = sum(vals) / len(vals)
+            var = sum((v - mean) ** 2 for v in vals) / max(1, len(vals) - 1)
+            dist_thr = mean + k * math.sqrt(var)
+        else:  # percentile (default p75)
+            try:
+                pct = float(mode[1:]) / 100.0 if mode.startswith("p") else 0.75
+            except Exception:
+                pct = 0.75
+            s = sorted(vals)
+            idx = min(len(s) - 1, max(0, int(round(pct * (len(s) - 1)))))
+            dist_thr = s[idx]
+    threshold = max(float(abs_floor), float(dist_thr))
+    return {"threshold": round(threshold, 2), "abs_floor": float(abs_floor),
+            "dist_threshold": round(dist_thr, 2), "mode": mode, "n": len(vals)}
+
+
 def model_status(min_clean: Optional[int] = None) -> Dict[str, Any]:
     """UI header: current model version, trained/untrained, progress toward the
     (configurable) clean-trade minimum below which the floor is display-only
