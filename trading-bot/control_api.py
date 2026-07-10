@@ -566,12 +566,13 @@ async def lifespan(app: FastAPI):
             #   Guarded by a stored rev marker so it runs exactly once.
             try:
                 import strategy_config as _scfg_s3
-                _S3_REV = 1
+                _S3_REV = 2
                 _raw_s3 = _load_strategy()
                 if int(_raw_s3.get("s3_tuning_rev", 0) or 0) < _S3_REV:
                     _ent = _raw_s3.get("entries") if isinstance(_raw_s3.get("entries"), dict) else {}
                     _dat = _raw_s3.get("data") if isinstance(_raw_s3.get("data"), dict) else {}
                     _ext = _raw_s3.get("exits") if isinstance(_raw_s3.get("exits"), dict) else {}
+                    _rgm = _raw_s3.get("regime") if isinstance(_raw_s3.get("regime"), dict) else {}
                     _s3_patch: dict = {}
 
                     def _s3_bump(block, blockname, key, oldval, newval, patch, *, is_float=False):
@@ -590,6 +591,9 @@ async def lifespan(app: FastAPI):
                     # S3-7 — R-multiple tuning (operator-approved): arm ratchet later + trail wider
                     _s3_bump(_ext, "exits", "ratchet_activate_r", 0.4, 0.8, _s3_patch, is_float=True)
                     _s3_bump(_ext, "exits", "ratchet_k_atr", 0.6, 1.0, _s3_patch, is_float=True)
+                    # S4-3.4 — neutral regime should keep the FULL ticket (slots), not
+                    # shrink it to $5.50 via the size multiplier (the recurring $5.50 bug).
+                    _s3_bump(_rgm, "regime", "neutral_scaling_mode", "auto", "slots", _s3_patch)
 
                     if _s3_patch:
                         _merged_s3, _errs_s3 = _scfg_s3.validate_patch(_raw_s3, _s3_patch)
@@ -8259,6 +8263,10 @@ def _run_ev_train_job(run_id: str):
                         "features":    feats,
                         "cohort":      feats.get("cohort"),
                         "label":       r.get("label"),
+                        # S4-1.2 / S4-2 — realized R drives the sample weight;
+                        # ts drives the temporal (oldest→newest) holdout split.
+                        "realized_r":  r.get("realized_r"),
+                        "ts":          r.get("ts"),
                     })
         except Exception:
             samples = []
