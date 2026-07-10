@@ -200,6 +200,11 @@ class DataConfig(BaseModel):
     paper_shadow_position_usdt:  float = Field(11.0, ge=1.0, le=100_000.0)
     paper_shadow_max_open:       int   = Field(300, ge=1, le=5000)
     paper_shadow_max_per_symbol: int   = Field(20, ge=1, le=500)
+    # Shadow-Lab evaluator cadence (seconds between paper cycles). Higher = less
+    # CPU (the flywheel manages up to max_open positions each cycle). Operator
+    # throttle to trade data-rate for headroom on a busy box. Floored at 3s in
+    # paper_shadow._loop_sec regardless of this value.
+    paper_shadow_loop_sec:       float = Field(8.0, ge=3.0, le=120.0)
     # Part S4.3 — minimum clean labeled trades before the EV win-probability model
     # is allowed to gate real buys (below this the floor is display-only/advisory).
     ev_min_clean_trades:         int  = Field(300, ge=20, le=100000)
@@ -561,6 +566,12 @@ SCHEMA: Dict[str, dict] = {
                                   "How many concurrent shadow positions one coin may hold (allows re-entry "
                                   "→ more outcomes per coin).",
                                   1, 500, 1, ""),
+    "data.paper_shadow_loop_sec": _meta("data.paper_shadow_loop_sec", "float", "Data",
+                                  "Shadow-Lab cycle cadence",
+                                  "Seconds between paper-shadow cycles. Higher = less CPU (each cycle "
+                                  "manages every open shadow position). Raise this for headroom on a "
+                                  "busy box; lower it for a faster data flywheel. Floored at 3s.",
+                                  3.0, 120.0, 1.0, "sec"),
     "data.ev_min_clean_trades": _meta("data.ev_min_clean_trades", "int", "Data",
                                   "EV model: min clean trades",
                                   "Minimum labeled trades before the win-probability model may gate real "
