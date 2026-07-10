@@ -8872,13 +8872,17 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # 1h regime tilt are computed ONCE per cycle and passed to every candidate.
     _entries_cfg_s2 = _entries_cfg()
     _ev_ranking_on   = bool(_entries_cfg_s2.get("ev_ranking_enabled", True))
-    _wolf_abs_floor  = float(_entries_cfg_s2.get("min_win_probability_floor", 55.0) or 55.0)
+    # THE buy gate (operator model): WolfScore ≥ buy_score_threshold (default 65).
+    # buy_score_threshold is canonical; min_win_probability_floor is the legacy
+    # alias kept for back-compat.
+    _wolf_abs_floor  = float(_entries_cfg_s2.get("buy_score_threshold",
+                             _entries_cfg_s2.get("min_win_probability_floor", 65.0)) or 65.0)
     _wolf_floor_k    = float(_entries_cfg_s2.get("ev_floor_meanstd_k", 0.5) or 0.5)
     try:
         _wolf_floor_mode = str((_load_strategy().get("entries") or {})
-                               .get("ev_floor_mode", "p75") or "p75")
+                               .get("ev_floor_mode", "absolute") or "absolute")
     except Exception:
-        _wolf_floor_mode = "p75"
+        _wolf_floor_mode = "absolute"
     _wolf_scores: Dict[str, dict] = {}
     _wolf_cohort: Dict[str, Any] = {}
     _wolf_tilt = 0.0

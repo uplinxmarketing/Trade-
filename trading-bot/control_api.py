@@ -566,7 +566,7 @@ async def lifespan(app: FastAPI):
             #   Guarded by a stored rev marker so it runs exactly once.
             try:
                 import strategy_config as _scfg_s3
-                _S3_REV = 4
+                _S3_REV = 5
                 _raw_s3 = _load_strategy()
                 if int(_raw_s3.get("s3_tuning_rev", 0) or 0) < _S3_REV:
                     _ent = _raw_s3.get("entries") if isinstance(_raw_s3.get("entries"), dict) else {}
@@ -606,20 +606,22 @@ async def lifespan(app: FastAPI):
                     # S4-3.4 — neutral regime should keep the FULL ticket (slots), not
                     # shrink it to $5.50 via the size multiplier (the recurring $5.50 bug).
                     _s3_bump(_rgm, "regime", "neutral_scaling_mode", "auto", "slots", _s3_patch)
-                    # ── Entry-gate un-stacking (buys weren't firing) ──────────────
-                    # Diagnosis: entries were over-gated. min_score=4 killed cached-
-                    # ready coins on the fresh re-check (they re-score 2-3), and the
-                    # v0.5.11 go-live added an untrained EV floor + up-regime veto ON
-                    # TOP. Un-stack so buys can fire; the trained model (when ready)
-                    # re-enables the floor legitimately via _ev_floor_active().
-                    _s3_bump(_ent, "entries", "min_score", 4, 3, _s3_patch)          # too high for the re-check
-                    _s3_bump(_ent, "entries", "confirm_seconds", 10.0, 3.0, _s3_patch, is_float=True)
-                    _s3_bump(_ent, "entries", "eval_heartbeat_sec", 15.0, 5.0, _s3_patch, is_float=True)
-                    # EV floor MUST NOT gate live while the model is untrained.
-                    _s3_force(_ent, "entries", "ev_floor_live_untrained", False, _s3_patch)
-                    # Undo the blanket up-regime veto (it blocked ALL up-regime buys);
-                    # the milder up_extension_veto still blocks pump-chasing.
-                    _s3_force(_ent, "entries", "live_up_regime_mode", "allow", _s3_patch)
+                    # ── Operator model: WolfScore ≥ 65 is THE single buy gate ─────
+                    # Forced (not conditional) so it applies regardless of the prior
+                    # over-stacked state. WolfScore ≥ buy_score_threshold gates;
+                    # highest-first ordering; the legacy signal-count gate is retired
+                    # (min_score/min_scored=0 → signal engine is VETO-ONLY); safety
+                    # vetoes stay. Freshness: fast heartbeat + short confirm.
+                    _s3_force(_ent, "entries", "min_score", 0, _s3_patch)                    # retire signal-count gate
+                    _s3_force(_ent, "entries", "buy_score_threshold", 65.0, _s3_patch)       # THE gate
+                    _s3_force(_ent, "entries", "min_win_probability_floor", 65.0, _s3_patch) # legacy alias = 65
+                    _s3_force(_ent, "entries", "ev_floor_mode", "absolute", _s3_patch)       # not percentile
+                    _s3_force(_ent, "entries", "ev_floor_live_untrained", True, _s3_patch)   # gate on interim (operator choice)
+                    _s3_force(_ent, "entries", "ev_ranking_enabled", True, _s3_patch)        # highest-first
+                    _s3_force(_ent, "entries", "live_up_regime_mode", "allow", _s3_patch)    # regime not a score gate
+                    _s3_force(_ent, "entries", "confirm_seconds", 3.0, _s3_patch)            # freshness
+                    _s3_force(_ent, "entries", "eval_heartbeat_sec", 5.0, _s3_patch)         # freshness
+                    _s3_force(_ent, "entries", "instant_fire_when_slots_free", True, _s3_patch)
 
                     if _s3_patch:
                         _merged_s3, _errs_s3 = _scfg_s3.validate_patch(_raw_s3, _s3_patch)
@@ -4010,6 +4012,8 @@ def api_diag_entry_report():
 
         out["effective_gates"] = {
             "trading_active":               strat.get("trading_active"),
+            "buy_score_threshold":          ent.get("buy_score_threshold",
+                                                    ent.get("min_win_probability_floor")),
             "min_score":                    ent.get("min_score", strat.get("min_signals")),
             "signal_engine_min_scored":     se.get("min_scored"),
             "min_win_probability":          ent.get("min_win_probability"),
@@ -4037,8 +4041,15 @@ def api_diag_entry_report():
             trace = _te.get_decision_trace() or {}
         except Exception:
             trace = {}
+        # Signal freshness (G2): age of the cached signal each coin is acting on.
+        try:
+            with _te._signal_cache_lock:
+                _cache_ts = {k: (v or {}).get("ts", 0) for k, v in _te._signal_cache.items()}
+        except Exception:
+            _cache_ts = {}
         per_coin = []
         silent = 0
+        stale = 0
         agg: dict = {}
         for sym, t in trace.items():
             if not isinstance(t, dict):
@@ -4056,14 +4067,19 @@ def api_diag_entry_report():
             else:
                 _bucket = _reason
             agg[_bucket] = agg.get(_bucket, 0) + 1
+            _sig_ts = _cache_ts.get(sym) or 0
+            _sig_age = round(now - _sig_ts, 1) if _sig_ts else None
+            if _sig_age is not None and _sig_age > 10:
+                stale += 1
             per_coin.append({
                 "symbol":            sym,
-                "cached_green":      t.get("cached_green"),
-                "engine_ready":      t.get("engine_ready"),
                 "wolfscore":         _sc.get("pct"),
+                "eligible_ge_65":    (_sc.get("pct") is not None
+                                      and _sc.get("pct") >= (out["effective_gates"]["buy_score_threshold"] or 65)),
                 "regime":            _sc.get("regime"),
                 "hard_gate":         _sc.get("hard_gate"),
                 "blocked_at":        _reason,
+                "signal_age_sec":    _sig_age,   # G2: freshness of the data acted on
                 "block_age_sec":     round(now - t["last_block_ts"], 1) if t.get("last_block_ts") else None,
                 "attempt_age_sec":   _attempt_age,
                 "evaluated_age_sec": round(now - t["last_evaluated_ts"], 1) if t.get("last_evaluated_ts") else None,
@@ -4071,6 +4087,7 @@ def api_diag_entry_report():
         per_coin.sort(key=lambda c: (c["wolfscore"] is None, -(c["wolfscore"] or 0)))
         out["buy_ready_count"] = len(per_coin)
         out["silent_gap_count"] = silent
+        out["stale_signal_count_gt10s"] = stale
         out["blockers_summary"] = dict(sorted(agg.items(), key=lambda kv: -kv[1]))
         out["per_coin"] = per_coin[:50]
         return out

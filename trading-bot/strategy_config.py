@@ -52,7 +52,11 @@ class SizingConfig(BaseModel):
 
 class EntriesConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    min_score:              int   = Field(3, ge=1, le=10)
+    # Operator model: WolfScore is THE buy gate (see buy_score_threshold). The
+    # legacy "N of M signals" score gate is RETIRED — min_score/min_scored=0 makes
+    # the signal engine VETO-ONLY (signals still compute + feed WolfScore's
+    # sub-metrics, but the count no longer blocks a buy). ge=0 allows the retire.
+    min_score:              int   = Field(0, ge=0, le=10)
     maker_first:            bool  = True
     chase_seconds:          float = Field(3.0, ge=1.0, le=30.0)
     max_reposts:            int   = Field(3, ge=0, le=10)
@@ -110,7 +114,12 @@ class EntriesConfig(BaseModel):
     # mean+k·stdev). In a downtrend where nothing decouples the best score fails the
     # floor → hold cash; in recovery scores rise back over it → re-engage. Both are
     # ignored (display-only) until the model is trained on ≥ ev_min_clean_trades.
-    min_win_probability_floor: float = Field(55.0, ge=0.0, le=100.0)
+    min_win_probability_floor: float = Field(65.0, ge=0.0, le=100.0)
+    # THE single buy gate (operator model): a coin is buy-eligible iff its
+    # WolfScore ≥ this. Default 65 (more selective than the paper-proven 55 cliff —
+    # conservative on interim weights, by the operator's choice). UI-tunable. When
+    # set, it is the WolfScore floor threshold (overrides min_win_probability_floor).
+    buy_score_threshold:    float = Field(65.0, ge=0.0, le=100.0)
     # S3-1 — default is now 'absolute': the buy floor is the static abs_floor (55,
     # the cliff the paper data revealed) regardless of the live distribution, so a
     # high scorer fires even in a strong field and sub-55 junk is cut in a weak one.
@@ -434,10 +443,17 @@ SCHEMA: Dict[str, dict] = {
                                          "Only buy if modeled P(win) ≥ this (0-1). Smarter replacement for "
                                          "min_score. Ignored until the model is trained. 0 = floor off.",
                                          0.0, 1.0, 0.01, ""),
+    "entries.buy_score_threshold": _meta("entries.buy_score_threshold", "float", "Entries",
+                                         "WolfScore buy gate (≥)",
+                                         "THE buy gate: a coin is eligible iff its WolfScore ≥ this (default 65). "
+                                         "Highest-scoring eligible coin buys first. This is the single selection "
+                                         "gate — the legacy signal-count gate is retired. On interim (untrained) "
+                                         "weights by operator choice; re-confirm from calibrated scores once trained.",
+                                         0.0, 100.0, 1.0, ""),
     "entries.min_win_probability_floor": _meta("entries.min_win_probability_floor", "float", "Entries",
-                                         "WolfScore absolute floor",
-                                         "Absolute WolfScore (0-100) a coin must clear to be bought — the "
-                                         "safety net so nothing terrible is bought. Ignored until trained.",
+                                         "WolfScore absolute floor (legacy)",
+                                         "Legacy alias of the WolfScore gate — kept for back-compat; "
+                                         "buy_score_threshold overrides it. Set both to the same value.",
                                          0.0, 100.0, 1.0, ""),
     "entries.ev_floor_mode": _meta("entries.ev_floor_mode", "enum", "Entries",
                                          "WolfScore floor distribution rule",
