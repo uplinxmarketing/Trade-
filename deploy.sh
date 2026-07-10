@@ -4,13 +4,17 @@
 set -e
 cd "$(dirname "$0")"
 
-echo "── Pulling latest main…"
-# The build step below regenerates tracked artifacts (dist/, public/version.json),
-# which leaves the working tree dirty and makes the next `git pull` abort with
-# "local changes would be overwritten". Discard those regenerated artifacts before
-# pulling so the pull always applies cleanly — they are rebuilt again below.
-git checkout -- dist public/version.json 2>/dev/null || true
-git pull origin main
+echo "── Fetching latest main…"
+# This is a deploy MIRROR: the source of truth is GitHub `main`. `git pull` was
+# fragile — the build step regenerates tracked artifacts (dist/, version.json) and
+# any earlier non-fast-forward pull left a local merge commit, after which every
+# pull aborts with "divergent branches / local changes would be overwritten".
+# Fetch + hard-reset makes the working tree EXACTLY origin/main every time, so it
+# can never diverge. Gitignored runtime state (data/bot.db, strategy.json, venv,
+# node_modules) is untouched by reset.
+git fetch origin main
+git reset --hard origin/main
+git clean -fd dist public 2>/dev/null || true
 
 # Rebuild the frontend bundle from source so the served dist/ always matches the
 # committed code (avoids the white-screen trap where index.html references a
