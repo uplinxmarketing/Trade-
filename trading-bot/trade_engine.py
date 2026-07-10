@@ -8914,7 +8914,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # win, −1.00R). Until a trained model proves it fixed, live entries in the up
     # regime are vetoed (mode='veto') or held to a higher score (mode='min_score').
     # Paper-shadow is UNAFFECTED (it keeps sampling every regime for training).
-    _live_up_mode = str(_entries_cfg_s2.get("live_up_regime_mode", "veto") or "veto")
+    _live_up_mode = str(_entries_cfg_s2.get("live_up_regime_mode", "allow") or "allow")
     _live_up_min_pct = float(_entries_cfg_s2.get("live_up_regime_min_pct", 70.0) or 70.0)
     if _ev_ranking_on and _wolf_scores:
         # Eligible candidates first, DESCENDING WolfScore pct, ties by DESCENDING

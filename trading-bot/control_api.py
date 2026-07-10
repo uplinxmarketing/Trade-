@@ -566,7 +566,7 @@ async def lifespan(app: FastAPI):
             #   Guarded by a stored rev marker so it runs exactly once.
             try:
                 import strategy_config as _scfg_s3
-                _S3_REV = 3
+                _S3_REV = 4
                 _raw_s3 = _load_strategy()
                 if int(_raw_s3.get("s3_tuning_rev", 0) or 0) < _S3_REV:
                     _ent = _raw_s3.get("entries") if isinstance(_raw_s3.get("entries"), dict) else {}
@@ -590,6 +590,12 @@ async def lifespan(app: FastAPI):
                         if key not in block:
                             patch.setdefault(blockname, {})[key] = value
 
+                    def _s3_force(block, blockname, key, value, patch):
+                        # Force a value regardless of present/absent (used to UNDO
+                        # over-stacked entry gates so buys can fire).
+                        if block.get(key) != value:
+                            patch.setdefault(blockname, {})[key] = value
+
                     # S3-1 — floor mode p75 → absolute (the 55 cliff, distribution-independent)
                     _s3_bump(_ent, "entries", "ev_floor_mode", "p75", "absolute", _s3_patch)
                     # S3-4 — paper-shadow load: 300 → 100 concurrent (same signal, ~1/3 load)
@@ -600,13 +606,20 @@ async def lifespan(app: FastAPI):
                     # S4-3.4 — neutral regime should keep the FULL ticket (slots), not
                     # shrink it to $5.50 via the size multiplier (the recurring $5.50 bug).
                     _s3_bump(_rgm, "regime", "neutral_scaling_mode", "auto", "slots", _s3_patch)
-                    # Go-live (proven slice): drop the legacy pre-gate 4→3 (biggest live
-                    # trade-count unlock), gate live at the ≥55 cliff even untrained, and
-                    # persist the up-regime veto. All three are exactly what the operator
-                    # approved for the evidence-backed go-live.
-                    _s3_bump(_ent, "entries", "min_score", 4, 3, _s3_patch)
-                    _s3_set(_ent, "entries", "ev_floor_live_untrained", True, _s3_patch)
-                    _s3_set(_ent, "entries", "live_up_regime_mode", "veto", _s3_patch)
+                    # ── Entry-gate un-stacking (buys weren't firing) ──────────────
+                    # Diagnosis: entries were over-gated. min_score=4 killed cached-
+                    # ready coins on the fresh re-check (they re-score 2-3), and the
+                    # v0.5.11 go-live added an untrained EV floor + up-regime veto ON
+                    # TOP. Un-stack so buys can fire; the trained model (when ready)
+                    # re-enables the floor legitimately via _ev_floor_active().
+                    _s3_bump(_ent, "entries", "min_score", 4, 3, _s3_patch)          # too high for the re-check
+                    _s3_bump(_ent, "entries", "confirm_seconds", 10.0, 3.0, _s3_patch, is_float=True)
+                    _s3_bump(_ent, "entries", "eval_heartbeat_sec", 15.0, 5.0, _s3_patch, is_float=True)
+                    # EV floor MUST NOT gate live while the model is untrained.
+                    _s3_force(_ent, "entries", "ev_floor_live_untrained", False, _s3_patch)
+                    # Undo the blanket up-regime veto (it blocked ALL up-regime buys);
+                    # the milder up_extension_veto still blocks pump-chasing.
+                    _s3_force(_ent, "entries", "live_up_regime_mode", "allow", _s3_patch)
 
                     if _s3_patch:
                         _merged_s3, _errs_s3 = _scfg_s3.validate_patch(_raw_s3, _s3_patch)
@@ -3946,6 +3959,123 @@ def api_diag_coin_trace(symbol: str, hours: float = 1.0):
         return _sr.get_coin_trace(symbol.upper(), hours)
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/api/diagnostics/entry-report")
+def api_diag_entry_report():
+    """One-shot 'why aren't buys firing?' report. Shows, in ONE place:
+      * effective_gates — the entry-gate config ACTUALLY in effect right now
+        (min_score, EV floor + whether it is GATING LIVE despite trained=False,
+        up-regime restriction, confirm_seconds, heartbeat, slots, open positions);
+      * per_coin — every currently buy-ready coin with its WolfScore, regime, and
+        the exact stage that blocked it (last_block_reason) + how long ago;
+      * blockers_summary — the reason histogram (which single gate kills the most);
+      * silent_gap_count — buy-ready coins with NO block reason and NO attempt
+        (a true silent drop = a bug).
+    Read-only; never 500s."""
+    import trade_engine as _te
+    out: dict = {}
+    try:
+        strat = _load_strategy() or {}
+        ent = strat.get("entries") if isinstance(strat.get("entries"), dict) else {}
+        se = strat.get("signal_engine") if isinstance(strat.get("signal_engine"), dict) else {}
+
+        ev_trained = False
+        try:
+            import ev_model as _ev
+            ev_trained = bool((_ev.model_status() or {}).get("trained"))
+        except Exception:
+            pass
+        try:
+            _ev_active = bool(_te._ev_floor_active())
+        except Exception:
+            _ev_active = None
+        ev_floor_live_untrained = bool(ent.get("ev_floor_live_untrained", False))
+        ev_floor_gating_live = bool(_ev_active or ev_floor_live_untrained)
+
+        regime = {}
+        floor = {}
+        scores = {}
+        try:
+            scores = _te.get_live_ev_scores() or {}
+            meta = scores.get("__meta__") or {}
+            regime = {"regime": meta.get("regime"), "tilt": meta.get("regime_tilt")}
+            floor = meta.get("adaptive_floor") or {}
+        except Exception:
+            pass
+        try:
+            open_pos = len(_te.get_open_positions() or [])
+        except Exception:
+            open_pos = None
+
+        out["effective_gates"] = {
+            "trading_active":               strat.get("trading_active"),
+            "min_score":                    ent.get("min_score", strat.get("min_signals")),
+            "signal_engine_min_scored":     se.get("min_scored"),
+            "min_win_probability":          ent.get("min_win_probability"),
+            "min_win_probability_floor":    ent.get("min_win_probability_floor"),
+            "ev_floor_mode":                ent.get("ev_floor_mode"),
+            "ev_ranking_enabled":           ent.get("ev_ranking_enabled"),
+            "ev_model_trained":             ev_trained,
+            "ev_floor_live_untrained":      ev_floor_live_untrained,
+            # THE answer to "is the EV floor blocking live even though untrained?":
+            "ev_floor_GATING_LIVE":         ev_floor_gating_live,
+            "ev_floor_threshold":           floor.get("threshold"),
+            "live_up_regime_mode":          ent.get("live_up_regime_mode", "veto"),
+            "up_extension_veto":            ent.get("up_extension_veto", True),
+            "current_regime":               regime,
+            "confirm_seconds":              ent.get("confirm_seconds"),
+            "eval_heartbeat_sec":           ent.get("eval_heartbeat_sec"),
+            "instant_fire_when_slots_free": ent.get("instant_fire_when_slots_free"),
+            "max_positions":                strat.get("max_positions")
+                                            or (strat.get("sizing") or {}).get("max_positions"),
+            "open_positions":               open_pos,
+        }
+
+        now = time.time()
+        try:
+            trace = _te.get_decision_trace() or {}
+        except Exception:
+            trace = {}
+        per_coin = []
+        silent = 0
+        agg: dict = {}
+        for sym, t in trace.items():
+            if not isinstance(t, dict):
+                continue
+            if not (t.get("cached_green") or t.get("engine_ready")):
+                continue  # only buy-ready coins
+            _sc = scores.get(sym) or {}
+            _attempt_age = round(now - t["last_attempt_ts"], 1) if t.get("last_attempt_ts") else None
+            _reason = t.get("last_block_reason")
+            if _reason is None and _attempt_age is None:
+                _bucket = "SILENT_GAP(no reason, no attempt)"
+                silent += 1
+            elif _reason is None:
+                _bucket = "ORDER_ATTEMPTED"
+            else:
+                _bucket = _reason
+            agg[_bucket] = agg.get(_bucket, 0) + 1
+            per_coin.append({
+                "symbol":            sym,
+                "cached_green":      t.get("cached_green"),
+                "engine_ready":      t.get("engine_ready"),
+                "wolfscore":         _sc.get("pct"),
+                "regime":            _sc.get("regime"),
+                "hard_gate":         _sc.get("hard_gate"),
+                "blocked_at":        _reason,
+                "block_age_sec":     round(now - t["last_block_ts"], 1) if t.get("last_block_ts") else None,
+                "attempt_age_sec":   _attempt_age,
+                "evaluated_age_sec": round(now - t["last_evaluated_ts"], 1) if t.get("last_evaluated_ts") else None,
+            })
+        per_coin.sort(key=lambda c: (c["wolfscore"] is None, -(c["wolfscore"] or 0)))
+        out["buy_ready_count"] = len(per_coin)
+        out["silent_gap_count"] = silent
+        out["blockers_summary"] = dict(sorted(agg.items(), key=lambda kv: -kv[1]))
+        out["per_coin"] = per_coin[:50]
+        return out
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 @app.get("/api/diagnostics/signal-win-rates")
