@@ -5287,8 +5287,10 @@ def api_diagnostics_bundle(
             parts = []
             for k, v in by_rg.items():
                 if isinstance(v, dict):
+                    _avgr = v.get("avg_r", v.get("expectancy_r"))
+                    _wr = v.get("win_rate")
                     parts.append(f"{k}(n={v.get('n', v.get('count'))},"
-                                 f"ev_r={v.get('expectancy_r')})")
+                                 f"wr={_wr},avg_r={_avgr})")
                 else:
                     parts.append(f"{k}={v}")
             out.write("  by_regime: " + " ".join(parts) + "\n")
