@@ -4532,6 +4532,15 @@ def api_diagnostics():
     wh = _dc._ws_health
     last_msg_age = round(now - wh["last_message_ts"], 1) if wh["last_message_ts"] else None
 
+    # Binance connectivity for the UI status dot. In WS-first mode the bot makes
+    # very FEW REST calls, so "no REST call in 30s" is NORMAL — not an outage. A
+    # raw last_rest_age<30 check therefore flapped the "connected/off" indicator on
+    # and off. Binance is reachable when REST is recent OR the WebSocket is
+    # streaming fresh data; it only reads disconnected when BOTH paths are cold.
+    _rest_recent = last_rest_age is not None and last_rest_age < 30
+    _ws_streaming = bool(wh.get("connected")) and (last_msg_age is not None and last_msg_age < 30)
+    _binance_ok = bool(_rest_recent or _ws_streaming)
+
     ssh = dict(_te._signal_scanner_health)   # defensive copy — scanner thread mutates it live
     last_scan_age = round(now - ssh.get("last_refresh_ts", 0.0), 1) if ssh.get("last_refresh_ts") else None
     # Effective interval (actual pacing, incl. adaptive stretch) — falls back to
@@ -4571,7 +4580,11 @@ def api_diagnostics():
         "server_time": now,
         "health": _health_compact,
         "binance": {
-            "rest_ok":            last_rest_age is not None and last_rest_age < 30,
+            # rest_ok now means "Binance reachable" (REST recent OR WS streaming),
+            # so it no longer flaps off during normal WS-first idle between REST
+            # calls. rest_recent keeps the strict REST-only signal for detail.
+            "rest_ok":            _binance_ok,
+            "rest_recent":        _rest_recent,
             "last_rest_age_sec":  last_rest_age,
             "last_latency_ms":    bh["last_rest_latency_ms"],
             "used_weight_1m":     bh["used_weight_1m"],
