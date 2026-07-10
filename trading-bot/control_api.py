@@ -5296,6 +5296,25 @@ def api_diagnostics_bundle(
             out.write("  by_regime: " + " ".join(parts) + "\n")
         else:
             out.write("  by_regime: (none)\n")
+        # S3-1 — the WolfScore cliff: win-rate by score bucket. This is the "before/
+        # after 55-floor" verification — ≥55 buckets should win materially more than
+        # <55. Printed here so the lift is auditable straight from the bundle.
+        by_sb = sm.get("by_score_bucket")
+        if isinstance(by_sb, dict) and by_sb:
+            parts = []
+            for k in ("0-40", "40-55", "55-70", "70-100"):
+                v = by_sb.get(k)
+                if isinstance(v, dict):
+                    parts.append(f"{k}(n={v.get('n')},wr={v.get('win_rate')},"
+                                 f"avg_r={v.get('avg_r')})")
+            # include any buckets outside the canonical four, just in case
+            for k, v in by_sb.items():
+                if k not in ("0-40", "40-55", "55-70", "70-100") and isinstance(v, dict):
+                    parts.append(f"{k}(n={v.get('n')},wr={v.get('win_rate')},"
+                                 f"avg_r={v.get('avg_r')})")
+            out.write("  by_score_bucket: " + " ".join(parts) + "\n")
+        else:
+            out.write("  by_score_bucket: (none)\n")
     safe(_shadow_bundle, "shadow_lab")
 
     # -- Config snapshot ----------------------------------------------------------

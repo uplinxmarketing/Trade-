@@ -2028,12 +2028,21 @@ def _wolf_score_cached(sym: str, cached: dict, cohort: dict, tilt: float) -> Opt
     """Guarded WolfScore v3 for a signal-cache entry:
     compute_submetrics → wolfscore. Returns the full decomposition dict
     (pct, submetrics, families, regime, regime_tilt, hard_gate, top_reasons,
-    trained, version) or None on any failure / when ev_model is unavailable."""
+    trained, version) or None on any failure / when ev_model is unavailable.
+    S3-2 — the up-regime anti-chasing veto/threshold are read from entries config
+    and applied inside wolfscore (extended-uptrend coins hard-gate)."""
     if ev_model is None:
         return None
     try:
+        _ec = _entries_cfg()
+        _veto = bool(_ec.get("up_extension_veto", True))
+        _wthr = float(_ec.get("up_extension_w_thr", 0.0) or 0.0)
+    except Exception:
+        _veto, _wthr = True, 0.0
+    try:
         sub = ev_model.compute_submetrics(_wolf_inputs(sym, cached), cohort or {})
-        return ev_model.wolfscore(sub, float(tilt or 0.0))
+        return ev_model.wolfscore(sub, float(tilt or 0.0),
+                                  up_extension_veto=_veto, up_extension_w_thr=_wthr)
     except Exception:
         return None
 
@@ -9036,6 +9045,15 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     _record_rejection(sym, cached.get("score", 0),
                                       "high_friction", "WolfScore friction >50% of stop")
                     _trace_mark_block(sym, "blocked: friction >50% of stop")
+                    continue
+                # 1b) S3-2 up-regime anti-chasing hard gate — a RULE (not a model
+                # probability), so it is authoritative immediately, independent of
+                # the trained/clean-trade guardrail. Operator-toggleable via
+                # entries.up_extension_veto (when off, no such gate is produced).
+                if _ws_here.get("hard_gate") == "extended_uptrend":
+                    _record_rejection(sym, cached.get("score", 0),
+                                      "up_extension", "extended vs VWAP in uptrend (anti-chase)")
+                    _trace_mark_block(sym, "blocked: extended vs VWAP in uptrend")
                     continue
                 # 2) Adaptive floor over this pass's WolfScore distribution.
                 _pct_here = float(_ws_here.get("pct", 0.0) or 0.0)

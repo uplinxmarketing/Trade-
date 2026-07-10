@@ -105,8 +105,18 @@ class EntriesConfig(BaseModel):
     # floor → hold cash; in recovery scores rise back over it → re-engage. Both are
     # ignored (display-only) until the model is trained on ≥ ev_min_clean_trades.
     min_win_probability_floor: float = Field(55.0, ge=0.0, le=100.0)
-    ev_floor_mode:          Literal["p75", "p60", "p90", "meanstd", "off"] = "p75"
+    # S3-1 — default is now 'absolute': the buy floor is the static abs_floor (55,
+    # the cliff the paper data revealed) regardless of the live distribution, so a
+    # high scorer fires even in a strong field and sub-55 junk is cut in a weak one.
+    # 'p75'/'meanstd' can only RAISE the bar above 55; 'off' disables it.
+    ev_floor_mode:          Literal["absolute", "p75", "p60", "p90", "meanstd", "off"] = "absolute"
     ev_floor_meanstd_k:     float = Field(0.5, ge=0.0, le=3.0)
+    # S3-2 — up-regime anti-chasing hard veto. In a clear uptrend (regime tilt>0.15)
+    # block coins that have run too far from VWAP (WolfScore W ≤ threshold) — the
+    # pump-chase that reverses (paper data: uptrend win-rate 15%). Toggle off to
+    # rely purely on the learned wu_W weight once a model is trained.
+    up_extension_veto:      bool  = True
+    up_extension_w_thr:     float = Field(0.0, ge=-1.0, le=1.0)
 
 
 class ExitsConfig(BaseModel):
@@ -198,7 +208,10 @@ class DataConfig(BaseModel):
     # bounded (open positions capped; outcomes persist to a capped DB table).
     paper_shadow_budget_usdt:    float = Field(10000.0, ge=0.0, le=10_000_000.0)
     paper_shadow_position_usdt:  float = Field(11.0, ge=1.0, le=100_000.0)
-    paper_shadow_max_open:       int   = Field(300, ge=1, le=5000)
+    # S3-4 — default lowered 300→100: the win-rate/bucket signal is already clean
+    # at n>1600, and 100 concurrent gives the same statistical picture at ~1/3 the
+    # per-cycle CPU/memory load. Raise it for a faster flywheel if the box has room.
+    paper_shadow_max_open:       int   = Field(100, ge=1, le=5000)
     paper_shadow_max_per_symbol: int   = Field(20, ge=1, le=500)
     # Shadow-Lab evaluator cadence (seconds between paper cycles). Higher = less
     # CPU (the flywheel manages up to max_open positions each cycle). Operator
@@ -400,13 +413,24 @@ SCHEMA: Dict[str, dict] = {
                                          0.0, 100.0, 1.0, ""),
     "entries.ev_floor_mode": _meta("entries.ev_floor_mode", "enum", "Entries",
                                          "WolfScore floor distribution rule",
-                                         "Percentile of live candidate scores the top coin must also clear "
-                                         "(p75), or mean+k·stdev, or off (absolute floor only).",
-                                         choices=["p75", "p60", "p90", "meanstd", "off"]),
+                                         "absolute = the static floor only (55, the paper-data cliff) — a high "
+                                         "scorer fires even in a strong field. p75/meanstd can only RAISE the bar "
+                                         "above 55. off disables the floor.",
+                                         choices=["absolute", "p75", "p60", "p90", "meanstd", "off"]),
     "entries.ev_floor_meanstd_k": _meta("entries.ev_floor_meanstd_k", "float", "Entries",
                                          "WolfScore floor mean+k·stdev",
                                          "k for the mean+k·stdev distribution rule (when ev_floor_mode=meanstd).",
                                          0.0, 3.0, 0.1, ""),
+    "entries.up_extension_veto": _meta("entries.up_extension_veto", "bool", "Entries",
+                                         "Up-regime anti-chasing veto",
+                                         "In a clear uptrend, hard-block coins that have run too far from VWAP "
+                                         "(WolfScore W ≤ threshold) — the pump-chase that reverses (paper: uptrend "
+                                         "win-rate 15%). Turn off to rely only on the learned wu_W weight."),
+    "entries.up_extension_w_thr": _meta("entries.up_extension_w_thr", "float", "Entries",
+                                         "Up-regime extension W threshold",
+                                         "WolfScore W at/below which an up-regime coin is vetoed as extended. "
+                                         "0 = at/above VWAP required; more negative = allow more extension.",
+                                         -1.0, 1.0, 0.05, ""),
 
     # ── Exits ─────────────────────────────────────────────────────────────
     "exits.k_sl": _meta("exits.k_sl", "float", "Exits", "SL ATR multiple (k_sl)",
