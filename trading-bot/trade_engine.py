@@ -6584,16 +6584,62 @@ def _check_rss_soft_cap(rss_kb: int) -> None:
     os._exit(0)
 
 
-def _sample_rss() -> None:
-    """M2 — sample process RSS (ru_maxrss, KB on Linux) into the rolling history,
-    updating _last_rss_kb / _rss_peak_kb, and WARN on sustained growth across the
-    window (> 1.5× the first sample AND > 500 MB). Never raises."""
-    global _last_rss_kb, _rss_peak_kb, _last_rss_warn_ts
-    if _resource is None:
-        return
+# S-gate — the Python leaks are fixed (tracemalloc-tracked allocations dropped
+# ~40×); the residual RSS climb is NATIVE (invisible to tracemalloc) — glibc
+# malloc fragmentation from sustained JSON-parse + candle churn that free() never
+# returns to the OS. malloc_trim(0) forces glibc to release freed pages. We call
+# it on a timer and log how much it reclaims so fragmentation is provable.
+_libc_for_trim = None
+_last_malloc_trim_ts: float = 0.0
+_MALLOC_TRIM_INTERVAL_SEC: float = 180.0
+
+
+def _read_current_rss_kb() -> int:
+    """CURRENT resident set (KB), not the monotonic ru_maxrss peak — so a
+    malloc_trim reclaim is actually visible and the soft cap tracks real usage.
+    /proc/self/statm field 2 = resident pages. Falls back to ru_maxrss."""
     try:
-        kb = int(_resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss)
+        with open("/proc/self/statm") as _f:
+            resident_pages = int(_f.read().split()[1])
+        return resident_pages * (os.sysconf("SC_PAGE_SIZE") // 1024)
     except Exception:
+        try:
+            return int(_resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss)
+        except Exception:
+            return 0
+
+
+def _maybe_malloc_trim(rss_kb_before: int) -> None:
+    """Every ~3 min, ask glibc to return freed heap pages to the OS (Linux only).
+    Logs the reclaim so a native-fragmentation leak is diagnosable. Never raises."""
+    global _libc_for_trim, _last_malloc_trim_ts
+    now = time.time()
+    if now - _last_malloc_trim_ts < _MALLOC_TRIM_INTERVAL_SEC:
+        return
+    _last_malloc_trim_ts = now
+    try:
+        if _libc_for_trim is None:
+            import ctypes as _ct
+            _libc_for_trim = _ct.CDLL("libc.so.6", use_errno=False)
+        _libc_for_trim.malloc_trim(0)
+        after = _read_current_rss_kb()
+        reclaimed = rss_kb_before - after
+        if reclaimed > 20_000:  # >20 MB returned to OS → fragmentation confirmed
+            database.log_activity(
+                f"MEMORY: malloc_trim reclaimed {reclaimed // 1024} MB "
+                f"({rss_kb_before // 1024}→{after // 1024} MB) — glibc fragmentation, "
+                f"not a Python leak.", "info")
+    except Exception:
+        pass
+
+
+def _sample_rss() -> None:
+    """M2 — sample CURRENT process RSS (KB) into the rolling history, update
+    _last_rss_kb / _rss_peak_kb, WARN on sustained growth, and periodically
+    malloc_trim to release glibc-fragmented native memory. Never raises."""
+    global _last_rss_kb, _rss_peak_kb, _last_rss_warn_ts
+    kb = _read_current_rss_kb()
+    if kb <= 0:
         return
     now = time.time()
     warn = False
@@ -6622,8 +6668,12 @@ def _sample_rss() -> None:
                 "warn")
         except Exception:
             pass
+    # Release glibc-fragmented native memory before the soft-cap check, so a
+    # reclaimable spike doesn't needlessly trigger a restart.
+    _maybe_malloc_trim(kb)
     # R4 — soft-cap guardrail (safety net): runs every sample; may os._exit(0).
-    _check_rss_soft_cap(kb)
+    # Re-read current RSS post-trim so the cap reflects reclaimed memory.
+    _check_rss_soft_cap(_read_current_rss_kb())
 
 
 def _read_tracemalloc_pre_restart():
