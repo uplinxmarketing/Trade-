@@ -152,6 +152,21 @@ _cache: Dict[str, Any] = {"ts": 0.0, "model": None}
 _CACHE_TTL = 10.0
 
 
+def config_min_clean(default: int = _MIN_CLEAN_TRADES_DEFAULT) -> int:
+    """S4.3 — the clean-trade guardrail is operator-configurable via
+    data.ev_min_clean_trades (falls back to 300). Read defensively from the live
+    strategy file so a UI change takes effect without a restart."""
+    try:
+        import config as _cfg
+        import json as _j
+        with open(_cfg.STRATEGY_FILE) as _f:
+            data = (_j.load(_f) or {}).get("data") or {}
+        v = int(data.get("ev_min_clean_trades", default))
+        return max(20, v)
+    except Exception:
+        return int(default)
+
+
 def _sigmoid(x: float) -> float:
     if x >= 0:
         z = math.exp(-x)
@@ -268,7 +283,7 @@ def _fit_logistic(X: List[List[float]], y: List[int],
     return w, b
 
 
-def train(samples: List[dict], min_clean: int = _MIN_CLEAN_TRADES_DEFAULT
+def train(samples: List[dict], min_clean: Optional[int] = None
           ) -> Dict[str, Any]:
     """Fit a NEW weight-version on labeled samples. Does NOT activate it.
     Each sample: {"features": {...}} or {"raw": {...}} plus "label" in {0,1}
@@ -288,6 +303,8 @@ def train(samples: List[dict], min_clean: int = _MIN_CLEAN_TRADES_DEFAULT
             continue
         rows.append((feats, label))
 
+    if min_clean is None:
+        min_clean = config_min_clean()
     n = len(rows)
     if n < max(20, int(min_clean)):
         return {"ok": False, "trained": False, "n": n, "min_clean": int(min_clean),
@@ -412,9 +429,22 @@ def activate_version(version_id: str, actor: str = "operator") -> Dict[str, Any]
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
-def model_status(min_clean: int = _MIN_CLEAN_TRADES_DEFAULT) -> Dict[str, Any]:
-    """UI header: current model version, trained/untrained, and progress toward
-    the clean-trade minimum (below which the floor is display-only, S4.3)."""
+def active_weights() -> List[Dict[str, Any]]:
+    """S4.4 — the active model's per-signal weights, sorted by magnitude, so the
+    operator can see what the data actually values (and which signals are dead)."""
+    m = get_active_model()
+    coeffs = m.get("coeffs", {}) or {}
+    rows = [{"feature": k, "weight": round(float(v), 4)} for k, v in coeffs.items()]
+    rows.sort(key=lambda r: abs(r["weight"]), reverse=True)
+    return rows
+
+
+def model_status(min_clean: Optional[int] = None) -> Dict[str, Any]:
+    """UI header: current model version, trained/untrained, progress toward the
+    (configurable) clean-trade minimum below which the floor is display-only
+    (S4.3), and the active per-signal learned weights (S4.4)."""
+    if min_clean is None:
+        min_clean = config_min_clean()
     m = get_active_model()
     n = int(m.get("n_trades", 0) or 0)
     return {
@@ -424,4 +454,5 @@ def model_status(min_clean: int = _MIN_CLEAN_TRADES_DEFAULT) -> Dict[str, Any]:
         "min_clean": int(min_clean),
         "floor_active": bool(m.get("trained", False) and n >= int(min_clean)),
         "note": m.get("note", ""),
+        "weights": active_weights(),
     }

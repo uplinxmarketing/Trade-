@@ -181,6 +181,33 @@ export function EvModelPanel({ baseUrl = '' }: { baseUrl?: string }) {
           {/* Live train report */}
           <ReportView report={report} />
 
+          {/* S4.4 — what the active model values (per-signal learned weights) */}
+          {Array.isArray(data?.status?.weights) && data!.status!.weights!.length > 0 && (
+            <div className="bg-muted/20 rounded px-2 py-1.5 space-y-1">
+              <p className="text-[8px] uppercase tracking-wider text-muted-foreground">
+                What the model values (per-signal weights)
+              </p>
+              <div className="space-y-0.5">
+                {data!.status!.weights!.slice(0, 8).map(w => {
+                  const mag = Math.min(1, Math.abs(w.weight) / 0.5);
+                  const pos = w.weight >= 0;
+                  return (
+                    <div key={w.feature} className="flex items-center gap-1.5">
+                      <span className="text-[9px] font-mono text-muted-foreground w-28 truncate">{w.feature}</span>
+                      <div className="flex-1 h-1.5 bg-muted/40 rounded overflow-hidden">
+                        <div className={`h-full ${pos ? 'bg-gain' : 'bg-loss'}`}
+                             style={{ width: `${mag * 100}%` }} />
+                      </div>
+                      <span className={`text-[9px] font-mono w-10 text-right ${pos ? 'text-gain' : 'text-loss'}`}>
+                        {w.weight >= 0 ? '+' : ''}{w.weight.toFixed(2)}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* Version list */}
           <div className="space-y-1">
             <p className="text-[8px] uppercase tracking-wider text-muted-foreground">Versions</p>
