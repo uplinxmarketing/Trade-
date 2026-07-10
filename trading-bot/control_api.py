@@ -760,6 +760,22 @@ async def lifespan(app: FastAPI):
                     _step_failed(f"spawn_{_task_name}", exc)
             steps.append(f"async tasks launched ({len(_spawned)}/6: {', '.join(_spawned) or 'none'})")
 
+            # 7a-b. Immediate rolling-window trim at boot — shrink any pre-existing
+            #     large paper/training tables to the 3000-row cap NOW (the daily
+            #     loop only runs after a warmup delay). Keeps the DB tiny + UI fast
+            #     right after deploy.
+            try:
+                for _trim_name in ("prune_training_samples_to_cap",
+                                   "prune_paper_trades_to_cap"):
+                    _tf = getattr(database, _trim_name, None)
+                    if _tf is not None:
+                        _removed = await asyncio.to_thread(_tf)
+                        if _removed:
+                            print(f"[Boot] {_trim_name}: trimmed {_removed} rows")
+                steps.append("rolling_window_trim OK")
+            except Exception as exc:
+                _step_failed("rolling_window_trim", exc)
+
             # 7b. Phase 1 daily maintenance: kline-store prune + nightly edge
             #     report. First pass ~60 s after startup, then every 24 h.
             try:
@@ -968,29 +984,25 @@ async def _daily_maintenance_loop():
                 print(f"[Maintenance] eval prune: {pruned}")
         except Exception as e:
             print(f"[Maintenance] eval prune failed: {e}")
-        # Part S3.5 — prune the EV training_samples store by retention (the 100k
-        # hard-cap bounds it on write; this drops genuinely stale samples too).
+        # Rolling-window trim: keep only the most recent _TRAINING_SAMPLES_CAP /
+        # _PAPER_TRADES_CAP (3000) rows. The write-path enforces this per insert;
+        # this backstop shrinks any pre-existing large table immediately and keeps
+        # the DB tiny (which keeps the whole UI fast). The paper-shadow improves
+        # over time, so a fixed recent window trains on current behaviour.
         try:
-            _fn = getattr(database, "prune_training_samples", None)
+            _fn = getattr(database, "prune_training_samples_to_cap", None)
             if _fn is not None:
-                _tr_ret = 180.0
-                try:
-                    _tr_ret = float((_load_strategy().get("data") or {})
-                                    .get("kline_retention_days", 180.0))
-                except Exception:
-                    pass
-                _tp = await _aio.to_thread(_fn, _tr_ret)
-                print(f"[Maintenance] training_samples prune: {_tp} (retention {_tr_ret}d)")
+                _tp = await _aio.to_thread(_fn)
+                print(f"[Maintenance] training_samples trimmed to cap: {_tp} removed")
         except Exception as e:
-            print(f"[Maintenance] training_samples prune failed: {e}")
-        # Shadow-Lab paper_trades prune (the 200k write-cap also bounds it).
+            print(f"[Maintenance] training_samples trim failed: {e}")
         try:
-            _fn = getattr(database, "prune_paper_trades", None)
+            _fn = getattr(database, "prune_paper_trades_to_cap", None)
             if _fn is not None:
-                _pp = await _aio.to_thread(_fn, 90.0)
-                print(f"[Maintenance] paper_trades prune: {_pp} (retention 90d)")
+                _pp = await _aio.to_thread(_fn)
+                print(f"[Maintenance] paper_trades trimmed to cap: {_pp} removed")
         except Exception as e:
-            print(f"[Maintenance] paper_trades prune failed: {e}")
+            print(f"[Maintenance] paper_trades trim failed: {e}")
         # Part G (G2) — re-validate approved_coins against exchangeInfo daily;
         # record (never remove) any symbol no longer TRADING. Fails open.
         try:
