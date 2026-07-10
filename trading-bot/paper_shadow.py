@@ -43,16 +43,37 @@ ABSOLUTE SAFETY RULES (enforced by construction)
   * Every cycle is wrapped in try/except; a paper-shadow failure is logged and
     can NEVER affect the live bot (separate daemon thread, all exceptions caught).
 
+SHADOW LAB — virtual budget + broad sampling (v0.5 S3 scale-up)
+===============================================================
+  * A VIRTUAL budget (``data.paper_shadow_budget_usdt``, default 10000) is
+    deployed in fixed ``data.paper_shadow_position_usdt`` (default 11) tranches.
+    The effective concurrent cap = ``min(paper_shadow_max_open, floor(budget /
+    position))`` and hard-bounds the open ledger.
+  * A symbol may hold UP TO ``data.paper_shadow_max_per_symbol`` (default 20)
+    concurrent paper positions — so a coin can RE-ENTER and generate many
+    outcomes/day, far more than the ~20 live trades. Each cycle every qualifying
+    symbol opens ONE more tranche if under BOTH the per-symbol and the global
+    (budget / concurrency) caps.
+  * On every exit ONE labeled ``training_samples`` row AND one rich
+    ``save_paper_trade`` row are written (guarded), the latter carrying
+    wolfscore/regime (computed at entry) + the exit ladder branch that fired.
+
 MEMORY DISCIPLINE (a leak was JUST fixed elsewhere — do not reintroduce one)
 ===========================================================================
   * Per-cycle evaluation is STATELESS: nothing about a rejected/evaluated symbol
     is retained.
-  * Only OPEN paper positions persist in memory, in a BOUNDED dict capped at
-    ``paper_shadow_max_open`` (default = universe size). New opens are refused
-    when the cap is reached; positions open longer than ``paper_shadow_max_hold_sec``
-    are force-closed (emitting their outcome) so nothing is retained forever.
-  * Only OUTCOMES persist — to the DB (``training_samples``, hard-capped there).
-    No growing in-memory history of any kind.
+  * Only OPEN paper positions persist in memory, in ONE BOUNDED dict hard-capped
+    at the effective concurrent cap (never exceeds ``paper_shadow_max_open``).
+    Even a 1000+ cap is just ≤ cap small dicts. New opens are refused (logged
+    ONCE, not per-cycle) when the budget or the cap is reached; positions open
+    longer than ``paper_shadow_max_hold_sec`` are force-closed (emitting their
+    outcome) so nothing is retained forever.
+  * DB writes are THROTTLED: at most ``_MAX_CLOSES_PER_CYCLE`` positions are
+    closed (and written) per cycle, so a burst of simultaneous exits can NEVER
+    stall the loop or hammer SQLite — the remainder stay in the bounded ledger
+    and are drained on subsequent cycles.
+  * Only OUTCOMES persist — to the DB (``training_samples`` + ``paper_trades``,
+    hard-capped there). No growing in-memory history of any kind.
 """
 from __future__ import annotations
 
@@ -65,11 +86,14 @@ log = logging.getLogger(__name__)
 
 # ── Tunables (all overridable via strategy.json data.* block) ──────────────────
 _DEFAULT_LOOP_SEC          = 8.0        # eval cadence (aligned to the live scanner)
-_DEFAULT_NOTIONAL_USDT     = 100.0      # fixed nominal notional per paper trade
+_DEFAULT_POSITION_USDT     = 11.0       # fixed virtual notional per paper tranche
+_DEFAULT_BUDGET_USDT       = 10000.0    # total virtual budget to deploy
+_DEFAULT_MAX_OPEN          = 300        # hard cap on concurrent open paper positions
+_DEFAULT_MAX_PER_SYMBOL    = 20         # concurrent paper positions allowed per symbol
 _DEFAULT_SLIPPAGE_BPS      = 2.0        # modeled slippage each side (basis points)
 _DEFAULT_MAX_HOLD_SEC      = 6 * 3600.0 # force-close + emit a stale paper position
-_DEFAULT_MAX_OPEN_FALLBACK = 200        # cap when the universe size can't be read
 _STATS_SAMPLE_LIMIT        = 5000       # bound get_paper_stats DB read
+_MAX_CLOSES_PER_CYCLE      = 40         # DB-write throttle: exits emitted per cycle
 
 
 def _num(v: Any, default: Optional[float] = None) -> Optional[float]:
@@ -90,8 +114,14 @@ class PaperShadow:
         self._thread: Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
-        # Bounded ledger — symbol → paper position dict. NEVER grows past the cap.
-        self._open: Dict[str, dict] = {}
+        # Bounded ledger — unique int id → paper position dict. ONE dict, hard-
+        # capped at the effective concurrent cap; NEVER grows past it. Keyed by an
+        # incrementing id (not symbol) so a symbol may re-enter up to max_per_symbol.
+        self._open: Dict[int, dict] = {}
+        self._sym_count: Dict[str, int] = {}   # symbol → live count in the ledger
+        self._deployed: float = 0.0            # virtual budget currently deployed
+        self._next_id: int = 0                 # monotonic position-id counter
+        self._full_logged = False              # "cap/budget reached" logged ONCE
         self._started = False
 
     # ── config helpers (read-only, hot-reloadable) ────────────────────────────
@@ -116,10 +146,30 @@ class PaperShadow:
         return max(3.0, _num(self._data_cfg().get("paper_shadow_loop_sec"),
                              _DEFAULT_LOOP_SEC) or _DEFAULT_LOOP_SEC)
 
-    def _notional(self) -> float:
-        n = _num(self._data_cfg().get("paper_shadow_notional_usdt"),
-                 _DEFAULT_NOTIONAL_USDT) or _DEFAULT_NOTIONAL_USDT
-        return n if n > 0 else _DEFAULT_NOTIONAL_USDT
+    def _position_usdt(self) -> float:
+        n = _num(self._data_cfg().get("paper_shadow_position_usdt"),
+                 _DEFAULT_POSITION_USDT) or _DEFAULT_POSITION_USDT
+        return n if n > 0 else _DEFAULT_POSITION_USDT
+
+    def _budget(self) -> float:
+        b = _num(self._data_cfg().get("paper_shadow_budget_usdt"),
+                 _DEFAULT_BUDGET_USDT) or _DEFAULT_BUDGET_USDT
+        return b if b > 0 else _DEFAULT_BUDGET_USDT
+
+    def _max_per_symbol(self) -> int:
+        m = _num(self._data_cfg().get("paper_shadow_max_per_symbol"),
+                 _DEFAULT_MAX_PER_SYMBOL) or _DEFAULT_MAX_PER_SYMBOL
+        return int(m) if m >= 1 else _DEFAULT_MAX_PER_SYMBOL
+
+    def _effective_cap(self) -> int:
+        """min(paper_shadow_max_open, floor(budget / position)) — the single hard
+        bound on the open ledger. Never exceeds paper_shadow_max_open."""
+        mo = _num(self._data_cfg().get("paper_shadow_max_open"), _DEFAULT_MAX_OPEN)
+        max_open = int(mo) if (mo is not None and mo >= 1) else _DEFAULT_MAX_OPEN
+        pos = self._position_usdt()
+        by_budget = int(self._budget() // pos) if pos > 0 else max_open
+        cap = min(max_open, by_budget)
+        return cap if cap >= 1 else 1
 
     def _slippage_bps(self) -> float:
         s = _num(self._data_cfg().get("paper_shadow_slippage_bps"),
@@ -130,17 +180,6 @@ class PaperShadow:
         h = _num(self._data_cfg().get("paper_shadow_max_hold_sec"),
                  _DEFAULT_MAX_HOLD_SEC) or _DEFAULT_MAX_HOLD_SEC
         return h if h > 0 else _DEFAULT_MAX_HOLD_SEC
-
-    def _max_open(self, universe_size: int) -> int:
-        # Default cap = universe size (≤ one paper position per symbol anyway,
-        # since a symbol already in a paper position is skipped). An explicit
-        # override may lower it further.
-        override = self._data_cfg().get("paper_shadow_max_open")
-        base = universe_size if universe_size > 0 else _DEFAULT_MAX_OPEN_FALLBACK
-        ov = _num(override, None)
-        if ov is not None and ov > 0:
-            return int(min(base, ov)) if universe_size > 0 else int(ov)
-        return int(base)
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
     def start(self) -> bool:
@@ -201,7 +240,10 @@ class PaperShadow:
             self._manage_open(strategy, set())
             return
         universe = set(approved)
-        max_open = self._max_open(len(universe))
+        effective_cap = self._effective_cap()
+        max_per_symbol = self._max_per_symbol()
+        position_usdt = self._position_usdt()
+        budget = self._budget()
 
         # Snapshot the SAME signal cache the live buy loop reads (under its lock).
         try:
@@ -211,28 +253,49 @@ class PaperShadow:
             cache_snapshot = {}
 
         # 1) Manage existing open paper positions (exits + stale eviction) first,
-        #    freeing ledger room before evaluating new entries this cycle.
+        #    freeing ledger room + budget before evaluating new entries this cycle.
         self._manage_open(strategy, universe)
 
-        # 2) Entry evaluation — STATELESS per symbol; only opens persist.
+        # 2) Entry evaluation — STATELESS per symbol; only opens persist. Compute
+        #    the regime tilt + cohort ONCE per cycle (O(universe)) for wolfscore.
         try:
             btc_regime = trade_engine.get_btc_regime()
         except Exception:
             btc_regime = None
+        try:
+            import ev_model
+            tilt = ev_model.regime_tilt(trade_engine._btc_roc_1h_frac())
+        except Exception:
+            tilt = 0.0
+        try:
+            cohort = trade_engine._wolf_cohort_from(list(cache_snapshot.items()))
+        except Exception:
+            cohort = {}
 
         for sym in approved:
             if self._stop_evt.is_set():
                 return
+            # Fast pre-check under lock — O(1). Refuse (log ONCE) when the global
+            # budget/concurrency cap is reached; skip this symbol when at its
+            # per-symbol cap. The definitive re-check happens at insert time.
             with self._lock:
-                if sym in self._open:
-                    continue  # already in a paper position — one per symbol
-                if len(self._open) >= max_open:
-                    break     # ledger cap reached — refuse new opens (bounded memory)
+                if len(self._open) >= effective_cap or \
+                        (self._deployed + position_usdt) > budget:
+                    if not self._full_logged:
+                        log.info("[PaperShadow] cap reached — open=%d/%d deployed=%.0f/%.0f "
+                                 "budget; pausing new opens", len(self._open),
+                                 effective_cap, self._deployed, budget)
+                        self._full_logged = True
+                    break
+                if self._sym_count.get(sym, 0) >= max_per_symbol:
+                    continue  # this coin is saturated; others may still open
             cached = cache_snapshot.get(sym)
             if not isinstance(cached, dict):
                 continue
             try:
-                self._maybe_open(sym, cached, strategy, btc_regime)
+                self._maybe_open(sym, cached, strategy, btc_regime,
+                                 effective_cap, max_per_symbol, position_usdt,
+                                 budget, cohort, tilt)
             except Exception as e:
                 log.debug("[PaperShadow] open-eval %s failed: %s", sym, e)
 
@@ -256,7 +319,9 @@ class PaperShadow:
         }
 
     def _maybe_open(self, sym: str, cached: dict, strategy: dict,
-                    btc_regime: Any) -> None:
+                    btc_regime: Any, effective_cap: int, max_per_symbol: int,
+                    position_usdt: float, budget: float,
+                    cohort: dict, tilt: float) -> None:
         import signal_registry
         import ev_model
 
@@ -270,7 +335,7 @@ class PaperShadow:
         if not price or price <= 0:
             return
 
-        pos = self._open_paper(sym, price, strategy)
+        pos = self._open_paper(sym, price, strategy, position_usdt)
         if pos is None:
             return
         # EV features + score from the SAME raw signals (interpretability parity).
@@ -282,14 +347,38 @@ class PaperShadow:
             pos["ev_score"] = ev_model.score(sig_data).get("probability")
         except Exception:
             pos["ev_score"] = None
+        # WolfScore + regime AT ENTRY (guarded) — stored so the exit can log the
+        # rich outcome row. Reuses the live compute_submetrics + wolfscore path.
+        wolf = None
+        try:
+            import trade_engine
+            wolf = trade_engine._wolf_score_cached(sym, cached, cohort, tilt)
+        except Exception:
+            wolf = None
+        if isinstance(wolf, dict):
+            pos["wolfscore"] = wolf.get("pct")
+            pos["regime"] = wolf.get("regime") or btc_regime
+        else:
+            pos["wolfscore"] = None
+            pos["regime"] = btc_regime
 
         with self._lock:
-            # Re-check the cap under lock (another entry may have filled it).
-            if sym in self._open:
+            # Definitive cap re-check under lock (all counters are single-thread
+            # written here, but keep the ledger strictly within every bound).
+            if len(self._open) >= effective_cap:
                 return
-            self._open[sym] = pos
+            if (self._deployed + position_usdt) > budget:
+                return
+            if self._sym_count.get(sym, 0) >= max_per_symbol:
+                return
+            pid = self._next_id
+            self._next_id += 1
+            self._open[pid] = pos
+            self._sym_count[sym] = self._sym_count.get(sym, 0) + 1
+            self._deployed += position_usdt
 
-    def _open_paper(self, sym: str, mid: float, strategy: dict) -> Optional[dict]:
+    def _open_paper(self, sym: str, mid: float, strategy: dict,
+                    position_usdt: float) -> Optional[dict]:
         """Open a paper position at a MODELED fill and compute exit geometry from
         the SAME config numbers the live engine resolves. Places NO real order."""
         import trade_engine
@@ -304,7 +393,7 @@ class PaperShadow:
         buy_fill = mid * (1.0 + half_spread_frac + slip_frac)
         if buy_fill <= 0:
             return None
-        notional = self._notional()
+        notional = position_usdt
         qty = notional / buy_fill
         buy_fee = qty * buy_fill * taker
 
@@ -313,6 +402,7 @@ class PaperShadow:
             "entry_price": buy_fill,
             "quantity":   qty,
             "buy_fee_usdt": buy_fee,
+            "deployed_usdt": position_usdt,
             "opened_ts":  time.time(),
             "be_moved":   False,
             "trail_armed": False,
@@ -399,29 +489,37 @@ class PaperShadow:
     # ── exits + management (read-only reuse of the exit MATH) ──────────────────
     def _manage_open(self, strategy: dict, universe: set) -> None:
         with self._lock:
-            open_syms = list(self._open.keys())
+            open_ids = list(self._open.keys())
         now = time.time()
         max_hold = self._max_hold_sec()
-        for sym in open_syms:
+        closes = 0  # DB-write throttle: bound exits emitted (and written) per cycle
+        for pid in open_ids:
             if self._stop_evt.is_set():
                 return
+            if closes >= _MAX_CLOSES_PER_CYCLE:
+                # Burst guard — leave the rest in the bounded ledger; they exit on
+                # a later cycle. Prevents a mass-exit from stalling the loop / DB.
+                break
             with self._lock:
-                pos = self._open.get(sym)
+                pos = self._open.get(pid)
             if pos is None:
                 continue
+            sym = pos.get("symbol")
             try:
                 price = _num(self._live_price(sym), None)
                 if not price or price <= 0:
                     # No fresh price — expire only if stale past the hold cap.
                     if now - pos.get("opened_ts", now) > max_hold:
-                        self._close_paper(sym, pos, pos.get("entry_price"),
-                                          "stale-no-price", now)
+                        self._close_paper(pid, pos, pos.get("entry_price"),
+                                          "time_stop", now)
+                        closes += 1
                     continue
                 reason = self._evaluate_paper_exit(pos, price, now)
                 if reason is None and (now - pos.get("opened_ts", now) > max_hold):
-                    reason = "stale-timeout"
+                    reason = "time_stop"
                 if reason is not None:
-                    self._close_paper(sym, pos, price, reason, now)
+                    self._close_paper(pid, pos, price, reason, now)
+                    closes += 1
             except Exception as e:
                 log.debug("[PaperShadow] manage %s failed: %s", sym, e)
 
@@ -584,16 +682,45 @@ class PaperShadow:
         except Exception:
             return None
 
-    def _close_paper(self, sym: str, pos: dict, exit_mid: Optional[float],
+    @staticmethod
+    def _exit_type(reason: str) -> str:
+        """Map the exit-ladder branch that fired to a compact exit_type label:
+        hard_stop / breakeven / ratchet / tp / time_stop."""
+        r = str(reason or "")
+        if "hard-stop" in r:
+            return "hard_stop"
+        if "breakeven" in r:
+            return "breakeven"
+        if "ratchet" in r:
+            return "ratchet"
+        if "take-profit" in r or "trail" in r:
+            return "tp"
+        if "stop-loss" in r:
+            return "hard_stop"
+        return "time_stop"  # time_stop / stale / anything else
+
+    def _close_paper(self, pid: int, pos: dict, exit_mid: Optional[float],
                      reason: str, now: float) -> None:
         """Close a paper position at a MODELED sell fill, compute realized_r, emit
-        ONE labeled training sample, and drop it from the bounded ledger."""
+        ONE labeled training sample + ONE rich paper_trades row, and drop it from
+        the bounded ledger (freeing its virtual budget + per-symbol slot)."""
         import fees
         import database
 
-        # Remove from the ledger FIRST so a save failure can't leak the position.
+        sym = pos.get("symbol")
+        # Remove from the ledger FIRST so a save failure can't leak the position;
+        # release its virtual budget + per-symbol count under the same lock.
         with self._lock:
-            self._open.pop(sym, None)
+            if self._open.pop(pid, None) is not None:
+                self._deployed = max(0.0, self._deployed
+                                     - float(pos.get("deployed_usdt") or 0.0))
+                c = self._sym_count.get(sym, 0) - 1
+                if c > 0:
+                    self._sym_count[sym] = c
+                else:
+                    self._sym_count.pop(sym, None)
+                # Room again — allow the "cap reached" notice to re-log later.
+                self._full_logged = False
 
         try:
             entry = float(pos.get("entry_price") or 0.0)
@@ -625,10 +752,33 @@ class PaperShadow:
 
             label = 1 if realized_r > 0 else 0
             features = pos.get("ev_features") or {}
+            exit_type = self._exit_type(reason)
+            # 1) Training sample — unchanged contract (submetrics/regime_tilt live
+            #    inside the features dict the EV path produced).
             database.save_training_sample("paper_shadow", sym, features,
                                           label, realized_r)
-            log.debug("[PaperShadow] EXIT %s reason=%s R=%.3f pnl=%.4f",
-                      sym, reason, realized_r, pnl)
+            # 2) Rich outcome row — guarded (a parallel agent adds save_paper_trade;
+            #    tolerate its absence so this never breaks the paper loop).
+            try:
+                database.save_paper_trade({
+                    "ts":         now,
+                    "symbol":     sym,
+                    "wolfscore":  pos.get("wolfscore"),
+                    "regime":     pos.get("regime"),
+                    "exit_type":  exit_type,
+                    "entry_px":   entry,
+                    "exit_px":    sell_fill,
+                    "pnl":        pnl,
+                    "realized_r": realized_r,
+                    "hold_sec":   max(0.0, now - float(pos.get("opened_ts", now))),
+                    "label":      label,
+                })
+            except AttributeError:
+                pass  # save_paper_trade not present yet — training row still logged
+            except Exception as e:
+                log.debug("[PaperShadow] save_paper_trade %s failed: %s", sym, e)
+            log.debug("[PaperShadow] EXIT %s type=%s reason=%s R=%.3f pnl=%.4f",
+                      sym, exit_type, reason, realized_r, pnl)
         except Exception as e:
             log.debug("[PaperShadow] close %s failed: %s", sym, e)
 
@@ -663,6 +813,15 @@ class PaperShadow:
         reads at most _STATS_SAMPLE_LIMIT recent rows."""
         with self._lock:
             open_positions = len(self._open)
+            deployed_budget = round(self._deployed, 2)
+        try:
+            effective_cap = self._effective_cap()
+        except Exception:
+            effective_cap = 0
+        try:
+            budget = self._budget()
+        except Exception:
+            budget = 0.0
 
         rows = []
         try:
@@ -700,14 +859,28 @@ class PaperShadow:
         expectancy = (r_sum / r_n) if r_n else 0.0
 
         return {
-            "open_positions": open_positions,
-            "trades_today":   trades_today,
-            "expectancy":     round(expectancy, 4),
-            "win_rate":       round(win_rate, 4),
-            "avg_win_r":      round(avg_win_r, 4),
-            "avg_loss_r":     round(avg_loss_r, 4),
-            "n_total":        n_total,
+            "open_positions":  open_positions,
+            "deployed_budget": deployed_budget,
+            "effective_cap":   effective_cap,
+            "budget":          budget,
+            "trades_today":    trades_today,
+            "expectancy":      round(expectancy, 4),
+            "win_rate":        round(win_rate, 4),
+            "avg_win_r":       round(avg_win_r, 4),
+            "avg_loss_r":      round(avg_loss_r, 4),
+            "n_total":         n_total,
         }
+
+    def get_shadow_summary(self) -> dict:
+        """Copy-paste-able results summary for control_api / UI. Delegates to
+        database.get_paper_summary() (added by a parallel agent) — guarded so it
+        returns {} rather than raising when that accessor isn't present yet."""
+        try:
+            import database
+            summary = database.get_paper_summary()
+            return summary if isinstance(summary, dict) else {}
+        except Exception:
+            return {}
 
 
 # ── Module-level singleton + thin wrappers ────────────────────────────────────
@@ -728,3 +901,7 @@ def is_running() -> bool:
 
 def get_paper_stats() -> dict:
     return _engine.get_paper_stats()
+
+
+def get_shadow_summary() -> dict:
+    return _engine.get_shadow_summary()
