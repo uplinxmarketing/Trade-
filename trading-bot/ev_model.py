@@ -462,6 +462,12 @@ WOLF_INTERIM: Dict[str, Any] = {
         "b0":   -1.0,
         "wm_T":  1.6, "wm_M": 1.4,          # momentum family
         "wd_R":  1.8, "wd_W": 1.4,          # defensive family (R = decoupling)
+        # S3-2 — up-regime anti-chasing. W (VWAP room) previously lived ONLY in the
+        # defensive family, gated by (dn + 0.5·neutral), so in a strong uptrend it
+        # was switched OFF — the bot had no brake on pump-chasing exactly where it
+        # matters most (paper data: uptrend win-rate 15%). wu_W makes W count in the
+        # UP regime: near VWAP (W→+1) rewarded, extended above VWAP (W<0) penalized.
+        "wu_W":  1.5,
         "w_C":   1.1, "w_V": 0.7, "w_X": 0.5, "w_F": 3.5,
     },
 }
@@ -599,11 +605,21 @@ def get_active_wolf_model() -> Dict[str, Any]:
 
 
 def wolfscore(sub: Dict[str, float], tilt: float,
-              model: Optional[dict] = None) -> Dict[str, Any]:
+              model: Optional[dict] = None,
+              up_extension_veto: bool = True,
+              up_extension_w_thr: float = 0.0) -> Dict[str, Any]:
     """Layer-2 regime-GATING score. Returns 0-100 calibrated probability + full
     decomposition. Flaw #2: F>0.5 is a HARD gate (score 0). Flaw #3: the regime
     tilt GATES which input families count (not just an additive dim), so downtrend
-    flips selection toward the decoupled coin."""
+    flips selection toward the decoupled coin.
+
+    S3-2 — up-regime anti-chasing:
+      * wu_W term: W (VWAP room) now contributes in the UP regime, so near-VWAP
+        coins score higher and extended-above-VWAP coins score lower in uptrends.
+      * up_extension_veto (default ON): in a clear uptrend (tilt>0.15), a coin
+        whose W has fallen at/below up_extension_w_thr (extended / broken vs VWAP)
+        is HARD-gated. Operator-toggleable — pass up_extension_veto=False to rely
+        purely on the learned wu_W weight once a model is trained on this regime."""
     m = model or get_active_wolf_model()
     w = m.get("weights", WOLF_INTERIM["weights"])
     T, M, R = sub.get("T", 0.0), sub.get("M", 0.0), sub.get("R", 0.0)
@@ -618,6 +634,16 @@ def wolfscore(sub: Dict[str, float], tilt: float,
                 "contributions": {}, "top_reasons": [{"feature": "F", "points": -999}],
                 "trained": bool(m.get("trained", False)), "version": m.get("version", "wolf-interim-v3")}
 
+    # S3-2 — extended-uptrend hard gate. In a clear uptrend, a coin that has run
+    # too far from VWAP (W ≤ threshold) is the classic pump-chase that reverses
+    # (paper data: uptrend win-rate 15%). Blocked here, before scoring.
+    if up_extension_veto and tilt > 0.15 and W <= up_extension_w_thr:
+        return {"score": 0.0, "pct": 0.0, "z": None, "hard_gate": "extended_uptrend",
+                "regime_tilt": round(tilt, 4), "submetrics": sub,
+                "families": {"momentum": 0.0, "defensive": 0.0, "base": 0.0, "residual": 0.0},
+                "contributions": {}, "top_reasons": [{"feature": "W", "points": -999}],
+                "trained": bool(m.get("trained", False)), "version": m.get("version", "wolf-interim-v3")}
+
     up = max(0.0, tilt)
     dn = max(0.0, -tilt)
     neutral = 1.0 - abs(tilt)
@@ -627,18 +653,21 @@ def wolfscore(sub: Dict[str, float], tilt: float,
 
     momentum_family = (up + 0.5 * neutral) * mom_core
     defensive_family = (dn + 0.5 * neutral) * def_core
+    # S3-2 — W (VWAP room) counts in the up-regime too (anti-chasing brake).
+    up_room = w.get("wu_W", 1.5) * W * up
     base = (w.get("w_C", 1.1) * C + w.get("w_V", 0.7) * V
             + w.get("w_X", 0.5) * X - w.get("w_F", 3.5) * F)
     residual = 0.3 * def_core * up - 0.3 * mom_core * dn
 
-    z = w.get("b0", -1.0) + momentum_family + defensive_family + base + residual
+    z = w.get("b0", -1.0) + momentum_family + defensive_family + up_room + base + residual
     p = _sigmoid(z)
 
     contributions = {
         "T": round(w.get("wm_T", 1.6) * T * (up + 0.5 * neutral), 3),
         "M": round(w.get("wm_M", 1.4) * M * (up + 0.5 * neutral), 3),
         "R": round(w.get("wd_R", 1.8) * R * (dn + 0.5 * neutral), 3),
-        "W": round(w.get("wd_W", 1.4) * W * (dn + 0.5 * neutral), 3),
+        "W": round(w.get("wd_W", 1.4) * W * (dn + 0.5 * neutral)
+                   + w.get("wu_W", 1.5) * W * up, 3),
         "C": round(w.get("w_C", 1.1) * C, 3),
         "V": round(w.get("w_V", 0.7) * V, 3),
         "X": round(w.get("w_X", 0.5) * X, 3),
@@ -675,6 +704,7 @@ def _wolf_derived_features(sub: Dict[str, float], tilt: float) -> List[float]:
         M * (gm - 0.3 * dn),      # wm_M
         R * (gd + 0.3 * up),      # wd_R (also in +0.3·def_core·up)
         W * (gd + 0.3 * up),      # wd_W
+        W * up,                   # wu_W (S3-2 up-regime VWAP-room / anti-chasing)
         sub.get("C", 0.0),        # w_C
         sub.get("V", 0.0),        # w_V
         sub.get("X", 0.0),        # w_X
@@ -682,7 +712,8 @@ def _wolf_derived_features(sub: Dict[str, float], tilt: float) -> List[float]:
     ]
 
 
-WOLF_WEIGHT_ORDER = ["wm_T", "wm_M", "wd_R", "wd_W", "w_C", "w_V", "w_X", "w_F"]
+WOLF_WEIGHT_ORDER = ["wm_T", "wm_M", "wd_R", "wd_W", "wu_W",
+                     "w_C", "w_V", "w_X", "w_F"]
 
 
 def train_wolfscore(samples: List[dict], min_clean: Optional[int] = None) -> Dict[str, Any]:
@@ -755,7 +786,10 @@ def adaptive_floor(scores: List[float], abs_floor: float = 55.0,
     it → re-engage automatically. Returns the effective threshold."""
     vals = [float(s) for s in (scores or []) if s is not None]
     dist_thr = abs_floor
-    if vals:
+    if vals and mode not in ("absolute", "off"):
+        # S3-1 — 'absolute'/'off' pin the threshold to the static abs_floor (55),
+        # so an 80-scoring coin fires even when it is not top-quartile in a strong
+        # field. The distribution modes below can only RAISE the bar above 55.
         if mode == "meanstd":
             mean = sum(vals) / len(vals)
             var = sum((v - mean) ** 2 for v in vals) / max(1, len(vals) - 1)
