@@ -1726,7 +1726,12 @@ def backup_db(keep: int = 7) -> dict:
 # the retrainer reads via get_training_samples. All helpers are CREATE-safe,
 # guarded, and never raise — a training-store failure must never break a trade.
 
-_TRAINING_SAMPLES_CAP = 100000
+# Rolling-window size: keep only the most recent N rows. The paper-shadow keeps
+# improving (better selection → better outcomes), so a fixed recent window trains
+# on the strategy's CURRENT behaviour and gets more accurate over time, while
+# keeping the DB tiny and the whole UI fast. Enforced continuously on every insert
+# and re-asserted at boot + in the daily maintenance loop.
+_TRAINING_SAMPLES_CAP = 3000
 
 _TRAINING_SAMPLES_DDL = """CREATE TABLE IF NOT EXISTS training_samples (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, mode TEXT, symbol TEXT,
@@ -1851,6 +1856,32 @@ def count_training_samples(modes=None) -> dict:
     }
 
 
+def prune_training_samples_to_cap(cap: int = None) -> int:
+    """Keep only the newest `cap` training_samples rows (default _TRAINING_SAMPLES_
+    CAP); delete the rest. The write-path enforces this on every insert too — this
+    is the explicit backstop the maintenance loop + boot call so an existing large
+    table is shrunk immediately rather than only on the next insert. Returns rows
+    deleted. Guarded/CREATE-safe."""
+    n = int(cap) if cap is not None else _TRAINING_SAMPLES_CAP
+    try:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute(_TRAINING_SAMPLES_DDL)
+                cur = conn.execute(
+                    "DELETE FROM training_samples WHERE id NOT IN "
+                    "(SELECT id FROM training_samples ORDER BY id DESC LIMIT ?)",
+                    (n,))
+                deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                conn.commit()
+            finally:
+                conn.close()
+        return deleted
+    except Exception as e:
+        print(f"[Database] prune_training_samples_to_cap failed: {e}")
+        return 0
+
+
 def prune_training_samples(retention_days: float) -> int:
     """Delete training_samples with ts older than now - retention_days (ts is
     epoch seconds). CREATE-safe, guarded. Returns rows deleted (0 on error).
@@ -1916,7 +1947,8 @@ def list_backups() -> list:
 # to the newest 200_000 rows on write (same pattern as buy_rejections /
 # training_samples / entry_snapshots).
 
-_PAPER_TRADES_CAP = 200000
+# Rolling window (see _TRAINING_SAMPLES_CAP) — keep only the most recent N.
+_PAPER_TRADES_CAP = 3000
 
 _PAPER_TRADES_DDL = """CREATE TABLE IF NOT EXISTS paper_trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, symbol TEXT, wolfscore REAL,
@@ -2202,6 +2234,29 @@ def count_paper_trades() -> dict:
         "wins": int(row["wins"] or 0),
         "open": None,
     }
+
+
+def prune_paper_trades_to_cap(cap: int = None) -> int:
+    """Keep only the newest `cap` paper_trades rows (default _PAPER_TRADES_CAP);
+    delete the rest. Backstop for the write-path row cap. Guarded/CREATE-safe."""
+    n = int(cap) if cap is not None else _PAPER_TRADES_CAP
+    try:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute(_PAPER_TRADES_DDL)
+                cur = conn.execute(
+                    "DELETE FROM paper_trades WHERE id NOT IN "
+                    "(SELECT id FROM paper_trades ORDER BY id DESC LIMIT ?)",
+                    (n,))
+                deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                conn.commit()
+            finally:
+                conn.close()
+        return deleted
+    except Exception as e:
+        print(f"[Database] prune_paper_trades_to_cap failed: {e}")
+        return 0
 
 
 def prune_paper_trades(retention_days: float) -> int:
