@@ -909,6 +909,14 @@ async def _daily_maintenance_loop():
                 print(f"[Maintenance] training_samples prune: {_tp} (retention {_tr_ret}d)")
         except Exception as e:
             print(f"[Maintenance] training_samples prune failed: {e}")
+        # Shadow-Lab paper_trades prune (the 200k write-cap also bounds it).
+        try:
+            _fn = getattr(database, "prune_paper_trades", None)
+            if _fn is not None:
+                _pp = await _aio.to_thread(_fn, 90.0)
+                print(f"[Maintenance] paper_trades prune: {_pp} (retention 90d)")
+        except Exception as e:
+            print(f"[Maintenance] paper_trades prune failed: {e}")
         # Part G (G2) — re-validate approved_coins against exchangeInfo daily;
         # record (never remove) any symbol no longer TRADING. Fails open.
         try:
@@ -5251,6 +5259,43 @@ def api_diagnostics_bundle(
             out.write("  paper_shadow: [unavailable]\n")
     safe(_ev_bundle, "ev_model")
 
+    # -- Shadow-Lab (paper-shadow data scraper w/ virtual budget) ----------------
+    section("SHADOW-LAB")
+    def _shadow_bundle():
+        st = _shadow_get_stats()
+        sm = _shadow_get_summary(_range_hours())
+        if not st and not sm:
+            out.write("  [unavailable]\n")
+            return
+        out.write(f"  open={st.get('open_positions')} "
+                  f"effective_cap={st.get('effective_cap')} "
+                  f"budget={st.get('budget')} "
+                  f"deployed={st.get('deployed_budget')} "
+                  f"n={st.get('n_total', sm.get('n'))}\n")
+
+        def _pct(v):
+            try:
+                return f"{float(v) * 100:.1f}%"
+            except Exception:
+                return "-"
+        out.write(f"  win_rate={_pct(sm.get('win_rate'))} "
+                  f"expectancy_r={sm.get('expectancy_r')} "
+                  f"profit_factor={sm.get('profit_factor')} "
+                  f"trades_per_hour={sm.get('trades_per_hour')}\n")
+        by_rg = sm.get("by_regime")
+        if isinstance(by_rg, dict) and by_rg:
+            parts = []
+            for k, v in by_rg.items():
+                if isinstance(v, dict):
+                    parts.append(f"{k}(n={v.get('n', v.get('count'))},"
+                                 f"ev_r={v.get('expectancy_r')})")
+                else:
+                    parts.append(f"{k}={v}")
+            out.write("  by_regime: " + " ".join(parts) + "\n")
+        else:
+            out.write("  by_regime: (none)\n")
+    safe(_shadow_bundle, "shadow_lab")
+
     # -- Config snapshot ----------------------------------------------------------
     section("CONFIG (resolved key settings)")
     def _cfg():
@@ -8263,6 +8308,171 @@ def api_ev_expectancy():
         return {"live": live, "paper_shadow": paper}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+# ── Shadow-Lab summary (data scraper w/ virtual budget) ──────────────────────
+
+def _shadow_get_summary(hours=None):
+    """Guarded fetch of the rich shadow aggregate. Prefers
+    database.get_paper_summary(hours), falls back to
+    paper_shadow.get_shadow_summary(). Returns {} on any failure."""
+    try:
+        fn = getattr(database, "get_paper_summary", None)
+        if callable(fn):
+            out = fn(hours=hours) if hours is not None else fn()
+            if isinstance(out, dict):
+                return out
+    except Exception:
+        pass
+    try:
+        import paper_shadow as _ps
+        fn = getattr(_ps, "get_shadow_summary", None)
+        if callable(fn):
+            out = fn()
+            if isinstance(out, dict):
+                return out
+    except Exception:
+        pass
+    return {}
+
+
+def _shadow_get_stats():
+    """Guarded fetch of paper_shadow.get_paper_stats(). Returns {} on failure."""
+    try:
+        import paper_shadow as _ps
+        fn = getattr(_ps, "get_paper_stats", None)
+        if callable(fn):
+            out = fn()
+            if isinstance(out, dict):
+                return out
+    except Exception:
+        pass
+    return {}
+
+
+def _shadow_fmt_sub(out, title, agg):
+    """Render one by_* sub-aggregate as an indented table. Each value may be a
+    dict (n/win_rate/expectancy_r/...) or a scalar — rendered defensively."""
+    out.write(f"  {title}:\n")
+    if not isinstance(agg, dict) or not agg:
+        out.write("    (none)\n")
+        return
+    for k, v in agg.items():
+        if isinstance(v, dict):
+            n = v.get("n", v.get("count"))
+            wr = v.get("win_rate")
+            ev = v.get("expectancy_r")
+            pnl = v.get("total_pnl")
+            parts = []
+            if n is not None:
+                parts.append(f"n={n}")
+            if wr is not None:
+                try:
+                    parts.append(f"win={float(wr) * 100:.1f}%")
+                except Exception:
+                    parts.append(f"win={wr}")
+            if ev is not None:
+                parts.append(f"ev_r={ev}")
+            if pnl is not None:
+                parts.append(f"pnl={pnl}")
+            extra = " ".join(parts) if parts else " ".join(
+                f"{kk}={vv}" for kk, vv in v.items())
+            out.write(f"    {k}: {extra}\n")
+        else:
+            out.write(f"    {k}: {v}\n")
+
+
+def _shadow_report_text(stats, summary):
+    """Plain-text copy-paste Shadow-Lab report, mirroring the diagnostics-bundle
+    section()/writer feel. Fully defensive — missing keys render as '-'."""
+    import io as _io
+    out = _io.StringIO()
+    gts = (summary.get("generated_ts") if isinstance(summary, dict) else None) \
+        or datetime.now(timezone.utc).isoformat()
+    out.write(f"WOLFBOT SHADOW-LAB SUMMARY — {gts}\n")
+
+    def g(d, k, default="-"):
+        v = (d or {}).get(k)
+        return default if v is None else v
+
+    def pct(v):
+        try:
+            return f"{float(v) * 100:.1f}%"
+        except Exception:
+            return "-"
+
+    out.write("\n===== BUDGET / POSITIONS =====\n")
+    out.write(f"  open_positions={g(stats, 'open_positions')} "
+              f"deployed_budget={g(stats, 'deployed_budget')} "
+              f"effective_cap={g(stats, 'effective_cap')} "
+              f"budget={g(stats, 'budget')}\n")
+    out.write(f"  n_total={g(stats, 'n_total')} "
+              f"trades_today={g(stats, 'trades_today')}\n")
+
+    out.write("\n===== HEADLINE =====\n")
+    out.write(f"  n={g(summary, 'n')} wins={g(summary, 'wins')} "
+              f"win_rate={pct(g(summary, 'win_rate', None))}\n")
+    out.write(f"  expectancy_r={g(summary, 'expectancy_r')} "
+              f"avg_win_r={g(summary, 'avg_win_r')} "
+              f"avg_loss_r={g(summary, 'avg_loss_r')} "
+              f"profit_factor={g(summary, 'profit_factor')}\n")
+    out.write(f"  total_pnl={g(summary, 'total_pnl')} "
+              f"avg_hold_sec={g(summary, 'avg_hold_sec')} "
+              f"trades_per_hour={g(summary, 'trades_per_hour')}\n")
+    out.write(f"  data_start_ts={g(summary, 'data_start_ts')}\n")
+
+    out.write("\n===== BREAKDOWNS =====\n")
+    _shadow_fmt_sub(out, "by_exit_type", (summary or {}).get("by_exit_type"))
+    _shadow_fmt_sub(out, "by_regime", (summary or {}).get("by_regime"))
+    _shadow_fmt_sub(out, "by_score_bucket", (summary or {}).get("by_score_bucket"))
+
+    out.write("\n===== TOP SYMBOLS =====\n")
+    tops = (summary or {}).get("top_symbols")
+    if isinstance(tops, (list, tuple)) and tops:
+        for row in tops:
+            if isinstance(row, dict):
+                sym = row.get("symbol", row.get("sym", "?"))
+                n = row.get("n", row.get("count"))
+                pnl = row.get("total_pnl", row.get("pnl"))
+                ev = row.get("expectancy_r")
+                out.write(f"  {sym}: n={n} pnl={pnl} ev_r={ev}\n")
+            else:
+                out.write(f"  {row}\n")
+    else:
+        out.write("  (none)\n")
+
+    out.write("\n===== END OF SHADOW-LAB =====\n")
+    return out.getvalue()
+
+
+@app.get("/api/ev/shadow")
+def api_ev_shadow(hours: Optional[float] = Query(None)):
+    """Shadow-Lab JSON: live paper-shadow stats + the rich aggregate summary.
+    All aggregation lives in paper_shadow / database; this endpoint is thin and
+    fully guarded. If neither source is available returns {available:false}."""
+    try:
+        stats = _shadow_get_stats()
+        summary = _shadow_get_summary(hours)
+        if not stats and not summary:
+            return {"available": False}
+        return {"available": True, "stats": stats, "summary": summary}
+    except Exception as e:
+        return {"available": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/ev/shadow/text")
+def api_ev_shadow_text(hours: Optional[float] = Query(None)):
+    """Plain-text Shadow-Lab summary for copy-paste into chat (the operator sends
+    us this to share the shadow data). Mirrors /api/diagnostics/bundle text
+    style; never 500s — a broken source yields a report with '-' fields."""
+    try:
+        stats = _shadow_get_stats()
+        summary = _shadow_get_summary(hours)
+        text = _shadow_report_text(stats, summary)
+    except Exception as e:
+        text = f"WOLFBOT SHADOW-LAB SUMMARY — unavailable: {type(e).__name__}: {e}\n"
+    return Response(content=text, media_type="text/plain",
+                    headers={"Cache-Control": "no-store"})
 
 
 # ── Expectancy stats ─────────────────────────────────────────────────────────

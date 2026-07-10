@@ -170,6 +170,60 @@ export interface EvExpectancyPayload {
   paper_shadow?: EvExpectancyLeg;
 }
 
+// ── Shadow-Lab (paper-shadow EV harvesting) ────────────────────────────────
+// GET /api/ev/shadow → live headline stats + a rolled-up summary of the
+// virtual-budget paper-shadow trades the bot logs to grow the EV dataset.
+// Every field optional; older backends 404 or omit sections.
+
+export interface EvShadowStats {
+  open_positions?: number;
+  effective_cap?: number;
+  budget?: number;
+  deployed_budget?: number;
+  n_total?: number;
+  expectancy?: number;
+  win_rate?: number;
+}
+
+export interface EvShadowBucket {
+  n?: number;
+  win_rate?: number;
+  avg_r?: number;
+}
+
+export interface EvShadowTopSymbol {
+  symbol: string;
+  n?: number;
+  win_rate?: number;
+  avg_r?: number;
+  pnl?: number;
+}
+
+export interface EvShadowSummary {
+  n?: number;
+  wins?: number;
+  win_rate?: number;
+  expectancy_r?: number;
+  avg_win_r?: number;
+  avg_loss_r?: number;
+  profit_factor?: number;
+  total_pnl?: number;
+  avg_hold_sec?: number;
+  trades_per_hour?: number;
+  by_exit_type?: Record<string, EvShadowBucket>;
+  by_regime?: Partial<Record<RegimeState, EvShadowBucket>>;
+  by_score_bucket?: Record<string, EvShadowBucket>;
+  top_symbols?: EvShadowTopSymbol[];
+  data_start_ts?: number;
+  generated_ts?: number;
+}
+
+export interface EvShadowPayload {
+  available?: boolean;
+  stats?: EvShadowStats;
+  summary?: EvShadowSummary;
+}
+
 // ── Generic defensive poller ───────────────────────────────────────────────
 
 interface PollState<T> {
@@ -229,6 +283,10 @@ export function useEvModel(baseUrl = '') {
 
 export function useEvExpectancy(baseUrl = '') {
   return usePoll<EvExpectancyPayload>('/api/ev/expectancy', 30000, baseUrl);
+}
+
+export function useEvShadow(baseUrl = '') {
+  return usePoll<EvShadowPayload>('/api/ev/shadow', 10000, baseUrl);
 }
 
 // Train-status poll runs fast (5s) but only while a retrain is running; the

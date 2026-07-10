@@ -191,6 +191,15 @@ class DataConfig(BaseModel):
     # read-only, writing labeled outcomes (mode=paper_shadow) to the training set.
     # NOT slot-limited → far more clean data/day than live for the EV model.
     paper_shadow_enabled:        bool = True
+    # Shadow-Lab scale (data scraper): a VIRTUAL budget the shadow can deploy so it
+    # holds many concurrent positions and re-enters a coin, generating far more
+    # labeled outcomes/day. Effective concurrent cap = min(max_open,
+    # floor(budget/position)). Fake money only — never a real order. Memory stays
+    # bounded (open positions capped; outcomes persist to a capped DB table).
+    paper_shadow_budget_usdt:    float = Field(10000.0, ge=0.0, le=10_000_000.0)
+    paper_shadow_position_usdt:  float = Field(11.0, ge=1.0, le=100_000.0)
+    paper_shadow_max_open:       int   = Field(300, ge=1, le=5000)
+    paper_shadow_max_per_symbol: int   = Field(20, ge=1, le=500)
     # Part S4.3 — minimum clean labeled trades before the EV win-probability model
     # is allowed to gate real buys (below this the floor is display-only/advisory).
     ev_min_clean_trades:         int  = Field(300, ge=20, le=100000)
@@ -533,6 +542,25 @@ SCHEMA: Dict[str, dict] = {
                                   "Paper-shadow data engine",
                                   "Run the risk-free paper-shadow evaluator alongside live to generate "
                                   "labeled training data for the EV model (no real orders)."),
+    "data.paper_shadow_budget_usdt": _meta("data.paper_shadow_budget_usdt", "float", "Data",
+                                  "Shadow-Lab virtual budget",
+                                  "Total fake budget the paper-shadow can deploy across concurrent shadow "
+                                  "positions. Never a real order. Effective cap = min(max_open, budget/size).",
+                                  0.0, 10_000_000.0, 100.0, "USDT"),
+    "data.paper_shadow_position_usdt": _meta("data.paper_shadow_position_usdt", "float", "Data",
+                                  "Shadow-Lab position size",
+                                  "Fake notional per shadow position (matches the live $11 ticket by default).",
+                                  1.0, 100_000.0, 1.0, "USDT"),
+    "data.paper_shadow_max_open": _meta("data.paper_shadow_max_open", "int", "Data",
+                                  "Shadow-Lab max open positions",
+                                  "Hard cap on concurrent shadow positions (memory bound). 300-1000 gives a "
+                                  "fast data flywheel; higher uses more RAM/CPU.",
+                                  1, 5000, 50, ""),
+    "data.paper_shadow_max_per_symbol": _meta("data.paper_shadow_max_per_symbol", "int", "Data",
+                                  "Shadow-Lab max per symbol",
+                                  "How many concurrent shadow positions one coin may hold (allows re-entry "
+                                  "→ more outcomes per coin).",
+                                  1, 500, 1, ""),
     "data.ev_min_clean_trades": _meta("data.ev_min_clean_trades", "int", "Data",
                                   "EV model: min clean trades",
                                   "Minimum labeled trades before the win-probability model may gate real "

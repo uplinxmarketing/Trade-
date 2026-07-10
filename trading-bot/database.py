@@ -332,6 +332,26 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_training_samples_ts   ON training_samples(ts);
             CREATE INDEX IF NOT EXISTS idx_training_samples_mode ON training_samples(mode);
+
+            -- WolfBot Shadow-Lab — rich paper-shadow outcome store. One row per
+            -- closed shadow trade; get_paper_summary aggregates it into the
+            -- copy-paste "results summary". Hard-capped to the newest 200k rows.
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts         REAL,
+                symbol     TEXT,
+                wolfscore  REAL,
+                regime     TEXT,
+                exit_type  TEXT,
+                entry_px   REAL,
+                exit_px    REAL,
+                pnl        REAL,
+                realized_r REAL,
+                hold_sec   REAL,
+                label      INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_trades_ts     ON paper_trades(ts);
+            CREATE INDEX IF NOT EXISTS idx_paper_trades_symbol ON paper_trades(symbol);
         """)
 
         # ── Schema migrations for existing databases ─────────────────────────
@@ -1884,3 +1904,323 @@ def list_backups() -> list:
     except Exception:
         return out
     return out
+
+
+# ── Paper-shadow outcome store (WolfBot Shadow-Lab) ───────────────────────────
+#
+# The paper-shadow runs many concurrent shadow trades as a data scraper. Each
+# closed shadow trade writes one detailed outcome row via save_paper_trade;
+# get_paper_summary aggregates the table into the operator's copy-paste
+# "results summary". All helpers are CREATE-safe, guarded, and never raise — a
+# shadow-store failure must never break a shadow trade. The table is hard-capped
+# to the newest 200_000 rows on write (same pattern as buy_rejections /
+# training_samples / entry_snapshots).
+
+_PAPER_TRADES_CAP = 200000
+
+_PAPER_TRADES_DDL = """CREATE TABLE IF NOT EXISTS paper_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, symbol TEXT, wolfscore REAL,
+    regime TEXT, exit_type TEXT, entry_px REAL, exit_px REAL, pnl REAL,
+    realized_r REAL, hold_sec REAL, label INTEGER)"""
+
+
+def save_paper_trade(row: dict) -> None:
+    """Store one closed paper-shadow trade outcome.
+
+    `row` is a dict with keys ts, symbol, wolfscore, regime, exit_type,
+    entry_px, exit_px, pnl, realized_r, hold_sec, label. Missing keys become
+    NULL (numeric fields coerce via _num; `ts` defaults to time.time()).
+    CREATE-safe, guarded, never raises. On write the table is hard-capped to
+    the newest 200_000 rows so it can't grow unbounded under heavy scrape."""
+    import time as _t
+    row = row if isinstance(row, dict) else {}
+    ts = row.get("ts")
+    if ts is None:
+        ts = _t.time()
+    try:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute(_PAPER_TRADES_DDL)
+                conn.execute("""
+                    INSERT INTO paper_trades
+                        (ts, symbol, wolfscore, regime, exit_type, entry_px,
+                         exit_px, pnl, realized_r, hold_sec, label)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    _num(ts), row.get("symbol"), _num(row.get("wolfscore")),
+                    row.get("regime"), row.get("exit_type"),
+                    _num(row.get("entry_px")), _num(row.get("exit_px")),
+                    _num(row.get("pnl")), _num(row.get("realized_r")),
+                    _num(row.get("hold_sec")),
+                    int(bool(row.get("label"))) if row.get("label") is not None else None,
+                ))
+                # Hard row cap (same pattern as buy_rejections/training_samples).
+                conn.execute(
+                    "DELETE FROM paper_trades WHERE id NOT IN "
+                    "(SELECT id FROM paper_trades ORDER BY id DESC LIMIT ?)",
+                    (_PAPER_TRADES_CAP,))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as e:
+        print(f"[Database] save_paper_trade failed: {e}")
+
+
+def _paper_score_bucket(score) -> Optional[str]:
+    """Bucket a wolfscore into one of '0-40'/'40-55'/'55-70'/'70-100'.
+    Returns None when the score is missing/non-numeric so it is excluded
+    from the by_score_bucket breakdown."""
+    s = _num(score)
+    if s is None:
+        return None
+    if s < 40:
+        return "0-40"
+    if s < 55:
+        return "40-55"
+    if s < 70:
+        return "55-70"
+    return "70-100"
+
+
+def _paper_regime_key(regime) -> Optional[str]:
+    """Normalise a regime string into 'up'/'down'/'side' for the by_regime
+    breakdown. Unknown/missing regimes are excluded (returns None)."""
+    if regime is None:
+        return None
+    r = str(regime).strip().lower()
+    if r in ("up", "bull", "bullish", "long"):
+        return "up"
+    if r in ("down", "bear", "bearish", "short"):
+        return "down"
+    if r in ("side", "sideways", "flat", "range", "ranging", "chop", "neutral"):
+        return "side"
+    return None
+
+
+def get_paper_summary(hours: float = None, limit: int = 200000) -> dict:
+    """Aggregate paper_trades into the copy-paste "results summary".
+
+    When `hours` is given, only trades in the last `hours` are included.
+    Bounded to the newest `limit` rows, pulled and aggregated in Python.
+    A trade is a win when realized_r > 0 (or pnl > 0 when realized_r is NULL).
+    Guarded → a zeros/empty-but-valid dict on error. Returns:
+      {n, wins, losses, win_rate, expectancy_r, avg_win_r, avg_loss_r,
+       profit_factor, total_pnl, avg_hold_sec, trades_per_hour,
+       by_exit_type: {exit_type: {n, win_rate, avg_r}},
+       by_regime:    {up/down/side: {n, win_rate, avg_r}},
+       by_score_bucket: {'0-40'/'40-55'/'55-70'/'70-100': {n, win_rate, avg_r}},
+       top_symbols: [{symbol, n, win_rate, avg_r, pnl} ...up to 15 by n],
+       data_start_ts, generated_ts}"""
+    import time as _t
+    generated_ts = _t.time()
+    empty = {
+        "n": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
+        "expectancy_r": 0.0, "avg_win_r": 0.0, "avg_loss_r": 0.0,
+        "profit_factor": 0.0, "total_pnl": 0.0, "avg_hold_sec": 0.0,
+        "trades_per_hour": 0.0,
+        "by_exit_type": {}, "by_regime": {}, "by_score_bucket": {},
+        "top_symbols": [], "data_start_ts": None, "generated_ts": generated_ts,
+    }
+    try:
+        where = ["1=1"]
+        params: list = []
+        if hours is not None:
+            where.append("ts >= ?")
+            params.append(generated_ts - float(hours) * 3600.0)
+        params.append(int(limit))
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute(_PAPER_TRADES_DDL)
+                rows = conn.execute(f"""
+                    SELECT ts, symbol, wolfscore, regime, exit_type,
+                           pnl, realized_r, hold_sec, label
+                    FROM paper_trades
+                    WHERE {' AND '.join(where)}
+                    ORDER BY id DESC LIMIT ?
+                """, params).fetchall()
+            finally:
+                conn.close()
+    except Exception as e:
+        print(f"[Database] get_paper_summary failed: {e}")
+        return dict(empty)
+
+    if not rows:
+        return dict(empty)
+
+    def _is_win(realized_r, pnl) -> bool:
+        if realized_r is not None:
+            return realized_r > 0
+        return (pnl is not None) and (pnl > 0)
+
+    def _grp():
+        return {"n": 0, "wins": 0, "r_sum": 0.0, "r_cnt": 0, "pnl": 0.0}
+
+    def _finalize(g: dict, with_pnl: bool = False) -> dict:
+        out = {
+            "n": g["n"],
+            "win_rate": round(g["wins"] / g["n"], 4) if g["n"] else 0.0,
+            "avg_r": round(g["r_sum"] / g["r_cnt"], 4) if g["r_cnt"] else 0.0,
+        }
+        if with_pnl:
+            out["pnl"] = round(g["pnl"], 6)
+        return out
+
+    n = 0
+    wins = 0
+    r_sum = 0.0
+    r_cnt = 0
+    win_r_sum = 0.0
+    win_r_cnt = 0
+    loss_r_sum = 0.0
+    loss_r_cnt = 0
+    gross_win = 0.0
+    gross_loss = 0.0  # magnitude of losing pnl
+    total_pnl = 0.0
+    hold_sum = 0.0
+    hold_cnt = 0
+    min_ts = None
+    max_ts = None
+    by_exit: Dict[str, dict] = {}
+    by_regime: Dict[str, dict] = {}
+    by_bucket: Dict[str, dict] = {}
+    by_symbol: Dict[str, dict] = {}
+
+    for r in rows:
+        realized_r = r["realized_r"]
+        pnl = r["pnl"]
+        won = _is_win(realized_r, pnl)
+        n += 1
+        if won:
+            wins += 1
+        if realized_r is not None:
+            r_sum += realized_r
+            r_cnt += 1
+            if realized_r > 0:
+                win_r_sum += realized_r
+                win_r_cnt += 1
+            else:
+                loss_r_sum += realized_r
+                loss_r_cnt += 1
+        if pnl is not None:
+            total_pnl += pnl
+            if pnl > 0:
+                gross_win += pnl
+            elif pnl < 0:
+                gross_loss += -pnl
+        if r["hold_sec"] is not None:
+            hold_sum += r["hold_sec"]
+            hold_cnt += 1
+        ts = r["ts"]
+        if ts is not None:
+            min_ts = ts if min_ts is None else min(min_ts, ts)
+            max_ts = ts if max_ts is None else max(max_ts, ts)
+
+        def _accum(bucket_map: dict, key):
+            if key is None:
+                return
+            g = bucket_map.get(key)
+            if g is None:
+                g = _grp()
+                bucket_map[key] = g
+            g["n"] += 1
+            if won:
+                g["wins"] += 1
+            if realized_r is not None:
+                g["r_sum"] += realized_r
+                g["r_cnt"] += 1
+            if pnl is not None:
+                g["pnl"] += pnl
+
+        et = r["exit_type"]
+        _accum(by_exit, et if et is not None else "unknown")
+        _accum(by_regime, _paper_regime_key(r["regime"]))
+        _accum(by_bucket, _paper_score_bucket(r["wolfscore"]))
+        _accum(by_symbol, r["symbol"] if r["symbol"] is not None else "?")
+
+    losses = n - wins
+    span_hours = None
+    if min_ts is not None and max_ts is not None and max_ts > min_ts:
+        span_hours = (max_ts - min_ts) / 3600.0
+    trades_per_hour = round(n / span_hours, 3) if span_hours else 0.0
+    profit_factor = round(gross_win / gross_loss, 4) if gross_loss > 0 else (
+        float(gross_win) if gross_win > 0 else 0.0)
+
+    top_symbols = sorted(
+        ({"symbol": sym, **_finalize(g, with_pnl=True)}
+         for sym, g in by_symbol.items()),
+        key=lambda d: d["n"], reverse=True)[:15]
+
+    return {
+        "n": n,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / n, 4) if n else 0.0,
+        "expectancy_r": round(r_sum / r_cnt, 4) if r_cnt else 0.0,
+        "avg_win_r": round(win_r_sum / win_r_cnt, 4) if win_r_cnt else 0.0,
+        "avg_loss_r": round(loss_r_sum / loss_r_cnt, 4) if loss_r_cnt else 0.0,
+        "profit_factor": profit_factor,
+        "total_pnl": round(total_pnl, 6),
+        "avg_hold_sec": round(hold_sum / hold_cnt, 2) if hold_cnt else 0.0,
+        "trades_per_hour": trades_per_hour,
+        "by_exit_type": {k: _finalize(v) for k, v in by_exit.items()},
+        "by_regime": {k: _finalize(v) for k, v in by_regime.items()},
+        "by_score_bucket": {k: _finalize(v) for k, v in by_bucket.items()},
+        "top_symbols": top_symbols,
+        "data_start_ts": min_ts,
+        "generated_ts": generated_ts,
+    }
+
+
+def count_paper_trades() -> dict:
+    """Return {"total", "wins", "open"} for the paper-shadow store. `open` is
+    tracked in-memory by paper_shadow (not persisted here) so it is always
+    None. A win is realized_r > 0, or pnl > 0 when realized_r is NULL.
+    CREATE-safe, guarded → zeros on error."""
+    try:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute(_PAPER_TRADES_DDL)
+                row = conn.execute("""
+                    SELECT
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN realized_r > 0
+                                   OR (realized_r IS NULL AND pnl > 0)
+                                 THEN 1 ELSE 0 END) AS wins
+                    FROM paper_trades
+                """).fetchone()
+            finally:
+                conn.close()
+    except Exception:
+        return {"total": 0, "wins": 0, "open": None}
+    if not row:
+        return {"total": 0, "wins": 0, "open": None}
+    return {
+        "total": int(row["total"] or 0),
+        "wins": int(row["wins"] or 0),
+        "open": None,
+    }
+
+
+def prune_paper_trades(retention_days: float) -> int:
+    """Delete paper_trades with ts older than now - retention_days (ts is epoch
+    seconds). CREATE-safe, guarded. Returns rows deleted (0 on error)."""
+    import time as _t
+    cutoff = _t.time() - float(retention_days) * 86400.0
+    try:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute(_PAPER_TRADES_DDL)
+                cur = conn.execute(
+                    "DELETE FROM paper_trades WHERE ts < ?", (cutoff,))
+                deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                conn.commit()
+            finally:
+                conn.close()
+        return deleted
+    except Exception as e:
+        print(f"[Database] prune_paper_trades failed: {e}")
+        return 0
