@@ -149,6 +149,11 @@ export interface EvTrainPayload {
   report?: EvReport | null;
   started?: string | number;
   error?: string;
+  status?: 'idle' | 'running' | 'done' | 'failed' | string;
+  rows_loaded?: number | null;
+  rows_usable?: number | null;
+  saved_version?: string | number | null;
+  finished_ts?: number | null;
 }
 
 // ── Expectancy ─────────────────────────────────────────────────────────────

@@ -80,6 +80,7 @@ from __future__ import annotations
 import threading
 import time
 import logging
+import random
 from typing import Any, Dict, Optional, Tuple
 
 log = logging.getLogger(__name__)
@@ -272,7 +273,15 @@ class PaperShadow:
         except Exception:
             cohort = {}
 
-        for sym in approved:
+        # Representativeness (Part-B constraint): evaluate candidates in a RANDOM
+        # order each cycle. With a low shadow_max_open the ledger fills before the
+        # whole universe is seen; a fixed order would then always open the same
+        # first-listed coins and silently bias the training set. Shuffling makes the
+        # opened subset a representative sample across the full score/regime range.
+        # No score/regime FILTER is applied — the shadow stays unbiased by design.
+        _eval_order = list(approved)
+        random.shuffle(_eval_order)
+        for sym in _eval_order:
             if self._stop_evt.is_set():
                 return
             # Fast pre-check under lock — O(1). Refuse (log ONCE) when the global
@@ -338,17 +347,12 @@ class PaperShadow:
         pos = self._open_paper(sym, price, strategy, position_usdt)
         if pos is None:
             return
-        # EV features + score from the SAME raw signals (interpretability parity).
-        try:
-            pos["ev_features"] = ev_model.extract_features(sig_data)
-        except Exception:
-            pos["ev_features"] = {}
         try:
             pos["ev_score"] = ev_model.score(sig_data).get("probability")
         except Exception:
             pos["ev_score"] = None
-        # WolfScore + regime AT ENTRY (guarded) — stored so the exit can log the
-        # rich outcome row. Reuses the live compute_submetrics + wolfscore path.
+        # WolfScore + regime AT ENTRY (guarded) — reuses the live compute_submetrics
+        # + wolfscore path.
         wolf = None
         try:
             import trade_engine
@@ -358,9 +362,21 @@ class PaperShadow:
         if isinstance(wolf, dict):
             pos["wolfscore"] = wolf.get("pct")
             pos["regime"] = wolf.get("regime") or btc_regime
+            # CRITICAL — the training sample MUST carry the WolfScore SUBMETRICS +
+            # regime_tilt, exactly like the live path (trade_engine ev_submetrics/
+            # ev_regime_tilt). Previously this stored ev_model.extract_features()
+            # (the legacy flat EV feature names), which train_wolfscore cannot read
+            # — feats.get('submetrics') was None and compute_submetrics() got the
+            # wrong keys, so every paper sample degraded to all-zero submetrics and
+            # the trained model was garbage (the "Retrain does nothing" bug).
+            pos["ev_features"] = {
+                "submetrics":  wolf.get("submetrics") or {},
+                "regime_tilt": wolf.get("regime_tilt", 0.0),
+            }
         else:
             pos["wolfscore"] = None
             pos["regime"] = btc_regime
+            pos["ev_features"] = {}
 
         with self._lock:
             # Definitive cap re-check under lock (all counters are single-thread

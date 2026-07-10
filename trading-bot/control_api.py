@@ -8268,10 +8268,19 @@ def _run_ev_train_job(run_id: str):
     training samples and saves (does NOT activate) it. Clears the running flag on
     exit no matter what. Never runs on the event loop."""
     global _ev_train_running, _ev_train_last, _ev_train_last_ts
-    result: dict = {"ok": False, "run_id": run_id}
+    _started = time.time()
+    # Publish an immediate 'running' state so the UI/diagnostics show progress
+    # rather than silence while the fit runs.
+    with _ev_train_lock:
+        _ev_train_last = {"ok": None, "run_id": run_id, "status": "running",
+                          "started_ts": _started, "rows_loaded": None}
+        _ev_train_last_ts = _started
+    result: dict = {"ok": False, "run_id": run_id, "status": "failed",
+                    "started_ts": _started}
     try:
         import ev_model as _ev
         samples = []
+        rows_usable = 0
         try:
             fn = getattr(database, "get_training_samples", None)
             if callable(fn):
@@ -8280,11 +8289,16 @@ def _run_ev_train_job(run_id: str):
                     if not isinstance(r, dict):
                         continue
                     feats = r.get("features") if isinstance(r.get("features"), dict) else {}
-                    # WolfScore-v3 rows carry submetrics + regime_tilt in features;
-                    # if a row lacks submetrics, train_wolfscore recomputes from the
-                    # raw features itself — pass them through so it can.
+                    _sub = feats.get("submetrics")
+                    # A row is USABLE for WolfScore training only if it carries the
+                    # 8 submetrics (T,M,R,C,W,V,X,F). Rows saved in the legacy flat
+                    # feature format have no submetrics → they'd degrade to all-zero
+                    # and teach the model nothing; count them so the operator sees
+                    # how much real training data exists.
+                    if isinstance(_sub, dict) and _sub:
+                        rows_usable += 1
                     samples.append({
-                        "submetrics":  feats.get("submetrics"),
+                        "submetrics":  _sub,
                         "regime_tilt": feats.get("regime_tilt", 0.0),
                         "features":    feats,
                         "cohort":      feats.get("cohort"),
@@ -8294,25 +8308,49 @@ def _run_ev_train_job(run_id: str):
                         "realized_r":  r.get("realized_r"),
                         "ts":          r.get("ts"),
                     })
-        except Exception:
+        except Exception as e:
             samples = []
+            result["load_error"] = f"{type(e).__name__}: {e}"
+        _rows_loaded = len(samples)
+        try:
+            database.log_activity(
+                f"EV retrain {run_id}: loaded {_rows_loaded} training rows "
+                f"({rows_usable} with WolfScore submetrics)", "info")
+        except Exception:
+            pass
         # WolfScore-v3 trainer (regime-gated logistic fit), not the generic train.
         _trainer = getattr(_ev, "train_wolfscore", None) or getattr(_ev, "train")
         res = _trainer(samples)
         if isinstance(res, dict):
             result = dict(res)
             result["run_id"] = run_id
-            result["n_samples"] = len(samples)
+            result["started_ts"] = _started
+            result["n_samples"] = _rows_loaded
+            result["rows_loaded"] = _rows_loaded
+            result["rows_usable"] = rows_usable
+            result["status"] = "done" if res.get("ok") else "failed"
+            if not res.get("ok") and res.get("error"):
+                result["error"] = res["error"]
             if res.get("ok") and isinstance(res.get("model"), dict):
                 try:
                     vid = _ev.save_version(res["model"])
                     result["saved_version"] = vid
+                    database.log_activity(
+                        f"EV retrain {run_id}: trained {vid} on {_rows_loaded} rows "
+                        f"(held-out n={res.get('report', {}).get('n_test')})", "info")
                 except Exception as e:
                     result["save_error"] = f"{type(e).__name__}: {e}"
+                    result["status"] = "failed"
     except Exception as e:
-        result = {"ok": False, "run_id": run_id,
+        result = {"ok": False, "run_id": run_id, "status": "failed",
+                  "started_ts": _started,
                   "error": f"{type(e).__name__}: {e}"}
+        try:
+            database.log_activity(f"EV retrain {run_id} FAILED: {result['error']}", "error")
+        except Exception:
+            pass
     finally:
+        result["finished_ts"] = time.time()
         with _ev_train_lock:
             _ev_train_running = False
             # Drop the (large) model dict from the stored report — keep it thin.
@@ -8352,14 +8390,31 @@ def api_ev_train_start():
 
 @app.get("/api/ev/train")
 def api_ev_train_report():
-    """S5 — last EV training result/report + the running flag. Never 500s."""
+    """S5 — last EV training result/report + the running flag. Never 500s.
+    The report/status/row-count fields are surfaced at the TOP LEVEL (not only
+    nested in `last`) so the UI can render them directly — previously the panel
+    read `report` at the top level while it was buried in `last`, so a completed
+    retrain showed nothing."""
     with _ev_train_lock:
         running = _ev_train_running
         run_id = _ev_train_run_id
-        last = _ev_train_last
+        last = dict(_ev_train_last) if isinstance(_ev_train_last, dict) else {}
         last_ts = _ev_train_last_ts
-    return {"running": running, "run_id": run_id,
-            "last": last, "last_run_ts": last_ts}
+    return {
+        "available":     True,
+        "running":       running,
+        "run_id":        run_id,
+        "status":        ("running" if running else last.get("status")),
+        "report":        last.get("report"),
+        "rows_loaded":   last.get("rows_loaded"),
+        "rows_usable":   last.get("rows_usable"),
+        "saved_version": last.get("saved_version"),
+        "error":         last.get("error") or last.get("save_error") or last.get("load_error"),
+        "started":       last.get("started_ts"),
+        "finished_ts":   last.get("finished_ts"),
+        "last":          last,
+        "last_run_ts":   last_ts,
+    }
 
 
 @app.post("/api/ev/activate")

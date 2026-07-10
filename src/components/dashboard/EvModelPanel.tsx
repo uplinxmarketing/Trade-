@@ -155,6 +155,30 @@ export function EvModelPanel({ baseUrl = '' }: { baseUrl?: string }) {
         </Button>
       </div>
 
+      {/* Retrain status — always shows rows-loaded / status / error so a click is
+          never silent. */}
+      {(trainStatus?.status || trainStatus?.rows_loaded != null || trainStatus?.error) && (
+        <div className={`rounded px-2 py-1 text-[9px] ${
+          trainStatus?.status === 'failed'
+            ? 'bg-loss/15 text-loss border border-loss/30'
+            : trainStatus?.running || trainStatus?.status === 'running'
+            ? 'bg-amber-500/15 text-amber-400 border border-amber-500/30'
+            : 'bg-muted/25 text-muted-foreground'
+        }`}>
+          {trainStatus?.running || trainStatus?.status === 'running' ? (
+            <span>Training… loading {trainStatus?.rows_loaded ?? '…'} rows</span>
+          ) : trainStatus?.status === 'failed' ? (
+            <span>Retrain failed{trainStatus?.error ? ` — ${trainStatus.error}` : ''}</span>
+          ) : trainStatus?.status === 'done' ? (
+            <span>
+              Trained on {trainStatus?.rows_loaded ?? '?'} rows
+              {trainStatus?.rows_usable != null ? ` (${trainStatus.rows_usable} with submetrics)` : ''}
+              {trainStatus?.saved_version ? ` → ${fmtVersion(trainStatus.saved_version)}` : ''}. Review the held-out report, then Activate.
+            </span>
+          ) : null}
+        </div>
+      )}
+
       {loading && !data ? (
         <p className="text-[9px] text-muted-foreground py-1">Loading model…</p>
       ) : unavailable ? (
