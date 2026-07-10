@@ -4088,6 +4088,16 @@ def api_diag_entry_report():
         out["buy_ready_count"] = len(per_coin)
         out["silent_gap_count"] = silent
         out["stale_signal_count_gt10s"] = stale
+        # Scan timing (diagnosis): per-stage ms of the last scan pass.
+        try:
+            out["scan_timing_ms"] = dict(getattr(_te, "_scan_stage_ms", {}) or {})
+            _ssh = getattr(_te, "_signal_scanner_health", {}) or {}
+            out["scan_timing_ms"]["last_total_duration_ms"] = _ssh.get("last_duration_ms")
+            out["scan_timing_ms"]["effective_interval_sec"] = _ssh.get("effective_interval_sec")
+            out["scan_timing_ms"]["paper_shadow_enabled"] = bool(
+                (strat.get("data") or {}).get("paper_shadow_enabled", True))
+        except Exception:
+            out["scan_timing_ms"] = {}
         out["blockers_summary"] = dict(sorted(agg.items(), key=lambda kv: -kv[1]))
         out["per_coin"] = per_coin[:50]
         return out
