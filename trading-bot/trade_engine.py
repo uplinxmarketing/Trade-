@@ -2075,15 +2075,36 @@ def _wolf_adaptive_floor(pcts, abs_floor: float, mode: str, k: float) -> Optiona
         return None
 
 
+_ev_scores_cache: Dict[str, Any] = {"ts": 0.0, "data": {}}
+_ev_scores_cache_lock = threading.Lock()
+_EV_SCORES_TTL_SEC = 5.0  # serve the UI/diagnostics feed from a memo; recompute
+                          # at most once per this window (single-flight below).
+
+
 def get_live_ev_scores() -> dict:
     """S5 data feed for control_api / UI: per currently-tracked symbol, the latest
-    WolfScore v3 computed on demand from _signal_cache, plus a top-level '__meta__'
-    entry carrying the regime tilt and the adaptive-floor threshold so the UI can
-    draw the score distribution and the floor line. Per-symbol shape:
-      {pct, submetrics, families, regime, regime_tilt, top_reasons, trained,
-       version, hard_gate}
-    O(universe); guarded so a scoring failure yields an empty/partial map rather
-    than raising. Returns {} when ev_model is unavailable."""
+    WolfScore v3, plus a top-level '__meta__' block. Served from a short-TTL,
+    single-flight memo so the /api/ev/scores poll AND the diagnostics bundle never
+    each recompute WolfScore over the whole universe on every request — under a
+    73-coin universe that per-request O(universe) recompute was starving the box
+    and 504-ing the EV + diagnostics endpoints. The lock makes at most ONE compute
+    happen per TTL window; concurrent callers reuse the same result."""
+    now = time.time()
+    with _ev_scores_cache_lock:
+        _cached = _ev_scores_cache.get("data")
+        if _cached and (now - float(_ev_scores_cache.get("ts", 0.0)) < _EV_SCORES_TTL_SEC):
+            return _cached
+        data = _compute_live_ev_scores()
+        _ev_scores_cache["ts"] = time.time()
+        _ev_scores_cache["data"] = data
+        return data
+
+
+def _compute_live_ev_scores() -> dict:
+    """Uncached WolfScore-v3 computation over the live signal cache. O(universe);
+    guarded so a scoring failure yields an empty/partial map rather than raising.
+    Returns {} when ev_model is unavailable. Callers should go through
+    get_live_ev_scores() (memoized) — this is the cold path."""
     if ev_model is None:
         return {}
     try:
@@ -2728,7 +2749,7 @@ _signal_scanner_health: Dict = {
     "interval_sec":     float(30),  # will be updated at runtime from config.SCAN_INTERVAL_SEC
     # C §6.1 scan stabilizers
     "scan_skipped_overlap":   0,      # refreshes skipped because one was already in flight
-    "effective_interval_sec": float(30),  # adaptive sleep (>= SCAN_INTERVAL_SEC, <= 600)
+    "effective_interval_sec": float(30),  # adaptive sleep (>= SCAN_INTERVAL_SEC, <= 120)
     "universe_size":          0,      # symbols in the last scan pass
     # C §6.2/§6.5 — WS-first signal engine
     "mode":                  "ws-first",  # "ws-first" | "legacy" (strategy data.legacy_rest_scan)
@@ -11876,10 +11897,15 @@ async def signal_scanner(prices: dict):
 
             # C §6.1b — duration telemetry + adaptive interval.
             # Slow pass (>0.8× current interval): next sleep = duration × 1.5,
-            # capped at 600s, floored at SCAN_INTERVAL_SEC. Fast pass
+            # capped at 120s, floored at SCAN_INTERVAL_SEC. Fast pass
             # (<0.5× SCAN_INTERVAL_SEC): decay back toward SCAN_INTERVAL_SEC.
+            # Cap lowered 600→120s: the poll-based buy backup is chained to this
+            # interval, so a runaway stretch was leaving entries un-polled for
+            # minutes (the "signal engine cooldown"). WS 5m-close buys fire on the
+            # dedicated _buy_check_executor regardless, but the poll backstop must
+            # not lag by minutes.
             if _duration_sec > 0.8 * _effective_interval:
-                _new_interval = min(600.0, max(_base_interval, _duration_sec * 1.5))
+                _new_interval = min(120.0, max(_base_interval, _duration_sec * 1.5))
                 log.warning(
                     "[SignalScanner] Slow scan pass: duration=%.1fs > 0.8×interval "
                     "(%.1fs) — stretching next interval to %.1fs",
