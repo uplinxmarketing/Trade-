@@ -743,7 +743,20 @@ async def lifespan(app: FastAPI):
         # and the /api/activity endpoint can show the error.
 
     yield
-    # Shutdown — daemon threads and tasks stop with the process
+    # Shutdown — daemon threads and tasks stop with the process. Write the
+    # clean-shutdown marker + persist risk latches here so a normal `systemctl
+    # restart` (SIGTERM → uvicorn graceful shutdown → this lifespan-exit) is
+    # recorded as CLEAN, not a false "unclean crash". Reliable regardless of who
+    # owns the SIGTERM handler. Guarded — shutdown must never raise.
+    try:
+        _wm = getattr(trade_engine, "_write_clean_shutdown_marker", None)
+        if callable(_wm):
+            _wm()
+        _pl = getattr(trade_engine, "persist_risk_latches", None)
+        if callable(_pl):
+            _pl()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="Trading Bot Control API", version="1.0", lifespan=lifespan)
@@ -5224,7 +5237,8 @@ def api_diagnostics_bundle(
             ps = pfn() if callable(pfn) else {}
             if isinstance(ps, dict) and ps:
                 out.write(f"  paper_shadow expectancy={ps.get('expectancy')} "
-                          f"win_rate={ps.get('win_rate')} n={ps.get('n')}\n")
+                          f"win_rate={ps.get('win_rate')} n={ps.get('n_total', ps.get('n'))} "
+                          f"open={ps.get('open_positions')}\n")
             else:
                 out.write("  paper_shadow: [unavailable]\n")
         except Exception:

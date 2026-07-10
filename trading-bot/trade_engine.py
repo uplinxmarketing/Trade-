@@ -7033,6 +7033,32 @@ def detect_restart_reason() -> dict:
 import atexit as _atexit
 _atexit.register(_write_clean_shutdown_marker)
 
+# A `systemctl restart` / normal stop sends SIGTERM, which kills the process
+# WITHOUT running atexit — so every deploy looked like an "unclean" crash in the
+# restart-reason detector. Handle SIGTERM/SIGINT: write the clean marker, then
+# re-raise the default behavior so shutdown proceeds normally. Only installed in
+# the main thread (signals can't be set elsewhere); guarded so it never blocks import.
+def _graceful_signal_shutdown(_signum, _frame):  # pragma: no cover - signal path
+    try:
+        _write_clean_shutdown_marker()
+    except Exception:
+        pass
+    try:
+        persist_risk_latches()
+    except Exception:
+        pass
+    os._exit(0)
+
+
+try:
+    import signal as _signal
+    import threading as _thr_sig
+    if _thr_sig.current_thread() is _thr_sig.main_thread():
+        _signal.signal(_signal.SIGTERM, _graceful_signal_shutdown)
+        _signal.signal(_signal.SIGINT, _graceful_signal_shutdown)
+except Exception:
+    pass
+
 # R1.1 — start leak instrumentation at module import (guarded; never blocks boot).
 _maybe_start_tracemalloc()
 
