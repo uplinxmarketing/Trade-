@@ -558,6 +558,63 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("v2_migration", exc)
 
+            # 4c-b. Part S-3 — ONE-TIME data-driven tuning migration. Schema DEFAULT
+            #   changes don't reach already-persisted keys, so the S3 tuning would be
+            #   inert on an existing strategy.json. This bumps the specific keys to
+            #   their S3 values, but ONLY where the persisted value is still the OLD
+            #   default — a value the operator has since tuned is NEVER clobbered.
+            #   Guarded by a stored rev marker so it runs exactly once.
+            try:
+                import strategy_config as _scfg_s3
+                _S3_REV = 1
+                _raw_s3 = _load_strategy()
+                if int(_raw_s3.get("s3_tuning_rev", 0) or 0) < _S3_REV:
+                    _ent = _raw_s3.get("entries") if isinstance(_raw_s3.get("entries"), dict) else {}
+                    _dat = _raw_s3.get("data") if isinstance(_raw_s3.get("data"), dict) else {}
+                    _ext = _raw_s3.get("exits") if isinstance(_raw_s3.get("exits"), dict) else {}
+                    _s3_patch: dict = {}
+
+                    def _s3_bump(block, blockname, key, oldval, newval, patch, *, is_float=False):
+                        if key not in block:
+                            return  # absent → the new schema default already applies
+                        cur = block.get(key)
+                        same = (abs(float(cur) - float(oldval)) < 1e-9) if is_float \
+                            else (cur == oldval)
+                        if same:
+                            patch.setdefault(blockname, {})[key] = newval
+
+                    # S3-1 — floor mode p75 → absolute (the 55 cliff, distribution-independent)
+                    _s3_bump(_ent, "entries", "ev_floor_mode", "p75", "absolute", _s3_patch)
+                    # S3-4 — paper-shadow load: 300 → 100 concurrent (same signal, ~1/3 load)
+                    _s3_bump(_dat, "data", "paper_shadow_max_open", 300, 100, _s3_patch)
+                    # S3-7 — R-multiple tuning (operator-approved): arm ratchet later + trail wider
+                    _s3_bump(_ext, "exits", "ratchet_activate_r", 0.4, 0.8, _s3_patch, is_float=True)
+                    _s3_bump(_ext, "exits", "ratchet_k_atr", 0.6, 1.0, _s3_patch, is_float=True)
+
+                    if _s3_patch:
+                        _merged_s3, _errs_s3 = _scfg_s3.validate_patch(_raw_s3, _s3_patch)
+                        if _errs_s3:
+                            _step_failed("s3_tuning_migration",
+                                         Exception(f"validate: {_errs_s3}"))
+                        else:
+                            _touched_s3 = [b for b in _scfg_s3.V2_BLOCKS if b in _s3_patch]
+                            _file_patch_s3 = {b: _merged_s3[b] for b in _touched_s3}
+                            _file_patch_s3["s3_tuning_rev"] = _S3_REV
+                            _write_strategy_patch(_file_patch_s3)
+                            _applied = {f"{b}.{k}": v for b, kv in _s3_patch.items()
+                                        for k, v in kv.items()}
+                            database.log_activity(
+                                "S3 tuning migration applied (only keys still at the "
+                                f"old default): {_applied}", "info")
+                            steps.append(f"s3_tuning applied ({len(_applied)} key(s))")
+                    else:
+                        # Nothing to bump (operator already tuned, or fresh install on
+                        # the new defaults) — stamp the rev so we don't re-check.
+                        _write_strategy_patch({"s3_tuning_rev": _S3_REV})
+                        steps.append("s3_tuning noop")
+            except Exception as exc:
+                _step_failed("s3_tuning_migration", exc)
+
             # 4d. Part G (G1c) — ONE-TIME F3 signal-roles drift migration.
             #     A prior CODE-default version persisted stale roles into
             #     strategy.json (min_scored=4, T1_ema_short_long=scored,

@@ -69,6 +69,12 @@ class EntriesConfig(BaseModel):
     # ≤ this %. 0 disables the fallback (abandon as before). Cheap insurance
     # against ready signals starving on tight books; wide books still abandon.
     taker_fallback_max_spread_pct: float = Field(0.05, ge=0.0, le=5.0)
+    # S3-6 — E1 spread veto is over-conservative for maker-first entries: posting at
+    # the bid, you never PAY the spread, yet a wide spread was hard-vetoing top coins
+    # (STRK/ILV/PEPE vetoed ~75% of the time). When maker_first is on AND taker
+    # fallback is off, E1 uses this relaxed threshold instead of signal_thresholds.
+    # spread_max_pct, so wide-book coins are still tradeable via maker posts.
+    spread_max_pct_maker:   float = Field(0.5, ge=0.0, le=5.0)
     # L2 Tier 1 — skip an entry when (half-spread + recent avg exit slippage)
     # exceeds this % of the planned 1R stop distance (friction eats the edge).
     max_friction_of_stop:   float = Field(15.0, ge=0.0, le=100.0)
@@ -143,9 +149,14 @@ class ExitsConfig(BaseModel):
     # green, then locks profit before it round-trips. All four are UI-tunable and
     # backtester levers; defaults are starting points, not claims.
     ratchet_enabled:           bool  = True
-    ratchet_activate_r:        float = Field(0.4, ge=0.0, le=5.0)   # arm at ≥ this R of profit
+    # S3-7 — operator-approved R-multiple tuning (parameters only; exit LOGIC frozen).
+    # Paper data: avg_win was only +0.49R vs the +1.6R target — the ratchet armed at
+    # 0.4R and trailed tight (k_atr 0.6), grabbing the first small green. Arm later
+    # (0.8R) and trail wider (1.0×ATR) so winners breathe toward the TP. Below
+    # activation the fixed protective stop still holds (round-trip protection intact).
+    ratchet_activate_r:        float = Field(0.8, ge=0.0, le=5.0)   # arm at ≥ this R of profit
     ratchet_activate_usdt:     float = Field(0.02, ge=0.0, le=100.0)  # OR ≥ this $ profit
-    ratchet_k_atr:             float = Field(0.6, ge=0.05, le=5.0)  # trail = peak − k×ATR (per-coin)
+    ratchet_k_atr:             float = Field(1.0, ge=0.05, le=5.0)  # trail = peak − k×ATR (per-coin)
     ratchet_giveback_pct:      float = Field(50.0, ge=1.0, le=100.0)  # exit if profit gives back ≥ this % of peak
 
     @model_validator(mode="after")
@@ -363,6 +374,12 @@ SCHEMA: Dict[str, dict] = {
                                          "After the maker chase is exhausted, fill as taker if the live "
                                          "spread is ≤ this %. 0 disables (abandon instead).",
                                          0.0, 5.0, 0.01, "%"),
+    "entries.spread_max_pct_maker": _meta("entries.spread_max_pct_maker", "float", "Entries",
+                                         "E1 spread veto (maker-first)",
+                                         "Relaxed spread ceiling for the E1 veto when maker_first is on and "
+                                         "taker fallback is off — you post at the bid so you never pay the "
+                                         "spread. Wide-book top coins (STRK/ILV/PEPE) stay tradeable.",
+                                         0.0, 5.0, 0.05, "%"),
     "entries.max_friction_of_stop": _meta("entries.max_friction_of_stop", "float", "Entries",
                                          "Max friction of stop",
                                          "Skip entry when (half-spread + recent avg exit slippage) exceeds "
@@ -484,7 +501,9 @@ SCHEMA: Dict[str, dict] = {
                                 "trade is meaningfully green (sits between breakeven and the target)."),
     "exits.ratchet_activate_r": _meta("exits.ratchet_activate_r", "float", "Exits",
                                 "Ratchet activate (R)",
-                                "Arm the profit ratchet once unrealized profit reaches this many R.",
+                                "Arm the profit ratchet once unrealized profit reaches this many R. Higher "
+                                "= let winners run further before trailing (S3-7: raised 0.4→0.8 so avg_win "
+                                "moves toward the +1.6R target instead of exiting at +0.49R).",
                                 0.0, 5.0, 0.1, "R"),
     "exits.ratchet_activate_usdt": _meta("exits.ratchet_activate_usdt", "float", "Exits",
                                 "Ratchet activate ($)",
@@ -492,7 +511,8 @@ SCHEMA: Dict[str, dict] = {
                                 0.0, 100.0, 0.01, "USDT"),
     "exits.ratchet_k_atr": _meta("exits.ratchet_k_atr", "float", "Exits", "Ratchet trail (×ATR)",
                                 "Trailing distance = peak − this × ATR (per-coin, so majors trail tight "
-                                "and volatile alts trail wide automatically).",
+                                "and volatile alts trail wide automatically). Wider = winners breathe "
+                                "through pullbacks (S3-7: raised 0.6→1.0).",
                                 0.05, 5.0, 0.05, "×ATR"),
     "exits.ratchet_giveback_pct": _meta("exits.ratchet_giveback_pct", "float", "Exits",
                                 "Ratchet give-back cap (%)",
