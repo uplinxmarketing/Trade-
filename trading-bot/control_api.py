@@ -4461,7 +4461,9 @@ def _limits_report_line() -> str:
 def api_health_data():
     """Part C §6.5 health panel: data feed + rate limits + engine health with RED rules."""
     try:
-        snap = _compute_health_snapshot()
+        # Cached ~2s — /api/health/data (5s) and /api/diagnostics (2-5s) both build
+        # this snapshot; the memo dedupes the overlapping work.
+        snap = _ttl_cached("health_snapshot", 2.0, _compute_health_snapshot)
         # J3 — make the scanner tile's universe count authoritative and consistent
         # with every other panel: valid-universe is the single number, suspended /
         # excluded are reported separately (never folded into the total). The
@@ -4562,9 +4564,9 @@ def api_diagnostics():
 
     active_threads = [t.name for t in _thr.enumerate() if t.is_alive()]
 
-    # Part C §6.5: compact health verdict (shared computation with /api/health/data)
+    # Part C §6.5: compact health verdict (shared, cached with /api/health/data)
     try:
-        _hs = _compute_health_snapshot()
+        _hs = _ttl_cached("health_snapshot", 2.0, _compute_health_snapshot)
         _health_compact = {"status": _hs.get("status", "green"), "causes": _hs.get("causes", [])}
     except Exception:
         _health_compact = {"status": "green", "causes": []}
@@ -8479,10 +8481,43 @@ def api_ev_expectancy():
 
 # ── Shadow-Lab summary (data scraper w/ virtual budget) ──────────────────────
 
+# ── Aggregate TTL cache ──────────────────────────────────────────────────────
+# The shadow summary aggregates thousands of paper_trades rows in Python and is
+# hit by the 10s /api/ev/shadow poll (often several mounted panels) AND the
+# diagnostics bundle. Uncached, that full scan ran many times a minute and
+# saturated the single process — making EVERY endpoint (settings, wallet, mode,
+# copy-diagnostics) laggy. This memo collapses all callers to one compute per TTL
+# window. Single-flight (compute under the lock) so a burst of pollers can't
+# stampede the DB; on producer error the last good value is served if present.
+_agg_cache = {}
+_agg_cache_lock = threading.Lock()
+
+
+def _ttl_cached(key: str, ttl: float, producer):
+    now = time.time()
+    with _agg_cache_lock:
+        ent = _agg_cache.get(key)
+        if ent is not None and (now - ent[0]) < ttl:
+            return ent[1]
+        try:
+            val = producer()
+        except Exception:
+            if ent is not None:
+                return ent[1]
+            raise
+        _agg_cache[key] = (time.time(), val)
+        return val
+
+
 def _shadow_get_summary(hours=None):
-    """Guarded fetch of the rich shadow aggregate. Prefers
-    database.get_paper_summary(hours), falls back to
+    """Guarded, TTL-cached fetch of the rich shadow aggregate (heavy DB scan +
+    Python aggregation). Prefers database.get_paper_summary(hours), falls back to
     paper_shadow.get_shadow_summary(). Returns {} on any failure."""
+    return _ttl_cached(f"shadow_summary:{hours}", 12.0,
+                       lambda: _shadow_get_summary_uncached(hours))
+
+
+def _shadow_get_summary_uncached(hours=None):
     try:
         fn = getattr(database, "get_paper_summary", None)
         if callable(fn):
@@ -8504,7 +8539,11 @@ def _shadow_get_summary(hours=None):
 
 
 def _shadow_get_stats():
-    """Guarded fetch of paper_shadow.get_paper_stats(). Returns {} on failure."""
+    """Guarded, TTL-cached fetch of paper_shadow.get_paper_stats(). Returns {}."""
+    return _ttl_cached("shadow_stats", 8.0, _shadow_get_stats_uncached)
+
+
+def _shadow_get_stats_uncached():
     try:
         import paper_shadow as _ps
         fn = getattr(_ps, "get_paper_stats", None)

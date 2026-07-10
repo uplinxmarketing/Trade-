@@ -1998,7 +1998,7 @@ def _paper_regime_key(regime) -> Optional[str]:
     return None
 
 
-def get_paper_summary(hours: float = None, limit: int = 200000) -> dict:
+def get_paper_summary(hours: float = None, limit: int = 50000) -> dict:
     """Aggregate paper_trades into the copy-paste "results summary".
 
     When `hours` is given, only trades in the last `hours` are included.

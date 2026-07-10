@@ -124,7 +124,7 @@ function IssueRow({ issue, expanded, onToggle }: {
   );
 }
 
-const POLL_MS = 2000;
+const POLL_MS = 5000;
 
 export function DiagnosticsPanel() {
   const [diag, setDiag]           = useState<Diagnostics | null>(null);
