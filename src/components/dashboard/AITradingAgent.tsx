@@ -1180,11 +1180,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="trading-card">
-      {/* Paper-fallback warning banner */}
+      {/* Live-connection-lost warning banner */}
       {usingPaperFallback && (
         <div className="flex items-center gap-2 px-4 py-2 bg-amber-500/15 border-b border-amber-500/30 text-amber-400 text-xs">
-          <span className="font-bold">⚠ PAPER FALLBACK ACTIVE</span>
-          <span className="text-amber-400/80">{liveErrorMsg ?? 'Live Binance connection failed — running on paper wallet. Retrying every 60 s.'}</span>
+          <span className="font-bold">⚠ LIVE CONNECTION LOST</span>
+          <span className="text-amber-400/80">{liveErrorMsg ?? 'Binance live connection failed — live trading is paused. Re-check your API keys; it retries automatically.'}</span>
         </div>
       )}
       {/* Header */}
@@ -1278,7 +1278,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 mode === 'live' && !usingPaperFallback ? 'bg-gain animate-pulse' :
                 usingPaperFallback ? 'bg-amber-400' : 'bg-muted-foreground'
               }`} />
-              {mode === 'live' ? (usingPaperFallback ? 'LIVE · PAPER FALLBACK' : 'LIVE') : 'PAPER'}
+              {mode === 'live' ? (usingPaperFallback ? 'LIVE · CONNECTION LOST' : 'LIVE') : 'NOT CONNECTED'}
               <ChevronDown className={`w-2.5 h-2.5 transition-transform ${showModeToggle ? 'rotate-180' : ''}`} />
             </button>
             {/* Phase 4 §4.4 — breaker badge next to the mode pill */}
@@ -1312,51 +1312,35 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           </div>
         </div>
 
-        {/* Expandable mode switcher */}
+        {/* Expandable mode panel — LIVE-only agent (paper mode removed) */}
         {showModeToggle && (
           <div className="px-4 pb-3 pt-1 border-t border-border/50 space-y-2">
             {mode === 'live' ? (
-              /* Currently LIVE — offer switch to paper */
-              <div className="space-y-2">
+              /* Currently LIVE — this agent is live-only; no paper switch offered. */
+              <div className="space-y-1">
                 <p className="text-[10px] text-muted-foreground">
-                  Switch to paper mode to trade with simulated funds. Any open live positions will remain on Binance.
+                  This agent runs in <strong className="text-gain">LIVE</strong> mode only — every trade uses real
+                  Binance funds. Paper mode has been retired.
                 </p>
-                <Button
-                  onClick={async () => {
-                    setLiveSetupLoading(true);
-                    try {
-                      await fetch(`${botUrl}/api/mode`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ mode: 'paper' }),
-                      });
-                      setShowModeToggle(false);
-                      toast.success('Switching to paper mode…');
-                      setTimeout(() => pollBot(), 3000);
-                    } catch (e: any) {
-                      toast.error('Failed', { description: e.message });
-                    } finally {
-                      setLiveSetupLoading(false);
-                    }
-                  }}
-                  disabled={liveSetupLoading}
-                  size="sm"
-                  variant="outline"
-                  className="w-full border-amber-500/40 text-amber-400 hover:bg-amber-500/10">
-                  {liveSetupLoading ? 'Switching…' : 'Switch to Paper Mode'}
-                </Button>
+                {usingPaperFallback && (
+                  <p className="text-[10px] text-amber-400/90">
+                    Live Binance connection failed — trading is paused on a paper fallback. Re-check your API keys
+                    via the <strong>Binance</strong> button; it retries automatically.
+                  </p>
+                )}
               </div>
             ) : (
-              /* Currently PAPER — direct user to the top-right Binance button */
+              /* Not live yet — the only path forward is connecting Binance for LIVE. */
               <div className="space-y-2">
                 <p className="text-[10px] text-muted-foreground">
-                  To trade with real funds, connect your Binance API keys using the <strong>Binance</strong> button in the top-right corner.
+                  This agent is <strong>live-only</strong>. Connect your Binance API keys to start trading with real
+                  funds — use the <strong>Binance</strong> button in the top-right corner.
                 </p>
                 <Button
                   onClick={() => { setShowModeToggle(false); onConnectBinance?.(); }}
                   size="sm"
                   className="w-full bg-gain hover:bg-gain/90 text-white font-semibold">
-                  Open Binance Settings
+                  Connect Binance (Live)
                 </Button>
               </div>
             )}
