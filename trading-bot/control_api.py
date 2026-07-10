@@ -566,7 +566,7 @@ async def lifespan(app: FastAPI):
             #   Guarded by a stored rev marker so it runs exactly once.
             try:
                 import strategy_config as _scfg_s3
-                _S3_REV = 2
+                _S3_REV = 3
                 _raw_s3 = _load_strategy()
                 if int(_raw_s3.get("s3_tuning_rev", 0) or 0) < _S3_REV:
                     _ent = _raw_s3.get("entries") if isinstance(_raw_s3.get("entries"), dict) else {}
@@ -584,6 +584,12 @@ async def lifespan(app: FastAPI):
                         if same:
                             patch.setdefault(blockname, {})[key] = newval
 
+                    def _s3_set(block, blockname, key, value, patch):
+                        # Set a (new) go-live key only when absent — never clobber an
+                        # operator-set value.
+                        if key not in block:
+                            patch.setdefault(blockname, {})[key] = value
+
                     # S3-1 — floor mode p75 → absolute (the 55 cliff, distribution-independent)
                     _s3_bump(_ent, "entries", "ev_floor_mode", "p75", "absolute", _s3_patch)
                     # S3-4 — paper-shadow load: 300 → 100 concurrent (same signal, ~1/3 load)
@@ -594,6 +600,13 @@ async def lifespan(app: FastAPI):
                     # S4-3.4 — neutral regime should keep the FULL ticket (slots), not
                     # shrink it to $5.50 via the size multiplier (the recurring $5.50 bug).
                     _s3_bump(_rgm, "regime", "neutral_scaling_mode", "auto", "slots", _s3_patch)
+                    # Go-live (proven slice): drop the legacy pre-gate 4→3 (biggest live
+                    # trade-count unlock), gate live at the ≥55 cliff even untrained, and
+                    # persist the up-regime veto. All three are exactly what the operator
+                    # approved for the evidence-backed go-live.
+                    _s3_bump(_ent, "entries", "min_score", 4, 3, _s3_patch)
+                    _s3_set(_ent, "entries", "ev_floor_live_untrained", True, _s3_patch)
+                    _s3_set(_ent, "entries", "live_up_regime_mode", "veto", _s3_patch)
 
                     if _s3_patch:
                         _merged_s3, _errs_s3 = _scfg_s3.validate_patch(_raw_s3, _s3_patch)
