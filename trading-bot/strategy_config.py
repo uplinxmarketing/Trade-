@@ -60,7 +60,7 @@ class EntriesConfig(BaseModel):
     cooldown_after_sl_min:  float = Field(15.0, ge=0.0, le=240.0)
     prefer_fee_promo_pairs: bool  = False
     falling_knife_atr_mult: float = Field(1.0, ge=0.1, le=5.0)
-    eval_heartbeat_sec:     float = Field(15.0, ge=5.0, le=120.0)
+    eval_heartbeat_sec:     float = Field(5.0, ge=5.0, le=120.0)
     tick_entries:           bool  = False
     max_lot_waste_pct:      float = Field(5.0, ge=0.0, le=50.0)
     maker_abandon_max:      int   = Field(3, ge=1, le=20)
@@ -86,7 +86,7 @@ class EntriesConfig(BaseModel):
     # up to a full 300s candle = max discipline. Filters intra-candle flickers
     # without the minutes-long heartbeat lag. Never a switch to raw tick-buying —
     # the fresh re-check still gates; this is only how long confirmation takes.
-    confirm_seconds:        float = Field(10.0, ge=0.0, le=300.0)
+    confirm_seconds:        float = Field(3.0, ge=0.0, le=300.0)
     # O5.2 — reason-specific candidacy cooldowns (minutes), replacing the flat
     # 30-min bench. A near-miss fresh re-check must not sideline a coin that may
     # qualify on the next tick; thin-liquidity/spread are stable so keep ~5 min.
@@ -132,7 +132,7 @@ class EntriesConfig(BaseModel):
     # win, −1.00R). 'veto' = no live up-regime entries; 'min_score' = only if
     # WolfScore ≥ live_up_regime_min_pct; 'allow' = no restriction (set this once a
     # trained model proves up-regime is fixed). Paper-shadow is never restricted.
-    live_up_regime_mode:    Literal["veto", "min_score", "allow"] = "veto"
+    live_up_regime_mode:    Literal["veto", "min_score", "allow"] = "allow"
     live_up_regime_min_pct: float = Field(70.0, ge=0.0, le=100.0)
 
 
