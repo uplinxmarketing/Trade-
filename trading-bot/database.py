@@ -1628,6 +1628,77 @@ def _backups_dir() -> str:
     return d
 
 
+def newest_backup_age_sec() -> Optional[float]:
+    """Seconds since the most recent backup file was written, or None if there are
+    no backups. Lets the maintenance loop throttle backups to ~daily so a series of
+    restarts can't each mint a full-size backup (the cause of a 7×2.5GB blowup)."""
+    try:
+        import time as _t
+        newest = None
+        d = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
+        if not os.path.isdir(d):
+            return None
+        for name in os.listdir(d):
+            if not name.startswith("bot.db.backup"):
+                continue
+            try:
+                mt = os.path.getmtime(os.path.join(d, name))
+            except OSError:
+                continue
+            if newest is None or mt > newest:
+                newest = mt
+        return None if newest is None else max(0.0, _t.time() - newest)
+    except Exception:
+        return None
+
+
+def vacuum_db(min_free_ratio: float = 1.2, min_reclaim_bytes: int = 50 * 1024 * 1024) -> dict:
+    """Reclaim SQLite free pages — bot.db does NOT shrink after DELETEs (e.g. the
+    rolling-window trims) without VACUUM, so the file stays at its high-water mark
+    and every backup copies that bloat. Runs OFF the boot path (maintenance loop,
+    background thread). Guarded twice:
+      * skips unless the freelist is worth reclaiming (≥ min_reclaim_bytes), so a
+        healthy DB isn't rewritten needlessly every cycle;
+      * skips if free disk < db_size × min_free_ratio — VACUUM needs temp space
+        roughly equal to the DB, and must never fill the disk.
+    Returns {ok, skipped?, before_bytes, after_bytes, freed, error?}. Never raises."""
+    import shutil
+    try:
+        if not os.path.exists(DB_PATH):
+            return {"ok": False, "skipped": "no db"}
+        db_size = os.path.getsize(DB_PATH)
+        # How much is reclaimable = freelist pages × page size.
+        with _lock:
+            conn = _conn()
+            try:
+                page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+                free_pages = conn.execute("PRAGMA freelist_count").fetchone()[0]
+            finally:
+                conn.close()
+        reclaimable = int(page_size) * int(free_pages)
+        if reclaimable < min_reclaim_bytes:
+            return {"ok": True, "skipped": f"little to reclaim ({reclaimable} bytes)",
+                    "before_bytes": db_size}
+        free_disk = shutil.disk_usage(os.path.dirname(os.path.abspath(DB_PATH))).free
+        if free_disk < db_size * min_free_ratio:
+            return {"ok": False,
+                    "skipped": f"insufficient free disk ({free_disk} < {db_size}×{min_free_ratio})",
+                    "before_bytes": db_size}
+        with _lock:
+            conn = _conn()
+            try:
+                conn.isolation_level = None  # VACUUM must run outside a transaction
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.execute("VACUUM")
+            finally:
+                conn.close()
+        after = os.path.getsize(DB_PATH)
+        return {"ok": True, "before_bytes": db_size, "after_bytes": after,
+                "freed": db_size - after}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 def backup_db(keep: int = 7) -> dict:
     """Write a consistent on-disk backup of the SQLite DB at DB_PATH.
 

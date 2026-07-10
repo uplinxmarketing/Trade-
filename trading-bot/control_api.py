@@ -1050,14 +1050,35 @@ async def _daily_maintenance_loop():
                         f"fees.per_symbol_overrides", "warn")
         except Exception as e:
             print(f"[Maintenance] fee-override staleness check failed: {e}")
-        # N4 — nightly DB backup (VACUUM INTO timestamped file, keep 7, verify
-        # readable). Mechanics live in database.backup_db() (parallel work); we
-        # only schedule it once per daily maintenance cycle and log the result.
+        # Reclaim SQLite free pages BEFORE backing up so bot.db (and therefore the
+        # backup) is compact — the rolling-window trims leave the file bloated at
+        # its high-water mark otherwise. Guarded (free-disk + worthwhile-reclaim)
+        # and in a worker thread; never on the boot path.
+        try:
+            _vac = getattr(database, "vacuum_db", None)
+            if callable(_vac):
+                _vres = await _aio.to_thread(_vac)
+                print(f"[Maintenance] vacuum: {_vres}")
+        except Exception as e:
+            print(f"[Maintenance] vacuum failed: {e}")
+        # DB backup — THROTTLED to ~daily and keep=3. Previously this ran on every
+        # process restart (the maintenance warmup pass), so a day of deploys minted
+        # 7×2.5GB backups (18GB). Skip if a backup was written < 20h ago, so
+        # restarts can't accumulate them.
         try:
             _bk = getattr(database, "backup_db", None)
             if callable(_bk):
-                _res = await _aio.to_thread(_bk)
-                print(f"[Maintenance] db backup OK: {_res}")
+                _age = None
+                try:
+                    _agefn = getattr(database, "newest_backup_age_sec", None)
+                    _age = _agefn() if callable(_agefn) else None
+                except Exception:
+                    _age = None
+                if _age is not None and _age < 20 * 3600:
+                    print(f"[Maintenance] db backup skipped — last one {_age/3600:.1f}h ago (<20h)")
+                else:
+                    _res = await _aio.to_thread(_bk, 3)   # keep newest 3
+                    print(f"[Maintenance] db backup OK: {_res}")
             else:
                 print("[Maintenance] db backup skipped (database.backup_db absent)")
         except Exception as e:
