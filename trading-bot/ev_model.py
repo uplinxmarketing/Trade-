@@ -258,29 +258,52 @@ def score(raw_or_features: Optional[dict], model: Optional[dict] = None) -> Dict
 
 # ── S4: training (pure-python logistic regression, dependency-light) ──────────
 def _fit_logistic(X: List[List[float]], y: List[int],
-                  epochs: int = 400, lr: float = 0.1, l2: float = 1e-3
+                  epochs: int = 400, lr: float = 0.1, l2: float = 1e-3,
+                  sample_weight: Optional[List[float]] = None
                   ) -> Tuple[List[float], float]:
-    """Batch gradient descent on standardized X. Returns (coeffs, intercept)."""
+    """Weighted batch gradient descent on standardized X. Returns (coeffs,
+    intercept). sample_weight (S4-1.2) scales each row's gradient contribution so
+    a +1.6R win teaches the model more than a +0.05R scratch — the score then
+    reflects PROFITABILITY, not just hit-rate. Weights default to 1.0."""
     n = len(X)
     d = len(X[0]) if n else 0
     w = [0.0] * d
     b = 0.0
     if n == 0 or d == 0:
         return w, b
+    if sample_weight and len(sample_weight) == n:
+        sw = [max(0.0, float(s)) for s in sample_weight]
+    else:
+        sw = [1.0] * n
+    wsum = sum(sw) or float(n)
     for _ in range(epochs):
         gw = [0.0] * d
         gb = 0.0
         for i in range(n):
             z = b + sum(w[j] * X[i][j] for j in range(d))
             p = _sigmoid(z)
-            err = p - y[i]
+            err = (p - y[i]) * sw[i]
             gb += err
             for j in range(d):
                 gw[j] += err * X[i][j]
-        b -= lr * (gb / n)
+        b -= lr * (gb / wsum)
         for j in range(d):
-            w[j] -= lr * (gw[j] / n + l2 * w[j])
+            w[j] -= lr * (gw[j] / wsum + l2 * w[j])
     return w, b
+
+
+def _realized_r_weight(realized_r: Optional[float],
+                       floor: float = 0.2, cap: float = 3.0) -> float:
+    """S4-1.2 — per-sample training weight from |realized_R|, clamped to [floor,
+    cap] so scratches still count a little and a single 5R outlier can't dominate
+    the fit. Missing R → 1.0 (neutral)."""
+    if realized_r is None:
+        return 1.0
+    try:
+        a = abs(float(realized_r))
+    except (TypeError, ValueError):
+        return 1.0
+    return floor if a < floor else cap if a > cap else a
 
 
 def train(samples: List[dict], min_clean: Optional[int] = None
@@ -717,14 +740,24 @@ WOLF_WEIGHT_ORDER = ["wm_T", "wm_M", "wd_R", "wd_W", "wu_W",
 
 
 def train_wolfscore(samples: List[dict], min_clean: Optional[int] = None) -> Dict[str, Any]:
-    """Fit the 9 WolfScore weights via logistic regression on stored (submetrics,
-    regime_tilt, label) rows. Each sample: {"submetrics": {...}, "regime_tilt":
-    float, "label": 0/1}. Friction-gated samples (F>0.5) are dropped (they'd be
-    hard-rejected in production). Returns a wolfscore_v3 model version (NOT
-    activated) + a held-out calibration report."""
+    """Fit the 9 WolfScore weights via REALIZED-R-WEIGHTED logistic regression on
+    stored (submetrics, regime_tilt, label, realized_r, ts) rows. Friction-gated
+    samples (F>0.5) are dropped (they'd be hard-rejected in production).
+
+    S4-1.2 — samples are weighted by |realized_R| so the model optimizes for
+    PROFITABILITY, not hit-rate (a +0.05R scratch and a +1.6R win are both wins
+    but must not count equally).
+    S4-2 — the held-out split is TEMPORAL: rows are sorted oldest→newest and the
+    model trains on the older 80%, validated on the most-recent 20% it never saw.
+    The report includes reliability bins (predicted bucket → actual win-rate +
+    avg realized R) so overfit is visible: if in-sample is great but held-out
+    isn't calibrated, DON'T activate.
+
+    Returns a wolfscore_v3 model version (NOT activated) + the report."""
     if min_clean is None:
         min_clean = config_min_clean()
-    rows: List[Tuple[List[float], int]] = []
+    # (features, label, weight, realized_r, ts)
+    rows: List[Tuple[List[float], int, float, Optional[float], float]] = []
     for s in samples or []:
         if not isinstance(s, dict) or "label" not in s:
             continue
@@ -739,40 +772,91 @@ def train_wolfscore(samples: List[dict], min_clean: Optional[int] = None) -> Dic
             label = 1 if int(s["label"]) > 0 else 0
         except Exception:
             continue
-        rows.append((_wolf_derived_features(sub, tilt), label))
+        rr = s.get("realized_r")
+        try:
+            rr = float(rr) if rr is not None else None
+        except (TypeError, ValueError):
+            rr = None
+        try:
+            ts = float(s.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        rows.append((_wolf_derived_features(sub, tilt), label,
+                     _realized_r_weight(rr), rr, ts))
 
     n = len(rows)
     if n < max(20, int(min_clean)):
         return {"ok": False, "trained": False, "n": n, "min_clean": int(min_clean),
                 "error": f"insufficient clean samples ({n} < {min_clean})"}
+    # S4-2 — chronological order (oldest first) for an honest temporal holdout.
+    rows.sort(key=lambda r: r[4])
     cut = int(n * 0.8)
-    Xtr = [x for x, _ in rows[:cut]]; ytr = [y for _, y in rows[:cut]]
-    w, b = _fit_logistic(Xtr, ytr)
+    train_rows, test_rows = rows[:cut], rows[cut:]
+    Xtr = [r[0] for r in train_rows]
+    ytr = [r[1] for r in train_rows]
+    swtr = [r[2] for r in train_rows]
+    w, b = _fit_logistic(Xtr, ytr, sample_weight=swtr)
     weights = {"b0": round(b, 6)}
     for i, name in enumerate(WOLF_WEIGHT_ORDER):
         weights[name] = round(w[i], 6)
 
+    def _p(x):
+        return _sigmoid(b + sum(w[i] * x[i] for i in range(len(x))))
+
     def _calib(rws):
         if not rws:
             return {"n": 0}
-        correct = pos = 0; brier = 0.0
-        for x, lbl in rws:
-            p = _sigmoid(b + sum(w[i] * x[i] for i in range(len(x))))
+        correct = pos = 0
+        brier = 0.0
+        # reliability bins by predicted probability → actual win-rate + avg R.
+        edges = [0.0, 0.4, 0.55, 0.7, 1.01]
+        names = ["0-40", "40-55", "55-70", "70-100"]
+        bins = {nm: {"n": 0, "wins": 0, "r_sum": 0.0, "r_n": 0} for nm in names}
+        for x, lbl, _sw, rr, _ts in rws:
+            p = _p(x)
             brier += (p - lbl) ** 2
             if (p >= 0.5) == (lbl == 1):
                 correct += 1
             pos += lbl
+            pc = p * 100.0
+            for j in range(len(names)):
+                if edges[j] * 100.0 <= pc < edges[j + 1] * 100.0:
+                    bk = bins[names[j]]
+                    bk["n"] += 1
+                    bk["wins"] += lbl
+                    if rr is not None:
+                        bk["r_sum"] += rr
+                        bk["r_n"] += 1
+                    break
         k = len(rws)
+        reliability = {}
+        for nm, bk in bins.items():
+            if bk["n"]:
+                reliability[nm] = {
+                    "n": bk["n"],
+                    "actual_win_rate": round(bk["wins"] / bk["n"], 4),
+                    "avg_r": round(bk["r_sum"] / bk["r_n"], 4) if bk["r_n"] else None,
+                }
         return {"n": k, "accuracy": round(correct / k, 4),
-                "win_rate": round(pos / k, 4), "brier": round(brier / k, 4)}
+                "win_rate": round(pos / k, 4), "brier": round(brier / k, 4),
+                "reliability": reliability}
+
+    # S4-1.4 — learned vs interim weight delta (which terms the data moved).
+    interim = WOLF_INTERIM["weights"]
+    delta = {nm: {"interim": interim.get(nm), "trained": weights.get(nm),
+                  "delta": round((weights.get(nm, 0.0) or 0.0)
+                                 - (interim.get(nm, 0.0) or 0.0), 4)}
+             for nm in WOLF_WEIGHT_ORDER}
 
     model = {
         "version": f"wolf-trained-{int(time.time())}", "kind": "wolfscore_v3",
         "trained": True, "weights": weights, "n_trades": n,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
-        "note": "fitted WolfScore v3 weights on live+paper outcomes",
+        "note": "R-weighted WolfScore v3 fit on live+paper outcomes (temporal holdout)",
         "report": {"n_total": n, "n_train": cut, "n_test": n - cut,
-                   "in_sample": _calib(rows[:cut]), "held_out": _calib(rows[cut:])},
+                   "r_weighted": True, "holdout": "temporal(last 20%)",
+                   "in_sample": _calib(train_rows), "held_out": _calib(test_rows),
+                   "weights_vs_interim": delta},
     }
     return {"ok": True, "trained": True, "model": model, "report": model["report"]}
 
