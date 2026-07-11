@@ -449,7 +449,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     effective_slots?: number | null; degraded?: boolean;
     slippage_veto_count?: number;
   } | null>(null);
-  const [signalRegistry, setSignalRegistry] = useState<{id: string; category: string; description: string; role: string}[]>([]);
   const [forcingBuy, setForcingBuy]   = useState<string | null>(null);
   const [forcingSell, setForcingSell] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -859,15 +858,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     serverPollRef.current = setInterval(pollBot, 3_000);
     return () => { if (serverPollRef.current) clearInterval(serverPollRef.current); };
   }, [isServerMode, pollBot]); // eslint-disable-line
-
-  // Fetch signal registry once on mount (server mode only)
-  useEffect(() => {
-    if (!isServerMode) return;
-    fetch(`${botUrl}/api/signal-registry`)
-      .then(r => r.json())
-      .then(d => { if (d.signals) setSignalRegistry(d.signals); })
-      .catch(() => {});
-  }, [isServerMode, botUrl]); // eslint-disable-line
 
   // Uses `current_price` from the server API response (not WebSocket prices)
   useEffect(() => {
@@ -1865,9 +1855,11 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         {/* Dynamic registry-driven table (server mode). Renders EVERY selected
             coin: real rows for coins with a signal-cache entry, plus status
             placeholder rows for the rest so the operator always sees all N. */}
-        {(isServerMode && signalRegistry.length > 0 && (signalsData.signals.length > 0 || selectedCoins.length > 0)) ? (() => {
-          // S-2 — WolfScore is the leading column, before COIN.
-          const cols = `2.5rem 4.5rem ${signalRegistry.map(() => '1fr').join(' ')} 2.5rem 3rem`;
+        {(isServerMode && (signalsData.signals.length > 0 || selectedCoins.length > 0)) ? (() => {
+          // WolfScore is the leading column, before COIN. Legacy per-signal role
+          // columns removed — WolfScore is the sole buy gate, so the only columns
+          // are WOLF · COIN · BUY(status) · PRICE.
+          const cols = `2.5rem 1fr 3rem 3.25rem`;
           const present = new Set(
             signalsData.signals.map((s: any) => String(s.symbol ?? '').toUpperCase())
           );
@@ -1911,11 +1903,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                   WOLF{wolfSort === 'desc' ? ' ▼' : ' ▲'}
                 </button>
                 <span className="text-[8px] text-muted-foreground font-semibold">COIN</span>
-                {signalRegistry.map(reg => (
-                  <span key={reg.id} className="text-[8px] text-muted-foreground text-center" title={`${reg.description} [${reg.role}]`}>
-                    {SIGNAL_SHORT_LABELS[reg.id] ?? reg.id.split('_')[0]}
-                  </span>
-                ))}
                 <span className="text-[8px] text-muted-foreground text-center">BUY</span>
                 <span className="text-[8px] text-muted-foreground text-right">PRICE</span>
               </div>
@@ -2034,20 +2021,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       <WolfScoreCell pct={row.pct} score={row.score} unavailable={evUnavailable} />
                     </div>
                     <span className="text-[9px] font-mono font-semibold truncate">{sig.symbol?.replace('USDT','')}</span>
-                    {signalRegistry.map(reg => {
-                      const r = results[reg.id];
-                      const fired = r?.fired ?? false;
-                      const isVeto = reg.role === 'veto';
-                      const dotColor = isVeto
-                        ? (fired ? 'bg-loss' : 'bg-gain/60')
-                        : (fired ? 'bg-gain' : 'bg-muted/40');
-                      return (
-                        <div key={reg.id} className="flex justify-center"
-                          title={`${reg.id}: ${r?.raw_value ?? 'n/a'}`}>
-                          <div className={`w-2 h-2 rounded-full ${dotColor}`} />
-                        </div>
-                      );
-                    })}
                     <span className={`text-[7px] font-bold text-center px-0.5 rounded ${labelColor}`}
                       title={reason}>
                       {label}
