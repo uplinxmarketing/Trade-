@@ -566,7 +566,7 @@ async def lifespan(app: FastAPI):
             #   Guarded by a stored rev marker so it runs exactly once.
             try:
                 import strategy_config as _scfg_s3
-                _S3_REV = 13
+                _S3_REV = 14
                 _raw_s3 = _load_strategy()
                 if int(_raw_s3.get("s3_tuning_rev", 0) or 0) < _S3_REV:
                     _ent = _raw_s3.get("entries") if isinstance(_raw_s3.get("entries"), dict) else {}
@@ -618,6 +618,14 @@ async def lifespan(app: FastAPI):
                     # S3-7 — R-multiple tuning (operator-approved): arm ratchet later + trail wider
                     _s3_bump(_ext, "exits", "ratchet_activate_r", 0.4, 0.8, _s3_patch, is_float=True)
                     _s3_bump(_ext, "exits", "ratchet_k_atr", 0.6, 1.0, _s3_patch, is_float=True)
+                    # Phase 6 — exchange-side crash protection: rest a full OCO
+                    # (take-profit + stop-loss-limit) on Binance for every live
+                    # position, at the exit engine's ALREADY-COMPUTED tp_price /
+                    # stop_price (no threshold change). Without this a position rested
+                    # only a TP — a trader-process death left the DOWNSIDE unprotected.
+                    # The trailing/ratchet stop keeps updating the resting stop via
+                    # _maybe_replace_oco_stop. Plumbing only — exit LOGIC untouched.
+                    _s3_force(_ext, "exits", "oco_enabled", True, _s3_patch)
                     # S4-3.4 — neutral regime should keep the FULL ticket (slots), not
                     # shrink it to $5.50 via the size multiplier (the recurring $5.50 bug).
                     _s3_bump(_rgm, "regime", "neutral_scaling_mode", "auto", "slots", _s3_patch)
