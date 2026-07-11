@@ -239,7 +239,7 @@ class DataConfig(BaseModel):
     # + universe, modeled fills (no real orders), reusing the live exit machinery
     # read-only, writing labeled outcomes (mode=paper_shadow) to the training set.
     # NOT slot-limited → far more clean data/day than live for the EV model.
-    paper_shadow_enabled:        bool = True
+    paper_shadow_enabled:        bool = False
     # Shadow-Lab scale (data scraper): a VIRTUAL budget the shadow can deploy so it
     # holds many concurrent positions and re-enters a coin, generating far more
     # labeled outcomes/day. Effective concurrent cap = min(max_open,
