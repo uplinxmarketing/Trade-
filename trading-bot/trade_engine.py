@@ -2125,6 +2125,11 @@ _EV_SCORES_TTL_SEC = 5.0  # serve the UI/diagnostics feed from a memo; recompute
 _scan_scores_pub: Dict[str, Any] = {"ts": 0.0, "scores": {}, "tilt": 0.0, "af": None}
 _scan_scores_pub_lock = threading.Lock()
 _EV_PUB_MAX_AGE_SEC = 20.0
+# Buy dispatch fires every 2.5–5s (heartbeat + fast-recheck) plus every 5m close;
+# a full WolfScore recompute over the universe on each stalls the box. Reuse the
+# last published scores for this long before recomputing — vetoes + the buy
+# decision still run every dispatch, only the scoring is paced.
+_WOLF_RESCORE_MIN_SEC = 8.0
 
 
 def _publish_scan_scores(scores: dict, tilt: float, af) -> None:
@@ -9056,27 +9061,49 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     _t_wolf0 = time.perf_counter()   # ── scan instrumentation: WolfScore stage
     _n_scored = 0
     if ev_model is not None:
-        try:
-            _wolf_tilt = ev_model.regime_tilt(_btc_roc_1h_frac())
-        except Exception:
-            _wolf_tilt = 0.0
-        _cand_items = [(_s, _c) for _s, _c in _items
-                       if _s in approved and _cached_ready(_c)]
-        _wolf_cohort = _wolf_cohort_from(_cand_items)   # median 15m ROC of the pass (ONCE)
-        for _s, _c in _cand_items:
-            _ws = _wolf_score_cached(_s, _c, _wolf_cohort, _wolf_tilt)
-            if _ws:
-                _wolf_scores[_s] = _ws
-        _n_scored = len(_cand_items)
-        # Adaptive floor over THIS pass's live scores (friction hard-gated ones
-        # score 0 and are excluded so they don't drag the distribution down).
-        _live_pcts = [float(_v.get("pct")) for _v in _wolf_scores.values()
-                      if _v.get("hard_gate") is None and _v.get("pct") is not None]
-        _wolf_af = _wolf_adaptive_floor(_live_pcts, _wolf_abs_floor,
-                                        _wolf_floor_mode, _wolf_floor_k)
-        # Publish this pass's scores so the UI/diagnostics feed serves them as a
-        # dict read instead of recomputing WolfScore over the universe per request.
-        _publish_scan_scores(_wolf_scores, _wolf_tilt, _wolf_af)
+        # THROTTLE the full-universe WolfScore recompute. _check_buys_from_cache
+        # is dispatched by the 5s veto heartbeat, the 2.5s fast-recheck, AND every
+        # 5m close — re-scoring all ~88 coins on each would stall the box every few
+        # seconds (the "freezing/interrupting" symptom). Scores barely move in a
+        # few seconds, so reuse the last published set when it is fresh; a full
+        # recompute happens at most once per _WOLF_RESCORE_MIN_SEC. Vetoes + the
+        # buy decision below still run EVERY dispatch on the reused scores, so
+        # entry latency is unchanged — only the expensive scoring is paced.
+        _reuse_scores = None
+        _now_ws = time.time()
+        with _scan_scores_pub_lock:
+            _pub_ts_ws = float(_scan_scores_pub.get("ts", 0.0) or 0.0)
+            if _pub_ts_ws and (_now_ws - _pub_ts_ws) < _WOLF_RESCORE_MIN_SEC:
+                _reuse_scores = dict(_scan_scores_pub.get("scores") or {})
+                _reuse_tilt = float(_scan_scores_pub.get("tilt", 0.0) or 0.0)
+                _reuse_af = _scan_scores_pub.get("af")
+        if _reuse_scores is not None:
+            _wolf_scores = _reuse_scores
+            _wolf_tilt = _reuse_tilt
+            _wolf_af = _reuse_af
+            _n_scored = len(_reuse_scores)
+        else:
+            try:
+                _wolf_tilt = ev_model.regime_tilt(_btc_roc_1h_frac())
+            except Exception:
+                _wolf_tilt = 0.0
+            _cand_items = [(_s, _c) for _s, _c in _items
+                           if _s in approved and _cached_ready(_c)]
+            _wolf_cohort = _wolf_cohort_from(_cand_items)   # median 15m ROC of the pass (ONCE)
+            for _s, _c in _cand_items:
+                _ws = _wolf_score_cached(_s, _c, _wolf_cohort, _wolf_tilt)
+                if _ws:
+                    _wolf_scores[_s] = _ws
+            _n_scored = len(_cand_items)
+            # Adaptive floor over THIS pass's live scores (friction hard-gated ones
+            # score 0 and are excluded so they don't drag the distribution down).
+            _live_pcts = [float(_v.get("pct")) for _v in _wolf_scores.values()
+                          if _v.get("hard_gate") is None and _v.get("pct") is not None]
+            _wolf_af = _wolf_adaptive_floor(_live_pcts, _wolf_abs_floor,
+                                            _wolf_floor_mode, _wolf_floor_k)
+            # Publish this pass's scores so the UI/diagnostics feed serves them as a
+            # dict read instead of recomputing WolfScore over the universe per request.
+            _publish_scan_scores(_wolf_scores, _wolf_tilt, _wolf_af)
     _wolf_stage_ms = round((time.perf_counter() - _t_wolf0) * 1000.0, 1)
     _scan_stage_ms["wolfscore_ms"] = _wolf_stage_ms
     _scan_stage_ms["n_scored"] = _n_scored
