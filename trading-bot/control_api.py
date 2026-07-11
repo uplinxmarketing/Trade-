@@ -4977,6 +4977,19 @@ def api_diagnostics():
     return _ttl_cached("diagnostics_full", 2.0, _diagnostics_impl)
 
 
+def _binance_limits_health() -> dict:
+    """Centralized Binance rate-limiter snapshot (Phase 4 proof). Guarded — an old
+    deploy without binance_limits just returns {}."""
+    try:
+        import binance_limits as _bl
+        h = _bl.get_limits_health()
+        h["weight_limit"] = getattr(_bl, "IP_WEIGHT_LIMIT_1M", 6000)
+        h["background_ceiling"] = getattr(_bl, "BACKGROUND_WEIGHT_CEILING", 4500)
+        return h
+    except Exception:
+        return {}
+
+
 def _diagnostics_impl():
     import trade_engine as _te
     import data_collector as _dc
@@ -5057,6 +5070,10 @@ def _diagnostics_impl():
             "rest_error_count":   bh["rest_error_count"],
             "last_error_age_sec": round(now - bh["last_error_ts"], 1) if bh["last_error_ts"] else None,
             "last_error_msg":     bh["last_error_msg"],
+            # Phase 4 proof: centralized limiter state. background_spend_60s ≈ 0 in
+            # steady state proves market data is WS-only (no REST kline/price
+            # polling); used_weight must stay well under weight_limit (6000).
+            "limits": _binance_limits_health(),
         },
         "websocket": {
             "connected":            wh["connected"],
