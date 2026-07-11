@@ -3220,7 +3220,10 @@ _warned_5m_warmup: bool = False        # one-shot "5m veto neutral during warmup
 # Buy stagger — prevents mass simultaneous buys on stale cache signals
 _last_buy_ts: float = 0.0
 _buys_this_scan: int = 0
-_BUY_STAGGER_SEC  = 15.0  # minimum seconds between consecutive buys
+_BUY_STAGGER_SEC  = 4.0   # minimum seconds between consecutive buys. Was 15s — but
+                          # the top-scoring coin then waited up to 15s after clearing
+                          # the gate, buying the top of the move the score detected.
+                          # 4s still prevents burst-buying the same correlated dump.
 _MAX_BUYS_PER_SCAN = 2    # max buys per scan cycle
 
 # Per-coin timestamp of last inline tick-driven signal refresh

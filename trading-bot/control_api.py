@@ -566,7 +566,7 @@ async def lifespan(app: FastAPI):
             #   Guarded by a stored rev marker so it runs exactly once.
             try:
                 import strategy_config as _scfg_s3
-                _S3_REV = 12
+                _S3_REV = 13
                 _raw_s3 = _load_strategy()
                 if int(_raw_s3.get("s3_tuning_rev", 0) or 0) < _S3_REV:
                     _ent = _raw_s3.get("entries") if isinstance(_raw_s3.get("entries"), dict) else {}
@@ -645,13 +645,13 @@ async def lifespan(app: FastAPI):
                     # Raise the ceiling to 0.30% so normal liquid/mid-cap spreads
                     # get a taker fill; genuinely wide (illiquid) books still abandon.
                     _s3_force(_ent, "entries", "taker_fallback_max_spread_pct", 0.30, _s3_patch)
-                    # Reliability over fee optimization (operator: "the buy MUST be
-                    # performed"): maker-first posts a limit at the bid that rarely
-                    # fills, then chases + maybe falls back — the whole abandon dance
-                    # that starved fills. maker_first=false places a MARKET order the
-                    # instant a coin clears the gate: immediate, guaranteed fill (pays
-                    # the ~0.1% taker fee). taker_fallback also ON as a belt-and-braces.
-                    _s3_force(_ent, "entries", "maker_first", False, _s3_patch)
+                    # EDGE PRESERVATION: on $11 tickets targeting $0.03–0.10, crossing
+                    # the spread + paying the taker fee on EVERY entry destroys the
+                    # edge. Restore maker-first — post at the bid (pay ~0 spread, maker
+                    # fee), short chase, and fall to a taker fill ONLY when the maker
+                    # misses AND the spread is tight (<= taker_fallback_max_spread_pct).
+                    # The abandon-forever bug is already fixed by the 0.30% ceiling.
+                    _s3_force(_ent, "entries", "maker_first", True, _s3_patch)
                     _s3_force(_ent, "entries", "taker_fallback", True, _s3_patch)
 
                     if _s3_patch:
@@ -927,20 +927,24 @@ async def lifespan(app: FastAPI):
             #    the signal cache. Each spawn is isolated so one failure can
             #    never stop the remaining tasks from launching.
             _spawned: list[str] = []
-            for _task_name, _coro_factory in (
+            _boot_tasks = [
                 ("websocket",         lambda: data_collector.start_websocket()),
                 ("strategy_loop",     lambda: strategy_engine.strategy_loop()),
                 ("signal_scanner",    lambda: trade_engine.signal_scanner(data_collector.prices)),
                 ("position_guardian", lambda: trade_engine.position_guardian()),
-                ("supabase_sync",     lambda: _supabase_periodic_sync()),
                 ("anomaly_checker",   lambda: _anomaly_checker()),
-            ):
+            ]
+            # Supabase periodic mirror — OFF by default (redundant background I/O;
+            # critical state is synced on-write). Env SUPABASE_PERIODIC_SYNC=1 re-adds it.
+            if getattr(config, "SUPABASE_PERIODIC_SYNC", False):
+                _boot_tasks.append(("supabase_sync", lambda: _supabase_periodic_sync()))
+            for _task_name, _coro_factory in _boot_tasks:
                 try:
                     _spawn_bg_task(_coro_factory(), _task_name)
                     _spawned.append(_task_name)
                 except Exception as exc:
                     _step_failed(f"spawn_{_task_name}", exc)
-            steps.append(f"async tasks launched ({len(_spawned)}/6: {', '.join(_spawned) or 'none'})")
+            steps.append(f"async tasks launched ({len(_spawned)}/{len(_boot_tasks)}: {', '.join(_spawned) or 'none'})")
 
             # 7a-b. Immediate rolling-window trim at boot — shrink any pre-existing
             #     large paper/training tables to the 3000-row cap. Runs in a

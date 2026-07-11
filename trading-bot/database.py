@@ -4,6 +4,8 @@ import hashlib
 import os
 import sqlite3
 import threading
+import queue as _queue_mod
+import time as _time_mod
 from contextlib import contextmanager
 import json
 from datetime import datetime, timezone
@@ -1055,23 +1057,17 @@ _REJECTION_PRUNE_EVERY = 500   # prune once per this many inserts (see log_activ
 
 
 def record_buy_rejection(coin: str, reason: str, detail: str = None, score: int = None, rsi_value: float = None):
+    """Non-blocking: enqueued to the background writer (diagnostic telemetry)."""
     global _buy_rejection_writes
     ts = datetime.now(timezone.utc).isoformat()
-    with _lock:
-        conn = _conn()
-        conn.execute(
-            "INSERT INTO buy_rejections (timestamp, coin, reason, detail, score, rsi_value) VALUES (?,?,?,?,?,?)",
-            (ts, coin, reason, detail, score, rsi_value)
-        )
-        # Same fix as log_activity: this cap DELETE is a full scan+sort over up to
-        # 50k rows, and record_buy_rejection fires per rejected coin (~80/pass when
-        # slots are free) — running it every call pinned the write lock. Prune
-        # occasionally; the table stays bounded at ~50k+500.
-        _buy_rejection_writes += 1
-        if _buy_rejection_writes % _REJECTION_PRUNE_EVERY == 0:
-            conn.execute("DELETE FROM buy_rejections WHERE id NOT IN (SELECT id FROM buy_rejections ORDER BY id DESC LIMIT 50000)")
-        conn.commit()
-        conn.close()
+    _enqueue_write(
+        "INSERT INTO buy_rejections (timestamp, coin, reason, detail, score, rsi_value) VALUES (?,?,?,?,?,?)",
+        (ts, coin, reason, detail, score, rsi_value))
+    _buy_rejection_writes += 1
+    if _buy_rejection_writes % _REJECTION_PRUNE_EVERY == 0:
+        _enqueue_write(
+            "DELETE FROM buy_rejections WHERE id NOT IN "
+            "(SELECT id FROM buy_rejections ORDER BY id DESC LIMIT 50000)")
 
 
 def get_trades_today_count() -> int:
@@ -1451,36 +1447,83 @@ def get_futures_trade_stats() -> dict:
     return {"total": 0, "wins": 0, "total_pnl": 0.0, "total_fees": 0.0, "win_rate": 0.0}
 
 
+# ── Background write queue (non-critical, high-frequency writes) ───────────────
+# activity_log + buy_rejections fire many times per second. Doing each as its own
+# lock-holding INSERT (+ periodic full-scan prune) pinned the single write lock,
+# starving readers (the api/all stall + signal-scan freeze). These writes are
+# NON-CRITICAL (telemetry) — nothing reads them back synchronously — so they are
+# enqueued and flushed by ONE background thread that batches many statements into
+# a single lock acquisition. The buy path and UI reads never wait on them.
+_write_queue: "._queue_mod.Queue" = _queue_mod.Queue(maxsize=20000)
+_writer_thread = None
+_writer_lock = threading.Lock()
+
+
+def _enqueue_write(sql: str, params: tuple = ()):  # non-blocking; drops if flooded
+    _ensure_writer()
+    try:
+        _write_queue.put_nowait((sql, params))
+    except _queue_mod.Full:
+        pass  # telemetry only — drop rather than block a buy or OOM
+
+
+def _writer_loop():
+    while True:
+        batch = []
+        try:
+            batch.append(_write_queue.get())           # block for the first item
+        except Exception:
+            continue
+        for _ in range(2000):                          # drain the burst
+            try:
+                batch.append(_write_queue.get_nowait())
+            except _queue_mod.Empty:
+                break
+        try:
+            with _lock:                                # ONE lock hold for the batch
+                conn = _conn()
+                for _sql, _params in batch:
+                    try:
+                        conn.execute(_sql, _params)
+                    except Exception:
+                        pass
+                conn.commit()
+                conn.close()
+        except Exception:
+            pass
+        _time_mod.sleep(0.5)                            # pace so bursts coalesce
+
+
+def _ensure_writer():
+    global _writer_thread
+    if _writer_thread is not None and _writer_thread.is_alive():
+        return
+    with _writer_lock:
+        if _writer_thread is not None and _writer_thread.is_alive():
+            return
+        _writer_thread = threading.Thread(target=_writer_loop, name="db-writer", daemon=True)
+        _writer_thread.start()
+
+
 # ── Activity log ──────────────────────────────────────────────────────────────
 
 _activity_log_writes = 0
-_ACTIVITY_PRUNE_EVERY = 300   # prune once per this many inserts (see below)
+_ACTIVITY_PRUNE_EVERY = 300   # prune once per this many inserts (batched, off-thread)
 
 
 def log_activity(message: str, level: str = "info"):
+    """Non-blocking: enqueued to the background writer (telemetry, not read back
+    synchronously), so it never holds the write lock during a buy or a UI read."""
     global _activity_log_writes
     ts = datetime.now(timezone.utc).isoformat()
-    with _lock:
-        conn = _conn()
-        conn.execute("""
-            INSERT INTO activity_log (message, level, timestamp)
-            VALUES (?, ?, ?)
-        """, (message, level, ts))
-        # The cap DELETE is a full-table scan+sort (NOT IN (SELECT ... ORDER BY
-        # ... LIMIT)). Running it on EVERY log line — and the bot logs many lines
-        # per second — held the exclusive write lock continuously, starving every
-        # reader (the api/all stall + signal-scan freeze). Prune only once every
-        # _ACTIVITY_PRUNE_EVERY inserts; the table still stays bounded (~5000+300).
-        _activity_log_writes += 1
-        if _activity_log_writes % _ACTIVITY_PRUNE_EVERY == 0:
-            conn.execute("""
-                DELETE FROM activity_log
-                WHERE id NOT IN (
-                    SELECT id FROM activity_log ORDER BY id DESC LIMIT 5000
-                )
-            """)
-        conn.commit()
-        conn.close()
+    _enqueue_write(
+        "INSERT INTO activity_log (message, level, timestamp) VALUES (?, ?, ?)",
+        (message, level, ts))
+    _activity_log_writes += 1
+    if _activity_log_writes % _ACTIVITY_PRUNE_EVERY == 0:
+        _enqueue_write(
+            "DELETE FROM activity_log WHERE id NOT IN "
+            "(SELECT id FROM activity_log ORDER BY id DESC LIMIT 5000)")
 
 
 def get_activity_log(limit: int = 100) -> List[dict]:
