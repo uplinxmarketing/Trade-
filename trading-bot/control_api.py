@@ -1416,6 +1416,15 @@ def _apply_alias_sync(s: dict, patch: dict) -> None:
                     se["min_scored"] = ms
             except (TypeError, ValueError):
                 pass
+        # WolfScore gate: buy_score_threshold is canonical, min_win_probability_floor
+        # is the legacy alias. They must stay EQUAL — otherwise a Settings edit to one
+        # leaves the other at its old default (65 vs 61) and reads flip-flop between
+        # them (the reported 65→61→65 rollback). Mirror whichever the patch touched.
+        if entries_p and isinstance(s.get("entries"), dict):
+            if "buy_score_threshold" in entries_p:
+                s["entries"]["min_win_probability_floor"] = entries_p["buy_score_threshold"]
+            elif "min_win_probability_floor" in entries_p:
+                s["entries"]["buy_score_threshold"] = entries_p["min_win_probability_floor"]
         # legacy root → v2 blocks (the resolved v2 view prefers stored blocks)
         if isinstance(s.get("sizing"), dict):
             for root_key, blk_key in _SIZING_ROOT_ALIASES:
@@ -1473,6 +1482,14 @@ def _write_strategy_patch(patch: dict):
     try:
         _API_ALL_CACHE["data"] = None
     except NameError:
+        pass
+    # Also drop cached DERIVED views that read the gate/settings (the entry-report
+    # is TTL-cached 4s and diagnostics 2s) so a poll right after a save never serves
+    # the pre-write gate value — the other half of the settings "rollback".
+    try:
+        for _k in ("entry_report", "diagnostics_full"):
+            _agg_cache.pop(_k, None)
+    except Exception:
         pass
 
 
