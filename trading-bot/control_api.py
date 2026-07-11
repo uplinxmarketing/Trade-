@@ -2992,6 +2992,50 @@ def api_set_coins(req: CoinsRequest):
     return {"ok": True, "coins": valid}
 
 
+class BuyThresholdRequest(BaseModel):
+    value: float
+
+
+@app.get("/api/entries/buy-threshold")
+def api_get_buy_threshold():
+    """Fast, dedicated read of the WolfScore buy gate (buy_score_threshold).
+    Independent of the full settings panel so the dashboard control always loads."""
+    ent = (_load_strategy().get("entries") or {})
+    val = ent.get("buy_score_threshold", ent.get("min_win_probability_floor", 61.0))
+    try:
+        val = float(val)
+    except (TypeError, ValueError):
+        val = 61.0
+    return {"ok": True, "value": val}
+
+
+@app.post("/api/entries/buy-threshold")
+def api_set_buy_threshold(req: BuyThresholdRequest):
+    """Set the WolfScore buy gate live (no restart). Writes both the canonical
+    buy_score_threshold and its legacy alias min_win_probability_floor so every
+    read path agrees. Buy-path/selection only — exits are untouched."""
+    try:
+        v = round(float(req.value), 1)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "value must be a number"}
+    if not (0.0 <= v <= 100.0):
+        return {"ok": False, "error": "value must be between 0 and 100"}
+    _cur = _load_strategy().get("entries") or {}
+    _write_strategy_patch({"entries": {**_cur,
+                                       "buy_score_threshold": v,
+                                       "min_win_probability_floor": v}})
+    try:
+        database.save_config_version("buy-threshold-api",
+                                     {"buy_score_threshold": v}, _strategy_raw_file())
+    except Exception:
+        pass
+    try:
+        database.log_activity(f"Buy score gate set to {v:.0f} via dashboard", "info")
+    except Exception:
+        pass
+    return {"ok": True, "value": v}
+
+
 @app.get("/api/activity")
 def api_activity():
     return {"entries": database.get_activity_log(limit=100)}

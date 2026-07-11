@@ -2113,16 +2113,95 @@ _ev_scores_cache_lock = threading.Lock()
 _EV_SCORES_TTL_SEC = 5.0  # serve the UI/diagnostics feed from a memo; recompute
                           # at most once per this window (single-flight below).
 
+# ── Scan-published WolfScores (the fast path for the UI/diagnostics feed) ──────
+# The buy scan already computes WolfScore for EVERY approved coin once per pass.
+# Publishing those here lets get_live_ev_scores() serve them as a plain dict read
+# instead of recomputing O(universe) WolfScores on every /api/ev/scores and
+# /api/diagnostics/entry-report request. Under an ~88-coin universe that
+# per-request recompute took >5s and timed the endpoints out (the "scores are
+# slow / frozen" symptom). The scan is now the SOLE scorer; the feed just mirrors
+# its latest result. Falls back to an on-demand compute only when the scan hasn't
+# published recently (cold start / at-capacity early return).
+_scan_scores_pub: Dict[str, Any] = {"ts": 0.0, "scores": {}, "tilt": 0.0, "af": None}
+_scan_scores_pub_lock = threading.Lock()
+_EV_PUB_MAX_AGE_SEC = 20.0
+
+
+def _publish_scan_scores(scores: dict, tilt: float, af) -> None:
+    """Called by the buy scan after it computes this pass's WolfScores, so the UI
+    feed can serve them without recomputing. Guarded — never breaks the scan."""
+    try:
+        with _scan_scores_pub_lock:
+            _scan_scores_pub["ts"] = time.time()
+            _scan_scores_pub["scores"] = dict(scores or {})
+            _scan_scores_pub["tilt"] = float(tilt or 0.0)
+            _scan_scores_pub["af"] = af
+    except Exception:
+        pass
+
+
+def _format_ev_scores(scores_map: dict, tilt: float, af) -> dict:
+    """Shape a {sym: wolfscore_decomposition} map into the UI/diagnostics feed
+    payload (per-symbol subset + a top-level __meta__). Shared by the scan-pub
+    fast path and the on-demand compute fallback."""
+    out: Dict[str, dict] = {}
+    pcts: List[float] = []
+    for _sym, _ws in (scores_map or {}).items():
+        if not _ws:
+            continue
+        out[_sym] = {
+            "pct":         _ws.get("pct"),
+            "submetrics":  _ws.get("submetrics"),
+            "families":    _ws.get("families"),
+            "regime":      _ws.get("regime"),
+            "regime_tilt": _ws.get("regime_tilt"),
+            "top_reasons": _ws.get("top_reasons", []),
+            "trained":     _ws.get("trained"),
+            "version":     _ws.get("version"),
+            "hard_gate":   _ws.get("hard_gate"),
+        }
+        if _ws.get("hard_gate") is None and _ws.get("pct") is not None:
+            try:
+                pcts.append(float(_ws["pct"]))
+            except (TypeError, ValueError):
+                pass
+    try:
+        _cfg = _entries_cfg()
+        _abs = float(_cfg.get("buy_score_threshold",
+                     _cfg.get("min_win_probability_floor", 61.0)) or 61.0)
+        _k = float(_cfg.get("ev_floor_meanstd_k", 0.5) or 0.5)
+        _mode = str((_load_strategy().get("entries") or {}).get("ev_floor_mode", "absolute") or "absolute")
+    except Exception:
+        _abs, _k, _mode = 61.0, 0.5, "absolute"
+    _t = float(tilt or 0.0)
+    out["__meta__"] = {
+        "regime_tilt":    round(_t, 4),
+        "regime":         "up" if _t > 0.15 else "down" if _t < -0.15 else "side",
+        "adaptive_floor": af if af is not None else _wolf_adaptive_floor(pcts, _abs, _mode, _k),
+        "floor_active":   _ev_floor_active(),
+    }
+    return out
+
 
 def get_live_ev_scores() -> dict:
     """S5 data feed for control_api / UI: per currently-tracked symbol, the latest
-    WolfScore v3, plus a top-level '__meta__' block. Served from a short-TTL,
-    single-flight memo so the /api/ev/scores poll AND the diagnostics bundle never
-    each recompute WolfScore over the whole universe on every request — under a
-    73-coin universe that per-request O(universe) recompute was starving the box
-    and 504-ing the EV + diagnostics endpoints. The lock makes at most ONE compute
-    happen per TTL window; concurrent callers reuse the same result."""
+    WolfScore v3, plus a top-level '__meta__' block. FAST PATH: mirror the scan's
+    last-published WolfScores (a dict read — no recompute). Only when the scan has
+    not published within _EV_PUB_MAX_AGE_SEC (cold start / at-capacity) do we fall
+    back to a short-TTL, single-flight on-demand compute."""
     now = time.time()
+    with _scan_scores_pub_lock:
+        _pub_ts = float(_scan_scores_pub.get("ts", 0.0) or 0.0)
+        _fresh = _pub_ts and (now - _pub_ts < _EV_PUB_MAX_AGE_SEC)
+        if _fresh:
+            _pub_scores = dict(_scan_scores_pub.get("scores") or {})
+            _pub_tilt = float(_scan_scores_pub.get("tilt", 0.0) or 0.0)
+            _pub_af = _scan_scores_pub.get("af")
+    if _fresh:
+        try:
+            return _format_ev_scores(_pub_scores, _pub_tilt, _pub_af)
+        except Exception:
+            pass
     with _ev_scores_cache_lock:
         _cached = _ev_scores_cache.get("data")
         if _cached and (now - float(_ev_scores_cache.get("ts", 0.0)) < _EV_SCORES_TTL_SEC):
@@ -8995,6 +9074,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                       if _v.get("hard_gate") is None and _v.get("pct") is not None]
         _wolf_af = _wolf_adaptive_floor(_live_pcts, _wolf_abs_floor,
                                         _wolf_floor_mode, _wolf_floor_k)
+        # Publish this pass's scores so the UI/diagnostics feed serves them as a
+        # dict read instead of recomputing WolfScore over the universe per request.
+        _publish_scan_scores(_wolf_scores, _wolf_tilt, _wolf_af)
     _wolf_stage_ms = round((time.perf_counter() - _t_wolf0) * 1000.0, 1)
     _scan_stage_ms["wolfscore_ms"] = _wolf_stage_ms
     _scan_stage_ms["n_scored"] = _n_scored

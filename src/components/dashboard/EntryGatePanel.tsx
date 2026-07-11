@@ -48,6 +48,14 @@ export function EntryGatePanel({ baseUrl = '' }: { baseUrl?: string }) {
   const [unavailable, setUnavailable] = useState(false);
   const disposed = useRef(false);
 
+  // Editable buy gate — read/written via the dedicated fast endpoint so the
+  // control works even when the (heavier) entry-report is slow to respond.
+  const [gateSaved, setGateSaved] = useState<number | null>(null);
+  const [gateInput, setGateInput] = useState<string>('');
+  const [saving, setSaving] = useState(false);
+  const [savedFlash, setSavedFlash] = useState(false);
+  const editing = useRef(false);
+
   const load = useCallback(async () => {
     try {
       const res = await fetch(`${baseUrl}/api/diagnostics/entry-report`, { cache: 'no-store' });
@@ -59,24 +67,85 @@ export function EntryGatePanel({ baseUrl = '' }: { baseUrl?: string }) {
     } catch { if (!disposed.current) setUnavailable(true); }
   }, [baseUrl]);
 
+  const loadGate = useCallback(async () => {
+    try {
+      const res = await fetch(`${baseUrl}/api/entries/buy-threshold`, { cache: 'no-store' });
+      const data = res.ok ? await res.json().catch(() => null) : null;
+      if (disposed.current || !data || typeof data.value !== 'number') return;
+      setGateSaved(data.value);
+      if (!editing.current) setGateInput(String(data.value));
+    } catch { /* leave prior value */ }
+  }, [baseUrl]);
+
+  const saveGate = useCallback(async () => {
+    const v = parseFloat(gateInput);
+    if (!isFinite(v) || v < 0 || v > 100) return;
+    setSaving(true);
+    try {
+      const res = await fetch(`${baseUrl}/api/entries/buy-threshold`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: v }),
+      });
+      const data = res.ok ? await res.json().catch(() => null) : null;
+      if (data?.ok && typeof data.value === 'number') {
+        setGateSaved(data.value); setGateInput(String(data.value));
+        setSavedFlash(true); setTimeout(() => { if (!disposed.current) setSavedFlash(false); }, 1500);
+      }
+    } catch { /* ignore */ } finally {
+      editing.current = false;
+      if (!disposed.current) setSaving(false);
+    }
+  }, [baseUrl, gateInput]);
+
   useEffect(() => {
     disposed.current = false;
-    load();
+    load(); loadGate();
     const id = setInterval(load, 6000);
-    return () => { disposed.current = true; clearInterval(id); };
-  }, [load]);
+    const gid = setInterval(loadGate, 8000);
+    return () => { disposed.current = true; clearInterval(id); clearInterval(gid); };
+  }, [load, loadGate]);
 
-  if (unavailable) {
-    return <p className="text-[9px] text-muted-foreground/70 italic py-1">entry gate report unavailable</p>;
-  }
-  if (!rep) {
-    return <p className="text-[9px] text-muted-foreground py-1">Loading entry gate…</p>;
-  }
-
-  const g = rep.effective_gates ?? {};
-  const gate = g.buy_score_threshold ?? 65;
-  const eligible = (rep.per_coin ?? []).filter(c => c.eligible_ge_65);
+  const g = rep?.effective_gates ?? {};
+  const gate = gateSaved ?? g.buy_score_threshold ?? 61;
+  const eligible = (rep?.per_coin ?? []).filter(c => c.eligible_ge_65);
   const regime = g.current_regime?.regime ?? '—';
+
+  // Reusable inline editor for the buy gate — always available (uses the fast
+  // dedicated endpoint), so the operator can retune the gate even if the live
+  // report below is slow or momentarily unavailable.
+  const gateEditor = (
+    <div className="flex items-center gap-1.5">
+      <span className="text-[8px] uppercase tracking-wider text-muted-foreground">Gate</span>
+      <input
+        type="number" min={0} max={100} step={1} inputMode="decimal"
+        className="w-12 px-1 py-0.5 text-[11px] font-mono font-bold text-center rounded bg-muted/30 border border-border/60 focus:border-accent outline-none"
+        value={gateInput}
+        onFocus={() => { editing.current = true; }}
+        onChange={e => { editing.current = true; setGateInput(e.target.value); }}
+        onKeyDown={e => { if (e.key === 'Enter') saveGate(); }}
+      />
+      <button
+        onClick={saveGate}
+        disabled={saving || gateInput === '' || parseFloat(gateInput) === gateSaved}
+        className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-accent/20 text-accent hover:bg-accent/30 disabled:opacity-40 disabled:cursor-not-allowed"
+      >{saving ? '…' : savedFlash ? '✓' : 'Set'}</button>
+    </div>
+  );
+
+  if (unavailable || !rep) {
+    return (
+      <div className="bg-accent/5 border border-accent/30 rounded-md p-3 space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-xs font-bold">Entry Gate · WolfScore ≥ {fmtNum(gate)}</p>
+          {gateEditor}
+        </div>
+        <p className="text-[9px] text-muted-foreground/70 italic">
+          {unavailable ? 'Live gate report unavailable — the gate value above is still editable.'
+                       : 'Loading live entry gate…'}
+        </p>
+      </div>
+    );
+  }
 
   const chip = (label: string, val: string, tone: 'ok' | 'warn' | 'muted' = 'muted') => (
     <div className={`px-2 py-1 rounded text-center ${
@@ -101,6 +170,7 @@ export function EntryGatePanel({ baseUrl = '' }: { baseUrl?: string }) {
         {g.trading_active === false && (
           <span className="text-[8px] font-bold px-1.5 py-0.5 rounded-full bg-loss/20 text-loss">PAUSED</span>
         )}
+        {gateEditor}
       </div>
 
       {/* Effective gates */}
