@@ -132,3 +132,50 @@ export function useUniverse(pollIntervalMs = 120_000): Universe {
 
   return { symbols, bySymbol, available, loaded };
 }
+
+// The FULL pickable universe (all live TRADING USDT spot pairs) + the
+// watchlist-vs-Binance diff, from GET /api/universe/available. One source of
+// truth for the coin picker — replaces the hardcoded BINANCE_COINS array.
+// Fails open: an unreachable backend leaves `available` empty so the caller can
+// fall back to its offline list rather than blanking the picker.
+export interface UniverseAvailable {
+  available: string[];   // upper-cased, full TRADING-USDT-spot universe
+  approved: string[];    // current watchlist
+  diff: { dead: unknown[]; missing: string[]; renamed: unknown[] } | null;
+  exchangeInfoAvailable: boolean;
+  loaded: boolean;
+}
+
+export function useUniverseAvailable(pollIntervalMs = 300_000): UniverseAvailable {
+  const [state, setState] = useState<UniverseAvailable>({
+    available: [], approved: [], diff: null, exchangeInfoAvailable: false, loaded: false,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/universe/available?t=${Date.now()}`, { cache: 'no-store' });
+        if (!res.ok) { if (!cancelled) setState(s => ({ ...s, loaded: true })); return; }
+        const d = await res.json().catch(() => null);
+        if (cancelled || !d || typeof d !== 'object') return;
+        const up = (arr: unknown) =>
+          Array.isArray(arr) ? arr.map(x => String(x).toUpperCase().trim()).filter(Boolean) : [];
+        setState({
+          available: up((d as Record<string, unknown>).available),
+          approved: up((d as Record<string, unknown>).approved),
+          diff: ((d as Record<string, unknown>).diff as UniverseAvailable['diff']) ?? null,
+          exchangeInfoAvailable: !!(d as Record<string, unknown>).exchange_info_available,
+          loaded: true,
+        });
+      } catch {
+        if (!cancelled) setState(s => ({ ...s, loaded: true }));
+      }
+    };
+    poll();
+    const id = setInterval(poll, pollIntervalMs);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [pollIntervalMs]);
+
+  return state;
+}
