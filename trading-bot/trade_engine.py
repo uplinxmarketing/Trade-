@@ -9483,14 +9483,20 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     continue
 
         # ── Hard veto checks: BB position and 5m trend ────────────────────────
-        if not bb_ok:
+        # Under the sole-gate model these are DISCRETIONARY signal filters that
+        # WolfScore already prices in — T (trend) covers the 5m-downtrend call and
+        # W (VWAP room) covers upper-band chasing — so a coin that cleared the
+        # ≥floor gate is NOT re-vetoed here. They were the last stack blocking the
+        # 70+ scorers (bb_upper / 5m_downtrend). Real-time SLIPPAGE + structural
+        # gates (capacity/budget/notional/cooldown/held) below remain authoritative.
+        if not bb_ok and not _wolfscore_sole_gate:
             _record_rejection(sym, score, "bb_upper", sig_str)
             database.log_activity(
                 f"[SKIP] {sym}: price near upper Bollinger Band | "
                 f"{sig_str} | {bb_str} | SKIP(upper band)", "info"
             )
             continue
-        if not five_ok:
+        if not five_ok and not _wolfscore_sole_gate:
             _record_rejection(sym, score, "5m_downtrend", sig_str)
             database.log_activity(
                 f"[SKIP] {sym}: 5m downtrend | "
@@ -9503,7 +9509,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # local 1m tops that the 5m hasn't reflected yet (e.g. INJUSDT case).
         try:
             _c1 = _latest_candles.get(sym)   # in-memory (batched once per scan)
-            if _c1:
+            if _c1 and not _wolfscore_sole_gate:
                 bb_pos_1m = _c1.get("bb_position")
                 if bb_pos_1m in ("above_upper", "at_upper"):
                     _record_rejection(sym, score, "bb_upper", f"1m {bb_pos_1m}")
@@ -9547,7 +9553,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         try:
             import data_collector as _dc_fk
             recent_closes = list(_dc_fk.price_samples.get(sym, []))
-            if len(recent_closes) >= 180:
+            if len(recent_closes) >= 180 and not _wolfscore_sole_gate:
                 price_now     = recent_closes[-1]
                 price_3min    = recent_closes[-180]
                 pct_3min      = (price_now - price_3min) / price_3min * 100 if price_3min > 0 else 0
