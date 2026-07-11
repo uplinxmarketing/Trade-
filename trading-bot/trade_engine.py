@@ -9087,8 +9087,17 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 _wolf_tilt = ev_model.regime_tilt(_btc_roc_1h_frac())
             except Exception:
                 _wolf_tilt = 0.0
+            # Only score coins whose data is actually backfilled. A half-backfilled
+            # coin is missing 5m klines / ATR / volume history, so WolfScore drops
+            # those inputs and returns a misleadingly LOW score (the 0–26 band the
+            # operator saw as "wrong / frozen" values). Scoring only ready coins
+            # means the feed shows REAL scores (not-ready coins simply don't appear
+            # until their buffers fill) AND cuts the per-pass scoring load during
+            # backfill. The buy loop already skips not-ready coins downstream, so
+            # this scores nothing it wouldn't have skipped anyway.
             _cand_items = [(_s, _c) for _s, _c in _items
-                           if _s in approved and _cached_ready(_c)]
+                           if _s in approved and _cached_ready(_c)
+                           and _entry_backfill_ready(_s)]
             _wolf_cohort = _wolf_cohort_from(_cand_items)   # median 15m ROC of the pass (ONCE)
             for _s, _c in _cand_items:
                 _ws = _wolf_score_cached(_s, _c, _wolf_cohort, _wolf_tilt)
