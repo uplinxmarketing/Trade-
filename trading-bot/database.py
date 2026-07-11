@@ -1050,7 +1050,12 @@ def get_recent_trades(limit: int = 20) -> List[dict]:
     return [dict(r) for r in rows]
 
 
+_buy_rejection_writes = 0
+_REJECTION_PRUNE_EVERY = 500   # prune once per this many inserts (see log_activity)
+
+
 def record_buy_rejection(coin: str, reason: str, detail: str = None, score: int = None, rsi_value: float = None):
+    global _buy_rejection_writes
     ts = datetime.now(timezone.utc).isoformat()
     with _lock:
         conn = _conn()
@@ -1058,7 +1063,13 @@ def record_buy_rejection(coin: str, reason: str, detail: str = None, score: int 
             "INSERT INTO buy_rejections (timestamp, coin, reason, detail, score, rsi_value) VALUES (?,?,?,?,?,?)",
             (ts, coin, reason, detail, score, rsi_value)
         )
-        conn.execute("DELETE FROM buy_rejections WHERE id NOT IN (SELECT id FROM buy_rejections ORDER BY id DESC LIMIT 50000)")
+        # Same fix as log_activity: this cap DELETE is a full scan+sort over up to
+        # 50k rows, and record_buy_rejection fires per rejected coin (~80/pass when
+        # slots are free) — running it every call pinned the write lock. Prune
+        # occasionally; the table stays bounded at ~50k+500.
+        _buy_rejection_writes += 1
+        if _buy_rejection_writes % _REJECTION_PRUNE_EVERY == 0:
+            conn.execute("DELETE FROM buy_rejections WHERE id NOT IN (SELECT id FROM buy_rejections ORDER BY id DESC LIMIT 50000)")
         conn.commit()
         conn.close()
 
@@ -1442,7 +1453,12 @@ def get_futures_trade_stats() -> dict:
 
 # ── Activity log ──────────────────────────────────────────────────────────────
 
+_activity_log_writes = 0
+_ACTIVITY_PRUNE_EVERY = 300   # prune once per this many inserts (see below)
+
+
 def log_activity(message: str, level: str = "info"):
+    global _activity_log_writes
     ts = datetime.now(timezone.utc).isoformat()
     with _lock:
         conn = _conn()
@@ -1450,19 +1466,25 @@ def log_activity(message: str, level: str = "info"):
             INSERT INTO activity_log (message, level, timestamp)
             VALUES (?, ?, ?)
         """, (message, level, ts))
-        # Keep only the last 500 entries so the table never bloats
-        conn.execute("""
-            DELETE FROM activity_log
-            WHERE id NOT IN (
-                SELECT id FROM activity_log ORDER BY id DESC LIMIT 5000
-            )
-        """)
+        # The cap DELETE is a full-table scan+sort (NOT IN (SELECT ... ORDER BY
+        # ... LIMIT)). Running it on EVERY log line — and the bot logs many lines
+        # per second — held the exclusive write lock continuously, starving every
+        # reader (the api/all stall + signal-scan freeze). Prune only once every
+        # _ACTIVITY_PRUNE_EVERY inserts; the table still stays bounded (~5000+300).
+        _activity_log_writes += 1
+        if _activity_log_writes % _ACTIVITY_PRUNE_EVERY == 0:
+            conn.execute("""
+                DELETE FROM activity_log
+                WHERE id NOT IN (
+                    SELECT id FROM activity_log ORDER BY id DESC LIMIT 5000
+                )
+            """)
         conn.commit()
         conn.close()
 
 
 def get_activity_log(limit: int = 100) -> List[dict]:
-    with _lock:
+    with _lock.read():
         conn = _conn()
         rows = conn.execute("""
             SELECT id, message, level, timestamp
