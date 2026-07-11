@@ -5,6 +5,7 @@ loop) starts in the FastAPI lifespan as async background tasks.
 """
 
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -1393,14 +1394,37 @@ async def _bnb_health_check():
 
 # ── Internal helpers ─────────────────────────────────────────────
 
+_ca_strategy_cache: dict = {"mtime": None, "data": None}
+
+
 def _load_strategy() -> dict:
+    """mtime-cached read of strategy.json. Re-parses (and re-diffs via
+    _log_strategy_changes) ONLY when the file changes — every write goes through
+    _write_strategy_patch → os.replace, which flips the mtime, so the next read
+    refreshes. This is a HOT path (api/all build, buy-threshold, entry-report and
+    many endpoints call it), and the old version did an open()+json.load()+full
+    flatten/diff on EVERY call — a real, if moderate, lag source.
+
+    Returns a DEEP COPY so callers may mutate the result freely without corrupting
+    the shared cache — behaviorally identical to the old parse-every-call, just
+    without the per-call file read, JSON parse, and flatten/diff on unchanged
+    files. Mirrors the proven mtime-cache in trade_engine._load_strategy."""
     try:
-        with open(config.STRATEGY_FILE) as f:
-            s = json.load(f)
-        _log_strategy_changes(s, "hot_reload")
-        return s
-    except Exception:
+        mtime = os.path.getmtime(config.STRATEGY_FILE)
+    except OSError:
         return {}
+    if _ca_strategy_cache["mtime"] != mtime:
+        try:
+            with open(config.STRATEGY_FILE) as f:
+                s = json.load(f)
+        except Exception:
+            _cached = _ca_strategy_cache["data"]
+            return copy.deepcopy(_cached) if _cached is not None else {}
+        _log_strategy_changes(s, "hot_reload")
+        _ca_strategy_cache["data"] = s
+        _ca_strategy_cache["mtime"] = mtime
+    _cached = _ca_strategy_cache["data"]
+    return copy.deepcopy(_cached) if _cached is not None else {}
 
 
 _strategy_write_lock = threading.Lock()
