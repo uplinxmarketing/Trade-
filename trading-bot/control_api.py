@@ -8880,6 +8880,18 @@ def _ev_live_scores_bundle() -> dict:
             "distribution": distribution}
 
 
+def _ev_model_status_safe() -> dict:
+    """ev_model.model_status() guarded → {} on any failure. Wrapped by a TTL cache
+    on the hot /api/ev/scores poll so the (possibly DB-scanning) status isn't
+    recomputed every 5s across several mounted panels."""
+    try:
+        import ev_model as _ev
+        fn = getattr(_ev, "model_status", None)
+        return fn() if callable(fn) else {}
+    except Exception:
+        return {}
+
+
 @app.get("/api/ev/scores")
 def api_ev_scores():
     """S5 — WolfScore-v3 watchlist feed for the UI: the WolfScore-first column,
@@ -8888,14 +8900,9 @@ def api_ev_scores():
     ranking = symbols by pct desc; next_buy = top-ranked symbol (or null);
     distribution = the list of pct values. Never 500s."""
     try:
-        model = {}
-        try:
-            import ev_model as _ev
-            fn = getattr(_ev, "model_status", None)
-            if callable(fn):
-                model = fn()
-        except Exception:
-            model = {}
+        # model_status() can do a DB scan; the /api/ev/scores poll (5s, several
+        # panels) shouldn't pay that every call. TTL-cache it like api_ev_model does.
+        model = _ttl_cached("ev_model_status", 6.0, _ev_model_status_safe)
 
         bundle = _ev_live_scores_bundle()
         scores = bundle.get("scores", {}) or {}
