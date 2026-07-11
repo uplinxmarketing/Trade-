@@ -1900,6 +1900,10 @@ def _wolf_roc_15m(cached: dict) -> Optional[float]:
 _wolf_stop_cache: Dict[str, tuple] = {}   # sym -> (stop_pct or None, ts)
 _WOLF_STOP_CACHE_TTL_SEC = 45.0
 
+# Per-symbol EMA/MACD memo (Phase 2): computed once per candle, reused across the
+# intra-candle re-scores. Keyed by a candle fingerprint; bounded to the universe.
+_wolf_ind_cache: Dict[str, dict] = {}
+
 
 def _planned_stop_pct_for_score(sym: str, price: float):
     """Memoized planned-stop % for WolfScore's friction term (45s TTL). no_db=True
@@ -1946,38 +1950,51 @@ def _wolf_inputs(sym: str, cached: dict) -> dict:
         except (TypeError, ValueError):
             pass
 
-    # T — EMA9 / EMA21 on 5m closes (gap normalized by ATR% inside the model).
-    try:
-        if len(closes) >= 21:
-            e9 = indicators.calc_ema(closes, 9)
-            e21 = indicators.calc_ema(closes, 21)
-            if e9 and e9[-1] is not None:
-                inp["ema9"] = e9[-1]
-            if e21 and e21[-1] is not None:
-                inp["ema21"] = e21[-1]
-    except Exception:
-        pass
-
-    # M — MACD histogram + rolling max |hist| over the last 20. calc_macd needs
-    # >=35 closes (26 slow + 9 signal); the 5m cache holds only ~30, so fall back
-    # to the deeper 1m buffer when it carries enough history. Both are scale-
-    # invariant (normalized by their own rolling max) so the timeframe mix is OK.
-    try:
-        m_closes = closes if len(closes) >= 35 else None
-        if m_closes is None:
-            k1 = cached.get("klines_1m") or []
-            c1 = [float(c["close"]) for c in k1
-                  if isinstance(c, dict) and c.get("close") is not None]
-            if len(c1) >= 35:
-                m_closes = c1
-        if m_closes:
-            _, _, hist = indicators.calc_macd(m_closes)
-            hvals = [h for h in hist if h is not None]
-            if hvals:
-                inp["macd_hist"] = hvals[-1]
-                inp["rolling_max_abs_hist_20"] = max(abs(h) for h in hvals[-20:])
-    except Exception:
-        pass
+    # ── EMA + MACD, computed ONCE per candle and reused (Phase 2) ─────────────
+    # calc_ema / calc_macd are pure O(n) but were recomputed on every score call.
+    # They only change when a new candle closes, so memoize per symbol keyed by a
+    # cheap candle fingerprint (5m close count + last close). Intra-candle re-scores
+    # (hot-tier every 2.5s) reuse the cached values → near-zero cost.
+    _ind_key = (len(closes), closes[-1] if closes else 0.0,
+                len(cached.get("klines_1m") or []))
+    _ic = _wolf_ind_cache.get(sym)
+    if _ic is not None and _ic.get("key") == _ind_key:
+        for _k in ("ema9", "ema21", "macd_hist", "rolling_max_abs_hist_20"):
+            if _k in _ic:
+                inp[_k] = _ic[_k]
+    else:
+        _new_ic = {"key": _ind_key}
+        # T — EMA9 / EMA21 on 5m closes (gap normalized by ATR% inside the model).
+        try:
+            if len(closes) >= 21:
+                e9 = indicators.calc_ema(closes, 9)
+                e21 = indicators.calc_ema(closes, 21)
+                if e9 and e9[-1] is not None:
+                    inp["ema9"] = _new_ic["ema9"] = e9[-1]
+                if e21 and e21[-1] is not None:
+                    inp["ema21"] = _new_ic["ema21"] = e21[-1]
+        except Exception:
+            pass
+        # M — MACD histogram + rolling max |hist| over 20. calc_macd needs >=35
+        # closes; the 5m cache holds ~30, so fall back to the deeper 1m buffer.
+        try:
+            m_closes = closes if len(closes) >= 35 else None
+            if m_closes is None:
+                k1 = cached.get("klines_1m") or []
+                c1 = [float(c["close"]) for c in k1
+                      if isinstance(c, dict) and c.get("close") is not None]
+                if len(c1) >= 35:
+                    m_closes = c1
+            if m_closes:
+                _, _, hist = indicators.calc_macd(m_closes)
+                hvals = [h for h in hist if h is not None]
+                if hvals:
+                    inp["macd_hist"] = _new_ic["macd_hist"] = hvals[-1]
+                    inp["rolling_max_abs_hist_20"] = _new_ic["rolling_max_abs_hist_20"] = \
+                        max(abs(h) for h in hvals[-20:])
+        except Exception:
+            pass
+        _wolf_ind_cache[sym] = _new_ic
 
     # R — this coin's 15m ROC (caller supplies the cohort median for decoupling).
     _roc = _wolf_roc_15m(cached)
@@ -9205,6 +9222,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     _wolf_tilt = 0.0
     _wolf_af: Optional[dict] = None
     _t_wolf0 = time.perf_counter()   # ── scan instrumentation: WolfScore stage
+    try:
+        _db0_score = database.db_ops_this_thread()   # Phase 2 proof: DB ops in scoring
+    except Exception:
+        _db0_score = None
     _n_scored = 0
     _tier_counts = {"hot": 0, "warm": 0, "cold": 0}
     if ev_model is not None:
@@ -9271,6 +9292,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     _wolf_stage_ms = round((time.perf_counter() - _t_wolf0) * 1000.0, 1)
     _scan_stage_ms["wolfscore_ms"] = _wolf_stage_ms
     _scan_stage_ms["n_scored"] = _n_scored
+    # Phase 2 proof: DB operations made ON THIS THREAD during the scoring stage.
+    # Must be 0 — WolfScore reads only in-memory buffers/caches (thread-local
+    # counter so the background writer thread cannot pollute it).
+    if _db0_score is not None:
+        try:
+            _scan_stage_ms["db_calls_in_score"] = database.db_ops_this_thread() - _db0_score
+        except Exception:
+            pass
     _scan_stage_ms["tiers"] = dict(_tier_counts)
     _signal_scanner_health["tiers"] = {
         **_tier_counts, "rescored": _n_scored,

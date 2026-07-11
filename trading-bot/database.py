@@ -153,7 +153,21 @@ def is_data_persistent() -> bool:
     return _persistence_check["ok"]
 
 
+# Per-THREAD DB-operation counter (Phase 2 proof). Every DB op opens a connection
+# via _conn(); a thread-local counter lets the scoring loop assert it made ZERO DB
+# calls, without the background writer thread polluting the number.
+_db_tls = threading.local()
+
+
+def db_ops_this_thread() -> int:
+    return getattr(_db_tls, "n", 0)
+
+
 def _conn() -> sqlite3.Connection:
+    try:
+        _db_tls.n = getattr(_db_tls, "n", 0) + 1
+    except Exception:
+        pass
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     # G4.5 — concurrency/durability pragmas. journal_mode=WAL is persisted in
