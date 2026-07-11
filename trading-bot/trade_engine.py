@@ -2190,6 +2190,56 @@ def _publish_scan_scores(scores: dict, tilt: float, af) -> None:
         pass
 
 
+def _refresh_and_publish_scores() -> None:
+    """Score the approved, backfill-ready universe and PUBLISH — decoupled from the
+    buy loop so the UI feed stays live even when the buy checker returns early
+    (at position capacity, paused, or a risk latch). WolfScore scoring is now
+    cheap (all inputs in-memory: ATR memoized, slippage cached, spreads/klines in
+    RAM), so scoring the whole universe here every dispatch is fast. Fully guarded
+    — a scoring failure must never break the buy check that calls this first."""
+    if ev_model is None:
+        return
+    try:
+        strategy = _load_strategy() or {}
+        approved = {c["symbol"] for c in strategy.get("approved_coins", [])
+                    if isinstance(c, dict) and c.get("approved")}
+        if not approved:
+            return
+        with _signal_cache_lock:
+            items = [(s, dict(v)) for s, v in _signal_cache.items() if s in approved]
+        cand = [(s, c) for s, c in items if _entry_backfill_ready(s)]
+        if not cand:
+            return
+        try:
+            tilt = ev_model.regime_tilt(_btc_roc_1h_frac())
+        except Exception:
+            tilt = 0.0
+        cohort = _wolf_cohort_from(cand)
+        _now_pub = time.time()
+        scores: Dict[str, dict] = {}
+        for s, c in cand:
+            ws = _wolf_score_cached(s, c, cohort, tilt)
+            if ws:
+                scores[s] = ws
+                # Stamp the tier meta so the buy loop's tiered scorer reuses these
+                # fresh scores this dispatch instead of recomputing them.
+                _coin_score_meta[s] = {
+                    "ts": _now_pub, "pct": ws.get("pct"),
+                    "prev_pct": (_coin_score_meta.get(s) or {}).get("pct"),
+                }
+        pcts = [float(v.get("pct")) for v in scores.values()
+                if v.get("hard_gate") is None and v.get("pct") is not None]
+        cfg = _entries_cfg()
+        abs_floor = float(cfg.get("buy_score_threshold",
+                          cfg.get("min_win_probability_floor", 61.0)) or 61.0)
+        mode = str((strategy.get("entries") or {}).get("ev_floor_mode", "absolute") or "absolute")
+        k = float(cfg.get("ev_floor_meanstd_k", 0.5) or 0.5)
+        af = _wolf_adaptive_floor(pcts, abs_floor, mode, k)
+        _publish_scan_scores(scores, tilt, af)
+    except Exception:
+        pass
+
+
 def _format_ev_scores(scores_map: dict, tilt: float, af) -> dict:
     """Shape a {sym: wolfscore_decomposition} map into the UI/diagnostics feed
     payload (per-symbol subset + a top-level __meta__). Shared by the scan-pub
@@ -8775,6 +8825,13 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # on a separate path (sell monitor / held watchdog) and is NOT gated here.
     if not _entries_armed():
         return
+
+    # Publish fresh WolfScores for the UI FIRST — before any early-return below
+    # (paused / at-capacity / risk latch). Scoring lives in this buy checker, so
+    # when the bot holds a full book and returns early, the feed used to freeze at
+    # the last scores. This decoupled publish keeps the signal panel live whether
+    # or not the bot is currently buying. Cheap (in-memory inputs) and guarded.
+    _refresh_and_publish_scores()
 
     # Load strategy once up front (_load_strategy is mtime-cached — cheap).
     strategy = _load_strategy()
