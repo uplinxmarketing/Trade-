@@ -771,21 +771,29 @@ async def lifespan(app: FastAPI):
             #   "decision path: SIGNAL ENGINE" log. Rev-guarded so a deliberate
             #   re-enable is never clobbered.
             try:
-                _ceR = 1
+                _ceR = 2
                 _raw_ce = _load_strategy()
                 if int(_raw_ce.get("engine_consolidation_rev", 0) or 0) < _ceR:
                     _se_ce = _raw_ce.get("signal_engine")
                     _se_ce = dict(_se_ce) if isinstance(_se_ce, dict) else {}
+                    _patch_ce: dict = {"engine_consolidation_rev": _ceR}
+                    # Disable the legacy signal engine (its mandatory/scored signals
+                    # were re-gating WolfScore-cleared coins — e.g. the "M1 rsi below
+                    # threshold" mandatory block).
                     if _se_ce.get("enabled") is not False:
                         _se_ce["enabled"] = False
-                        _write_strategy_patch({"signal_engine": _se_ce,
-                                               "engine_consolidation_rev": _ceR})
-                        database.log_activity(
-                            "Engine consolidation: legacy signal_engine disabled — "
-                            "WolfScore is the sole buy engine", "info")
-                        steps.append("engine_consolidation (signal_engine off)")
-                    else:
-                        _write_strategy_patch({"engine_consolidation_rev": _ceR})
+                        _patch_ce["signal_engine"] = _se_ce
+                    # Also hard-disable the LEGACY mandatory EMA/RSI layer that the
+                    # buy loop falls back to when the engine is off. Under sole-gate
+                    # WolfScore is the only gate — no mandatory-signal check should
+                    # ever block a coin that cleared the >=floor score.
+                    if _raw_ce.get("mandatory_signals_enabled") is not False:
+                        _patch_ce["mandatory_signals_enabled"] = False
+                    _write_strategy_patch(_patch_ce)
+                    database.log_activity(
+                        "Engine consolidation: signal_engine + legacy mandatory "
+                        "signals disabled — WolfScore is the sole buy gate", "info")
+                    steps.append("engine_consolidation (engine + mandatory off)")
             except Exception as exc:
                 _step_failed("engine_consolidation", exc)
 

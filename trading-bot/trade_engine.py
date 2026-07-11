@@ -9509,9 +9509,18 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         bb_str  = "BB:PASS" if bb_ok   else "BB:FAIL"
         m5_str  = "5m:PASS" if five_ok else "5m:FAIL"
 
-        # ── Buy decision: new signal engine OR legacy mandatory/score path ───────
-        _buy_decision: dict = {}  # populated below for signal_snapshot capture
-        if signal_engine_active:
+        # ── Buy decision: WolfScore-only (operator model) ───────────────────────
+        # Under wolfscore_sole_gate the WolfScore floor check ABOVE is the ONE and
+        # ONLY buy gate. The legacy signal engine and the legacy mandatory EMA/RSI
+        # layer are NOT run at all — not even evaluated — so the old engine's
+        # "M1 rsi below threshold / Mandatory" checks can never block or even show
+        # up on a coin that cleared the score. This is the "delete the old engine
+        # from the buy path" the operator asked for; only WolfScore + the real-time
+        # safety vetoes below decide. (The sell/exit engine is entirely separate.)
+        _buy_decision: dict = {}  # populated only on the legacy paths for snapshots
+        if _wolfscore_sole_gate:
+            pass  # WolfScore floor already decided; skip engine + mandatory entirely
+        elif signal_engine_active:
             _sig_data = {
                 **sigs,
                 "rsi_value":      rsi_v,
@@ -9519,9 +9528,6 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 "low_24h":        cached.get("low_24h"),
                 "klines_1m":      cached.get("klines_1m", []),
                 "stoch_rsi_value": cached.get("stoch_rsi_val"),
-                # Phase 3 §3.1/§3.3 fields (populated on 5m closes; the
-                # regime is read live — 60 s cache — so the REGIME veto
-                # reacts within a minute of BTC flipping risk_off)
                 "klines_5m":       cached.get("klines_5m", []),
                 "ema50_15m_slope": cached.get("ema50_15m_slope"),
                 "bb_position_5m":  cached.get("bb_position_5m"),
@@ -9531,27 +9537,13 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _dec = _sr_evaluate_buy_decision(sym, _sig_data, strategy)
             _buy_decision = _dec
             if not _dec["allowed"]:
-                _dec_reason = str(_dec.get("reason", ""))
-                _is_safety_veto = _dec_reason.startswith("veto_")
-                # WolfScore is the SOLE selection gate (operator model). The legacy
-                # signal-count ("score_N_below_min") and mandatory-signal rejects
-                # must NOT block — the coin already cleared WolfScore ≥ the buy gate
-                # above. Only real safety VETOES (spread / ATR-untradeable / regime
-                # risk_off) still stop the buy. This keeps the old engine's count out
-                # of the buy path regardless of min_score/min_scored config.
-                if _wolfscore_sole_gate and not _is_safety_veto:
-                    pass  # ignore score/mandatory reject; fall through to vetoes+exec
-                else:
-                    _record_rejection(sym, _dec.get("score", score), _dec["reason"],
-                                      f"score={_dec['score']} fired={_dec['fired_signals']}")
-                    _note_candidacy_fail(sym, _dec.get("score"), _dec["reason"])
-                    continue
-            # Passed the gate — fall through to existing veto checks below
+                _record_rejection(sym, _dec.get("score", score), _dec["reason"],
+                                  f"score={_dec['score']} fired={_dec['fired_signals']}")
+                _note_candidacy_fail(sym, _dec.get("score"), _dec["reason"])
+                continue
         else:
             # ── Legacy mandatory signal layer ──────────────────────────────────
-            # Mandatory 1: EMA trend up (EMA9 > EMA21) — don't buy into a downtrend.
-            # Mandatory 2: RSI below threshold — require a real dip, not mid-channel noise.
-            if mandatory_enabled and not _wolfscore_sole_gate:
+            if mandatory_enabled:
                 if not sigs.get("trend", False):
                     _record_rejection(sym, score, "mandatory_ema_down", "EMA9 < EMA21")
                     continue
