@@ -4,6 +4,7 @@ import type { LivePrices } from '@/lib/trading-engine';
 import { useUniverseHealth, type InvalidInfo } from '@/hooks/useUniverseHealth';
 import { useMarketSnapshot } from '@/hooks/useMarketSnapshot';
 import { useUniverse } from '@/hooks/useUniverse';
+import { CoinIcon } from '@/components/CoinIcon';
 
 // I4 — distinguish the two dead-ticker statuses from /api/universe/validate:
 //  - BREAK   → symbol trading is halted; the backend auto-restores it, so this
@@ -49,7 +50,7 @@ const FALLBACK_USDT_COINS = [
   // Mid-caps / L2
   'ARBUSDT','OPUSDT','INJUSDT','FETUSDT','NEARUSDT',
   'TONUSDT','APTUSDT','SUIUSDT','SHIBUSDT','RENDERUSDT',
-  'TIAUSDT','SEIUSDT','STXUSDT','LDOUSDT','MKRUSDT',
+  'TIAUSDT','SEIUSDT','STXUSDT','LDOUSDT','SKYUSDT',   // MKR→SKY rename
   // Meme / high-vol
   'PEPEUSDT','WIFUSDT','BONKUSDT','JUPUSDT','FLOKIUSDT',
   'MEMEUSDT','DOGSUSDT','NEIROUSDT','BRETTUSDT','1000SATSUSDT',
@@ -100,9 +101,7 @@ function CoinRow({
       >
         <Star className="w-3 h-3" fill={isFav ? 'currentColor' : 'none'} />
       </button>
-      <div style={{ background: color }} className="w-5 h-5 rounded-full flex items-center justify-center text-white text-[8px] font-bold flex-shrink-0">
-        {ticker.slice(0, 3)}
-      </div>
+      <CoinIcon symbol={symbol} size={20} className="flex-shrink-0" />
       <div className="flex-1 min-w-0">
         <div className={`text-xs font-semibold leading-none ${isActive ? 'text-gain' : 'text-foreground'}`}>{ticker}</div>
         {invalidInfo ? (

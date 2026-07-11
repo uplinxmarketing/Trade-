@@ -2,6 +2,8 @@ import { useState, memo } from 'react';
 import { Check, X, Search } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { BINANCE_COINS, COIN_CATEGORIES } from '@/lib/binance-coins';
+import { useUniverseAvailable } from '@/hooks/useUniverse';
+import { CoinIcon } from '@/components/CoinIcon';
 
 interface CoinSelectorProps {
   selected: string[];
@@ -13,6 +15,12 @@ const CoinSelector = ({ selected, onChange, maxCoins = 10 }: CoinSelectorProps) 
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [activeCategory, setActiveCategory] = useState<string>('All');
+  // One source of truth: the live TRADING-USDT universe from /api/universe/available.
+  // Fall back to the bundled list ONLY when the backend is unreachable.
+  const { available, exchangeInfoAvailable } = useUniverseAvailable();
+  const universeReady = exchangeInfoAvailable && available.length > 0;
+  const allCoins = universeReady ? available : BINANCE_COINS;
+  const allSet = new Set(allCoins);
 
   const toggle = (coin: string) => {
     if (selected.includes(coin)) {
@@ -25,7 +33,14 @@ const CoinSelector = ({ selected, onChange, maxCoins = 10 }: CoinSelectorProps) 
   const categories = ['All', ...Object.keys(COIN_CATEGORIES)];
 
   const filteredCoins = (() => {
-    let coins = activeCategory === 'All' ? BINANCE_COINS : (COIN_CATEGORIES[activeCategory] || []);
+    // "All" → the full live universe. A category → its curated members that are
+    // ALSO live (so delisted coins never show even in a category). When the
+    // universe is unavailable we degrade to the bundled category list.
+    let coins = activeCategory === 'All'
+      ? allCoins
+      : (universeReady
+          ? (COIN_CATEGORIES[activeCategory] || []).filter(c => allSet.has(c))
+          : (COIN_CATEGORIES[activeCategory] || []));
     if (search.trim()) {
       const q = search.toUpperCase().trim();
       coins = coins.filter(c => c.includes(q));
@@ -56,6 +71,7 @@ const CoinSelector = ({ selected, onChange, maxCoins = 10 }: CoinSelectorProps) 
             key={coin}
             className="inline-flex items-center gap-1 px-2 py-1 rounded bg-accent/20 text-accent text-xs font-mono font-medium"
           >
+            <CoinIcon symbol={coin} size={14} />
             {coin.replace('USDT', '')}
             {isOpen && (
               <button
@@ -119,8 +135,11 @@ const CoinSelector = ({ selected, onChange, maxCoins = 10 }: CoinSelectorProps) 
                       : 'text-muted-foreground hover:text-foreground hover:bg-muted/50 border border-transparent'
                   }`}
                 >
-                  {coin.replace('USDT', '')}
-                  {isSelected && <Check className="w-3 h-3" />}
+                  <span className="inline-flex items-center gap-1.5 min-w-0">
+                    <CoinIcon symbol={coin} size={16} />
+                    <span className="truncate">{coin.replace('USDT', '')}</span>
+                  </span>
+                  {isSelected && <Check className="w-3 h-3 shrink-0" />}
                 </button>
               );
             })}

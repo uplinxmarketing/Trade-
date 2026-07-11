@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 // their universe changed under them, so we poll GET /api/universe/notices and
 // surface recent changes in an unobtrusive-but-visible banner.
 
-export type UniverseNoticeAction = 'removed' | 'suspended' | 'restored';
+export type UniverseNoticeAction = 'removed' | 'suspended' | 'restored' | 'deferred';
 
 export interface UniverseNotice {
   ts: number;
@@ -34,7 +34,7 @@ function parseNotices(raw: unknown): UniverseNotice[] {
     const o = item as Record<string, unknown>;
     const symbol = normSym(o.symbol);
     const action = o.action;
-    if (!symbol || (action !== 'removed' && action !== 'suspended' && action !== 'restored')) continue;
+    if (!symbol || (action !== 'removed' && action !== 'suspended' && action !== 'restored' && action !== 'deferred')) continue;
     out.push({
       ts: typeof o.ts === 'number' ? o.ts : 0,
       action,

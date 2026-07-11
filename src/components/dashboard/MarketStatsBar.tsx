@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
 import { supabase } from '@/integrations/supabase/client';
+import { CoinIcon } from '@/components/CoinIcon';
 
 const BREAK_EVEN_MULT = 1 / Math.pow(1 - TAKER_FEE, 2);
 
@@ -90,9 +91,7 @@ export default function MarketStatsBar({ activeCoin, prices }: Props) {
     <div className="flex items-center gap-4 px-4 py-2 border-b border-border bg-card/80 overflow-x-auto scrollbar-thin">
       {/* Coin badge */}
       <div className="flex items-center gap-2 flex-shrink-0">
-        <div style={{ background: coinColor }} className="w-7 h-7 rounded-full flex items-center justify-center text-white text-[9px] font-bold">
-          {ticker3.slice(0, 3)}
-        </div>
+        <CoinIcon symbol={ticker3} size={28} />
         <div>
           <div className="text-xs font-bold text-foreground leading-none">{ticker3}USDT</div>
           <div className="text-[9px] text-muted-foreground">Spot</div>

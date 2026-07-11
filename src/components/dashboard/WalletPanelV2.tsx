@@ -6,6 +6,7 @@ import { TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
 import { toast } from 'sonner';
 import { API_BASE } from '@/config';
+import { CoinIcon as SharedCoinIcon } from '@/components/CoinIcon';
 
 const PAPER_CFG_KEY  = 'paper_wallet_config';
 
@@ -73,12 +74,9 @@ interface Props {
 }
 
 function CoinIcon({ coin }: { coin: string }) {
-  const color = COIN_COLORS[coin] ?? '#6b7280';
-  return (
-    <div style={{ background: color }} className="w-8 h-8 rounded-full flex items-center justify-center text-white text-[10px] font-bold flex-shrink-0 select-none">
-      {coin.slice(0, 3)}
-    </div>
-  );
+  // Delegate to the shared icon (real logo + initials fallback). `coin` here is a
+  // base asset (BTC/USDT/ETH); the shared component tolerates base or full symbol.
+  return <SharedCoinIcon symbol={coin} size={32} className="flex-shrink-0" />;
 }
 
 function PnlPill({ pnl, pct }: { pnl: number; pct: number }) {

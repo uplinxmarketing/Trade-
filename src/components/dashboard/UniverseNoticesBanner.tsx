@@ -28,7 +28,7 @@ export default function UniverseNoticesBanner({ selectedCoins, onAddSuccessor }:
 
   const visible = notices.filter(n => !dismissed.has(noticeKey(n)));
   const removed = visible.filter(n => n.action === 'removed');
-  const quiet = visible.filter(n => n.action === 'suspended' || n.action === 'restored');
+  const quiet = visible.filter(n => n.action === 'suspended' || n.action === 'restored' || n.action === 'deferred');
 
   if (removed.length === 0 && quiet.length === 0) return null;
 
@@ -111,6 +111,10 @@ export default function UniverseNoticesBanner({ selectedCoins, onAddSuccessor }:
       {quiet.map(n => {
         const base = n.symbol.replace('USDT', '');
         const isRestore = n.action === 'restored';
+        const isDeferred = n.action === 'deferred';
+        const label = isRestore ? 'restored to the universe'
+          : isDeferred ? 'delisted — removal deferred until your open position closes'
+          : 'suspended (trading break) — auto-restores';
         return (
           <div
             key={noticeKey(n)}
@@ -118,10 +122,10 @@ export default function UniverseNoticesBanner({ selectedCoins, onAddSuccessor }:
           >
             {isRestore
               ? <RotateCcw className="w-3 h-3 text-gain shrink-0" />
-              : <PauseCircle className="w-3 h-3 text-warn shrink-0" />}
+              : <PauseCircle className={`w-3 h-3 shrink-0 ${isDeferred ? 'text-loss' : 'text-warn'}`} />}
             <span className="flex-1 min-w-0 truncate">
               <span className="font-mono font-semibold text-foreground">{base}</span>{' '}
-              {isRestore ? 'restored to the universe' : 'suspended (trading break) — auto-restores'}
+              {label}
               {n.reason ? ` · ${n.reason}` : ''}
             </span>
             <button
