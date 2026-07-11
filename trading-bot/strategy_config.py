@@ -72,7 +72,7 @@ class EntriesConfig(BaseModel):
     # L1 — when the maker chase is exhausted, fill as TAKER if the live spread is
     # ≤ this %. 0 disables the fallback (abandon as before). Cheap insurance
     # against ready signals starving on tight books; wide books still abandon.
-    taker_fallback_max_spread_pct: float = Field(0.05, ge=0.0, le=5.0)
+    taker_fallback_max_spread_pct: float = Field(0.30, ge=0.0, le=5.0)
     # S3-6 — E1 spread veto is over-conservative for maker-first entries: posting at
     # the bid, you never PAY the spread, yet a wide spread was hard-vetoing top coins
     # (STRK/ILV/PEPE vetoed ~75% of the time). When maker_first is on AND taker

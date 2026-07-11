@@ -566,7 +566,7 @@ async def lifespan(app: FastAPI):
             #   Guarded by a stored rev marker so it runs exactly once.
             try:
                 import strategy_config as _scfg_s3
-                _S3_REV = 8
+                _S3_REV = 9
                 _raw_s3 = _load_strategy()
                 if int(_raw_s3.get("s3_tuning_rev", 0) or 0) < _S3_REV:
                     _ent = _raw_s3.get("entries") if isinstance(_raw_s3.get("entries"), dict) else {}
@@ -625,6 +625,13 @@ async def lifespan(app: FastAPI):
                     _s3_force(_ent, "entries", "confirm_seconds", 3.0, _s3_patch)            # freshness
                     _s3_force(_ent, "entries", "eval_heartbeat_sec", 5.0, _s3_patch)         # freshness
                     _s3_force(_ent, "entries", "instant_fire_when_slots_free", True, _s3_patch)
+                    # Maker chase rarely fills (you sit at the bid); the taker
+                    # fallback was capped at a 0.05% spread — tighter than almost
+                    # every real book — so gated coins posted a maker order, chased,
+                    # then ABANDONED ("spread 0.11% > 0.05% ceiling"), never buying.
+                    # Raise the ceiling to 0.30% so normal liquid/mid-cap spreads
+                    # get a taker fill; genuinely wide (illiquid) books still abandon.
+                    _s3_force(_ent, "entries", "taker_fallback_max_spread_pct", 0.30, _s3_patch)
 
                     if _s3_patch:
                         _merged_s3, _errs_s3 = _scfg_s3.validate_patch(_raw_s3, _s3_patch)
