@@ -1041,7 +1041,7 @@ def log_trade(trade: dict, *,
 
 
 def get_recent_trades(limit: int = 20) -> List[dict]:
-    with _lock:
+    with _lock.read():
         conn = _conn()
         rows = conn.execute("""
             SELECT * FROM trades ORDER BY id DESC LIMIT ?
@@ -1263,7 +1263,7 @@ def get_trade_stats(mode: str = "paper") -> dict:
     are always consistent with each other.
     """
     today = datetime.now(timezone.utc).date().isoformat()
-    with _lock:
+    with _lock.read():
         conn = _conn()
         row = conn.execute("""
             SELECT
@@ -1302,7 +1302,7 @@ def get_trade_stats(mode: str = "paper") -> dict:
 def get_trade_stats_all_modes() -> dict:
     """Aggregate closed-trade stats across ALL modes (paper + live combined)."""
     today = datetime.now(timezone.utc).date().isoformat()
-    with _lock:
+    with _lock.read():
         conn = _conn()
         row = conn.execute("""
             SELECT
