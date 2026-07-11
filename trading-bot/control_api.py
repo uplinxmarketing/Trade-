@@ -7278,15 +7278,27 @@ def _format_trades(raw: list) -> list:
             "created_at": buy_ts,
             "volume_usdt": budget,
         })
-        # SELL leg — only if exit_price exists (completed trade)
+        # SELL leg — only if exit_price exists (completed trade). pnl is NET (both
+        # fee sides already deducted by the engine). Surface the per-trade fee
+        # (entry+exit) and the gross so the UI can show "net (fee)" and net stays
+        # the headline. entry_fee_usdt/exit_fee_usdt mirror buy_fee/sell_fee.
         if t.get("exit_price"):
+            _buy_fee  = t.get("buy_fee")  if t.get("buy_fee")  is not None else t.get("entry_fee_usdt")
+            _sell_fee = t.get("sell_fee") if t.get("sell_fee") is not None else t.get("exit_fee_usdt")
+            _fee = (float(_buy_fee or 0.0) + float(_sell_fee or 0.0))
+            _net = t.get("net_profit")
+            _gross = (float(_net) + _fee) if _net is not None else None
             result.append({
                 "id":         f"{t.get('id','')}-sell",
                 "symbol":     sym,
                 "side":       "SELL",
                 "price":      t.get("exit_price", 0),
                 "quantity":   qty,
-                "pnl":        t.get("net_profit"),
+                "pnl":        _net,                      # NET (after entry+exit fees)
+                "fee":        round(_fee, 6),            # entry_fee + exit_fee (USDT)
+                "buy_fee":    (round(float(_buy_fee), 6)  if _buy_fee  is not None else None),
+                "sell_fee":   (round(float(_sell_fee), 6) if _sell_fee is not None else None),
+                "gross_pnl":  (round(_gross, 6) if _gross is not None else None),
                 "reason":     t.get("sell_reason") or "take-profit",
                 "created_at": sell_ts,
                 "volume_usdt": t.get("exit_price", 0) * qty if t.get("exit_price") else budget,
@@ -7962,6 +7974,94 @@ def api_universe():
         "exchange_info_available": ei_ok,
         "warming": warming,
         "available": True,
+    }
+
+
+@app.get("/api/diagnostics/fee-audit")
+def api_fee_audit(limit: int = 50):
+    """Damage report: recompute the last N CLOSED trades net-of-fees and quantify
+    the fee impact. net_profit is already net of both legs; this exposes gross vs
+    net side by side, how many GROSS wins are actually NET losses ('flipped'), net
+    vs gross expectancy, and total fees as a % of gross P&L. Read-only accounting —
+    no engine/scoring change. Rows whose stored fee is a config estimate (maker-TP/
+    OCO exits, paper) rather than actual Binance commission are flagged."""
+    limit = max(1, min(500, int(limit)))
+    try:
+        rows = database.get_recent_trades(limit=limit) or []
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    import config as _cfg_fa
+    _fr = float(getattr(_cfg_fa, "FEE_RATE", 0.001) or 0.001)
+    closed = [r for r in rows if r.get("exit_price") is not None]
+    per_trade = []
+    n = 0
+    wins_net = wins_gross = flipped = fee_estimated = 0
+    sum_net = sum_gross = sum_fee = 0.0
+    gross_win_sum = gross_loss_sum = 0.0
+    for r in closed:
+        try:
+            entry = float(r.get("entry_price") or 0.0)
+            exitp = float(r.get("exit_price") or 0.0)
+            qty   = float(r.get("quantity") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        gross = exitp * qty - entry * qty
+        bf = r.get("buy_fee");  bf = float(bf) if bf is not None else None
+        sf = r.get("sell_fee"); sf = float(sf) if sf is not None else None
+        est = bf is None or sf is None
+        if bf is None:
+            bf = entry * qty * _fr
+        if sf is None:
+            sf = exitp * qty * _fr
+        fee = bf + sf
+        net = r.get("net_profit")
+        net = float(net) if net is not None else (gross - fee)
+        n += 1
+        sum_net += net; sum_gross += gross; sum_fee += fee
+        if net > 0:
+            wins_net += 1
+        if gross > 0:
+            wins_gross += 1
+            gross_win_sum += gross
+        else:
+            gross_loss_sum += -gross
+        is_flip = gross > 0 and net <= 0
+        if is_flip:
+            flipped += 1
+        if est:
+            fee_estimated += 1
+        per_trade.append({
+            "symbol": r.get("coin") or r.get("symbol"),
+            "gross": round(gross, 6), "fee": round(fee, 6), "net": round(net, 6),
+            "flipped_win_to_loss": is_flip, "fee_estimated": est,
+            "sell_reason": r.get("sell_reason"),
+        })
+    net_win_sum = sum(t["net"] for t in per_trade if t["net"] > 0)
+    net_loss_sum = -sum(t["net"] for t in per_trade if t["net"] <= 0)
+    return {
+        "trades_analyzed": n,
+        "displayed_default": "net_profit (already net of entry+exit fees)",
+        "wins_gross": wins_gross,
+        "wins_net": wins_net,
+        "wins_flipped_to_loss_by_fees": flipped,
+        "win_rate_gross": round(wins_gross / n, 4) if n else 0.0,
+        "win_rate_net": round(wins_net / n, 4) if n else 0.0,
+        "expectancy_per_trade_gross": round(sum_gross / n, 6) if n else 0.0,
+        "expectancy_per_trade_net": round(sum_net / n, 6) if n else 0.0,
+        "total_gross_pnl": round(sum_gross, 6),
+        "total_net_pnl": round(sum_net, 6),
+        "total_fees": round(sum_fee, 6),
+        "fee_share_of_gross_pct": (round(sum_fee / sum_gross * 100.0, 2)
+                                   if sum_gross > 0 else None),
+        "profit_factor_net": (round(net_win_sum / net_loss_sum, 3)
+                              if net_loss_sum > 0 else None),
+        "profit_factor_gross": (round(gross_win_sum / gross_loss_sum, 3)
+                                if gross_loss_sum > 0 else None),
+        "rows_with_estimated_fees": fee_estimated,
+        "note": ("Fees are ACTUAL Binance commission for live market fills; "
+                 "config-estimated for maker-TP/OCO exits, maker-first entries, "
+                 "and paper trades (flagged fee_estimated)."),
+        "trades": per_trade,
     }
 
 
