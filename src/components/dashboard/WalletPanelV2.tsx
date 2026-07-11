@@ -422,7 +422,9 @@ const WalletPanelV2 = ({ binanceConnected, prices, mode, selectedCoins, agentPos
     const livePrice  = wsPrice > 0 ? wsPrice : entryPrice;
     const buyValue     = qty * entryPrice;
     const currentValue = qty * livePrice;
-    const pnl          = currentValue - buyValue;
+    // NET P&L (take-home if closed now): gross move minus the round-trip fee
+    // (entry already paid + estimated exit) — matches the break-even line below.
+    const pnl          = currentValue - buyValue - (currentValue + buyValue) * TAKER_FEE;
     let pct = entryPrice > 0 ? ((livePrice - entryPrice) / entryPrice) * 100 : 0;
     if (!Number.isFinite(pct)) pct = 0;
     if (pct < -100) pct = -100;
