@@ -57,7 +57,7 @@ class EntriesConfig(BaseModel):
     # the signal engine VETO-ONLY (signals still compute + feed WolfScore's
     # sub-metrics, but the count no longer blocks a buy). ge=0 allows the retire.
     min_score:              int   = Field(0, ge=0, le=10)
-    maker_first:            bool  = True
+    maker_first:            bool  = False
     chase_seconds:          float = Field(3.0, ge=1.0, le=30.0)
     max_reposts:            int   = Field(3, ge=0, le=10)
     taker_fallback:         bool  = False
