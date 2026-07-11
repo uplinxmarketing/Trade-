@@ -404,28 +404,14 @@ const AgentTradingFields = React.memo(({
       </div>
     </div>
 
-    {/* ── Max Positions + Min Signals ── */}
-    <div className="grid grid-cols-2 gap-3">
-      <div>
-        <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Max Positions</label>
-        <input type="number" min="1" max="50" step="1"
-          value={maxPositions}
-          onChange={e => setMaxPositions(parseInt(e.target.value) || 10)}
-          className="w-full mt-1 bg-muted/40 border border-border rounded px-2 py-1.5 text-xs font-mono focus:outline-none focus:border-accent/60" />
-        <p className="text-[9px] text-muted-foreground mt-0.5">Max concurrent open positions</p>
-      </div>
-      <div>
-        <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Min Signals to Buy</label>
-        <div className="flex gap-1 mt-1">
-          {[1,2,3,4,5,6].map(n => (
-            <button key={n} onClick={() => setMinSignals(n)}
-              className={`flex-1 py-1.5 text-xs font-bold rounded border transition-colors ${minSignals === n ? 'bg-accent text-accent-foreground border-accent' : 'border-border text-muted-foreground hover:border-accent/50'}`}>
-              {n}/6
-            </button>
-          ))}
-        </div>
-        <p className="text-[9px] text-muted-foreground mt-0.5">Higher = fewer, more confident buys</p>
-      </div>
+    {/* ── Max Positions (legacy Min-Signals selector removed — WolfScore is the sole gate) ── */}
+    <div>
+      <label className="text-[10px] uppercase tracking-wider text-muted-foreground">Max Positions</label>
+      <input type="number" min="1" max="50" step="1"
+        value={maxPositions}
+        onChange={e => setMaxPositions(parseInt(e.target.value) || 10)}
+        className="w-full mt-1 bg-muted/40 border border-border rounded px-2 py-1.5 text-xs font-mono focus:outline-none focus:border-accent/60" />
+      <p className="text-[9px] text-muted-foreground mt-0.5">Max concurrent open positions</p>
     </div>
   </div>
 ));
@@ -1993,10 +1979,10 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                   label = 'GATE'; labelColor = 'bg-amber-500/20 text-amber-400';
                 } else if (reason.startsWith('veto_')) {
                   label = 'VETO'; labelColor = 'bg-orange-500/20 text-orange-400';
-                } else if (reason.startsWith('mandatory_')) {
-                  label = 'MAND'; labelColor = 'bg-red-500/20 text-red-400';
-                } else if (reason.startsWith('score_')) {
-                  label = 'WAIT'; labelColor = 'bg-yellow-500/20 text-yellow-400';
+                } else if (reason.startsWith('mandatory_') || reason.startsWith('score_')) {
+                  // WolfScore below the buy gate (the old MAND/WAIT signal-engine
+                  // states collapse to one: not yet at the WolfScore threshold).
+                  label = 'BELOW'; labelColor = 'bg-yellow-500/20 text-yellow-400';
                 } else {
                   label = 'HOLD'; labelColor = 'bg-muted/30 text-muted-foreground';
                 }
