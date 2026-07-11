@@ -757,6 +757,33 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("successor_reconcile", exc)
 
+            # 4c-d. ONE engine only: disable the legacy signal_engine so WolfScore
+            #   is the sole scorer. With signal_engine.enabled=true the old signal
+            #   registry ran a full per-coin evaluation in the buy loop AND again in
+            #   the fresh re-check, ALONGSIDE WolfScore — redundant double work.
+            #   WolfScore v3 already folds every one of those signals/vetoes into its
+            #   formula, so the legacy engine adds nothing but load and a confusing
+            #   "decision path: SIGNAL ENGINE" log. Rev-guarded so a deliberate
+            #   re-enable is never clobbered.
+            try:
+                _ceR = 1
+                _raw_ce = _load_strategy()
+                if int(_raw_ce.get("engine_consolidation_rev", 0) or 0) < _ceR:
+                    _se_ce = _raw_ce.get("signal_engine")
+                    _se_ce = dict(_se_ce) if isinstance(_se_ce, dict) else {}
+                    if _se_ce.get("enabled") is not False:
+                        _se_ce["enabled"] = False
+                        _write_strategy_patch({"signal_engine": _se_ce,
+                                               "engine_consolidation_rev": _ceR})
+                        database.log_activity(
+                            "Engine consolidation: legacy signal_engine disabled — "
+                            "WolfScore is the sole buy engine", "info")
+                        steps.append("engine_consolidation (signal_engine off)")
+                    else:
+                        _write_strategy_patch({"engine_consolidation_rev": _ceR})
+            except Exception as exc:
+                _step_failed("engine_consolidation", exc)
+
             # 4d. Part G (G1c) — ONE-TIME F3 signal-roles drift migration.
             #     A prior CODE-default version persisted stale roles into
             #     strategy.json (min_scored=4, T1_ema_short_long=scored,
