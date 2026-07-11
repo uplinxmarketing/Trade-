@@ -784,6 +784,23 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("engine_consolidation", exc)
 
+            # 4c-e. Hard-stop paper-shadow if it is disabled. It is start()ed early
+            #   in boot (above), BEFORE the s3 migration flips
+            #   data.paper_shadow_enabled=false, so the thread is alive and merely
+            #   idle-skips its cycles — which still reads as "started" and keeps the
+            #   engine referenced. Stop it outright so the disable is HARD (no
+            #   lingering thread contending for anything). Runs every boot (cheap).
+            try:
+                _ps_data = (_load_strategy().get("data") or {})
+                if not bool(_ps_data.get("paper_shadow_enabled", True)):
+                    import paper_shadow as _ps_stop
+                    _fn_stop = getattr(_ps_stop, "stop", None)
+                    if callable(_fn_stop):
+                        _fn_stop()
+                        steps.append("paper_shadow stopped (disabled)")
+            except Exception as exc:
+                _step_failed("paper_shadow_stop", exc)
+
             # 4d. Part G (G1c) — ONE-TIME F3 signal-roles drift migration.
             #     A prior CODE-default version persisted stale roles into
             #     strategy.json (min_scored=4, T1_ema_short_long=scored,
