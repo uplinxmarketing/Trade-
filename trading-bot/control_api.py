@@ -5034,9 +5034,15 @@ def _diagnostics_impl():
         _auth_uni = {"universe_valid": None, "suspended": None,
                      "excluded": None, "available": False}
 
+    try:
+        _db_writer = database.writer_stats()
+    except Exception:
+        _db_writer = {}
+
     return {
         "server_time": now,
         "health": _health_compact,
+        "db_writer": _db_writer,   # Phase 1: background write queue telemetry
         "binance": {
             # rest_ok now means "Binance reachable" (REST recent OR WS streaming),
             # so it no longer flaps off during normal WS-first idle between REST
