@@ -5083,6 +5083,17 @@ def _diagnostics_impl():
             "disconnect_count":     wh["disconnect_count"],
             "subscribed_symbols":   len(_dc.prices),
         },
+        # Phase 5 (intermediate) proof: the trader runs on DEDICATED executors,
+        # isolated from the API request pool. This endpoint is cached (no live
+        # compute), so hitting it does not queue behind or stall the buy loop.
+        "trader_isolation": {
+            "buy_check_workers":   getattr(getattr(_te, "_buy_check_executor", None), "_max_workers", None),
+            "sell_workers":        getattr(getattr(_te, "_sell_executor", None), "_max_workers", None),
+            "buy_loop_last_ms":    dict(getattr(_te, "_scan_stage_ms", {}) or {}).get("buy_check_ms"),
+            "gate_loop_last_ms":   dict(getattr(_te, "_scan_stage_ms", {}) or {}).get("gate_loop_ms"),
+            "api_triggers_live_compute": False,   # all feeds served from cache/pub
+            "db_writer": _db_writer,
+        },
         "signal_scanner": {
             # Old field names kept for the current UI — semantics now honest:
             # ages/progress are computed against the EFFECTIVE interval, and
