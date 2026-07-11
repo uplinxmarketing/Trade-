@@ -37,6 +37,7 @@ CANDLE_LOOKBACK         = 50
 FEE_RATE                = 0.001    # 0.1% standard Binance spot (USDT, no BNB discount)
 CLAUDE_MODEL            = "claude-haiku-4-5-20251001"
 CLAUDE_MAX_TOKENS       = 400
+import os
 import os as _os
 def _data_dir() -> str:
     """MUST resolve identically to database._resolve_data_dir() — strategy.json
