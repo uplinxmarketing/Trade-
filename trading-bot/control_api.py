@@ -650,6 +650,90 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("s3_tuning_migration", exc)
 
+            # 4c-c. ONE-TIME successor reconciliation. The bot auto-REMOVES
+            #   confirmed-delisted coins but, with auto_replace off, left the
+            #   renamed successor to be added by hand — and once the predecessor
+            #   is gone from the list the auto-add can never re-trigger. This
+            #   (a) turns auto_replace ON going forward, (b) drops any lingering
+            #   KNOWN_DELISTED coin from approved_coins (network-free), and
+            #   (c) adds each mapped successor that is TRADING and not already
+            #   present. Idempotent + guarded by a rev marker so it runs once.
+            try:
+                import exchange_info as _ei
+                _SR_REV = 1
+                _raw_sr = _load_strategy()
+                if int(_raw_sr.get("successor_reconcile_rev", 0) or 0) < _SR_REV:
+                    _approved_sr = _raw_sr.get("approved_coins", []) or []
+                    _present_sr = {
+                        (c.get("symbol") if isinstance(c, dict) else c)
+                        for c in _approved_sr
+                    }
+                    try:
+                        _tradeable_sr = _ei.get_tradeable_symbols()
+                    except Exception:
+                        _tradeable_sr = set()
+                    # (b) drop lingering delisted predecessors (works offline).
+                    _kept_sr = [
+                        c for c in _approved_sr
+                        if (c.get("symbol") if isinstance(c, dict) else c)
+                        not in _ei.KNOWN_DELISTED
+                    ]
+                    # (c) add mapped successors that are live and absent. Only add
+                    #     when exchangeInfo confirms TRADING (fail-safe: skip adds
+                    #     when unreachable rather than add a possibly-dead ticker).
+                    _added_sr: list = []
+                    if _tradeable_sr:
+                        _kept_syms = {
+                            (c.get("symbol") if isinstance(c, dict) else c)
+                            for c in _kept_sr
+                        }
+                        for _succ in dict.fromkeys(_ei.RENAMED_SYMBOLS.values()):
+                            if _succ in _kept_syms:
+                                continue
+                            if _succ not in _tradeable_sr:
+                                continue
+                            _kept_sr.append({
+                                "symbol":         _succ,
+                                "approved":       True,
+                                "budget_usdt":    config.BUDGET_PER_TRADE_USDT,
+                                "max_concurrent": 2,
+                                "confidence":     0.5,
+                                "reason":         "auto-added successor of delisted coin",
+                            })
+                            _added_sr.append(_succ)
+                    _removed_sr = len(_ei.KNOWN_DELISTED & _present_sr)
+                    # Persist auto_replace=True + the reconciled list + rev marker.
+                    _sr_patch = {
+                        "data": {**(_raw_sr.get("data") or {}),
+                                 "auto_replace_with_successor": True},
+                        "approved_coins": _kept_sr,
+                        "successor_reconcile_rev": _SR_REV,
+                    }
+                    _write_strategy_patch(_sr_patch)
+                    # Purge engine state for any predecessor we just dropped.
+                    try:
+                        import trade_engine as _te_sr
+                        for _sym in (_ei.KNOWN_DELISTED & _present_sr):
+                            try:
+                                _te_sr.purge_symbol_state(_sym)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        import data_collector as _dc_sr
+                        _dc_sr.refresh_watchlist()
+                    except Exception:
+                        pass
+                    database.log_activity(
+                        f"Successor reconcile: added {_added_sr or 'none'}, "
+                        f"dropped {_removed_sr} delisted; auto-replace ON", "info")
+                    steps.append(
+                        f"successor_reconcile (added {len(_added_sr)}, "
+                        f"dropped {_removed_sr})")
+            except Exception as exc:
+                _step_failed("successor_reconcile", exc)
+
             # 4d. Part G (G1c) — ONE-TIME F3 signal-roles drift migration.
             #     A prior CODE-default version persisted stale roles into
             #     strategy.json (min_scored=4, T1_ema_short_long=scored,
