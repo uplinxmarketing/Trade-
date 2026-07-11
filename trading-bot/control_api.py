@@ -983,9 +983,8 @@ async def lifespan(app: FastAPI):
             #     without the trader having to. Guarded by SNAPSHOT_WRITER_ENABLED;
             #     a complete no-op (thread never starts) when the flag is off.
             try:
-                if getattr(config, "SNAPSHOT_WRITER_ENABLED", False):
-                    threading.Thread(target=_snapshot_writer_loop,
-                                     name="snapshot-writer", daemon=True).start()
+                _ensure_snapshot_writer()
+                if _snapshot_writer_started["v"]:
                     steps.append("snapshot_writer spawned")
             except Exception as exc:
                 _step_failed("snapshot_writer", exc)
@@ -7322,13 +7321,49 @@ def _snapshot_writer_loop():
         time.sleep(_SNAPSHOT_WRITER_INTERVAL)
 
 
+_snapshot_writer_started = {"v": False}
+_snapshot_writer_start_lock = threading.Lock()
+
+
+def _ensure_snapshot_writer():
+    """Idempotently start the snapshot-writer thread if the flag is on. Safe to
+    call from many places (module import, lifespan boot, /api/snapshot) — only the
+    first successful call spawns the thread; the rest are no-ops. This makes the
+    writer independent of the lifespan boot sequence, which is the reliable place
+    to start it. No-op when SNAPSHOT_WRITER_ENABLED=0."""
+    if _snapshot_writer_started["v"]:
+        return
+    if not getattr(config, "SNAPSHOT_WRITER_ENABLED", False):
+        return
+    with _snapshot_writer_start_lock:
+        if _snapshot_writer_started["v"]:
+            return
+        try:
+            threading.Thread(target=_snapshot_writer_loop,
+                             name="snapshot-writer", daemon=True).start()
+            _snapshot_writer_started["v"] = True
+            try:
+                database.log_activity("snapshot-writer thread started", "info")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+# Start the writer at import time too, so it never depends on the lifespan boot
+# sequence executing this step. Idempotent + flag-guarded → no-op when disabled.
+_ensure_snapshot_writer()
+
+
 @app.get("/api/snapshot")
 def api_snapshot():
     """Proof/introspection endpoint for the process-split foundation. Reports
     whether the snapshot tee is enabled and, if so, the on-disk file's age so an
     operator can confirm Process B would be reading fresh state. Read-only."""
+    _ensure_snapshot_writer()   # lazy safety-net: guarantees the writer is running
     out = {
         "writer_enabled": bool(getattr(config, "SNAPSHOT_WRITER_ENABLED", False)),
+        "writer_thread_alive": _snapshot_writer_started["v"],
         "path": _SNAPSHOT_PATH,
         "exists": False,
         "age_sec": None,
