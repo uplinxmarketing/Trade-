@@ -1763,6 +1763,7 @@ def _manage_universe() -> dict:
                 return summary
 
             to_remove: list = []           # [(sym, successor)]
+            _suspend_notify: list = []     # (sym, status) — pushed AFTER the lock
             with _universe_state_lock:
                 for sym in symbols:
                     if sym in tradeable:
@@ -1789,9 +1790,10 @@ def _manage_universe() -> dict:
                         summary["suspended"].append(sym)
                         if sym not in _notified_suspended:
                             _notified_suspended.add(sym)
-                            _push_universe_notice(
-                                "suspended", sym,
-                                f"halted on Binance ({st_up}) — trading paused, not removed")
+                            # DEFER the push: _push_universe_notice acquires
+                            # _universe_state_lock, which we HOLD here — and it is a
+                            # non-reentrant Lock, so pushing inline self-deadlocks.
+                            _suspend_notify.append((sym, st_up))
                         continue
                     # Tier 1 — delisted / permanently gone. Confirm across 2 passes.
                     count = _delist_confirm.get(sym, 0) + 1
@@ -1800,6 +1802,13 @@ def _manage_universe() -> dict:
                         summary["pending"].append({"symbol": sym, "confirm_count": count})
                         continue
                     to_remove.append(sym)
+
+            # Push suspended-coin notices now that _universe_state_lock is RELEASED
+            # (the pusher re-acquires it). Transition-guarded above, so no spam.
+            for _sn_sym, _sn_st in _suspend_notify:
+                _push_universe_notice(
+                    "suspended", _sn_sym,
+                    f"halted on Binance ({_sn_st}) — trading paused, not removed")
 
             if not auto_remove:
                 # Confirmed but auto-remove disabled — just report as pending.
