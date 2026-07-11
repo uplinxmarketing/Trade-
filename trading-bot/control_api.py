@@ -566,7 +566,7 @@ async def lifespan(app: FastAPI):
             #   Guarded by a stored rev marker so it runs exactly once.
             try:
                 import strategy_config as _scfg_s3
-                _S3_REV = 7
+                _S3_REV = 8
                 _raw_s3 = _load_strategy()
                 if int(_raw_s3.get("s3_tuning_rev", 0) or 0) < _S3_REV:
                     _ent = _raw_s3.get("entries") if isinstance(_raw_s3.get("entries"), dict) else {}
@@ -615,8 +615,8 @@ async def lifespan(app: FastAPI):
                     # (min_score/min_scored=0 → signal engine is VETO-ONLY); safety
                     # vetoes stay. Freshness: fast heartbeat + short confirm.
                     _s3_force(_ent, "entries", "min_score", 0, _s3_patch)                    # retire signal-count gate
-                    _s3_force(_ent, "entries", "buy_score_threshold", 65.0, _s3_patch)       # THE gate
-                    _s3_force(_ent, "entries", "min_win_probability_floor", 65.0, _s3_patch) # legacy alias = 65
+                    _s3_force(_ent, "entries", "buy_score_threshold", 61.0, _s3_patch)       # THE gate
+                    _s3_force(_ent, "entries", "min_win_probability_floor", 61.0, _s3_patch) # legacy alias = 61
                     _s3_force(_ent, "entries", "ev_floor_mode", "absolute", _s3_patch)       # not percentile
                     _s3_force(_ent, "entries", "ev_floor_live_untrained", True, _s3_patch)   # gate on interim (operator choice)
                     _s3_force(_ent, "entries", "ev_ranking_enabled", True, _s3_patch)        # highest-first
