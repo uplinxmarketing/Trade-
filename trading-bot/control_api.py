@@ -978,6 +978,18 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("rolling_window_trim", exc)
 
+            # 7a-c. Process-split snapshot writer — keep dashboard_snapshot.json
+            #     fresh on a timer so a read-only Process B can serve /api/all
+            #     without the trader having to. Guarded by SNAPSHOT_WRITER_ENABLED;
+            #     a complete no-op (thread never starts) when the flag is off.
+            try:
+                if getattr(config, "SNAPSHOT_WRITER_ENABLED", False):
+                    threading.Thread(target=_snapshot_writer_loop,
+                                     name="snapshot-writer", daemon=True).start()
+                    steps.append("snapshot_writer spawned")
+            except Exception as exc:
+                _step_failed("snapshot_writer", exc)
+
             # 7b. Phase 1 daily maintenance: kline-store prune + nightly edge
             #     report. First pass ~60 s after startup, then every 24 h.
             try:
@@ -7105,6 +7117,7 @@ _API_ALL_TTL = 0.8   # seconds — slightly less than the 1 s fast-poll cadence
 # beyond one throttled json dump of data that was already assembled for the cache.
 _SNAPSHOT_PATH = os.path.join(database._DATA_DIR, "dashboard_snapshot.json")
 _SNAPSHOT_MIN_INTERVAL = 1.0   # write at most once/sec even under heavy polling
+_SNAPSHOT_WRITER_INTERVAL = 2.0  # background refresh cadence (see _snapshot_writer_loop)
 _snapshot_last_write = {"ts": 0.0}
 _snapshot_lock = threading.Lock()
 
@@ -7289,6 +7302,24 @@ def api_all():
     _API_ALL_CACHE["data"] = payload
     _publish_api_snapshot(payload)   # tee to Process B (inert unless enabled)
     return _append_fresh_prices(payload)
+
+
+def _snapshot_writer_loop():
+    """Refresh dashboard_snapshot.json on a fixed cadence, independent of inbound
+    HTTP. Once nginx routes /api/all to the read-only Process B, the trader no
+    longer serves that poll — so the tee-on-request path would freeze and the file
+    would go stale. This loop forces a periodic rebuild so the snapshot stays
+    fresh for Process B regardless of who is (or isn't) polling the trader.
+
+    Guarded: only started when SNAPSHOT_WRITER_ENABLED=1. Fully defensive — a
+    build error just retries next tick and never touches trading."""
+    while True:
+        try:
+            _API_ALL_CACHE["ts"] = 0.0   # invalidate cache so api_all rebuilds + tees
+            api_all()
+        except Exception:
+            pass
+        time.sleep(_SNAPSHOT_WRITER_INTERVAL)
 
 
 @app.get("/api/snapshot")
