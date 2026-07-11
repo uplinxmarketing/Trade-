@@ -8855,20 +8855,20 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     global _last_buy_check, _buys_this_scan, _last_buy_ts
     _buys_this_scan = 0  # reset per-scan counter each invocation
 
-    # ── I1.2 — arm entries LAST: withhold ALL buy-check evaluation until the
-    # data layer reports backfill_complete (or a ~2min grace elapses). This is
-    # the single choke point every buy path flows through (5m-close, veto
-    # heartbeat, signal_scanner, legacy tick). Held-symbol EXIT monitoring runs
-    # on a separate path (sell monitor / held watchdog) and is NOT gated here.
+    # Publish fresh WolfScores for the UI FIRST — before EVERY early-return below,
+    # including the arming gate. Scoring is read-only, self-throttled
+    # (_REFRESH_PUBLISH_MIN_SEC) and backfill-gated (_entry_backfill_ready), and it
+    # arms NO entries — so publishing during the ~120s boot arming window lets the
+    # score table populate coin-by-coin as candles backfill, instead of showing an
+    # empty table until entries arm. The arming gate below still withholds only the
+    # BUY evaluation. Also keeps the feed live at capacity / paused / risk-latched.
+    _refresh_and_publish_scores()
+
+    # ── I1.2 — arm entries LAST: withhold ALL buy-check evaluation until the data
+    # layer reports backfill_complete (or a ~2min grace). This gate governs BUYS
+    # only; the score publish above runs regardless so the UI never sits blank.
     if not _entries_armed():
         return
-
-    # Publish fresh WolfScores for the UI FIRST — before any early-return below
-    # (paused / at-capacity / risk latch). Scoring lives in this buy checker, so
-    # when the bot holds a full book and returns early, the feed used to freeze at
-    # the last scores. This decoupled publish keeps the signal panel live whether
-    # or not the bot is currently buying. Cheap (in-memory inputs) and guarded.
-    _refresh_and_publish_scores()
 
     # Load strategy once up front (_load_strategy is mtime-cached — cheap).
     strategy = _load_strategy()
