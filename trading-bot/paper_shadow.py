@@ -509,9 +509,10 @@ class PaperShadow:
         now = time.time()
         max_hold = self._max_hold_sec()
         closes = 0  # DB-write throttle: bound exits emitted (and written) per cycle
+        _sink: dict = {"train": [], "trades": []}   # batched DB writes for this cycle
         for pid in open_ids:
             if self._stop_evt.is_set():
-                return
+                break
             if closes >= _MAX_CLOSES_PER_CYCLE:
                 # Burst guard — leave the rest in the bounded ledger; they exit on
                 # a later cycle. Prevents a mass-exit from stalling the loop / DB.
@@ -527,17 +528,29 @@ class PaperShadow:
                     # No fresh price — expire only if stale past the hold cap.
                     if now - pos.get("opened_ts", now) > max_hold:
                         self._close_paper(pid, pos, pos.get("entry_price"),
-                                          "time_stop", now)
+                                          "time_stop", now, sink=_sink)
                         closes += 1
                     continue
                 reason = self._evaluate_paper_exit(pos, price, now)
                 if reason is None and (now - pos.get("opened_ts", now) > max_hold):
                     reason = "time_stop"
                 if reason is not None:
-                    self._close_paper(pid, pos, price, reason, now)
+                    self._close_paper(pid, pos, price, reason, now, sink=_sink)
                     closes += 1
             except Exception as e:
                 log.debug("[PaperShadow] manage %s failed: %s", sym, e)
+        # ── Flush this cycle's closes in ONE transaction each (2 lock acquisitions
+        #    total, vs up to 2×_MAX_CLOSES). Keeps paper-shadow off database._lock
+        #    during the live buy-check.
+        if _sink["train"] or _sink["trades"]:
+            try:
+                import database
+                if _sink["train"]:
+                    database.save_training_samples_bulk(_sink["train"])
+                if _sink["trades"]:
+                    database.save_paper_trades_bulk(_sink["trades"])
+            except Exception as e:
+                log.debug("[PaperShadow] bulk flush failed: %s", e)
 
     def _evaluate_paper_exit(self, pos: dict, price: float,
                              now: float) -> Optional[str]:
@@ -716,10 +729,15 @@ class PaperShadow:
         return "time_stop"  # time_stop / stale / anything else
 
     def _close_paper(self, pid: int, pos: dict, exit_mid: Optional[float],
-                     reason: str, now: float) -> None:
+                     reason: str, now: float, sink: Optional[dict] = None) -> None:
         """Close a paper position at a MODELED sell fill, compute realized_r, emit
         ONE labeled training sample + ONE rich paper_trades row, and drop it from
-        the bounded ledger (freeing its virtual budget + per-symbol slot)."""
+        the bounded ledger (freeing its virtual budget + per-symbol slot).
+
+        When `sink` is provided ({'train': [...], 'trades': [...]}) the two rows are
+        APPENDED to it instead of written immediately — the caller bulk-flushes them
+        in ONE DB transaction per cycle, so paper-shadow never grabs database._lock
+        once per close (which was starving the live buy-check)."""
         import fees
         import database
 
@@ -769,30 +787,27 @@ class PaperShadow:
             label = 1 if realized_r > 0 else 0
             features = pos.get("ev_features") or {}
             exit_type = self._exit_type(reason)
-            # 1) Training sample — unchanged contract (submetrics/regime_tilt live
-            #    inside the features dict the EV path produced).
-            database.save_training_sample("paper_shadow", sym, features,
-                                          label, realized_r)
-            # 2) Rich outcome row — guarded (a parallel agent adds save_paper_trade;
-            #    tolerate its absence so this never breaks the paper loop).
-            try:
-                database.save_paper_trade({
-                    "ts":         now,
-                    "symbol":     sym,
-                    "wolfscore":  pos.get("wolfscore"),
-                    "regime":     pos.get("regime"),
-                    "exit_type":  exit_type,
-                    "entry_px":   entry,
-                    "exit_px":    sell_fill,
-                    "pnl":        pnl,
-                    "realized_r": realized_r,
-                    "hold_sec":   max(0.0, now - float(pos.get("opened_ts", now))),
-                    "label":      label,
-                })
-            except AttributeError:
-                pass  # save_paper_trade not present yet — training row still logged
-            except Exception as e:
-                log.debug("[PaperShadow] save_paper_trade %s failed: %s", sym, e)
+            _train_row = {"mode": "paper_shadow", "symbol": sym, "features": features,
+                          "label": label, "realized_r": realized_r, "ts": now}
+            _trade_row = {
+                "ts": now, "symbol": sym, "wolfscore": pos.get("wolfscore"),
+                "regime": pos.get("regime"), "exit_type": exit_type,
+                "entry_px": entry, "exit_px": sell_fill, "pnl": pnl,
+                "realized_r": realized_r,
+                "hold_sec": max(0.0, now - float(pos.get("opened_ts", now))),
+                "label": label,
+            }
+            if isinstance(sink, dict):
+                # Deferred: caller bulk-flushes ONE transaction per cycle.
+                sink.setdefault("train", []).append(_train_row)
+                sink.setdefault("trades", []).append(_trade_row)
+            else:
+                database.save_training_sample("paper_shadow", sym, features,
+                                              label, realized_r)
+                try:
+                    database.save_paper_trade(_trade_row)
+                except Exception as e:
+                    log.debug("[PaperShadow] save_paper_trade %s failed: %s", sym, e)
             log.debug("[PaperShadow] EXIT %s type=%s reason=%s R=%.3f pnl=%.4f",
                       sym, exit_type, reason, realized_r, pnl)
         except Exception as e:

@@ -566,7 +566,7 @@ async def lifespan(app: FastAPI):
             #   Guarded by a stored rev marker so it runs exactly once.
             try:
                 import strategy_config as _scfg_s3
-                _S3_REV = 5
+                _S3_REV = 6
                 _raw_s3 = _load_strategy()
                 if int(_raw_s3.get("s3_tuning_rev", 0) or 0) < _S3_REV:
                     _ent = _raw_s3.get("entries") if isinstance(_raw_s3.get("entries"), dict) else {}
@@ -598,8 +598,10 @@ async def lifespan(app: FastAPI):
 
                     # S3-1 — floor mode p75 → absolute (the 55 cliff, distribution-independent)
                     _s3_bump(_ent, "entries", "ev_floor_mode", "p75", "absolute", _s3_patch)
-                    # S3-4 — paper-shadow load: 300 → 100 concurrent (same signal, ~1/3 load)
-                    _s3_bump(_dat, "data", "paper_shadow_max_open", 300, 100, _s3_patch)
+                    # Paper-shadow load: cap open positions at 30 (was 300→100) to
+                    # cut its per-cycle management + DB writes that contended with the
+                    # live buy-check for database._lock.
+                    _s3_force(_dat, "data", "paper_shadow_max_open", 30, _s3_patch)
                     # S3-7 — R-multiple tuning (operator-approved): arm ratchet later + trail wider
                     _s3_bump(_ext, "exits", "ratchet_activate_r", 0.4, 0.8, _s3_patch, is_float=True)
                     _s3_bump(_ext, "exits", "ratchet_k_atr", 0.6, 1.0, _s3_patch, is_float=True)

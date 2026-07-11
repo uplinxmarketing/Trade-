@@ -239,10 +239,11 @@ class DataConfig(BaseModel):
     # bounded (open positions capped; outcomes persist to a capped DB table).
     paper_shadow_budget_usdt:    float = Field(10000.0, ge=0.0, le=10_000_000.0)
     paper_shadow_position_usdt:  float = Field(11.0, ge=1.0, le=100_000.0)
-    # S3-4 — default lowered 300→100: the win-rate/bucket signal is already clean
-    # at n>1600, and 100 concurrent gives the same statistical picture at ~1/3 the
-    # per-cycle CPU/memory load. Raise it for a faster flywheel if the box has room.
-    paper_shadow_max_open:       int   = Field(100, ge=1, le=5000)
+    # Default lowered 300→100→30: 30 concurrent still gives a clean win-rate/bucket
+    # signal while sharply cutting the per-cycle position management + DB writes that
+    # were contending with the live buy-check for database._lock. Raise it only if
+    # the box has clear headroom.
+    paper_shadow_max_open:       int   = Field(30, ge=1, le=5000)
     paper_shadow_max_per_symbol: int   = Field(20, ge=1, le=500)
     # Shadow-Lab evaluator cadence (seconds between paper cycles). Higher = less
     # CPU (the flywheel manages up to max_open positions each cycle). Operator
