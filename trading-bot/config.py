@@ -124,6 +124,11 @@ FUTURES_ENABLED           = os.getenv("FUTURES_ENABLED", "0") == "1"
 # (coin selection, buy/sell results) is synced on-write elsewhere; this periodic
 # loop is redundant background I/O — OFF by default, SUPABASE_PERIODIC_SYNC=1 re-enables.
 SUPABASE_PERIODIC_SYNC    = os.getenv("SUPABASE_PERIODIC_SYNC", "0") == "1"
+# Phase 7 — heavy on-demand "cold" endpoints (backtester, lever-matrix, AI chat)
+# run CPU/LLM work IN the trader process and compete for the GIL. OFF by default
+# so they cannot be triggered against the live trader; COLD_ENDPOINTS_ENABLED=1
+# (or a dedicated cold process) re-enables them.
+COLD_ENDPOINTS_ENABLED    = os.getenv("COLD_ENDPOINTS_ENABLED", "0") == "1"
 FUTURES_WATCHED_COINS     = [
     "BTCUSDT", "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
     "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT",  "ARBUSDT",

@@ -5101,6 +5101,17 @@ def _diagnostics_impl():
             "gate_loop_last_ms":   dict(getattr(_te, "_scan_stage_ms", {}) or {}).get("gate_loop_ms"),
             "api_triggers_live_compute": False,   # all feeds served from cache/pub
             "db_writer": _db_writer,
+            # Phase 7 proof: dead-weight quarantine — which cold subsystems are OFF
+            # in the trader process, and the live thread count.
+            "quarantine": {
+                "futures_enabled":        bool(getattr(config, "FUTURES_ENABLED", False)),
+                "supabase_periodic_sync": bool(getattr(config, "SUPABASE_PERIODIC_SYNC", False)),
+                "cold_endpoints_enabled": bool(getattr(config, "COLD_ENDPOINTS_ENABLED", False)),
+                "paper_shadow_enabled":   bool((_load_strategy().get("data") or {}).get("paper_shadow_enabled", False)),
+                "signal_engine_enabled":  bool((_load_strategy().get("signal_engine") or {}).get("enabled", False)),
+                "live_thread_count":      len(active_threads),
+                "thread_names":           active_threads,
+            },
         },
         "signal_scanner": {
             # Old field names kept for the current UI — semantics now honest:
@@ -7493,6 +7504,9 @@ class ChatRequest(BaseModel):
 @app.post("/api/chat")
 async def api_chat(req: ChatRequest):
     """Proxy streaming chat to Anthropic API, converting to OpenAI SSE format."""
+    if not getattr(config, "COLD_ENDPOINTS_ENABLED", False):
+        return {"disabled": True, "reason": "cold endpoint quarantined from the "
+                "trader process (Phase 7); set COLD_ENDPOINTS_ENABLED=1 to enable"}
     import aiohttp
     import json as _json
 
@@ -8408,6 +8422,9 @@ def api_backtest_start(body: dict = Body(default={})):
     """Start a backtest job. Body: {start: 'YYYY-MM-DD', end: 'YYYY-MM-DD',
     symbols: ['BTCUSDT', ...] | 'approved', config: optional strategy override}.
     Single-flight: 409 while another job is queued/running."""
+    if not getattr(config, "COLD_ENDPOINTS_ENABLED", False):
+        return {"disabled": True, "reason": "backtester quarantined from the trader "
+                "process (Phase 7); set COLD_ENDPOINTS_ENABLED=1 to enable"}
     try:
         try:
             import backtest as _bt
@@ -8512,6 +8529,9 @@ def api_lever_matrix_start(months: float = 3.0, symbols: Optional[str] = None):
     """L3 — kick a lever-matrix backtest sweep in a BACKGROUND thread (long-
     running; never blocks the event loop). Returns immediately with the run_id.
     409 if a run is already in flight; 503 if lever_matrix isn't installed."""
+    if not getattr(config, "COLD_ENDPOINTS_ENABLED", False):
+        return {"disabled": True, "reason": "lever-matrix quarantined from the trader "
+                "process (Phase 7); set COLD_ENDPOINTS_ENABLED=1 to enable"}
     global _lever_matrix_running, _lever_matrix_run_id
     try:
         import lever_matrix as _lm  # noqa: F401 — presence check only
