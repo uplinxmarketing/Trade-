@@ -8863,6 +8863,34 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # reason, so the DECISION-GAP tripwire can never fire "no block reason".
     _ready_syms_pass: set = set()
 
+    # ── Perf: batch the per-coin DB reads into ONE query each per scan ──────────
+    # The buy-check used to fire ~2 get_candles + 1 slippage query PER COIN (~280
+    # DB hits / 280 database._lock acquisitions per scan), which queued behind the
+    # paper-shadow's lock and turned a 35ms scan into 120s. Prefetch the latest
+    # candle per coin and the recent slippage per coin in ONE query each; the loop
+    # then reads from these in-memory maps. Slippage prefetch also warms
+    # _slippage_cache so _wolf_inputs → _avg_slippage_bps never touches the DB.
+    _approved_list = list(approved)
+    try:
+        _latest_candles = database.get_latest_candle_bulk(
+            _approved_list, config.CANDLE_TIMEFRAME)
+    except Exception:
+        _latest_candles = {}
+    try:
+        from datetime import timedelta as _td_sl
+        _since_sl = (datetime.now(timezone.utc)
+                     - _td_sl(days=_SLIPPAGE_MAX_AGE_DAYS)).isoformat()
+        _slip_bulk = database.get_slippage_avg_bulk(
+            _approved_list, get_mode(), _since_sl)
+        _now_sl = time.time()
+        with _slippage_lock:
+            for _sy in _approved_list:
+                _slippage_cache[_sy] = {
+                    "avg_bps": _slip_bulk.get(_sy), "n": 1 if _sy in _slip_bulk else 0,
+                    "ts": _now_sl}
+    except Exception:
+        pass
+
     def _cached_ready(_c) -> bool:
         return bool(_c.get("score", 0) >= min_sigs)
 
@@ -9208,9 +9236,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # The 5m BB check (bb_ok above) catches medium-term tops; this catches
         # local 1m tops that the 5m hasn't reflected yet (e.g. INJUSDT case).
         try:
-            candles_1m = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=1)
-            if candles_1m:
-                bb_pos_1m = candles_1m[-1].get("bb_position")
+            _c1 = _latest_candles.get(sym)   # in-memory (batched once per scan)
+            if _c1:
+                bb_pos_1m = _c1.get("bb_position")
                 if bb_pos_1m in ("above_upper", "at_upper"):
                     _record_rejection(sym, score, "bb_upper", f"1m {bb_pos_1m}")
                     database.log_activity(
@@ -9282,9 +9310,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # Block buys when price is below MA20 AND RSI is not deeply oversold (<35).
         # Also block when volume trend is decreasing (no buying pressure).
         try:
-            _th_candles = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=1)
-            if _th_candles:
-                _last_c = _th_candles[-1]
+            _last_c = _latest_candles.get(sym)   # in-memory (batched once per scan)
+            if _last_c:
                 _ma_pos  = _last_c.get("ma_position") or _derive_ma_pos(price, _last_c.get("ma20"))
                 _vol_tr  = _last_c.get("volume_trend")
                 if _ma_pos == "below" and rsi_v > 35:

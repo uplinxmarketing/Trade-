@@ -496,6 +496,66 @@ def get_candles(coin: str, timeframe: str, limit: int = 50) -> List[dict]:
     return [dict(r) for r in reversed(rows)]
 
 
+def get_latest_candle_bulk(coins: list, timeframe: str) -> dict:
+    """Latest stored candle per coin, in ONE query → {coin: row_dict}. Replaces
+    the per-coin get_candles(limit=1) reads in the buy-check hot loop: 1 DB hit +
+    1 lock acquisition per scan instead of ~N. Guarded → {} on error."""
+    if not coins:
+        return {}
+    out: dict = {}
+    try:
+        syms = list(dict.fromkeys(coins))
+        ph = ",".join(["?"] * len(syms))
+        with _lock:
+            conn = _conn()
+            try:
+                rows = conn.execute(f"""
+                    SELECT c.* FROM candles c
+                    JOIN (SELECT coin, MAX(open_time) AS mo FROM candles
+                          WHERE timeframe=? AND coin IN ({ph}) GROUP BY coin) m
+                      ON c.coin=m.coin AND c.open_time=m.mo AND c.timeframe=?
+                """, (timeframe, *syms, timeframe)).fetchall()
+            finally:
+                conn.close()
+        for r in rows:
+            d = dict(r)
+            out[d.get("coin")] = d
+    except Exception as e:
+        print(f"[Database] get_latest_candle_bulk failed: {e}")
+    return out
+
+
+def get_slippage_avg_bulk(coins: list, mode: str, since_iso: str) -> dict:
+    """Mean |slippage_bps| per coin over the recent window, in ONE query →
+    {coin: avg_bps}. Replaces the per-coin _avg_slippage_bps DB reads in the
+    WolfScore hot loop. Guarded → {} on error."""
+    if not coins:
+        return {}
+    out: dict = {}
+    try:
+        syms = list(dict.fromkeys(coins))
+        ph = ",".join(["?"] * len(syms))
+        with _lock:
+            conn = _conn()
+            try:
+                rows = conn.execute(f"""
+                    SELECT coin, AVG(ABS(slippage_bps)) AS avg_bps, COUNT(*) AS n
+                    FROM trades
+                    WHERE mode=? AND slippage_bps IS NOT NULL
+                      AND timestamp_sell >= ? AND coin IN ({ph})
+                    GROUP BY coin
+                """, (mode, since_iso, *syms)).fetchall()
+            finally:
+                conn.close()
+        for r in rows:
+            d = dict(r)
+            if d.get("avg_bps") is not None:
+                out[d.get("coin")] = float(d["avg_bps"])
+    except Exception as e:
+        print(f"[Database] get_slippage_avg_bulk failed: {e}")
+    return out
+
+
 def candles_table_empty() -> bool:
     with _lock:
         conn = _conn()
@@ -2077,6 +2137,90 @@ def save_paper_trade(row: dict) -> None:
                 conn.close()
     except Exception as e:
         print(f"[Database] save_paper_trade failed: {e}")
+
+
+def save_paper_trades_bulk(rows: list) -> int:
+    """Insert many paper_trades in ONE transaction / ONE database._lock
+    acquisition — the paper-shadow's per-cycle flush. Replaces up to _MAX_CLOSES
+    per-trade writes (each grabbing the lock the live scan needs) with a single
+    executemany. Returns rows written. Guarded."""
+    import time as _t
+    rows = [r for r in (rows or []) if isinstance(r, dict)]
+    if not rows:
+        return 0
+    try:
+        params = []
+        for row in rows:
+            ts = row.get("ts") or _t.time()
+            params.append((
+                _num(ts), row.get("symbol"), _num(row.get("wolfscore")),
+                row.get("regime"), row.get("exit_type"),
+                _num(row.get("entry_px")), _num(row.get("exit_px")),
+                _num(row.get("pnl")), _num(row.get("realized_r")),
+                _num(row.get("hold_sec")),
+                int(bool(row.get("label"))) if row.get("label") is not None else None,
+            ))
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute(_PAPER_TRADES_DDL)
+                conn.executemany("""
+                    INSERT INTO paper_trades
+                        (ts, symbol, wolfscore, regime, exit_type, entry_px,
+                         exit_px, pnl, realized_r, hold_sec, label)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """, params)
+                conn.execute(
+                    "DELETE FROM paper_trades WHERE id NOT IN "
+                    "(SELECT id FROM paper_trades ORDER BY id DESC LIMIT ?)",
+                    (_PAPER_TRADES_CAP,))
+                conn.commit()
+            finally:
+                conn.close()
+        return len(params)
+    except Exception as e:
+        print(f"[Database] save_paper_trades_bulk failed: {e}")
+        return 0
+
+
+def save_training_samples_bulk(rows: list) -> int:
+    """Insert many training_samples in ONE transaction / ONE lock acquisition.
+    Each row: dict{mode, symbol, features, label, realized_r, ts?}. Guarded."""
+    import time as _t
+    rows = [r for r in (rows or []) if isinstance(r, dict)]
+    if not rows:
+        return 0
+    try:
+        params = []
+        for r in rows:
+            try:
+                fj = json.dumps(r.get("features") if r.get("features") is not None else {}, default=str)
+            except Exception:
+                fj = "{}"
+            params.append((
+                _num(r.get("ts") or _t.time()), r.get("mode"), r.get("symbol"),
+                fj, int(bool(r.get("label"))), _num(r.get("realized_r")),
+            ))
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute(_TRAINING_SAMPLES_DDL)
+                conn.executemany("""
+                    INSERT INTO training_samples
+                        (ts, mode, symbol, features_json, label, realized_r)
+                    VALUES (?,?,?,?,?,?)
+                """, params)
+                conn.execute(
+                    "DELETE FROM training_samples WHERE id NOT IN "
+                    "(SELECT id FROM training_samples ORDER BY id DESC LIMIT ?)",
+                    (_TRAINING_SAMPLES_CAP,))
+                conn.commit()
+            finally:
+                conn.close()
+        return len(params)
+    except Exception as e:
+        print(f"[Database] save_training_samples_bulk failed: {e}")
+        return 0
 
 
 def _paper_score_bucket(score) -> Optional[str]:
