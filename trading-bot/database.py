@@ -898,18 +898,16 @@ def save_entry_snapshot(symbol: str, origin: str, executed, price,
         gates_json = json.dumps(gates if gates is not None else {}, default=str)
     except Exception:
         gates_json = "{}"
-    with _lock:
-        conn = _conn()
-        cur = conn.execute("""
-            INSERT INTO entry_snapshots
-                (ts, symbol, origin, executed, price, raw_json, gates_json, config_hash)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (ts, symbol, origin, int(bool(executed)),
-              _num(price), raw_json, gates_json, config_hash))
-        conn.commit()
-        row_id = cur.lastrowid
-        conn.close()
-    return row_id
+    # Phase 1: entry snapshots fire IN the buy hot path (per attempt + near-miss).
+    # Non-critical diagnostics never read back synchronously → enqueue to the
+    # background writer so the buy loop never holds the write lock for them.
+    _enqueue_write(
+        "INSERT INTO entry_snapshots "
+        "(ts, symbol, origin, executed, price, raw_json, gates_json, config_hash) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (ts, symbol, origin, int(bool(executed)),
+         _num(price), raw_json, gates_json, config_hash))
+    return None  # deferred write — callers do not use the row id
 
 
 def get_entry_snapshots(since_ts: Optional[float] = None,
@@ -1457,17 +1455,33 @@ def get_futures_trade_stats() -> dict:
 _write_queue: "._queue_mod.Queue" = _queue_mod.Queue(maxsize=20000)
 _writer_thread = None
 _writer_lock = threading.Lock()
+_writer_flushed = 0        # total statements written by the background thread
+_writer_batches = 0        # total flush cycles
+_writer_dropped = 0        # statements dropped because the queue was full
+
+
+def writer_stats() -> dict:
+    """Background-writer telemetry (Phase 1 proof: queue draining, hot path off-lock)."""
+    return {
+        "queued_now":   _write_queue.qsize(),
+        "flushed_total": _writer_flushed,
+        "batches_total": _writer_batches,
+        "dropped_total": _writer_dropped,
+        "alive": bool(_writer_thread is not None and _writer_thread.is_alive()),
+    }
 
 
 def _enqueue_write(sql: str, params: tuple = ()):  # non-blocking; drops if flooded
+    global _writer_dropped
     _ensure_writer()
     try:
         _write_queue.put_nowait((sql, params))
     except _queue_mod.Full:
-        pass  # telemetry only — drop rather than block a buy or OOM
+        _writer_dropped += 1  # telemetry only — drop rather than block a buy or OOM
 
 
 def _writer_loop():
+    global _writer_flushed, _writer_batches
     while True:
         batch = []
         try:
@@ -1489,6 +1503,8 @@ def _writer_loop():
                         pass
                 conn.commit()
                 conn.close()
+            _writer_flushed += len(batch)
+            _writer_batches += 1
         except Exception:
             pass
         _time_mod.sleep(0.5)                            # pace so bursts coalesce
@@ -1592,15 +1608,12 @@ def get_patterns(min_occurrences: int = 3) -> List[dict]:
 # ── Decisions ─────────────────────────────────────────────────────────────────
 
 def log_decision(d: dict):
-    with _lock:
-        conn = _conn()
-        conn.execute("""
-            INSERT INTO decisions (action, coin, confidence, reason, pattern_observed)
-            VALUES (?,?,?,?,?)
-        """, (d.get("action"), d.get("coin"), d.get("confidence"),
-              d.get("reason"), d.get("pattern_observed")))
-        conn.commit()
-        conn.close()
+    # Phase 1: non-critical telemetry → background writer (never blocks the caller).
+    _enqueue_write(
+        "INSERT INTO decisions (action, coin, confidence, reason, pattern_observed) "
+        "VALUES (?,?,?,?,?)",
+        (d.get("action"), d.get("coin"), d.get("confidence"),
+         d.get("reason"), d.get("pattern_observed")))
 
 
 # ── Futures state ─────────────────────────────────────────────────────────────
@@ -2007,6 +2020,7 @@ def backup_db(keep: int = 7) -> dict:
 # keeping the DB tiny and the whole UI fast. Enforced continuously on every insert
 # and re-asserted at boot + in the daily maintenance loop.
 _TRAINING_SAMPLES_CAP = 3000
+_training_sample_writes = 0
 
 _TRAINING_SAMPLES_DDL = """CREATE TABLE IF NOT EXISTS training_samples (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, mode TEXT, symbol TEXT,
@@ -2022,33 +2036,25 @@ def save_training_sample(mode, symbol, features, label, realized_r, ts=None) -> 
     time.time(). CREATE-safe, guarded, never raises. On write the table is
     hard-capped to the newest 100_000 rows so it can't grow unbounded."""
     import time as _t
+    global _training_sample_writes
     if ts is None:
         ts = _t.time()
     try:
         features_json = json.dumps(features if features is not None else {}, default=str)
     except Exception:
         features_json = "{}"
-    try:
-        with _lock:
-            conn = _conn()
-            try:
-                conn.execute(_TRAINING_SAMPLES_DDL)
-                conn.execute("""
-                    INSERT INTO training_samples
-                        (ts, mode, symbol, features_json, label, realized_r)
-                    VALUES (?,?,?,?,?,?)
-                """, (float(ts), mode, symbol, features_json,
-                      int(bool(label)), _num(realized_r)))
-                # Hard row cap (same pattern as buy_rejections/entry_snapshots).
-                conn.execute(
-                    "DELETE FROM training_samples WHERE id NOT IN "
-                    "(SELECT id FROM training_samples ORDER BY id DESC LIMIT ?)",
-                    (_TRAINING_SAMPLES_CAP,))
-                conn.commit()
-            finally:
-                conn.close()
-    except Exception as e:
-        print(f"[Database] save_training_sample failed: {e}")
+    # Phase 1: enqueue to the background writer (table exists from init_db). The
+    # cap DELETE is a full scan — throttle it off the caller like the others.
+    _enqueue_write(
+        "INSERT INTO training_samples (ts, mode, symbol, features_json, label, realized_r) "
+        "VALUES (?,?,?,?,?,?)",
+        (float(ts), mode, symbol, features_json, int(bool(label)), _num(realized_r)))
+    _training_sample_writes += 1
+    if _training_sample_writes % 500 == 0:
+        _enqueue_write(
+            "DELETE FROM training_samples WHERE id NOT IN "
+            "(SELECT id FROM training_samples ORDER BY id DESC LIMIT ?)",
+            (_TRAINING_SAMPLES_CAP,))
 
 
 def get_training_samples(limit: int = 20000, modes=None) -> List[dict]:
