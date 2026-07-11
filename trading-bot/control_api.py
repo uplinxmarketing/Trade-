@@ -1144,6 +1144,16 @@ async def _daily_maintenance_loop():
                 print(f"[Maintenance] kline prune: {deleted} row(s) deleted")
         except Exception as e:
             print(f"[Maintenance] kline prune failed: {e}")
+        # candles table — never previously pruned; the primary DB bloat. Keep only
+        # the recent window the scan needs (default 5 days). Off-thread so a large
+        # first delete can't stall the event loop.
+        try:
+            _fn = getattr(database, "prune_candles", None)
+            if _fn is not None:
+                _cd = await _aio.to_thread(_fn)
+                print(f"[Maintenance] candles prune: {_cd} row(s) deleted")
+        except Exception as e:
+            print(f"[Maintenance] candles prune failed: {e}")
         try:
             import attribution as _attr
             _fn = getattr(_attr, "run_nightly", None)
