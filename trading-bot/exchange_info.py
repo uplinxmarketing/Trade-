@@ -11,7 +11,8 @@ log = logging.getLogger(__name__)
 _exchange_info_cache = {
     "last_fetched_ts": 0.0,
     "symbol_filters": {},
-    "symbol_status": {},   # symbol → Binance status string (e.g. "TRADING")
+    "symbol_status": {},        # symbol → Binance status string (e.g. "TRADING")
+    "usdt_spot_trading": set(),  # ALL symbols that are TRADING + quote USDT + spot
 }
 _exchange_info_lock = Lock()
 _EXCHANGE_INFO_TTL_SEC = 86400  # 24h — exchangeInfo is weight 20 (addendum 6.4); the -1013 error path already forces a refresh on symbol errors
@@ -62,11 +63,18 @@ def _fetch_exchange_info():
 
     filters = {}
     statuses = {}
+    usdt_spot = set()
     for sym_info in data.get("symbols", []):
         symbol = sym_info.get("symbol")
         if not symbol:
             continue
         statuses[symbol] = sym_info.get("status", "")
+        # Full tradeable-universe derivation (for the frontend picker + diff report):
+        # a symbol counts only if it is TRADING, quoted in USDT, and spot-enabled.
+        if (sym_info.get("status") == "TRADING"
+                and sym_info.get("quoteAsset") == "USDT"
+                and sym_info.get("isSpotTradingAllowed")):
+            usdt_spot.add(symbol)
         step_size = 0.0
         min_qty = 0.0
         min_notional = 0.0
@@ -87,7 +95,7 @@ def _fetch_exchange_info():
                     pass
         if step_size > 0:
             filters[symbol] = {"step_size": step_size, "min_qty": min_qty, "min_notional": min_notional}
-    return filters, statuses
+    return filters, statuses, usdt_spot
 
 
 def _refresh_locked(now: float) -> None:
@@ -98,12 +106,14 @@ def _refresh_locked(now: float) -> None:
     if age > _EXCHANGE_INFO_TTL_SEC or not _exchange_info_cache["symbol_filters"]:
         result = _fetch_exchange_info()
         if result:
-            new_filters, new_statuses = result
+            new_filters, new_statuses, new_usdt_spot = result
             if new_filters:
                 _exchange_info_cache["symbol_filters"] = new_filters
                 _exchange_info_cache["symbol_status"] = new_statuses
+                _exchange_info_cache["usdt_spot_trading"] = new_usdt_spot
                 _exchange_info_cache["last_fetched_ts"] = now
-                log.info("Refreshed exchangeInfo: %d symbols cached", len(new_filters))
+                log.info("Refreshed exchangeInfo: %d symbols cached (%d TRADING USDT spot)",
+                         len(new_filters), len(new_usdt_spot))
 
 
 def get_symbol_filters(symbol: str) -> dict:
@@ -126,6 +136,19 @@ def get_tradeable_symbols() -> set:
         _refresh_locked(now)
         return {sym for sym, st in _exchange_info_cache["symbol_status"].items()
                 if st == "TRADING" and sym not in KNOWN_DELISTED}
+
+
+def get_all_trading_usdt_spot() -> set:
+    """The FULL set of Binance symbols that are status=='TRADING', quoted in USDT,
+    and spot-enabled — the tradeable universe the frontend picker offers and the
+    watchlist diff report is computed against. KNOWN_DELISTED is always subtracted
+    (a stale cache can never resurface a known-dead ticker). Fails open: an
+    unavailable cache returns an empty set (callers treat that as 'cannot derive')."""
+    now = time.time()
+    with _exchange_info_lock:
+        _refresh_locked(now)
+        return {s for s in _exchange_info_cache["usdt_spot_trading"]
+                if s not in KNOWN_DELISTED}
 
 
 def symbol_status(sym: str) -> str:
