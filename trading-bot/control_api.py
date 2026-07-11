@@ -566,7 +566,7 @@ async def lifespan(app: FastAPI):
             #   Guarded by a stored rev marker so it runs exactly once.
             try:
                 import strategy_config as _scfg_s3
-                _S3_REV = 11
+                _S3_REV = 12
                 _raw_s3 = _load_strategy()
                 if int(_raw_s3.get("s3_tuning_rev", 0) or 0) < _S3_REV:
                     _ent = _raw_s3.get("entries") if isinstance(_raw_s3.get("entries"), dict) else {}
@@ -610,6 +610,11 @@ async def lifespan(app: FastAPI):
                     # the API, so the buy executor stops getting starved and the
                     # panels stop timing out. Re-enable via data.paper_shadow_enabled.
                     _s3_force(_dat, "data", "paper_shadow_enabled", False, _s3_patch)
+                    # klines were pruned on a 180-day window — for ~89 coins that's
+                    # ~23M rows (the 19.5M-row, multi-GB bloat). The bot only ever
+                    # reads recent klines, so 7 days is ample. Keeps the DB small so
+                    # lock-held ops stay fast.
+                    _s3_force(_dat, "data", "kline_retention_days", 7.0, _s3_patch)
                     # S3-7 — R-multiple tuning (operator-approved): arm ratchet later + trail wider
                     _s3_bump(_ext, "exits", "ratchet_activate_r", 0.4, 0.8, _s3_patch, is_float=True)
                     _s3_bump(_ext, "exits", "ratchet_k_atr", 0.6, 1.0, _s3_patch, is_float=True)
@@ -7092,7 +7097,14 @@ def api_all():
     Reduces frontend from 4 concurrent fetches to 1, cutting Railway load 4x."""
     now_ts = time.time()
     cached = _API_ALL_CACHE.get("data")
-    _ttl = 0.1 if _API_ALL_CACHE.get("has_positions") else 0.8
+    # /api/all is the dashboard's main poll (status + positions + trades + stats).
+    # The old 0.1–0.8s TTL recomputed the DB stats + balance on nearly every poll;
+    # with several panels polling that hammered the box. Live prices are re-stamped
+    # onto the cached payload by _append_fresh_prices every call, so a longer base
+    # TTL keeps positions/prices live while the heavier stats refresh only every
+    # ~2–3s. This is the single most-polled endpoint — the agent "not connected"
+    # flag trips when it responds slowly, so keeping it cheap keeps the agent green.
+    _ttl = 2.0 if _API_ALL_CACHE.get("has_positions") else 3.0
     if cached is not None and (now_ts - _API_ALL_CACHE["ts"]) < _ttl:
         return _append_fresh_prices(cached)
 

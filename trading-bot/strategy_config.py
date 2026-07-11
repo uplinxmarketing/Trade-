@@ -221,7 +221,7 @@ class RiskConfig(BaseModel):
 
 class DataConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    kline_retention_days: float = Field(180.0, ge=7.0, le=730.0)
+    kline_retention_days: float = Field(7.0, ge=7.0, le=730.0)
     legacy_rest_scan:     bool  = False
     eval_retention_days:  int   = Field(14, ge=1, le=365)
     # I4 — three-tier auto-management of the approved_coins watchlist.
