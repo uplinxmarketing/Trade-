@@ -9916,7 +9916,16 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         "btc_regime":      get_btc_regime(),
                     }
                     _fresh_dec = _sr_evaluate_buy_decision(sym, _fresh_data, strategy)
-                    if not _fresh_dec["allowed"]:
+                    # Sole-gate: the fresh re-check must apply the SAME veto-only
+                    # rule as the primary decision above. WolfScore ≥ floor is THE
+                    # gate; the legacy engine's non-safety reject (low signal count)
+                    # must NOT block here either — otherwise every coin passes the
+                    # primary gate then dies on this second engine run (the
+                    # "fresh_recheck: 0" funnel + endless "fresh re-check pending").
+                    _fresh_reason = str(_fresh_dec.get("reason", ""))
+                    _fresh_is_safety = _fresh_reason.startswith("veto_")
+                    if (not _fresh_dec["allowed"]) and not (
+                            _wolfscore_sole_gate and not _fresh_is_safety):
                         cache_age = round(time.time() - cached.get("ts", 0), 1)
                         # F6: dedupe the [SKIP] line per (symbol, reason) 15 min.
                         _log_skip_dedup(
@@ -9965,7 +9974,11 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             )
 
         # ── Reversal confirmation ──────────────────────────────────────────────
-        if bool(strategy.get("reversal_confirmation_enabled", True)):
+        # Discretionary momentum gate — under the sole-gate model WolfScore's
+        # trend/momentum sub-metrics already own that judgement, so it is skipped
+        # (it was another layer blocking coins that cleared the ≥floor gate).
+        if bool(strategy.get("reversal_confirmation_enabled", True)) \
+                and not _wolfscore_sole_gate:
             _rev_ok, _rev_reason = is_reversal_confirmed(sym)
             if not _rev_ok:
                 _record_rejection(sym, score, "no_reversal_confirmed", _rev_reason)
