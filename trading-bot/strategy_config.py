@@ -167,7 +167,7 @@ class ExitsConfig(BaseModel):
     smart_hold_score_gate:     bool  = False
     maker_tp:                  bool  = True
     maker_tp_timeout_ms:       float = Field(1500.0, ge=100.0, le=30000.0)
-    oco_enabled:               bool  = False
+    oco_enabled:               bool  = True
     oco_stop_limit_buffer_pct: float = Field(0.5, ge=0.0, le=5.0)
     oco_skip_rescue_sec:       float = Field(3.0, ge=1.0, le=30.0)
     sl_confirm_ticks:          int   = Field(2, ge=1, le=10)
