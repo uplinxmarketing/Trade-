@@ -9575,9 +9575,18 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # ── Trend health gate ──────────────────────────────────────────────────
         # Block buys when price is below MA20 AND RSI is not deeply oversold (<35).
         # Also block when volume trend is decreasing (no buying pressure).
+        #
+        # These are LEGACY pre-WolfScore entry filters. Under the operator's
+        # sole-gate model WolfScore v3 already prices trend (T sub-metric) and
+        # volume (V sub-metric) into the score, so a coin that cleared the ≥floor
+        # gate has ALREADY passed a holistic trend/volume judgement — re-vetoing it
+        # with a cruder MA20/volume-trend check overrides WolfScore and was blocking
+        # the highest-scoring coins (e.g. WolfScore 74 killed by "below MA20"). So
+        # skip these two when sole-gate is on. Real-time SAFETY vetoes below
+        # (falling-knife, BB-upper, slippage) are unaffected and still authoritative.
         try:
             _last_c = _latest_candles.get(sym)   # in-memory (batched once per scan)
-            if _last_c:
+            if _last_c and not _wolfscore_sole_gate:
                 _ma_pos  = _last_c.get("ma_position") or _derive_ma_pos(price, _last_c.get("ma20"))
                 _vol_tr  = _last_c.get("volume_trend")
                 if _ma_pos == "below" and rsi_v > 35:
