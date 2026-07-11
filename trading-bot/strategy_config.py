@@ -108,6 +108,14 @@ class EntriesConfig(BaseModel):
     # blunt min_score — buy only if modeled P(win) ≥ this. 0 = floor off (display
     # only); the floor is ignored anyway until the model is trained (S4 guardrail).
     ev_ranking_enabled:     bool  = True
+    # Operator model (default ON): WolfScore ≥ buy_score_threshold is the SOLE buy
+    # gate. When true the buy path IGNORES the legacy signal-count decision — the
+    # signal engine still COMPUTES signals (they feed WolfScore sub-metrics) but
+    # "N of M ≥ min_score / min_scored" and the mandatory-signal checks NO LONGER
+    # block a buy; only safety VETOES (spread / ATR-untradeable / regime risk_off)
+    # do. Config-revert-proof: even if min_score drifts back to 4, this flag keeps
+    # the legacy count out of the buy decision.
+    wolfscore_sole_gate:    bool  = True
     min_win_probability:    float = Field(0.0, ge=0.0, le=1.0)
     # Part S-2 — WolfScore adaptive buy floor (0-100 scale). A candidate must clear
     # BOTH the absolute floor AND the distribution rule (p75 of live scores, or
@@ -439,6 +447,12 @@ SCHEMA: Dict[str, dict] = {
                                          "EV ranking (best-first)",
                                          "Rank ready coins by modeled win-probability and buy the highest "
                                          "first. Only reorders coins already past vetoes/gates."),
+    "entries.wolfscore_sole_gate": _meta("entries.wolfscore_sole_gate", "bool", "Entries",
+                                         "WolfScore is the sole buy gate",
+                                         "ON: WolfScore ≥ buy_score_threshold is the ONLY buy gate — the legacy "
+                                         "signal-count (min_score/min_scored) and mandatory-signal checks no "
+                                         "longer block a buy (signals still feed WolfScore). Only safety vetoes "
+                                         "remain. OFF: legacy engine gates entries too."),
     "entries.min_win_probability": _meta("entries.min_win_probability", "float", "Entries",
                                          "Min win probability",
                                          "Only buy if modeled P(win) ≥ this (0-1). Smarter replacement for "

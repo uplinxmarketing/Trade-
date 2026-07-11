@@ -8891,7 +8891,15 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     except Exception:
         pass
 
+    # Operator model: WolfScore is the SOLE gate. When on, the legacy signal-count
+    # pre-gate is retired — EVERY approved coin is scored by WolfScore and the ≥65
+    # floor decides eligibility (so a high-WolfScore coin is never excluded just for
+    # having few legacy signals). Config-revert-proof (defaults True in schema).
+    _wolfscore_sole_gate = bool(_entries_cfg().get("wolfscore_sole_gate", True))
+
     def _cached_ready(_c) -> bool:
+        if _wolfscore_sole_gate:
+            return True   # WolfScore ≥65 floor is the real gate, not signal count
         return bool(_c.get("score", 0) >= min_sigs)
 
     # ── WolfBot v0.5 Part S-2 — WolfScore v3 buy SELECTION ────────────────────
@@ -8955,8 +8963,12 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # model is untrained, because that cliff is proven by the paper data and is
     # here PAIRED with the up-regime restriction below (the safe subset).
     _ev_floor_live_untrained = bool(_entries_cfg_s2.get("ev_floor_live_untrained", False))
+    # Under the sole-gate model the WolfScore floor MUST gate (block < buy_score_
+    # threshold) — with the legacy count removed, an advisory floor would mean NO
+    # gate at all (buy everything). So sole-gate forces the floor authoritative.
     _ev_floor_on = bool(ev_model is not None
-                        and (_ev_floor_active() or _ev_floor_live_untrained))
+                        and (_ev_floor_active() or _ev_floor_live_untrained
+                             or _wolfscore_sole_gate))
     # Go-live regime restriction — up-regime is the proven loss source (paper: 26%
     # win, −1.00R). Until a trained model proves it fixed, live entries in the up
     # regime are vetoed (mode='veto') or held to a higher score (mode='min_score').
@@ -9098,6 +9110,13 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _ws_here = _wolf_scores.get(sym)
             if _ws_here is None:
                 _ws_here = _wolf_score_cached(sym, cached, _wolf_cohort, _wolf_tilt)
+            if _ws_here is None and _wolfscore_sole_gate:
+                # Fail-closed: WolfScore is the sole gate, so a coin we couldn't
+                # score cannot be verified as eligible — never buy it blindly.
+                _record_rejection(sym, cached.get("score", 0), "no_wolfscore",
+                                  "WolfScore unavailable (sole-gate → skip)")
+                _trace_mark_block(sym, "blocked: no WolfScore")
+                continue
             if _ws_here is not None:
                 # 1) Friction hard gate — always authoritative.
                 if _ws_here.get("hard_gate") == "friction":
@@ -9193,16 +9212,22 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _dec = _sr_evaluate_buy_decision(sym, _sig_data, strategy)
             _buy_decision = _dec
             if not _dec["allowed"]:
-                # Record the ENGINE score — the legacy score is irrelevant on
-                # this path and previously hid these rejections behind the
-                # (now removed) score<3 filter.
-                _record_rejection(sym, _dec.get("score", score), _dec["reason"],
-                                  f"score={_dec['score']} fired={_dec['fired_signals']}")
-                # F6: write the fresh engine score back + arm the candidacy
-                # cooldown so the fast pre-check stops re-selecting this coin.
-                _note_candidacy_fail(sym, _dec.get("score"), _dec["reason"])
-                continue
-            # Passed new engine — fall through to existing veto checks below
+                _dec_reason = str(_dec.get("reason", ""))
+                _is_safety_veto = _dec_reason.startswith("veto_")
+                # WolfScore is the SOLE selection gate (operator model). The legacy
+                # signal-count ("score_N_below_min") and mandatory-signal rejects
+                # must NOT block — the coin already cleared WolfScore ≥ the buy gate
+                # above. Only real safety VETOES (spread / ATR-untradeable / regime
+                # risk_off) still stop the buy. This keeps the old engine's count out
+                # of the buy path regardless of min_score/min_scored config.
+                if _wolfscore_sole_gate and not _is_safety_veto:
+                    pass  # ignore score/mandatory reject; fall through to vetoes+exec
+                else:
+                    _record_rejection(sym, _dec.get("score", score), _dec["reason"],
+                                      f"score={_dec['score']} fired={_dec['fired_signals']}")
+                    _note_candidacy_fail(sym, _dec.get("score"), _dec["reason"])
+                    continue
+            # Passed the gate — fall through to existing veto checks below
         else:
             # ── Legacy mandatory signal layer ──────────────────────────────────
             # Mandatory 1: EMA trend up (EMA9 > EMA21) — don't buy into a downtrend.
