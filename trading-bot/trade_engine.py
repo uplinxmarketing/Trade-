@@ -2190,15 +2190,28 @@ def _publish_scan_scores(scores: dict, tilt: float, af) -> None:
         pass
 
 
+_last_refresh_publish_ts = 0.0
+_REFRESH_PUBLISH_MIN_SEC = 12.0   # scoring the whole universe is CPU-heavy (holds
+                                  # the GIL); pace the decoupled UI publish so it
+                                  # can't starve the API request threads.
+
+
 def _refresh_and_publish_scores() -> None:
     """Score the approved, backfill-ready universe and PUBLISH — decoupled from the
     buy loop so the UI feed stays live even when the buy checker returns early
-    (at position capacity, paused, or a risk latch). WolfScore scoring is now
-    cheap (all inputs in-memory: ATR memoized, slippage cached, spreads/klines in
-    RAM), so scoring the whole universe here every dispatch is fast. Fully guarded
-    — a scoring failure must never break the buy check that calls this first."""
+    (at position capacity, paused, or a risk latch). THROTTLED: scoring the whole
+    ~89-coin universe is CPU-heavy and holds the Python GIL, so running it on every
+    2.5–5s dispatch starved the API threads (api/all + ev/scores timing out). Here
+    it runs at most once per _REFRESH_PUBLISH_MIN_SEC; the buy loop's own tiered
+    scorer keeps hot (near-gate) coins fresher when there are free slots. Fully
+    guarded — a scoring failure must never break the buy check that calls this."""
+    global _last_refresh_publish_ts
     if ev_model is None:
         return
+    _now_rp = time.time()
+    if (_now_rp - _last_refresh_publish_ts) < _REFRESH_PUBLISH_MIN_SEC:
+        return
+    _last_refresh_publish_ts = _now_rp
     try:
         strategy = _load_strategy() or {}
         approved = {c["symbol"] for c in strategy.get("approved_coins", [])
