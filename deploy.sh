@@ -16,33 +16,32 @@ git fetch origin main
 git reset --hard origin/main
 git clean -fd dist public 2>/dev/null || true
 
-# Rebuild the frontend bundle from source so the served dist/ always matches the
-# committed code (avoids the white-screen trap where index.html references a
-# hashed asset that never got committed). Best-effort: if npm is unavailable the
-# committed dist/ is used as-is.
-if command -v npm >/dev/null 2>&1; then
-    echo "── Building frontend…"
-    if npm ci --silent 2>/dev/null || npm install --silent; then
-        if npm run build --silent; then
-            echo "  ✓ frontend built"
-        else
-            echo "  ! frontend build failed — serving committed dist/ as-is"
-        fi
-    else
-        echo "  ! npm install failed — serving committed dist/ as-is"
-    fi
+# Frontend: use the COMMITTED dist/ as-is. Every release builds dist/ and commits
+# it (index.html + hashed assets always in sync), so rebuilding on the VPS added
+# 30-60s of `npm ci` + `npm run build` for zero gain. Force a rebuild only when you
+# deliberately changed src/ without committing dist/: DEPLOY_BUILD=1 ./deploy.sh
+if [ "${DEPLOY_BUILD:-0}" = "1" ] && command -v npm >/dev/null 2>&1; then
+    echo "── Building frontend (DEPLOY_BUILD=1)…"
+    npm ci --silent 2>/dev/null || npm install --silent
+    npm run build --silent && echo "  ✓ built" || echo "  ! build failed — serving committed dist/"
 else
-    echo "── npm not found — serving committed dist/ as-is"
+    echo "── Using committed dist/ (skip npm build; DEPLOY_BUILD=1 to force a rebuild)"
 fi
 
-# Rebuild the venv if its interpreter is missing/broken (e.g. clobbered by git)
+# venv: only touch pip when the interpreter is broken OR requirements changed
+# (hash guard). Skips the ~10s no-op pip install on every routine deploy.
+_REQ=trading-bot/requirements.txt
+_REQ_HASH=venv/.req_hash
 if ! venv/bin/python -c "import fastapi" >/dev/null 2>&1; then
-    echo "── venv broken or missing deps — rebuilding…"
+    echo "── venv broken — rebuilding…"
     python3 -m venv venv --clear
     venv/bin/pip install -q --upgrade pip
-    venv/bin/pip install -q -r trading-bot/requirements.txt
+    venv/bin/pip install -q -r "$_REQ" && sha256sum "$_REQ" > "$_REQ_HASH" 2>/dev/null || true
+elif ! sha256sum -c "$_REQ_HASH" >/dev/null 2>&1; then
+    echo "── requirements changed — updating deps…"
+    venv/bin/pip install -q -r "$_REQ" && sha256sum "$_REQ" > "$_REQ_HASH" 2>/dev/null || true
 else
-    venv/bin/pip install -q -r trading-bot/requirements.txt
+    echo "── deps unchanged — skipping pip"
 fi
 
 echo "── Restarting bot…"
