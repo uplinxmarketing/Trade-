@@ -1669,6 +1669,10 @@ _delist_confirm: dict = {}                  # sym -> consecutive delisted passes
 import collections as _collections
 _universe_notices = _collections.deque(maxlen=50)
 _universe_state_lock = threading.Lock()
+# Transition trackers so a coin's suspended/held-deferred notice fires ONCE, not
+# on every daily reconcile pass. Cleared when the coin recovers to TRADING.
+_notified_suspended: set = set()
+_notified_held_deferred: set = set()
 
 # Statuses that mean "temporarily halted" (suspend, do NOT delete). Everything
 # else that is not TRADING and not reachable-as-valid is treated as delisted.
@@ -1765,6 +1769,10 @@ def _manage_universe() -> dict:
                         # Tier 3 — valid. Reset confirmation; note restores.
                         if _delist_confirm.pop(sym, 0):
                             pass
+                        # Recovered to TRADING — allow a fresh notice next time it
+                        # halts / gets deferred (transition-only, no daily spam).
+                        _notified_suspended.discard(sym)
+                        _notified_held_deferred.discard(sym)
                         continue
                     try:
                         st = _ei.symbol_status(sym)
@@ -1779,6 +1787,11 @@ def _manage_universe() -> dict:
                         # (a halt is not a delist) and leave it in the list.
                         _delist_confirm.pop(sym, None)
                         summary["suspended"].append(sym)
+                        if sym not in _notified_suspended:
+                            _notified_suspended.add(sym)
+                            _push_universe_notice(
+                                "suspended", sym,
+                                f"halted on Binance ({st_up}) — trading paused, not removed")
                         continue
                     # Tier 1 — delisted / permanently gone. Confirm across 2 passes.
                     count = _delist_confirm.get(sym, 0) + 1
@@ -1812,6 +1825,12 @@ def _manage_universe() -> dict:
                             "warn")
                     except Exception:
                         pass
+                    if sym not in _notified_held_deferred:
+                        _notified_held_deferred.add(sym)
+                        _push_universe_notice(
+                            "deferred", sym,
+                            "delisted but a position is open — removal deferred "
+                            "until it closes", successor)
                     continue
                 # Perform the removal.
                 removed_successor = _remove_delisted_symbol(sym, successor, auto_replace)
@@ -7934,6 +7953,54 @@ def api_universe():
         "exchange_info_available": ei_ok,
         "warming": warming,
         "available": True,
+    }
+
+
+@app.get("/api/universe/available")
+def api_universe_available():
+    """Single source of truth for the coin PICKER + the watchlist-vs-Binance diff
+    report. Returns the FULL live TRADING-USDT-spot universe from exchangeInfo, the
+    current approved watchlist, and a diff: approved coins that are DEAD (not
+    TRADING / known-delisted), live coins MISSING from the watchlist (offer to add),
+    and RENAMED old→new (RENAMED_SYMBOLS). Fails open — exchange_info_available
+    false + empty available when exchangeInfo is unreachable, so the frontend keeps
+    its last-known universe rather than blanking."""
+    import exchange_info as _ei
+    try:
+        available = sorted(_ei.get_all_trading_usdt_spot() or set())
+    except Exception:
+        available = []
+    ei_ok = len(available) > 0
+    strat = _load_strategy()
+    approved = [c.get("symbol") for c in (strat.get("approved_coins") or [])
+                if isinstance(c, dict) and c.get("symbol")]
+    approved_set = set(approved)
+    avail_set = set(available)
+    renamed = getattr(_ei, "RENAMED_SYMBOLS", {}) or {}
+    known_delisted = getattr(_ei, "KNOWN_DELISTED", set()) or set()
+    # dead = approved coins Binance no longer lists as a TRADING USDT spot pair (or
+    # are hard-coded known-delisted). Only computed when exchangeInfo is up, so a
+    # transient outage never mass-flags the whole watchlist as dead.
+    dead = []
+    if ei_ok:
+        for s in approved:
+            if s not in avail_set:
+                dead.append({"symbol": s, "successor": renamed.get(s),
+                             "known_delisted": s in known_delisted})
+    # renamed = approved coins with a known successor mapping (old → new).
+    renamed_out = [{"old": old, "new": new, "successor_trading": new in avail_set}
+                   for old, new in renamed.items() if old in approved_set]
+    # missing = live TRADING USDT coins not yet in the watchlist (pickable additions).
+    missing = sorted(avail_set - approved_set) if ei_ok else []
+    return {
+        "available": available,          # the pickable universe (frontend source of truth)
+        "approved":  approved,
+        "diff": {"dead": dead, "missing": missing, "renamed": renamed_out},
+        "counts": {
+            "available_total": len(available), "approved_total": len(approved),
+            "dead": len(dead), "missing": len(missing), "renamed": len(renamed_out),
+        },
+        "exchange_info_available": ei_ok,
     }
 
 
