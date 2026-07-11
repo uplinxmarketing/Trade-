@@ -711,6 +711,30 @@ def get_klines(symbol: str, interval: str,
     return [dict(r) for r in rows]
 
 
+_CANDLE_RETENTION_DAYS_DEFAULT = 5.0
+
+
+def prune_candles(retention_days: float = None) -> int:
+    """Delete rows from the `candles` table older than retention_days (default 5).
+
+    This table stores 1m candles and was NEVER pruned — at ~89 coins it grows
+    ~130k rows/day and was the primary DB bloat (multi-GB), which makes every
+    lock-held operation slow (the low-CPU freeze). The scan only needs ~130 recent
+    candles per coin for indicators / 5m aggregation, so a few days is ample.
+    Pruned by `saved_at` (a real wall-clock timestamp) so it's unit-safe regardless
+    of how open_time is stored. Returns rows deleted."""
+    days = float(retention_days) if retention_days else _CANDLE_RETENTION_DAYS_DEFAULT
+    with _lock:
+        conn = _conn()
+        cur = conn.execute(
+            "DELETE FROM candles WHERE saved_at < datetime('now', ?)",
+            (f"-{days} days",))
+        deleted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+        conn.commit()
+        conn.close()
+    return deleted
+
+
 def prune_klines(retention_days: float) -> int:
     """Delete klines with open_time older than now - retention_days.
     Returns the number of rows deleted."""
