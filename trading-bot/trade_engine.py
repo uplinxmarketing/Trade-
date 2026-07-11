@@ -577,12 +577,13 @@ def _quote_volume_24h_usd(symbol: str):
     return qv
 
 
-def _planned_sl_distance_pct(symbol: str, price: float):
+def _planned_sl_distance_pct(symbol: str, price: float, no_db: bool = False):
     """The 1R stop distance (%) the exit geometry WOULD assign to an entry at
     `price` right now — same clamp/legacy rules as _apply_entry_exit_geometry
     (which only runs post-fill). Used by the L2.1 friction gate to size friction
     against the risk budget BEFORE ordering. None when the stop is disabled
-    (legacy mapping) → the gate then fails open."""
+    (legacy mapping) → the gate then fails open. no_db forwards to the ATR source
+    ladder so the scoring hot path never reads the database."""
     try:
         cfg = _exit_cfg()
     except Exception:
@@ -591,7 +592,7 @@ def _planned_sl_distance_pct(symbol: str, price: float):
         return None
     if cfg["legacy_mode"]:
         return cfg["sl_min_pct"] if cfg["sl_enabled"] else None
-    atr_pct, _ = _atr_pct_5m_at_entry(symbol, price)
+    atr_pct, _ = _atr_pct_5m_at_entry(symbol, price, no_db=no_db)
     if atr_pct is None:
         return cfg["sl_min_pct"]   # conservative tight stop (matches geometry)
     return min(max(cfg["k_sl"] * atr_pct, cfg["sl_min_pct"]), cfg["sl_max_pct"])
@@ -1901,12 +1902,14 @@ _WOLF_STOP_CACHE_TTL_SEC = 45.0
 
 
 def _planned_stop_pct_for_score(sym: str, price: float):
-    """Memoized planned-stop % for WolfScore's friction term (45s TTL)."""
+    """Memoized planned-stop % for WolfScore's friction term (45s TTL). no_db=True
+    → the ATR source ladder uses only in-memory buffers, so the scoring path never
+    touches the database."""
     now = time.time()
     ent = _wolf_stop_cache.get(sym)
     if ent and (now - ent[1]) < _WOLF_STOP_CACHE_TTL_SEC:
         return ent[0]
-    val = _planned_sl_distance_pct(sym, float(price))
+    val = _planned_sl_distance_pct(sym, float(price), no_db=True)
     _wolf_stop_cache[sym] = (val, now)
     return val
 
@@ -2032,7 +2035,7 @@ def _wolf_inputs(sym: str, cached: dict) -> dict:
     except Exception:
         pass
     try:
-        _slip_bps = _avg_slippage_bps(sym)
+        _slip_bps = _avg_slippage_bps(sym, no_db=True)   # scoring path: cache-only
         if _slip_bps is not None:
             inp["avg_slippage_pct"] = _slip_bps / 100.0
     except Exception:
@@ -2130,6 +2133,48 @@ _EV_PUB_MAX_AGE_SEC = 20.0
 # last published scores for this long before recomputing — vetoes + the buy
 # decision still run every dispatch, only the scoring is paced.
 _WOLF_RESCORE_MIN_SEC = 8.0
+
+# ── Tiered scan cadence (keeps all coins tracked, scores by proximity to gate) ─
+_coin_score_meta: Dict[str, dict] = {}   # sym -> {ts, pct, prev_pct}; per-coin last score
+_TIER_HOT_SEC   = 2.5     # near/above the gate, or rising → re-score fast
+_TIER_WARM_SEC  = 12.0    # mid-range
+_TIER_COLD_SEC  = 45.0    # far below / hard-gated → re-score rarely
+_TIER_HOT_BAND  = 8.0     # within this many points of the gate → HOT
+_TIER_WARM_BAND = 25.0    # within this many points of the gate → WARM
+_TIER_RISE_PTS  = 3.0     # a jump of this many points since last score → promote HOT
+
+# Buy-loop bulk DB prefetch (latest candle + slippage) reused between refreshes so
+# the hot scoring path makes ZERO DB reads on the vast majority of dispatches.
+_buy_prefetch: Dict[str, Any] = {"ts": 0.0, "latest_candles": {}}
+_BUY_PREFETCH_TTL_SEC = 30.0
+
+
+def _score_tier_for(prev_pct, threshold: float, meta) -> tuple:
+    """Return (tier_name, interval_sec) for a coin given its last WolfScore pct.
+    Proximity to the buy threshold drives the re-score cadence; a coin never
+    scored (prev_pct None) or rising sharply is treated as HOT so a fast mover is
+    caught within a couple seconds."""
+    try:
+        thr = float(threshold)
+    except (TypeError, ValueError):
+        thr = 61.0
+    if prev_pct is None:
+        return ("hot", _TIER_HOT_SEC)     # unscored → score now
+    try:
+        p = float(prev_pct)
+    except (TypeError, ValueError):
+        return ("hot", _TIER_HOT_SEC)
+    if meta is not None and meta.get("prev_pct") is not None:
+        try:
+            if p - float(meta["prev_pct"]) >= _TIER_RISE_PTS:
+                return ("hot", _TIER_HOT_SEC)   # rising momentum
+        except (TypeError, ValueError):
+            pass
+    if p >= thr - _TIER_HOT_BAND:
+        return ("hot", _TIER_HOT_SEC)
+    if p >= thr - _TIER_WARM_BAND:
+        return ("warm", _TIER_WARM_SEC)
+    return ("cold", _TIER_COLD_SEC)
 
 
 def _publish_scan_scores(scores: dict, tilt: float, af) -> None:
@@ -5459,14 +5504,20 @@ _SLIPPAGE_WINDOW_TRADES = 20
 _SLIPPAGE_MAX_AGE_DAYS = 7.0
 
 
-def _avg_slippage_bps(sym: str, force: bool = False) -> Optional[float]:
+def _avg_slippage_bps(sym: str, force: bool = False,
+                      no_db: bool = False) -> Optional[float]:
     """Rolling mean of |slippage_bps| for sym (see section comment). Updates
-    the veto set as a side effect. Returns None when no qualifying trades."""
+    the veto set as a side effect. Returns None when no qualifying trades.
+    no_db=True (scoring hot path) NEVER queries the database: it returns the
+    cached value or None so a per-coin scoring pass makes zero DB reads — the
+    scan's bulk prefetch keeps _slippage_cache warm."""
     now = time.time()
     with _slippage_lock:
         ent = _slippage_cache.get(sym)
         if ent and not force and now - ent["ts"] < _SLIPPAGE_CACHE_TTL_SEC:
             return ent["avg_bps"]
+    if no_db:
+        return ent["avg_bps"] if ent else None
     from datetime import timedelta as _td
     since_iso = (datetime.now(timezone.utc)
                  - _td(days=_SLIPPAGE_MAX_AGE_DAYS)).isoformat()
@@ -6151,7 +6202,8 @@ def _ws_buffer_candles(symbol: str, min_candles: int = 16) -> list:
 
 # ── Phase 2 §2.1 — ATR-based stop geometry at entry ──────────────────────────
 
-def _atr_pct_5m_at_entry(symbol: str, price: float) -> Tuple[Optional[float], str]:
+def _atr_pct_5m_at_entry(symbol: str, price: float,
+                         no_db: bool = False) -> Tuple[Optional[float], str]:
     """ATR(14) on 5m candles as a % of `price` (§2.1). Source ladder:
 
       1. data_collector.ws_candles_5m (>= 15 candles)         → "ws_5m"
@@ -6185,9 +6237,12 @@ def _atr_pct_5m_at_entry(symbol: str, price: float) -> Tuple[Optional[float], st
                     return atr / price * 100.0, "ws_1m_agg"
     except Exception:
         pass
-    # 3) DB 1m candles aggregated → 5m (covers cold restart)
+    # 3) DB 1m candles aggregated → 5m (covers cold restart). Skipped when no_db
+    #    (scoring hot path) so a per-coin score never touches the database — the WS
+    #    buffers above cover every backfill-ready coin, which is all the scorer sees.
     try:
-        rows = database.get_candles(symbol, config.CANDLE_TIMEFRAME, limit=120)
+        rows = ([] if no_db
+                else database.get_candles(symbol, config.CANDLE_TIMEFRAME, limit=120))
         c1 = [c for c in (_row_to_candle(r) for r in (rows or [])) if c is not None]
         if c1:
             c5 = indicators.aggregate_candles(c1, group=5)
@@ -8997,26 +9052,36 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # candle per coin and the recent slippage per coin in ONE query each; the loop
     # then reads from these in-memory maps. Slippage prefetch also warms
     # _slippage_cache so _wolf_inputs → _avg_slippage_bps never touches the DB.
+    # Gate the two bulk prefetch queries to ~30s. They warm _slippage_cache
+    # (5-min TTL) and the latest-candle map used for per-coin price-freshness
+    # cross-checks — neither needs refreshing on every 2.5s dispatch. Between
+    # refreshes the scoring path reads purely from the warmed in-memory caches, so
+    # a hot-tier pass makes ZERO DB reads.
     _approved_list = list(approved)
-    try:
-        _latest_candles = database.get_latest_candle_bulk(
-            _approved_list, config.CANDLE_TIMEFRAME)
-    except Exception:
-        _latest_candles = {}
-    try:
-        from datetime import timedelta as _td_sl
-        _since_sl = (datetime.now(timezone.utc)
-                     - _td_sl(days=_SLIPPAGE_MAX_AGE_DAYS)).isoformat()
-        _slip_bulk = database.get_slippage_avg_bulk(
-            _approved_list, get_mode(), _since_sl)
-        _now_sl = time.time()
-        with _slippage_lock:
-            for _sy in _approved_list:
-                _slippage_cache[_sy] = {
-                    "avg_bps": _slip_bulk.get(_sy), "n": 1 if _sy in _slip_bulk else 0,
-                    "ts": _now_sl}
-    except Exception:
-        pass
+    _now_pf = time.time()
+    if (_now_pf - float(_buy_prefetch.get("ts", 0.0))) >= _BUY_PREFETCH_TTL_SEC \
+            or not _buy_prefetch.get("latest_candles"):
+        try:
+            _buy_prefetch["latest_candles"] = database.get_latest_candle_bulk(
+                _approved_list, config.CANDLE_TIMEFRAME)
+        except Exception:
+            _buy_prefetch.setdefault("latest_candles", {})
+        try:
+            from datetime import timedelta as _td_sl
+            _since_sl = (datetime.now(timezone.utc)
+                         - _td_sl(days=_SLIPPAGE_MAX_AGE_DAYS)).isoformat()
+            _slip_bulk = database.get_slippage_avg_bulk(
+                _approved_list, get_mode(), _since_sl)
+            _now_sl = time.time()
+            with _slippage_lock:
+                for _sy in _approved_list:
+                    _slippage_cache[_sy] = {
+                        "avg_bps": _slip_bulk.get(_sy), "n": 1 if _sy in _slip_bulk else 0,
+                        "ts": _now_sl}
+        except Exception:
+            pass
+        _buy_prefetch["ts"] = _now_pf
+    _latest_candles = _buy_prefetch.get("latest_candles") or {}
 
     # Operator model: WolfScore is the SOLE gate. When on, the legacy signal-count
     # pre-gate is retired — EVERY approved coin is scored by WolfScore and the ≥65
@@ -9060,62 +9125,77 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     _wolf_af: Optional[dict] = None
     _t_wolf0 = time.perf_counter()   # ── scan instrumentation: WolfScore stage
     _n_scored = 0
+    _tier_counts = {"hot": 0, "warm": 0, "cold": 0}
     if ev_model is not None:
-        # THROTTLE the full-universe WolfScore recompute. _check_buys_from_cache
-        # is dispatched by the 5s veto heartbeat, the 2.5s fast-recheck, AND every
-        # 5m close — re-scoring all ~88 coins on each would stall the box every few
-        # seconds (the "freezing/interrupting" symptom). Scores barely move in a
-        # few seconds, so reuse the last published set when it is fresh; a full
-        # recompute happens at most once per _WOLF_RESCORE_MIN_SEC. Vetoes + the
-        # buy decision below still run EVERY dispatch on the reused scores, so
-        # entry latency is unchanged — only the expensive scoring is paced.
-        _reuse_scores = None
-        _now_ws = time.time()
+        # ── TIERED SCAN ───────────────────────────────────────────────────────
+        # _check_buys_from_cache is dispatched every 2.5–5s (heartbeat + fast
+        # recheck) plus every 5m close. Re-scoring all ~88 coins each time stalls
+        # the box. But not all coins need the same rate: a coin near the buy gate
+        # matters far more than one deep below it. So each coin is assigned a tier
+        # by proximity to the threshold and RE-SCORED only when its tier interval
+        # has elapsed:
+        #   HOT  (within _TIER_HOT_BAND of the gate, or rising) → every ~2.5s
+        #   WARM (within _TIER_WARM_BAND)                       → every ~12s
+        #   COLD (far below / hard-gated)                       → every ~45s
+        # ALL coins stay tracked; only the scan RATE differs. Coins not due this
+        # pass keep last cycle's published score. Cohort median + regime tilt are
+        # computed ONCE per pass and passed into every per-coin score. The per-coin
+        # scoring path reads only in-memory buffers/caches — no DB (the bulk
+        # prefetch above is gated to ~30s and warms _slippage_cache).
+        _now_sc = time.time()
+        _cand_items = [(_s, _c) for _s, _c in _items
+                       if _s in approved and _cached_ready(_c)
+                       and _entry_backfill_ready(_s)]
+        _cand_syms = {_s for _s, _ in _cand_items}
         with _scan_scores_pub_lock:
-            _pub_ts_ws = float(_scan_scores_pub.get("ts", 0.0) or 0.0)
-            if _pub_ts_ws and (_now_ws - _pub_ts_ws) < _WOLF_RESCORE_MIN_SEC:
-                _reuse_scores = dict(_scan_scores_pub.get("scores") or {})
-                _reuse_tilt = float(_scan_scores_pub.get("tilt", 0.0) or 0.0)
-                _reuse_af = _scan_scores_pub.get("af")
-        if _reuse_scores is not None:
-            _wolf_scores = _reuse_scores
-            _wolf_tilt = _reuse_tilt
-            _wolf_af = _reuse_af
-            _n_scored = len(_reuse_scores)
-        else:
-            try:
-                _wolf_tilt = ev_model.regime_tilt(_btc_roc_1h_frac())
-            except Exception:
-                _wolf_tilt = 0.0
-            # Only score coins whose data is actually backfilled. A half-backfilled
-            # coin is missing 5m klines / ATR / volume history, so WolfScore drops
-            # those inputs and returns a misleadingly LOW score (the 0–26 band the
-            # operator saw as "wrong / frozen" values). Scoring only ready coins
-            # means the feed shows REAL scores (not-ready coins simply don't appear
-            # until their buffers fill) AND cuts the per-pass scoring load during
-            # backfill. The buy loop already skips not-ready coins downstream, so
-            # this scores nothing it wouldn't have skipped anyway.
-            _cand_items = [(_s, _c) for _s, _c in _items
-                           if _s in approved and _cached_ready(_c)
-                           and _entry_backfill_ready(_s)]
-            _wolf_cohort = _wolf_cohort_from(_cand_items)   # median 15m ROC of the pass (ONCE)
-            for _s, _c in _cand_items:
-                _ws = _wolf_score_cached(_s, _c, _wolf_cohort, _wolf_tilt)
-                if _ws:
-                    _wolf_scores[_s] = _ws
-            _n_scored = len(_cand_items)
-            # Adaptive floor over THIS pass's live scores (friction hard-gated ones
-            # score 0 and are excluded so they don't drag the distribution down).
-            _live_pcts = [float(_v.get("pct")) for _v in _wolf_scores.values()
-                          if _v.get("hard_gate") is None and _v.get("pct") is not None]
-            _wolf_af = _wolf_adaptive_floor(_live_pcts, _wolf_abs_floor,
-                                            _wolf_floor_mode, _wolf_floor_k)
-            # Publish this pass's scores so the UI/diagnostics feed serves them as a
-            # dict read instead of recomputing WolfScore over the universe per request.
-            _publish_scan_scores(_wolf_scores, _wolf_tilt, _wolf_af)
+            _prev_scores = dict(_scan_scores_pub.get("scores") or {})
+        # Carry forward prior scores for coins still in the candidate set.
+        _wolf_scores = {_s: _v for _s, _v in _prev_scores.items() if _s in _cand_syms}
+        # Cohort + tilt ONCE per pass (cheap, in-memory).
+        try:
+            _wolf_tilt = ev_model.regime_tilt(_btc_roc_1h_frac())
+        except Exception:
+            _wolf_tilt = 0.0
+        _wolf_cohort = _wolf_cohort_from(_cand_items)
+        # Decide which coins are DUE for a fresh score, then score only those.
+        _due_items = []
+        for _s, _c in _cand_items:
+            _prev_pct = (_prev_scores.get(_s) or {}).get("pct")
+            _meta = _coin_score_meta.get(_s)
+            _tier, _iv = _score_tier_for(_prev_pct, _wolf_abs_floor, _meta)
+            _tier_counts[_tier] += 1
+            _last_ts = float(_meta.get("ts", 0.0)) if _meta else 0.0
+            if _s not in _wolf_scores or (_now_sc - _last_ts) >= _iv:
+                _due_items.append((_s, _c))
+        for _s, _c in _due_items:
+            _ws = _wolf_score_cached(_s, _c, _wolf_cohort, _wolf_tilt)
+            if _ws:
+                _wolf_scores[_s] = _ws
+                _coin_score_meta[_s] = {
+                    "ts": _now_sc, "pct": _ws.get("pct"),
+                    "prev_pct": (_prev_scores.get(_s) or {}).get("pct"),
+                }
+        _n_scored = len(_due_items)
+        # Drop meta for coins no longer tracked (keep it bounded to the universe).
+        if len(_coin_score_meta) > len(_cand_syms) + 8:
+            for _s in [k for k in _coin_score_meta if k not in _cand_syms]:
+                _coin_score_meta.pop(_s, None)
+        # Adaptive floor over the FULL current score set (fresh + carried-forward).
+        _live_pcts = [float(_v.get("pct")) for _v in _wolf_scores.values()
+                      if _v.get("hard_gate") is None and _v.get("pct") is not None]
+        _wolf_af = _wolf_adaptive_floor(_live_pcts, _wolf_abs_floor,
+                                        _wolf_floor_mode, _wolf_floor_k)
+        # Publish the merged set so the UI/diagnostics feed serves it as a dict read.
+        _publish_scan_scores(_wolf_scores, _wolf_tilt, _wolf_af)
     _wolf_stage_ms = round((time.perf_counter() - _t_wolf0) * 1000.0, 1)
     _scan_stage_ms["wolfscore_ms"] = _wolf_stage_ms
     _scan_stage_ms["n_scored"] = _n_scored
+    _scan_stage_ms["tiers"] = dict(_tier_counts)
+    _signal_scanner_health["tiers"] = {
+        **_tier_counts, "rescored": _n_scored,
+        "tracked": len(_cand_items) if ev_model is not None else 0,
+        "last_wolfscore_ms": _wolf_stage_ms,
+    }
     _t_gate0 = time.perf_counter()   # ── gate/veto loop stage starts below
     # The floor GATES a real buy when the active model is trained AND past the ≥300
     # clean-trade guardrail — OR when the operator has explicitly opted into the
