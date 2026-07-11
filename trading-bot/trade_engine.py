@@ -8615,6 +8615,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         SIGNAL_REGISTRY_AVAILABLE
         and bool(strategy.get("signal_engine", {}).get("enabled", False))
     )
+    # WolfScore-sole-gate mode: the legacy 6-signal count is NOT the buy
+    # criterion, so the any_ready fast pre-check below MUST NOT short-circuit —
+    # otherwise the per-coin WolfScore loop (the actual gate) is never reached
+    # and NO buys fire no matter how many coins score >= 65. When sole-gate is
+    # on we proceed to the loop whenever the cache is non-empty.
+    _pre_sole_gate = bool(
+        (strategy.get("entries") or {}).get("wolfscore_sole_gate", True)
+    )
 
     # Paused bot: check BEFORE the any_ready pre-gate — previously this warn
     # sat below the pre-gate and was unreachable unless a coin coincidentally
@@ -8682,7 +8690,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         any_ready = any(v["score"] >= _pre_min_sigs for v in _signal_cache.values())
         cache_size = len(_signal_cache)
 
-    if cache_size == 0 or (not any_ready and not _pre_engine_active):
+    if cache_size == 0 or (not any_ready and not _pre_engine_active
+                           and not _pre_sole_gate):
         global _last_no_signal_log
         now_ns = time.time()
         if now_ns - _last_no_signal_log >= 60.0:
