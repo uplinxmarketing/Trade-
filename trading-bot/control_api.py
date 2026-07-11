@@ -7115,8 +7115,14 @@ def api_all():
     # Use aggregated SQL stats — covers ALL trades, not just the last 500.
     # get_recent_trades(limit=500) was causing total_trades/wins/pnl/trades_today to
     # describe different subsets (500 rows vs. full table) making them inconsistent.
-    stats     = database.get_trade_stats(mode=get_mode())
-    all_stats = database.get_trade_stats_all_modes()
+    # Trade aggregates change only when a trade closes (~tens/day), so serve them
+    # from a short single-flight memo instead of running 3 aggregate DB queries on
+    # every poll. This keeps api/all off the DB hot path — the queries used the
+    # exclusive lock and were the entire 6-8s api/all stall (wolfscore_ms was 0).
+    _mode_all = get_mode()
+    stats     = _ttl_cached(f"trade_stats:{_mode_all}", 8.0,
+                            lambda: database.get_trade_stats(mode=_mode_all))
+    all_stats = _ttl_cached("trade_stats_all", 8.0, database.get_trade_stats_all_modes)
     wins      = stats["wins"]
     total     = stats["total"]
     balance   = round(_get_usdt_display_balance(block=False), 2)  # never block the poll on Binance REST
@@ -7124,7 +7130,8 @@ def api_all():
     approved  = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
     positions = _get_positions()
     _API_ALL_CACHE["has_positions"] = len(positions) > 0
-    trades    = database.get_recent_trades(limit=200)   # for the trades list payload only
+    trades    = _ttl_cached("recent_trades_200", 5.0,
+                            lambda: database.get_recent_trades(limit=200))
     payload = {
         "status": {
             "running":                strategy.get("trading_active", False),
