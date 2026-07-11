@@ -2,7 +2,6 @@ import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { API_BASE } from '@/config';
 import TopBar from '@/components/dashboard/TopBar';
 import VersionFooter from '@/components/dashboard/VersionFooter';
-import AiChatPanel from '@/components/dashboard/AiChatPanel';
 import AITradingAgent from '@/components/dashboard/AITradingAgent';
 import CoinSelector from '@/components/dashboard/CoinSelector';
 import BinanceConnect from '@/components/dashboard/BinanceConnect';
@@ -14,10 +13,8 @@ import OrderFormPanel from '@/components/dashboard/OrderFormPanel';
 import WalletPanelV2 from '@/components/dashboard/WalletPanelV2';
 import ReportDashboard from '@/components/dashboard/ReportDashboard';
 import OrderBookPanel from '@/components/dashboard/OrderBookPanel';
-import FuturesAgent from '@/components/dashboard/FuturesAgent';
 import { FunnelPanel } from '@/components/dashboard/FunnelPanel';
 import { EvScorePanel } from '@/components/dashboard/EvScorePanel';
-import { ShadowLabPanel } from '@/components/dashboard/ShadowLabPanel';
 import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
@@ -250,12 +247,6 @@ const Index = () => {
             {/* EV win-probability scores — S5: per-coin scores, ranking, expectancy, model */}
             <EvScorePanel baseUrl={API_BASE} />
 
-            {/* Shadow-Lab — paper-shadow EV harvesting flywheel + copy-results */}
-            <ShadowLabPanel baseUrl={API_BASE} />
-
-            {/* Futures Paper-Trading Agent */}
-            <FuturesAgent />
-
             {/* Order Book & 24h Stats */}
             <OrderBookPanel activeCoin={activeCoin} prices={prices} />
 
@@ -270,10 +261,6 @@ const Index = () => {
           </div>
         </div>
 
-        {/* AI Chat sidebar */}
-        <div className="w-80 xl:w-96 border-l border-border hidden md:flex flex-col flex-shrink-0">
-          <AiChatPanel />
-        </div>
       </div>
 
       {/* Persistent self-diagnosing version footer (I2) */}

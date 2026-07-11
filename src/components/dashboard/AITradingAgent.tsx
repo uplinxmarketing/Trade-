@@ -14,16 +14,12 @@ import { checkExits, TAKER_FEE } from '@/lib/trading-engine';
 import type { LivePrices } from '@/lib/trading-engine';
 import { calcEMA, calcRSI, calcMACD, calcBollingerBands, calcSMA } from '@/lib/indicators';
 import { formatTime, formatPnL } from '@/lib/format';
-import { SignalEnginePanel } from './SignalEnginePanel';
 import { DiagnosticsTab } from './DiagnosticsTab';
 import { AnalyticsPanel } from './AnalyticsPanel';
 import { SessionStatsPanel } from './SessionStatsPanel';
-import { BacktestPanel } from './BacktestPanel';
-import { LeverMatrixPanel } from './LeverMatrixPanel';
 import { RiskPanel } from './RiskPanel';
 import { StrategySettingsPanel } from './StrategySettingsPanel';
 import { EntryGatePanel } from './EntryGatePanel';
-import { SignalsEditorPanel } from './SignalsEditorPanel';
 import { ConfigHistoryPanel } from './ConfigHistoryPanel';
 import UniverseNoticesBanner from './UniverseNoticesBanner';
 import { MemoryRestartBanner } from './DataHealthPanel';
@@ -1754,28 +1750,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         </div>
       )}
 
-      {/* Signal Engine configuration (server mode only) */}
-      {isServerMode && (
-        <div className="border-t border-border">
-          <button
-            onClick={() => setShowSignalEngine(!showSignalEngine)}
-            className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/20 transition-colors">
-            <div className="flex items-center gap-2">
-              <FlaskConical className="w-3.5 h-3.5 text-muted-foreground" />
-              <span className="text-xs font-semibold">Signal Engine</span>
-            </div>
-            {showSignalEngine
-              ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
-              : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
-          </button>
-          {showSignalEngine && (
-            <div className="px-4 pb-4">
-              <SignalEnginePanel baseUrl={botUrl} />
-            </div>
-          )}
-        </div>
-      )}
-
       {/* Diagnostics (server mode only) */}
       {isServerMode && (
         <div className="border-t border-border">
@@ -1818,28 +1792,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                   editor below so it still shows if the strategy schema fails). */}
               <EntryGatePanel baseUrl={botUrl} />
               <StrategySettingsPanel baseUrl={botUrl} />
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Signals Editor — roles / thresholds / 24h impact (server mode only, §5.2.2) */}
-      {isServerMode && (
-        <div className="border-t border-border">
-          <button
-            onClick={() => setShowSignalsEditor(!showSignalsEditor)}
-            className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/20 transition-colors">
-            <div className="flex items-center gap-2">
-              <ListChecks className="w-3.5 h-3.5 text-muted-foreground" />
-              <span className="text-xs font-semibold">Signals Editor</span>
-            </div>
-            {showSignalsEditor
-              ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
-              : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
-          </button>
-          {showSignalsEditor && (
-            <div className="px-4 pb-4">
-              <SignalsEditorPanel baseUrl={botUrl} />
             </div>
           )}
         </div>
@@ -1890,32 +1842,6 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               {/* L2.3 — session / hour expectancy tables */}
               <div className="border-t border-border/50 pt-3">
                 <SessionStatsPanel baseUrl={botUrl} />
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Backtest (server mode only) */}
-      {isServerMode && (
-        <div className="border-t border-border">
-          <button
-            onClick={() => setShowBacktest(!showBacktest)}
-            className="w-full flex items-center justify-between px-4 py-2 hover:bg-muted/20 transition-colors">
-            <div className="flex items-center gap-2">
-              <History className="w-3.5 h-3.5 text-muted-foreground" />
-              <span className="text-xs font-semibold">Backtest</span>
-            </div>
-            {showBacktest
-              ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
-              : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
-          </button>
-          {showBacktest && (
-            <div className="px-4 pb-4 space-y-4">
-              <BacktestPanel baseUrl={botUrl} />
-              {/* L3 — edge-report / lever matrix ranked variants */}
-              <div className="border-t border-border/50 pt-3">
-                <LeverMatrixPanel baseUrl={botUrl} />
               </div>
             </div>
           )}
