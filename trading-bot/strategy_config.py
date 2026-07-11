@@ -226,7 +226,7 @@ class DataConfig(BaseModel):
     eval_retention_days:  int   = Field(14, ge=1, le=365)
     # I4 — three-tier auto-management of the approved_coins watchlist.
     auto_remove_delisted:        bool = True   # remove confirmed-delisted coins
-    auto_replace_with_successor: bool = False  # also auto-add the renamed successor
+    auto_replace_with_successor: bool = True   # also auto-add the renamed successor
     # R4 — memory-safety guardrail. When process RSS crosses the soft cap, warn
     # loudly (CRITICAL + UI banner) and gracefully self-restart (flush + clean
     # shutdown marker + exit 0) so an OOM kill becomes a clean restart. 0 disables.
