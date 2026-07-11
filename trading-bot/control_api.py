@@ -4151,7 +4151,9 @@ def _entry_report_impl():
         floor = {}
         scores = {}
         try:
-            scores = _te.get_live_ev_scores() or {}
+            # Diagnostics must never trigger the heavy O(universe) fallback —
+            # serve published scores only so this endpoint is always instant.
+            scores = _te.get_live_ev_scores(allow_compute=False) or {}
             meta = scores.get("__meta__") or {}
             regime = {"regime": meta.get("regime"), "tilt": meta.get("regime_tilt")}
             floor = meta.get("adaptive_floor") or {}
