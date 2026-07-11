@@ -4121,7 +4121,12 @@ def api_diag_entry_report():
       * blockers_summary — the reason histogram (which single gate kills the most);
       * silent_gap_count — buy-ready coins with NO block reason and NO attempt
         (a true silent drop = a bug).
-    Read-only; never 500s."""
+    Read-only; never 500s. TTL-cached (4s, single-flight) so many dashboard polls
+    share one computation instead of each rebuilding the report."""
+    return _ttl_cached("entry_report", 4.0, _entry_report_impl)
+
+
+def _entry_report_impl():
     import trade_engine as _te
     out: dict = {}
     try:
@@ -4867,7 +4872,13 @@ def api_funnel():
 
 @app.get("/api/diagnostics")
 def api_diagnostics():
-    """Comprehensive bot health snapshot. Zero extra Binance calls — all data is in-memory."""
+    """Comprehensive bot health snapshot. Zero extra Binance calls — all data is
+    in-memory. TTL-cached (2s, single-flight) so concurrent dashboard polls share
+    one snapshot."""
+    return _ttl_cached("diagnostics_full", 2.0, _diagnostics_impl)
+
+
+def _diagnostics_impl():
     import trade_engine as _te
     import data_collector as _dc
     import threading as _thr
@@ -8586,7 +8597,12 @@ def api_ev_scores():
 
 @app.get("/api/ev/model")
 def api_ev_model():
-    """S5 — EV model status + saved versions + training-sample counts."""
+    """S5 — EV model status + saved versions + training-sample counts.
+    TTL-cached (6s) — the training-sample counts are a DB scan."""
+    return _ttl_cached("ev_model", 6.0, _ev_model_impl)
+
+
+def _ev_model_impl():
     try:
         status, versions = {}, []
         try:
@@ -8809,7 +8825,11 @@ def api_ev_activate(body: dict = Body(default={})):
 def api_ev_expectancy():
     """S5 — LIVE vs paper-shadow expectancy side by side. `live` reuses the
     existing expectancy analytics; `paper_shadow` from paper_shadow.get_paper_stats()
-    (guarded → {}). Never 500s."""
+    (guarded → {}). Never 500s. TTL-cached (10s) — both sides are DB aggregations."""
+    return _ttl_cached("ev_expectancy", 10.0, _ev_expectancy_impl)
+
+
+def _ev_expectancy_impl():
     try:
         live = _ev_live_expectancy()
         paper = {}
@@ -8837,12 +8857,29 @@ def api_ev_expectancy():
 # stampede the DB; on producer error the last good value is served if present.
 _agg_cache = {}
 _agg_cache_lock = threading.Lock()
+_agg_key_locks: dict = {}          # per-key single-flight locks
+_agg_key_locks_guard = threading.Lock()
 
 
 def _ttl_cached(key: str, ttl: float, producer):
+    """Per-key single-flight TTL memo. The fast path is a lockless dict read, so a
+    fresh value never blocks. On a miss ONLY callers of the SAME key serialize on
+    that key's lock (so a slow producer for one endpoint can never freeze every
+    other cached endpoint — the old single global lock did exactly that). A stale
+    value is served if the producer raises."""
     now = time.time()
-    with _agg_cache_lock:
+    ent = _agg_cache.get(key)                      # atomic dict read, no lock
+    if ent is not None and (now - ent[0]) < ttl:
+        return ent[1]
+    with _agg_key_locks_guard:
+        klock = _agg_key_locks.get(key)
+        if klock is None:
+            klock = threading.Lock()
+            _agg_key_locks[key] = klock
+    with klock:
+        # Re-check: another caller of this key may have refreshed while we waited.
         ent = _agg_cache.get(key)
+        now = time.time()
         if ent is not None and (now - ent[0]) < ttl:
             return ent[1]
         try:
