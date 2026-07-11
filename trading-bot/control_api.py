@@ -8809,96 +8809,57 @@ def _ev_model_impl():
 
 
 def _run_ev_train_job(run_id: str):
-    """Background worker — trains a new EV weight-version off live+paper_shadow
-    training samples and saves (does NOT activate) it. Clears the running flag on
-    exit no matter what. Never runs on the event loop."""
+    """Background orchestrator — runs the WolfScore fit in a SEPARATE PROCESS so
+    its CPU/GIL never stalls the live trader (Phase 5 cold-work isolation), then
+    records the thin result. Falls back to in-process if a subprocess can't be
+    spawned. Clears the running flag on exit no matter what."""
     global _ev_train_running, _ev_train_last, _ev_train_last_ts
     _started = time.time()
-    # Publish an immediate 'running' state so the UI/diagnostics show progress
-    # rather than silence while the fit runs.
     with _ev_train_lock:
         _ev_train_last = {"ok": None, "run_id": run_id, "status": "running",
                           "started_ts": _started, "rows_loaded": None}
         _ev_train_last_ts = _started
-    result: dict = {"ok": False, "run_id": run_id, "status": "failed",
-                    "started_ts": _started}
+    result = None
     try:
-        import ev_model as _ev
-        samples = []
-        rows_usable = 0
+        import ev_train_worker
         try:
-            fn = getattr(database, "get_training_samples", None)
-            if callable(fn):
-                rows = fn(limit=100000, modes=["live", "paper_shadow"]) or []
-                for r in rows:
-                    if not isinstance(r, dict):
-                        continue
-                    feats = r.get("features") if isinstance(r.get("features"), dict) else {}
-                    _sub = feats.get("submetrics")
-                    # A row is USABLE for WolfScore training only if it carries the
-                    # 8 submetrics (T,M,R,C,W,V,X,F). Rows saved in the legacy flat
-                    # feature format have no submetrics → they'd degrade to all-zero
-                    # and teach the model nothing; count them so the operator sees
-                    # how much real training data exists.
-                    if isinstance(_sub, dict) and _sub:
-                        rows_usable += 1
-                    samples.append({
-                        "submetrics":  _sub,
-                        "regime_tilt": feats.get("regime_tilt", 0.0),
-                        "features":    feats,
-                        "cohort":      feats.get("cohort"),
-                        "label":       r.get("label"),
-                        # S4-1.2 / S4-2 — realized R drives the sample weight;
-                        # ts drives the temporal (oldest→newest) holdout split.
-                        "realized_r":  r.get("realized_r"),
-                        "ts":          r.get("ts"),
-                    })
-        except Exception as e:
-            samples = []
-            result["load_error"] = f"{type(e).__name__}: {e}"
-        _rows_loaded = len(samples)
-        try:
-            database.log_activity(
-                f"EV retrain {run_id}: loaded {_rows_loaded} training rows "
-                f"({rows_usable} with WolfScore submetrics)", "info")
-        except Exception:
-            pass
-        # WolfScore-v3 trainer (regime-gated logistic fit), not the generic train.
-        _trainer = getattr(_ev, "train_wolfscore", None) or getattr(_ev, "train")
-        res = _trainer(samples)
-        if isinstance(res, dict):
-            result = dict(res)
-            result["run_id"] = run_id
-            result["started_ts"] = _started
-            result["n_samples"] = _rows_loaded
-            result["rows_loaded"] = _rows_loaded
-            result["rows_usable"] = rows_usable
-            result["status"] = "done" if res.get("ok") else "failed"
-            if not res.get("ok") and res.get("error"):
-                result["error"] = res["error"]
-            if res.get("ok") and isinstance(res.get("model"), dict):
-                try:
-                    vid = _ev.save_version(res["model"])
-                    result["saved_version"] = vid
-                    database.log_activity(
-                        f"EV retrain {run_id}: trained {vid} on {_rows_loaded} rows "
-                        f"(held-out n={res.get('report', {}).get('n_test')})", "info")
-                except Exception as e:
-                    result["save_error"] = f"{type(e).__name__}: {e}"
-                    result["status"] = "failed"
+            # spawn context: the child imports ONLY ev_model + database (light) —
+            # it does NOT re-run this API module's boot. Its logistic fit holds its
+            # OWN GIL on its OWN core; only the thin result dict crosses back.
+            import multiprocessing as _mp
+            import concurrent.futures as _cf
+            _ctx = _mp.get_context("spawn")
+            with _cf.ProcessPoolExecutor(max_workers=1, mp_context=_ctx) as _ex:
+                result = _ex.submit(ev_train_worker.run_training_job, run_id).result(timeout=900)
+            try:
+                database.log_activity(
+                    f"EV retrain {run_id}: fit ran in a separate process "
+                    f"(trader GIL not held)", "info")
+            except Exception:
+                pass
+        except Exception as _sp_exc:
+            try:
+                database.log_activity(
+                    f"EV retrain {run_id}: subprocess unavailable ({_sp_exc}) — "
+                    f"running in-process this once", "warn")
+            except Exception:
+                pass
+            result = ev_train_worker.run_training_job(run_id)   # in-process fallback
     except Exception as e:
         result = {"ok": False, "run_id": run_id, "status": "failed",
-                  "started_ts": _started,
-                  "error": f"{type(e).__name__}: {e}"}
+                  "started_ts": _started, "error": f"{type(e).__name__}: {e}"}
         try:
             database.log_activity(f"EV retrain {run_id} FAILED: {result['error']}", "error")
         except Exception:
             pass
     finally:
-        result["finished_ts"] = time.time()
+        if not isinstance(result, dict):
+            result = {"ok": False, "run_id": run_id, "status": "failed",
+                      "started_ts": _started, "error": "no result from trainer"}
+        result.setdefault("started_ts", _started)
+        result.setdefault("finished_ts", time.time())
         with _ev_train_lock:
             _ev_train_running = False
-            # Drop the (large) model dict from the stored report — keep it thin.
             result.pop("model", None)
             _ev_train_last = result
             _ev_train_last_ts = time.time()
