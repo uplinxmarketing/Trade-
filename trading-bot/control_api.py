@@ -566,7 +566,7 @@ async def lifespan(app: FastAPI):
             #   Guarded by a stored rev marker so it runs exactly once.
             try:
                 import strategy_config as _scfg_s3
-                _S3_REV = 6
+                _S3_REV = 7
                 _raw_s3 = _load_strategy()
                 if int(_raw_s3.get("s3_tuning_rev", 0) or 0) < _S3_REV:
                     _ent = _raw_s3.get("entries") if isinstance(_raw_s3.get("entries"), dict) else {}
@@ -620,6 +620,7 @@ async def lifespan(app: FastAPI):
                     _s3_force(_ent, "entries", "ev_floor_mode", "absolute", _s3_patch)       # not percentile
                     _s3_force(_ent, "entries", "ev_floor_live_untrained", True, _s3_patch)   # gate on interim (operator choice)
                     _s3_force(_ent, "entries", "ev_ranking_enabled", True, _s3_patch)        # highest-first
+                    _s3_force(_ent, "entries", "wolfscore_sole_gate", True, _s3_patch)       # legacy count out of buy path
                     _s3_force(_ent, "entries", "live_up_regime_mode", "allow", _s3_patch)    # regime not a score gate
                     _s3_force(_ent, "entries", "confirm_seconds", 3.0, _s3_patch)            # freshness
                     _s3_force(_ent, "entries", "eval_heartbeat_sec", 5.0, _s3_patch)         # freshness
@@ -4016,6 +4017,7 @@ def api_diag_entry_report():
             "trading_active":               strat.get("trading_active"),
             "buy_score_threshold":          ent.get("buy_score_threshold",
                                                     ent.get("min_win_probability_floor")),
+            "wolfscore_sole_gate":          ent.get("wolfscore_sole_gate", True),
             "min_score":                    ent.get("min_score", strat.get("min_signals")),
             "signal_engine_min_scored":     se.get("min_scored"),
             "min_win_probability":          ent.get("min_win_probability"),
