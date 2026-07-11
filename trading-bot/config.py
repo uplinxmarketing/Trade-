@@ -116,7 +116,14 @@ BUDGET_PER_COIN = {
 }
 
 # ── Futures paper-trading agent ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-FUTURES_ENABLED           = True
+# OFF by default: the futures agent runs its own mark-price + signal-scanner
+# loops in THIS process, competing for the GIL + DB lock with live spot trading.
+# Not needed for live spot. Set FUTURES_ENABLED=1 in the env to re-enable.
+FUTURES_ENABLED           = os.getenv("FUTURES_ENABLED", "0") == "1"
+# Supabase PERIODIC push loop (positions/balance mirror). The critical persistence
+# (coin selection, buy/sell results) is synced on-write elsewhere; this periodic
+# loop is redundant background I/O — OFF by default, SUPABASE_PERIODIC_SYNC=1 re-enables.
+SUPABASE_PERIODIC_SYNC    = os.getenv("SUPABASE_PERIODIC_SYNC", "0") == "1"
 FUTURES_WATCHED_COINS     = [
     "BTCUSDT", "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
     "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT",  "ARBUSDT",
