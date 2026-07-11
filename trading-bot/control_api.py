@@ -2158,12 +2158,15 @@ def _get_usdt_balance() -> float:
     return float(os.getenv("STARTING_PAPER_USDT", "10000.0"))
 
 
-def _get_usdt_display_balance() -> float:
-    """Returns free+locked USDT — matches what Binance UI shows."""
+def _get_usdt_display_balance(block: bool = True) -> float:
+    """Returns free+locked USDT — matches what Binance UI shows.
+    block=False (latency-sensitive polls like /api/all): never performs a cold
+    signed Binance fetch — serves the cached balance and refreshes in the
+    background, so a slow/erroring Binance REST call can't stall the request."""
     from connection import get_mode, client as _client
     try:
         if get_mode() == "live":
-            acc = _get_cached_account()
+            acc = _get_cached_account(block=block)
             for b in acc.get("balances", []):
                 if b["asset"] == "USDT":
                     return float(b["free"]) + float(b["locked"])
@@ -2171,7 +2174,7 @@ def _get_usdt_display_balance() -> float:
         if hasattr(_client, "_balances"):
             with _client._lock:
                 return float(_client._balances.get("USDT", 0.0))
-        acc = _get_cached_account()
+        acc = _get_cached_account(block=block)
         for b in acc.get("balances", []):
             if b["asset"] == "USDT":
                 return float(b["free"]) + float(b["locked"])
@@ -7116,7 +7119,7 @@ def api_all():
     all_stats = database.get_trade_stats_all_modes()
     wins      = stats["wins"]
     total     = stats["total"]
-    balance   = round(_get_usdt_display_balance(), 2)
+    balance   = round(_get_usdt_display_balance(block=False), 2)  # never block the poll on Binance REST
     initial   = _get_initial_balance() or balance
     approved  = [c["symbol"] for c in strategy.get("approved_coins", []) if c.get("approved")]
     positions = _get_positions()
