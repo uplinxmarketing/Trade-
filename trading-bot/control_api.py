@@ -805,6 +805,37 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("engine_consolidation", exc)
 
+            # ── Perf: enable universe bookTicker streaming ───────────────────
+            # entries.bookticker_universe defaulted False → the WolfScore scorer's
+            # per-coin spread lookup (_fresh_book) fell through to a SYNCHRONOUS
+            # REST bookTicker fetch for EVERY non-held coin on EVERY scan (~86
+            # calls), making one full scan ~188s (wolfscore_ms ~98s) and starving
+            # buys (coins that briefly cross the gate drift back before the slow
+            # scan re-evaluates them). With the flag on, _fresh_book serves books
+            # from the WS stream and short-circuits BEFORE the REST call, so the
+            # scorer never REST-fetches — scans drop to sub-second and scores are
+            # preserved (real spread still supplied via WS). One-time + guarded;
+            # touches ONLY entries.bookticker_universe — NOT the WolfScore gate,
+            # any other entries key, or the exit engine.
+            try:
+                _btuR = 1
+                _raw_bt = _load_strategy()
+                if int(_raw_bt.get("bookticker_universe_rev", 0) or 0) < _btuR:
+                    _ent_bt = _raw_bt.get("entries")
+                    _ent_bt = dict(_ent_bt) if isinstance(_ent_bt, dict) else {}
+                    _patch_bt: dict = {"bookticker_universe_rev": _btuR}
+                    if _ent_bt.get("bookticker_universe") is not True:
+                        _ent_bt["bookticker_universe"] = True
+                        _patch_bt["entries"] = _ent_bt
+                    _write_strategy_patch(_patch_bt)
+                    database.log_activity(
+                        "Perf: entries.bookticker_universe enabled — universe "
+                        "@bookTicker over WS; scorer no longer REST-fetches books "
+                        "per coin (fixes ~188s scans starving buys)", "info")
+                    steps.append("bookticker_universe enabled")
+            except Exception as exc:
+                _step_failed("bookticker_universe_enable", exc)
+
             # 4c-e. Hard-stop paper-shadow if it is disabled. It is start()ed early
             #   in boot (above), BEFORE the s3 migration flips
             #   data.paper_shadow_enabled=false, so the thread is alive and merely
