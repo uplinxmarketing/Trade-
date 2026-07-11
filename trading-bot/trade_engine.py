@@ -9481,7 +9481,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             # ── Legacy mandatory signal layer ──────────────────────────────────
             # Mandatory 1: EMA trend up (EMA9 > EMA21) — don't buy into a downtrend.
             # Mandatory 2: RSI below threshold — require a real dip, not mid-channel noise.
-            if mandatory_enabled:
+            if mandatory_enabled and not _wolfscore_sole_gate:
                 if not sigs.get("trend", False):
                     _record_rejection(sym, score, "mandatory_ema_down", "EMA9 < EMA21")
                     continue
