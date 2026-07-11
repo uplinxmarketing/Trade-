@@ -7096,6 +7096,46 @@ def api_buy_rejections_reset():
 _API_ALL_CACHE: dict = {"ts": 0.0, "data": None}
 _API_ALL_TTL = 0.8   # seconds — slightly less than the 1 s fast-poll cadence
 
+# ── Process-split foundation: /api/all snapshot tee ─────────────────────────────
+# When SNAPSHOT_WRITER_ENABLED=1, the trader mirrors its already-computed /api/all
+# payload to a JSON file. A SEPARATE read-only process (snapshot_server.py) then
+# serves the dashboard from that file, so browser polling never touches the
+# trader's DB lock or Binance weight budget. This is the IPC substrate for the
+# process split. It is inert by default and adds NOTHING to the trader's hot path
+# beyond one throttled json dump of data that was already assembled for the cache.
+_SNAPSHOT_PATH = os.path.join(database._DATA_DIR, "dashboard_snapshot.json")
+_SNAPSHOT_MIN_INTERVAL = 1.0   # write at most once/sec even under heavy polling
+_snapshot_last_write = {"ts": 0.0}
+_snapshot_lock = threading.Lock()
+
+
+def _publish_api_snapshot(payload: dict) -> None:
+    """Atomically mirror the freshly-built /api/all payload to the snapshot file.
+    Guarded + throttled + never raises — a failure here must never affect a poll
+    or the trader. No-op unless SNAPSHOT_WRITER_ENABLED=1."""
+    if not getattr(config, "SNAPSHOT_WRITER_ENABLED", False):
+        return
+    now = time.time()
+    # Cheap unlocked pre-check keeps the common (throttled-out) path lock-free.
+    if now - _snapshot_last_write["ts"] < _SNAPSHOT_MIN_INTERVAL:
+        return
+    if not _snapshot_lock.acquire(blocking=False):
+        return
+    try:
+        if now - _snapshot_last_write["ts"] < _SNAPSHOT_MIN_INTERVAL:
+            return
+        _snapshot_last_write["ts"] = now
+        body = json.dumps({"snapshot_ts": now, "payload": payload},
+                          separators=(",", ":"), default=str)
+        tmp = f"{_SNAPSHOT_PATH}.tmp"
+        with open(tmp, "w") as fh:
+            fh.write(body)
+        os.replace(tmp, _SNAPSHOT_PATH)   # atomic — Process B never sees a partial file
+    except Exception:
+        pass
+    finally:
+        _snapshot_lock.release()
+
 
 def _format_trades(raw: list) -> list:
     """Convert DB trade rows (coin/entry_price/exit_price/net_profit) to the
@@ -7247,7 +7287,35 @@ def api_all():
     }
     _API_ALL_CACHE["ts"]   = now_ts
     _API_ALL_CACHE["data"] = payload
+    _publish_api_snapshot(payload)   # tee to Process B (inert unless enabled)
     return _append_fresh_prices(payload)
+
+
+@app.get("/api/snapshot")
+def api_snapshot():
+    """Proof/introspection endpoint for the process-split foundation. Reports
+    whether the snapshot tee is enabled and, if so, the on-disk file's age so an
+    operator can confirm Process B would be reading fresh state. Read-only."""
+    out = {
+        "writer_enabled": bool(getattr(config, "SNAPSHOT_WRITER_ENABLED", False)),
+        "path": _SNAPSHOT_PATH,
+        "exists": False,
+        "age_sec": None,
+        "snapshot_ts": None,
+        "size_bytes": None,
+    }
+    try:
+        if os.path.exists(_SNAPSHOT_PATH):
+            out["exists"] = True
+            out["size_bytes"] = os.path.getsize(_SNAPSHOT_PATH)
+            with open(_SNAPSHOT_PATH) as fh:
+                snap = json.load(fh)
+            ts = float(snap.get("snapshot_ts") or 0.0)
+            out["snapshot_ts"] = ts
+            out["age_sec"] = round(time.time() - ts, 2) if ts else None
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
 
 
 @app.get("/api/backup/export")

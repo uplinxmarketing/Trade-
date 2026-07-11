@@ -129,6 +129,13 @@ SUPABASE_PERIODIC_SYNC    = os.getenv("SUPABASE_PERIODIC_SYNC", "0") == "1"
 # so they cannot be triggered against the live trader; COLD_ENDPOINTS_ENABLED=1
 # (or a dedicated cold process) re-enables them.
 COLD_ENDPOINTS_ENABLED    = os.getenv("COLD_ENDPOINTS_ENABLED", "0") == "1"
+# Process-split foundation — the trader tees its already-computed /api/all
+# dashboard payload to a JSON snapshot file so a SEPARATE read-only API process
+# (snapshot_server.py, "Process B") can serve the dashboard with ZERO DB/Binance
+# contention against live trading. OFF by default: shipping it inert means the
+# trader is byte-for-byte unchanged until the operator opts in with
+# SNAPSHOT_WRITER_ENABLED=1. The tee reuses the cached payload (no new DB reads).
+SNAPSHOT_WRITER_ENABLED   = os.getenv("SNAPSHOT_WRITER_ENABLED", "0") == "1"
 FUTURES_WATCHED_COINS     = [
     "BTCUSDT", "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
     "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT",  "ARBUSDT",
