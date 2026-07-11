@@ -1887,6 +1887,30 @@ def _wolf_roc_15m(cached: dict) -> Optional[float]:
     return None
 
 
+# Scoring-path memo for the planned 1R stop % (the WolfScore F term). The raw
+# _planned_sl_distance_pct → _atr_pct_5m_at_entry falls through to a per-coin
+# database.get_candles(limit=120) whenever the WS 5m/1m buffers are thin (cold
+# start, WS churn) — 70+ uncached DB reads under the global lock per scoring
+# pass, in BOTH the buy scan AND the 5s UI feed. That is the dominant cause of
+# "scores frozen for minutes / scan freezes mid-way". ATR% over 5m candles moves
+# at most once per 5-min bar, so a short per-symbol memo is exact enough for the
+# score and eliminates the storm. Scoring path ONLY — the exit geometry keeps
+# calling _atr_pct_5m_at_entry directly (unchanged), so stops are unaffected.
+_wolf_stop_cache: Dict[str, tuple] = {}   # sym -> (stop_pct or None, ts)
+_WOLF_STOP_CACHE_TTL_SEC = 45.0
+
+
+def _planned_stop_pct_for_score(sym: str, price: float):
+    """Memoized planned-stop % for WolfScore's friction term (45s TTL)."""
+    now = time.time()
+    ent = _wolf_stop_cache.get(sym)
+    if ent and (now - ent[1]) < _WOLF_STOP_CACHE_TTL_SEC:
+        return ent[0]
+    val = _planned_sl_distance_pct(sym, float(price))
+    _wolf_stop_cache[sym] = (val, now)
+    return val
+
+
 def _wolf_inputs(sym: str, cached: dict) -> dict:
     """Assemble the WolfScore v3 sub-metric inputs for `sym` from what the engine
     already computes (5m klines + cached ATR% + live book / slippage / planned
@@ -2015,7 +2039,7 @@ def _wolf_inputs(sym: str, cached: dict) -> dict:
         pass
     try:
         if price:
-            _stop = _planned_sl_distance_pct(sym, float(price))
+            _stop = _planned_stop_pct_for_score(sym, float(price))
             if _stop:
                 inp["planned_stop_pct"] = _stop
     except Exception:
