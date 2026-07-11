@@ -8558,7 +8558,13 @@ def _ev_live_scores_bundle() -> dict:
         import trade_engine as _te
         fn = getattr(_te, "get_live_ev_scores", None)
         if callable(fn):
-            raw = fn()
+            # allow_compute=False: serve the scan-published scores only, never run
+            # the O(89) WolfScore compute on this request thread (that held the GIL
+            # and timed out the feed). The scan/buy loop keeps the pub fresh.
+            try:
+                raw = fn(allow_compute=False)
+            except TypeError:
+                raw = fn()   # older signature
     except Exception:
         raw = None
 
