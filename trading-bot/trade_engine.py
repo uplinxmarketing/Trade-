@@ -2233,25 +2233,33 @@ def _format_ev_scores(scores_map: dict, tilt: float, af) -> dict:
     return out
 
 
-def get_live_ev_scores() -> dict:
+def get_live_ev_scores(allow_compute: bool = True) -> dict:
     """S5 data feed for control_api / UI: per currently-tracked symbol, the latest
     WolfScore v3, plus a top-level '__meta__' block. FAST PATH: mirror the scan's
     last-published WolfScores (a dict read — no recompute). Only when the scan has
     not published within _EV_PUB_MAX_AGE_SEC (cold start / at-capacity) do we fall
-    back to a short-TTL, single-flight on-demand compute."""
+    back to a short-TTL, single-flight on-demand compute.
+    allow_compute=False (diagnostics) NEVER triggers the O(universe) fallback — it
+    returns the last published scores (even if a little stale) or the last memo,
+    else {}. This keeps read-only endpoints like the entry-report instant instead
+    of blocking multiple seconds when the scan is at-capacity and not publishing."""
     now = time.time()
     with _scan_scores_pub_lock:
         _pub_ts = float(_scan_scores_pub.get("ts", 0.0) or 0.0)
         _fresh = _pub_ts and (now - _pub_ts < _EV_PUB_MAX_AGE_SEC)
-        if _fresh:
-            _pub_scores = dict(_scan_scores_pub.get("scores") or {})
-            _pub_tilt = float(_scan_scores_pub.get("tilt", 0.0) or 0.0)
-            _pub_af = _scan_scores_pub.get("af")
-    if _fresh:
+        _pub_scores = dict(_scan_scores_pub.get("scores") or {})
+        _pub_tilt = float(_scan_scores_pub.get("tilt", 0.0) or 0.0)
+        _pub_af = _scan_scores_pub.get("af")
+    if _fresh or (not allow_compute and _pub_scores):
         try:
             return _format_ev_scores(_pub_scores, _pub_tilt, _pub_af)
         except Exception:
             pass
+    if not allow_compute:
+        # Diagnostics path: never run the heavy fallback. Serve the last memo if
+        # present, else an empty map — the caller degrades gracefully.
+        _cached = _ev_scores_cache.get("data")
+        return _cached if _cached else {}
     with _ev_scores_cache_lock:
         _cached = _ev_scores_cache.get("data")
         if _cached and (now - float(_ev_scores_cache.get("ts", 0.0)) < _EV_SCORES_TTL_SEC):
