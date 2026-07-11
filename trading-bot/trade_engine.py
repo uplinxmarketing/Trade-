@@ -4648,6 +4648,7 @@ def evaluate_buy_gates(sym: str) -> dict:
     """
     blockers: list = []
     strategy = _load_strategy()
+    _sole_gate_disp = bool((strategy.get("entries") or {}).get("wolfscore_sole_gate", True))
 
     if not strategy.get("trading_active", True):
         blockers.append("bot_paused")
@@ -4729,7 +4730,9 @@ def evaluate_buy_gates(sym: str) -> dict:
                 blockers.append(f"engine:{_dec.get('reason', 'blocked')}")
         except Exception:
             pass
-    else:
+    elif not _sole_gate_disp:
+        # Legacy score/mandatory gate — the real buy loop SKIPS this under
+        # sole-gate, so only report it when sole-gate is off.
         if cached.get("score", 0) < min_sigs:
             blockers.append(f"score {cached.get('score', 0)}/{min_sigs}")
         if bool(strategy.get("mandatory_signals_enabled", True)):
@@ -4747,10 +4750,30 @@ def evaluate_buy_gates(sym: str) -> dict:
             if rsi_v <= 0 or rsi_v >= rsi_threshold:
                 blockers.append(f"rsi {rsi_v:.0f} >= {rsi_threshold:.0f}")
 
-    if not cached.get("bb_ok", True):
-        blockers.append("price_at_upper_bollinger")
-    if not cached.get("5m_ok", True):
-        blockers.append("5m_downtrend")
+    if _sole_gate_disp:
+        # Under sole-gate the ONLY score gate is WolfScore ≥ floor. The legacy
+        # 5m-downtrend / Bollinger / mandatory vetoes above are BYPASSED by the
+        # real buy loop, so reporting them here was a phantom gate (a 70-scorer in
+        # a 5m dip shown as "5m downtrend blocked" though the engine ignores it).
+        # Report the true gate instead: the coin's WolfScore vs the floor.
+        try:
+            _raw_sg = get_live_ev_scores(allow_compute=False) or {}
+            _scores_sg = _raw_sg.get("scores") if isinstance(_raw_sg.get("scores"), dict) else _raw_sg
+            _pct_sg = (_scores_sg.get(sym) or {}).get("pct") if isinstance(_scores_sg, dict) else None
+            _ent_sg = strategy.get("entries") or {}
+            _floor_sg = float(_ent_sg.get("buy_score_threshold",
+                              _ent_sg.get("min_win_probability_floor", 61.0)) or 61.0)
+            if _pct_sg is None:
+                blockers.append("wolfscore_pending")
+            elif float(_pct_sg) < _floor_sg:
+                blockers.append(f"wolfscore {float(_pct_sg):.0f} < {_floor_sg:.0f}")
+        except Exception:
+            pass
+    else:
+        if not cached.get("bb_ok", True):
+            blockers.append("price_at_upper_bollinger")
+        if not cached.get("5m_ok", True):
+            blockers.append("5m_downtrend")
 
     return {"ready": not blockers, "blockers": blockers}
 
