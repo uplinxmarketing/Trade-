@@ -122,12 +122,12 @@ class EntriesConfig(BaseModel):
     # mean+k·stdev). In a downtrend where nothing decouples the best score fails the
     # floor → hold cash; in recovery scores rise back over it → re-engage. Both are
     # ignored (display-only) until the model is trained on ≥ ev_min_clean_trades.
-    min_win_probability_floor: float = Field(65.0, ge=0.0, le=100.0)
+    min_win_probability_floor: float = Field(61.0, ge=0.0, le=100.0)
     # THE single buy gate (operator model): a coin is buy-eligible iff its
     # WolfScore ≥ this. Default 65 (more selective than the paper-proven 55 cliff —
     # conservative on interim weights, by the operator's choice). UI-tunable. When
     # set, it is the WolfScore floor threshold (overrides min_win_probability_floor).
-    buy_score_threshold:    float = Field(65.0, ge=0.0, le=100.0)
+    buy_score_threshold:    float = Field(61.0, ge=0.0, le=100.0)
     # S3-1 — default is now 'absolute': the buy floor is the static abs_floor (55,
     # the cliff the paper data revealed) regardless of the live distribution, so a
     # high scorer fires even in a strong field and sub-55 junk is cut in a weak one.

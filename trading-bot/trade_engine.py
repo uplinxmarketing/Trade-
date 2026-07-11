@@ -8963,7 +8963,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # buy_score_threshold is canonical; min_win_probability_floor is the legacy
     # alias kept for back-compat.
     _wolf_abs_floor  = float(_entries_cfg_s2.get("buy_score_threshold",
-                             _entries_cfg_s2.get("min_win_probability_floor", 65.0)) or 65.0)
+                             _entries_cfg_s2.get("min_win_probability_floor", 61.0)) or 61.0)
     _wolf_floor_k    = float(_entries_cfg_s2.get("ev_floor_meanstd_k", 0.5) or 0.5)
     try:
         _wolf_floor_mode = str((_load_strategy().get("entries") or {})
