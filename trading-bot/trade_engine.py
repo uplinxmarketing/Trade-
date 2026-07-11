@@ -2159,6 +2159,8 @@ _TIER_COLD_SEC  = 45.0    # far below / hard-gated → re-score rarely
 _TIER_HOT_BAND  = 8.0     # within this many points of the gate → HOT
 _TIER_WARM_BAND = 25.0    # within this many points of the gate → WARM
 _TIER_RISE_PTS  = 3.0     # a jump of this many points since last score → promote HOT
+_TIER_HOT_ABS   = 50.0    # Phase 3: absolute HOT floor — any coin scoring >= this
+                          # is re-scored fast regardless of the (movable) gate.
 
 # Buy-loop bulk DB prefetch (latest candle + slippage) reused between refreshes so
 # the hot scoring path makes ZERO DB reads on the vast majority of dispatches.
@@ -2166,11 +2168,13 @@ _buy_prefetch: Dict[str, Any] = {"ts": 0.0, "latest_candles": {}}
 _BUY_PREFETCH_TTL_SEC = 30.0
 
 
-def _score_tier_for(prev_pct, threshold: float, meta) -> tuple:
+def _score_tier_for(prev_pct, threshold: float, meta, held: bool = False) -> tuple:
     """Return (tier_name, interval_sec) for a coin given its last WolfScore pct.
-    Proximity to the buy threshold drives the re-score cadence; a coin never
-    scored (prev_pct None) or rising sharply is treated as HOT so a fast mover is
-    caught within a couple seconds."""
+    HOT (re-score ~2.5s): held position, score >= _TIER_HOT_ABS (~50), within
+    _TIER_HOT_BAND of the (movable) gate, rising sharply, or never scored. WARM
+    within _TIER_WARM_BAND; COLD otherwise. All coins stay tracked — only rate."""
+    if held:
+        return ("hot", _TIER_HOT_SEC)     # Phase 3: held coins always score fast
     try:
         thr = float(threshold)
     except (TypeError, ValueError):
@@ -2187,7 +2191,7 @@ def _score_tier_for(prev_pct, threshold: float, meta) -> tuple:
                 return ("hot", _TIER_HOT_SEC)   # rising momentum
         except (TypeError, ValueError):
             pass
-    if p >= thr - _TIER_HOT_BAND:
+    if p >= _TIER_HOT_ABS or p >= thr - _TIER_HOT_BAND:
         return ("hot", _TIER_HOT_SEC)
     if p >= thr - _TIER_WARM_BAND:
         return ("warm", _TIER_WARM_SEC)
@@ -9249,22 +9253,31 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                        if _s in approved and _cached_ready(_c)
                        and _entry_backfill_ready(_s)]
         _cand_syms = {_s for _s, _ in _cand_items}
+        # Phase 3: held positions are always HOT (fresh score for the UI / any
+        # exit-side reads). Snapshot the held set once per pass.
+        try:
+            with _positions_lock:
+                _held_syms_tier = {p.get("symbol") for p in _positions}
+        except Exception:
+            _held_syms_tier = set()
         with _scan_scores_pub_lock:
             _prev_scores = dict(_scan_scores_pub.get("scores") or {})
         # Carry forward prior scores for coins still in the candidate set.
         _wolf_scores = {_s: _v for _s, _v in _prev_scores.items() if _s in _cand_syms}
-        # Cohort + tilt ONCE per pass (cheap, in-memory).
+        # Regime tilt ONCE per pass; basket-median ROC from a CHEAP ROC sample over
+        # ALL cached coins (Phase 3), not just the ready subset — in-memory, no DB.
         try:
             _wolf_tilt = ev_model.regime_tilt(_btc_roc_1h_frac())
         except Exception:
             _wolf_tilt = 0.0
-        _wolf_cohort = _wolf_cohort_from(_cand_items)
+        _wolf_cohort = _wolf_cohort_from(_items)
         # Decide which coins are DUE for a fresh score, then score only those.
         _due_items = []
         for _s, _c in _cand_items:
             _prev_pct = (_prev_scores.get(_s) or {}).get("pct")
             _meta = _coin_score_meta.get(_s)
-            _tier, _iv = _score_tier_for(_prev_pct, _wolf_abs_floor, _meta)
+            _tier, _iv = _score_tier_for(_prev_pct, _wolf_abs_floor, _meta,
+                                         held=(_s in _held_syms_tier))
             _tier_counts[_tier] += 1
             _last_ts = float(_meta.get("ts", 0.0)) if _meta else 0.0
             if _s not in _wolf_scores or (_now_sc - _last_ts) >= _iv:
