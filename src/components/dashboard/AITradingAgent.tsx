@@ -294,7 +294,8 @@ interface TradeRow {
   side: 'BUY' | 'SELL';
   price: number;
   quantity: number;
-  pnl: number | null;
+  pnl: number | null;      // NET P&L (after entry + exit fees)
+  fee?: number | null;     // entry_fee + exit_fee (USDT), SELL leg only
   reason: string | null;
   volume_usdt?: number;
 }
@@ -807,6 +808,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         symbol: t.symbol, side: t.side,
         price: Number(t.price), quantity: Number(t.quantity),
         pnl: t.pnl !== null && t.pnl !== undefined ? Number(t.pnl) : null,
+        fee: t.fee !== null && t.fee !== undefined ? Number(t.fee) : null,
         reason: t.reason ?? null,
         volume_usdt: t.volume_usdt !== undefined ? Number(t.volume_usdt) : undefined,
       });
@@ -1129,9 +1131,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
     return sum + cur * p.quantity;
   }, 0);
 
+  // NET unrealized P&L (take-home if closed now): prefer the server's fee-aware
+  // net_profit_now; otherwise subtract the round-trip fee (entry already paid +
+  // estimated exit) from the gross move, so the headline P&L is never gross.
   const unrealizedPnl = positions.reduce((sum, p) => {
     const cur = (isServerMode && p.current_price) ? p.current_price : (numPrice(prices, p.symbol) ?? p.avg_entry_price);
-    return sum + (cur - p.avg_entry_price) * p.quantity;
+    if (p.net_profit_now !== undefined && p.net_profit_now !== null) return sum + Number(p.net_profit_now);
+    const gross = (cur - p.avg_entry_price) * p.quantity;
+    const roundTripFee = (cur * p.quantity + p.avg_entry_price * p.quantity) * TAKER_FEE;
+    return sum + (gross - roundTripFee);
   }, 0);
 
   // Use server stats when available; fall back to summing trade rows.
@@ -1650,8 +1658,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                       <div className="text-right">
                         <p className="text-[11px] font-mono">{t.price.toFixed(4)}</p>
                         {t.pnl !== null && (
-                          <p className={`text-[9px] font-mono font-bold ${t.pnl >= 0 ? 'text-gain' : 'text-loss'}`}>
-                            {formatPnL(t.pnl, 2)}
+                          <p className={`text-[9px] font-mono font-bold ${t.pnl >= 0 ? 'text-gain' : 'text-loss'}`}
+                             title="Net P&L — after entry + exit fees">
+                            {formatPnL(t.pnl, 2)} <span className="font-normal opacity-70">net</span>
+                          </p>
+                        )}
+                        {t.pnl !== null && t.fee != null && t.fee > 0 && (
+                          <p className="text-[8px] font-mono text-muted-foreground"
+                             title="Total fee paid on this trade (entry + exit)">
+                            fee {formatPnL(-t.fee, 2)}
                           </p>
                         )}
                       </div>
