@@ -1583,18 +1583,16 @@ def _persist_and_signal(sym: str, closed: list, buf_snapshot: list):
     close their candle in the same second, and inline processing froze
     @trade ticks (and the realtime sell path) for the whole burst."""
     try:
-        # ── Persist to DB (best-effort, not required)
-        existing = database.get_candles(sym, config.CANDLE_TIMEFRAME, limit=50)
-        db_raw = [
-            [row["open_time"], row["open"], row["high"],
-             row["low"], row["close"], row["volume"]]
-            for row in existing
-        ]
-        all_raw = db_raw + [closed]
+        # Use the in-memory WS buffer as the candle source — it already contains
+        # `closed` and up to 120 candles (more than the old DB read of 50). The
+        # previous get_candles(limit=50) fired for ALL ~89 coins at every minute
+        # boundary, bursting the single DB lock (89 reads + 89 writes/min) — a
+        # needless read since the data is already in RAM. Now: zero per-minute DB
+        # READ; only the latest candle is persisted (cold-start fallback store).
+        all_raw = list(buf_snapshot) if (buf_snapshot and len(buf_snapshot) >= 2) else [closed]
         _compute_and_save(sym, all_raw)
 
-        # ── Signal update: prefer DB+new, fall back to WS buffer
-        signal_src = all_raw if len(all_raw) >= _MIN_CANDLES else buf_snapshot
+        signal_src = all_raw
         if _kline_callback and len(signal_src) >= _MIN_CANDLES:
             closes  = [float(r[4]) for r in signal_src]
             volumes = [float(r[5]) for r in signal_src]
