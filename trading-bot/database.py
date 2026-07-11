@@ -4,6 +4,7 @@ import hashlib
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 import json
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
@@ -71,7 +72,61 @@ def _migrate_legacy_db():
             print(f"[Database] WARNING: could not migrate legacy DB {legacy} → {DB_PATH}: {e}")
 
 _migrate_legacy_db()
-_lock = threading.Lock()
+
+
+class _RWLock:
+    """Read-write lock. `with _lock:` is an EXCLUSIVE (write) acquire — identical to
+    the old threading.Lock, so every existing call site stays correct. `with
+    _lock.read():` is a SHARED (read) acquire — many readers run concurrently and
+    only block against writers. This removes the app-wide serialization where every
+    module's DB reads queued behind each other + the paper-shadow's writes on one
+    global lock (WAL already allows concurrent readers at the SQLite level).
+    Reader-preferring; fine here — reads are bursty polls, writes are brief/batched."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._writers_waiting = 0   # WRITER-PREFERRING: writes (saving trades /
+                                    # config / logs) must never starve behind a
+                                    # steady stream of poll reads.
+
+    # ── exclusive (write) — the default `with _lock:` ────────────────────────
+    def __enter__(self):
+        with self._cond:
+            self._writers_waiting += 1
+            try:
+                while self._writer or self._readers > 0:
+                    self._cond.wait()
+            finally:
+                self._writers_waiting -= 1
+            self._writer = True
+        return self
+
+    def __exit__(self, *exc):
+        with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+        return False
+
+    # ── shared (read) ────────────────────────────────────────────────────────
+    @contextmanager
+    def read(self):
+        with self._cond:
+            # Defer to any pending/active writer so writes can't starve.
+            while self._writer or self._writers_waiting > 0:
+                self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._cond.notify_all()
+
+
+_lock = _RWLock()
 
 import time as _time
 _persistence_check: dict = {"ts": 0.0, "ok": None}
@@ -485,7 +540,7 @@ def save_candle(coin: str, timeframe: str, ohlcv: dict):
 
 
 def get_candles(coin: str, timeframe: str, limit: int = 50) -> List[dict]:
-    with _lock:
+    with _lock.read():
         conn = _conn()
         rows = conn.execute("""
             SELECT * FROM candles
@@ -506,7 +561,7 @@ def get_latest_candle_bulk(coins: list, timeframe: str) -> dict:
     try:
         syms = list(dict.fromkeys(coins))
         ph = ",".join(["?"] * len(syms))
-        with _lock:
+        with _lock.read():
             conn = _conn()
             try:
                 rows = conn.execute(f"""
@@ -535,7 +590,7 @@ def get_slippage_avg_bulk(coins: list, mode: str, since_iso: str) -> dict:
     try:
         syms = list(dict.fromkeys(coins))
         ph = ",".join(["?"] * len(syms))
-        with _lock:
+        with _lock.read():
             conn = _conn()
             try:
                 rows = conn.execute(f"""
@@ -557,7 +612,7 @@ def get_slippage_avg_bulk(coins: list, mode: str, since_iso: str) -> dict:
 
 
 def candles_table_empty() -> bool:
-    with _lock:
+    with _lock.read():
         conn = _conn()
         row = conn.execute("SELECT COUNT(*) AS cnt FROM candles").fetchone()
         conn.close()
@@ -644,7 +699,7 @@ def get_klines(symbol: str, interval: str,
         where.append("open_time <= ?")
         params.append(int(end_ms))
     sql = f"SELECT open_time, o, h, l, c, v, quote_v FROM klines WHERE {' AND '.join(where)}"
-    with _lock:
+    with _lock.read():
         conn = _conn()
         if limit is not None:
             rows = conn.execute(sql + " ORDER BY open_time DESC LIMIT ?",
@@ -1922,7 +1977,7 @@ def get_training_samples(limit: int = 20000, modes=None) -> List[dict]:
         params.extend(list(modes))
     params.append(int(limit))
     try:
-        with _lock:
+        with _lock.read():
             conn = _conn()
             try:
                 conn.execute(_TRAINING_SAMPLES_DDL)
@@ -1960,7 +2015,7 @@ def count_training_samples(modes=None) -> dict:
         where.append(f"mode IN ({placeholders})")
         params.extend(list(modes))
     try:
-        with _lock:
+        with _lock.read():
             conn = _conn()
             try:
                 conn.execute(_TRAINING_SAMPLES_DDL)
@@ -2285,7 +2340,7 @@ def get_paper_summary(hours: float = None, limit: int = 50000) -> dict:
             where.append("ts >= ?")
             params.append(generated_ts - float(hours) * 3600.0)
         params.append(int(limit))
-        with _lock:
+        with _lock.read():
             conn = _conn()
             try:
                 conn.execute(_PAPER_TRADES_DDL)
@@ -2435,7 +2490,7 @@ def count_paper_trades() -> dict:
     None. A win is realized_r > 0, or pnl > 0 when realized_r is NULL.
     CREATE-safe, guarded → zeros on error."""
     try:
-        with _lock:
+        with _lock.read():
             conn = _conn()
             try:
                 conn.execute(_PAPER_TRADES_DDL)
