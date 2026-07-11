@@ -566,7 +566,7 @@ async def lifespan(app: FastAPI):
             #   Guarded by a stored rev marker so it runs exactly once.
             try:
                 import strategy_config as _scfg_s3
-                _S3_REV = 10
+                _S3_REV = 11
                 _raw_s3 = _load_strategy()
                 if int(_raw_s3.get("s3_tuning_rev", 0) or 0) < _S3_REV:
                     _ent = _raw_s3.get("entries") if isinstance(_raw_s3.get("entries"), dict) else {}
@@ -602,6 +602,14 @@ async def lifespan(app: FastAPI):
                     # cut its per-cycle management + DB writes that contended with the
                     # live buy-check for database._lock.
                     _s3_force(_dat, "data", "paper_shadow_max_open", 30, _s3_patch)
+                    # Overload fix: DISABLE paper-shadow. It re-scores the whole
+                    # ~89-coin universe every few seconds AND writes paper trades to
+                    # the DB, on top of the live scan — the biggest background hog on
+                    # this box, and the operator does not use the Shadow-Lab. Off = a
+                    # large chunk of CPU + DB-lock + GIL freed for LIVE trading and
+                    # the API, so the buy executor stops getting starved and the
+                    # panels stop timing out. Re-enable via data.paper_shadow_enabled.
+                    _s3_force(_dat, "data", "paper_shadow_enabled", False, _s3_patch)
                     # S3-7 — R-multiple tuning (operator-approved): arm ratchet later + trail wider
                     _s3_bump(_ext, "exits", "ratchet_activate_r", 0.4, 0.8, _s3_patch, is_float=True)
                     _s3_bump(_ext, "exits", "ratchet_k_atr", 0.6, 1.0, _s3_patch, is_float=True)
