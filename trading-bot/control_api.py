@@ -2866,6 +2866,22 @@ def api_set_coins(req: CoinsRequest):
         })
     _write_strategy_patch({"approved_coins": new_approved, "user_selected_coins": True})
 
+    # Purge per-symbol engine state for coins the user just DE-selected. Without
+    # this, a removed coin lingers in trade_engine._signal_cache (the refresh
+    # loop only writes approved coins, never deletes) and its last WolfScore is
+    # served to the UI feed forever — appearing frozen and for a coin no longer
+    # tracked. purge_symbol_state skips coins with an open position defensively.
+    try:
+        import trade_engine as _te_purge
+        _removed = [s for s in existing.keys() if s not in set(valid)]
+        for _sym in _removed:
+            try:
+                _te_purge.purge_symbol_state(_sym)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # Re-subscribe the WebSocket to the new coin list immediately — without
     # this, newly added coins stream no data until the 60s self-heal poll.
     try:

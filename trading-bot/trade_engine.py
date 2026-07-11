@@ -2121,6 +2121,16 @@ def _compute_live_ev_scores() -> dict:
             snap = dict(_signal_cache)
     except Exception:
         return {}
+    # Score ONLY the active (approved) universe. A coin de-selected from the
+    # watchlist can linger in _signal_cache — the refresh loop only ever writes
+    # approved coins, it never deletes stale keys. Without this filter that
+    # coin's last-computed WolfScore is served to the UI feed forever: it looks
+    # frozen (never refreshed) AND shows for a coin the user no longer tracks.
+    # purge_symbol_state() on de-select clears it at the source; this is the
+    # backstop so a missed purge can never leak a stale score into the feed.
+    _universe = _active_universe
+    if _universe:
+        snap = {s: v for s, v in snap.items() if s in _universe}
     try:
         tilt = ev_model.regime_tilt(_btc_roc_1h_frac())
     except Exception:
