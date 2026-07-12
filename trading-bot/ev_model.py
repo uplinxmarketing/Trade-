@@ -849,7 +849,7 @@ def wolfscore_mr(sub: Dict[str, float], tilt: float = 0.0) -> Dict[str, Any]:
     if O < dip_min:  return _mr_zero("no_dip")
     if K < -0.5:     return _mr_zero("falling_knife")
     if Mk < -0.6:    return _mr_zero("market_crashing")
-    if Fr > 0.5:     return _mr_zero("high_friction")
+    if Fr > 0.5:     return _mr_zero("too_expensive")
     if Q < -0.5:     return _mr_zero("dying_coin")
 
     thesis = wE * E + wK * K + wMk * Mk + wQ * Q + wRS * RS - wFr * Fr
