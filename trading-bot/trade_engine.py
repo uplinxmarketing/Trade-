@@ -2080,17 +2080,92 @@ def _wolf_inputs(sym: str, cached: dict) -> dict:
     return inp
 
 
+# ── WolfScore-MR feeds (Phase 2 + 4) ────────────────────────────────────────────
+_sma200_cache: Dict[str, tuple] = {}   # sym -> (sma200 or None, ts)
+_SMA200_TTL_SEC = 600.0                # 10 min — the 200-bar mean moves slowly
+
+
+def _sma200_5m(sym: str) -> Optional[float]:
+    """200-bar 5m SMA for MR's Q sub-metric, from the durable kline store. Cached
+    10 min so it is one bounded DB read per coin per ~10 min (NOT per score). None
+    when <100 bars stored (Q degrades → the dying-coin gate can't fire)."""
+    now = time.time()
+    ce = _sma200_cache.get(sym)
+    if ce and (now - ce[1]) < _SMA200_TTL_SEC:
+        return ce[0]
+    val = None
+    try:
+        rows = database.get_klines(sym, "5m", limit=200) or []
+        closes = [float(r["c"]) for r in rows if isinstance(r, dict) and r.get("c") is not None]
+        if len(closes) >= 100:
+            val = sum(closes[-200:]) / float(min(200, len(closes)))
+    except Exception:
+        val = None
+    _sma200_cache[sym] = (val, now)
+    return val
+
+
+def _wolf_inputs_mr(sym: str, cached: dict) -> dict:
+    """Assemble WolfScore-MR inputs from the cached 5m klines (with taker volume
+    from Phase 1) + spread/atr + btc 1h roc + sma200. Every feed is optional and
+    degrades safely inside compute_submetrics_mr."""
+    cached = cached or {}
+    inp: dict = {}
+    k5 = cached.get("klines_5m") or []
+    inp["closes_5m"] = [float(c["close"]) for c in k5
+                        if isinstance(c, dict) and c.get("close") is not None]
+    inp["volumes_5m"] = [float(c.get("volume", 0.0) or 0.0) for c in k5 if isinstance(c, dict)]
+    inp["taker_5m"] = [float(c.get("taker_buy_volume", 0.0) or 0.0) for c in k5 if isinstance(c, dict)]
+    _price = cached.get("price") or (inp["closes_5m"][-1] if inp["closes_5m"] else None)
+    if _price:
+        inp["price"] = float(_price)
+    if k5 and isinstance(k5[-1], dict):
+        _l = k5[-1]
+        inp["ohlc_last"] = (float(_l.get("open", 0.0) or 0.0), float(_l.get("high", 0.0) or 0.0),
+                            float(_l.get("low", 0.0) or 0.0), float(_l.get("close", 0.0) or 0.0))
+    _atr = cached.get("atr_pct")
+    if _atr is not None:
+        try:
+            inp["atr_frac"] = float(_atr) / 100.0   # atr_pct is a percent → fraction
+        except (TypeError, ValueError):
+            pass
+    inp["fee_frac"] = _fee_rate_for(sym)
+    try:
+        _full_sp, _half_sp = _spread_pcts(sym)   # cache-only under bookticker_universe
+        if _full_sp is not None:
+            inp["spread_frac"] = float(_full_sp) / 100.0
+    except Exception:
+        pass
+    try:
+        _btc = _btc_roc_1h_frac()
+        if _btc is not None:
+            inp["btc_roc_1h"] = float(_btc)
+    except Exception:
+        pass
+    _s200 = _sma200_5m(sym)
+    if _s200:
+        inp["sma200"] = _s200
+    return inp
+
+
 def _wolf_score_cached(sym: str, cached: dict, cohort: dict, tilt: float) -> Optional[dict]:
-    """Guarded WolfScore v3 for a signal-cache entry:
-    compute_submetrics → wolfscore. Returns the full decomposition dict
-    (pct, submetrics, families, regime, regime_tilt, hard_gate, top_reasons,
-    trained, version) or None on any failure / when ev_model is unavailable.
-    S3-2 — the up-regime anti-chasing veto/threshold are read from entries config
-    and applied inside wolfscore (extended-uptrend coins hard-gate)."""
+    """Buy-selection score for a signal-cache entry. Selects the formula from
+    entries.buy_formula: 'mr' → WolfScore-MR (compute_submetrics_mr → wolfscore_mr);
+    anything else → WolfScore v3 (default, unchanged). Returns the full decomposition
+    dict or None on failure / when ev_model is unavailable."""
     if ev_model is None:
         return None
     try:
         _ec = _entries_cfg()
+    except Exception:
+        _ec = {}
+    if str(_ec.get("buy_formula", "v3")).lower() == "mr":
+        try:
+            _sub = ev_model.compute_submetrics_mr(_wolf_inputs_mr(sym, cached), cohort or {})
+            return ev_model.wolfscore_mr(_sub, float(tilt or 0.0))
+        except Exception:
+            return None
+    try:
         _veto = bool(_ec.get("up_extension_veto", True))
         _wthr = float(_ec.get("up_extension_w_thr", 0.0) or 0.0)
     except Exception:
@@ -2107,6 +2182,7 @@ def _wolf_cohort_from(items) -> dict:
     """Cohort context for R (decoupling): median 15m ROC across the given
     (sym, cached) candidates. Empty → {} (R degrades to neutral)."""
     rocs = []
+    rocs3 = []   # MR: 3-bar (3×5m = 15m) roc per coin, for RS relative-strength
     for _it in items:
         try:
             _c = _it[1]
@@ -2115,12 +2191,21 @@ def _wolf_cohort_from(items) -> dict:
         r = _wolf_roc_15m(_c)
         if r is not None:
             rocs.append(r)
-    if not rocs:
-        return {}
-    s = sorted(rocs)
-    m = len(s)
-    med = s[m // 2] if m % 2 else (s[m // 2 - 1] + s[m // 2]) / 2.0
-    return {"median_roc_15m": med}
+        try:
+            _cl = [float(x["close"]) for x in ((_c or {}).get("klines_5m") or [])
+                   if isinstance(x, dict) and x.get("close") is not None]
+            if len(_cl) >= 4 and _cl[-4]:
+                rocs3.append(_cl[-1] / _cl[-4] - 1.0)
+        except Exception:
+            pass
+    out: dict = {}
+    if rocs:
+        s = sorted(rocs); m = len(s)
+        out["median_roc_15m"] = s[m // 2] if m % 2 else (s[m // 2 - 1] + s[m // 2]) / 2.0
+    if rocs3:
+        s = sorted(rocs3); m = len(s)
+        out["median_roc_3bar"] = s[m // 2] if m % 2 else (s[m // 2 - 1] + s[m // 2]) / 2.0
+    return out
 
 
 def _wolf_adaptive_floor(pcts, abs_floor: float, mode: str, k: float) -> Optional[dict]:
