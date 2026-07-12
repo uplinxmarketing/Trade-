@@ -2168,7 +2168,17 @@ def _wolf_score_cached(sym: str, cached: dict, cohort: dict, tilt: float) -> Opt
         _ec = _entries_cfg()
     except Exception:
         _ec = {}
-    if str(_ec.get("buy_formula", "v3")).lower() == "mr":
+    # buy_formula is a STRING — read it DIRECTLY from strategy.entries, NOT via
+    # _entries_cfg(), which is a numeric whitelist keyed on _ENTRIES_DEFAULTS: it
+    # only returns keys present there and coerces every non-bool/int value with
+    # float(), so a string field is silently dropped (same documented trap as
+    # ev_floor_mode at _ENTRIES_DEFAULTS). Through _entries_cfg this returned "v3"
+    # forever even with buy_formula=mr on disk, keeping the live engine on v3.
+    try:
+        _formula = str((_load_strategy().get("entries") or {}).get("buy_formula", "v3")).lower()
+    except Exception:
+        _formula = "v3"
+    if _formula == "mr":
         try:
             _sub = ev_model.compute_submetrics_mr(_wolf_inputs_mr(sym, cached), cohort or {})
             return ev_model.wolfscore_mr(_sub, float(tilt or 0.0))
