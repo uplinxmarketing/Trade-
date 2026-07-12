@@ -837,6 +837,38 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("bookticker_universe_enable", exc)
 
+            # ── Entries: market (taker) buys — "score>=65 → buy INSTANTLY" ───────
+            # maker_first defaulted True, so a live entry posted a passive
+            # LIMIT_MAKER bid and chased it. On a coin that scored >=65 *because it
+            # is moving up*, the bid rarely fills (the maker sits below the market),
+            # so after entries.maker_abandon_max chases it ABANDONED and armed a
+            # 5-min candidacy cooldown (_note_maker_abandon) — the buy was placed
+            # but never FILLED, so no position opened (the "score>=65 not bought"
+            # the operator saw, e.g. ARPA stuck in candidacy_cooldown). The operator
+            # wants instant execution, so switch entries to a direct market/taker
+            # buy: _use_maker_first is False -> _market_buy fills immediately.
+            # One-time + guarded; touches ONLY entries.maker_first — NOT the buy
+            # gate, WolfScore math, or the exit engine. (Cost: the taker fee, a few
+            # cents on a $5-11 ticket, vs. missing the entry entirely.)
+            try:
+                _mfR = 1
+                _raw_mf = _load_strategy()
+                if int(_raw_mf.get("maker_first_off_rev", 0) or 0) < _mfR:
+                    _ent_mf = _raw_mf.get("entries")
+                    _ent_mf = dict(_ent_mf) if isinstance(_ent_mf, dict) else {}
+                    _patch_mf: dict = {"maker_first_off_rev": _mfR}
+                    if _ent_mf.get("maker_first") is not False:
+                        _ent_mf["maker_first"] = False
+                        _patch_mf["entries"] = _ent_mf
+                    _write_strategy_patch(_patch_mf)
+                    database.log_activity(
+                        "Entries: maker_first disabled — live buys now fill as an "
+                        "instant market (taker) order instead of a passive maker bid "
+                        "that chased and abandoned (fixes 'score>=65 not bought')", "info")
+                    steps.append("maker_first disabled (instant market entries)")
+            except Exception as exc:
+                _step_failed("maker_first_off", exc)
+
             # 4c-e. Hard-stop paper-shadow if it is disabled. It is start()ed early
             #   in boot (above), BEFORE the s3 migration flips
             #   data.paper_shadow_enabled=false, so the thread is alive and merely
