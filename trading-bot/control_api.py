@@ -869,6 +869,41 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("maker_first_off", exc)
 
+            # ── WolfScore-MR GO-LIVE (operator-approved) ─────────────────────────
+            # Flip the LIVE buy formula from v3 (momentum — buys tops, losing) to MR
+            # (mean-reversion — buys dips). One-time + guarded. Sets ONLY the
+            # documented values: entries.buy_formula=mr, buy_score_threshold=55 (NOT
+            # 65 — the backtest shows 65 halves profit + worsens avg loss), and the
+            # two exit PARAMS (ratchet price-arm 0.015 + hard_sl 20). The MR
+            # sub-metrics/gates/regime/weights live in ev_model (Phase 3); the exit
+            # LOGIC is untouched. max_positions=8 (do NOT raise). Shadow keeps running
+            # (mr_shadow_enabled stays True) as a comparison, not a gate. v3 remains
+            # in the code one flag away for instant rollback (buy_formula=v3).
+            try:
+                _mrglR = 1
+                _raw_gl = _load_strategy()
+                if int(_raw_gl.get("mr_golive_rev", 0) or 0) < _mrglR:
+                    _ent_gl = dict(_raw_gl.get("entries") or {})
+                    _ext_gl = dict(_raw_gl.get("exits") or {})
+                    _siz_gl = dict(_raw_gl.get("sizing") or {})
+                    _ent_gl["buy_formula"] = "mr"
+                    _ent_gl["buy_score_threshold"] = 55.0
+                    _ent_gl["min_win_probability_floor"] = 55.0   # alias kept in sync
+                    _ent_gl["mr_shadow_enabled"] = True
+                    _ext_gl["ratchet_activate_price_pct"] = 0.015
+                    _ext_gl["hard_sl_pct"] = 20.0
+                    _siz_gl["max_positions"] = 8
+                    _write_strategy_patch({"mr_golive_rev": _mrglR,
+                                           "entries": _ent_gl, "exits": _ext_gl,
+                                           "sizing": _siz_gl, "max_positions": 8})
+                    database.log_activity(
+                        "WolfScore-MR GO-LIVE: buy_formula=mr, buy_score_threshold=55, "
+                        "max_positions=8, ratchet arm +1.5% (0.015), hard_sl 20% — v3 "
+                        "retired from the live buy path; exit LOGIC unchanged", "warn")
+                    steps.append("MR go-live (buy_formula=mr, threshold=55)")
+            except Exception as exc:
+                _step_failed("mr_golive", exc)
+
             # 4c-e. Hard-stop paper-shadow if it is disabled. It is start()ed early
             #   in boot (above), BEFORE the s3 migration flips
             #   data.paper_shadow_enabled=false, so the thread is alive and merely
@@ -8095,6 +8130,19 @@ def api_fee_audit(limit: int = 50):
                  "and paper trades (flagged fee_estimated)."),
         "trades": per_trade,
     }
+
+
+@app.get("/api/diagnostics/mr-shadow")
+def api_mr_shadow():
+    """WolfScore-MR shadow-validation report (Phase 5-A). Virtual MR trades scored
+    live and simulated through the real exit params — n, win%, avg win/loss %,
+    profit factor, disaster-stop count, $/day, and realized entry cost per trade.
+    Gate go-live on meets_bar (>=200 trades, win%>88, PF>1.5). Read-only."""
+    try:
+        import mr_shadow as _mrs
+        return _mrs.get_mr_shadow_report()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "available": False}
 
 
 @app.get("/api/universe/available")

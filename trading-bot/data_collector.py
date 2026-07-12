@@ -637,6 +637,7 @@ def fetch_5m_candles(symbol: str, limit: int = 30) -> list:
                 "low":       float(k[3]),
                 "close":     float(k[4]),
                 "volume":    float(k[5]),
+                "taker_buy_volume": (float(k[9]) if len(k) > 9 else 0.0),
             }
             for k in buf[-limit:]
         ]
@@ -651,6 +652,7 @@ def fetch_5m_candles(symbol: str, limit: int = 30) -> list:
                 "low":       float(k[3]),
                 "close":     float(k[4]),
                 "volume":    float(k[5]),
+                "taker_buy_volume": (float(k[9]) if len(k) > 9 else 0.0),
             }
             for k in raw
         ]
@@ -678,6 +680,7 @@ def fetch_15m_candles(symbol: str, limit: int = 60) -> list:
                 "low":       float(k[3]),
                 "close":     float(k[4]),
                 "volume":    float(k[5]),
+                "taker_buy_volume": (float(k[9]) if len(k) > 9 else 0.0),
             }
             for k in buf[-limit:]
         ]
@@ -692,6 +695,7 @@ def fetch_15m_candles(symbol: str, limit: int = 60) -> list:
                 "low":       float(k[3]),
                 "close":     float(k[4]),
                 "volume":    float(k[5]),
+                "taker_buy_volume": (float(k[9]) if len(k) > 9 else 0.0),
             }
             for k in raw
         ]
@@ -734,6 +738,7 @@ def _compute_and_save(symbol: str, raw_klines: list, save_all: bool = False):
             "low":       float(k[3]),
             "close":     float(k[4]),
             "volume":    float(k[5]),
+            "taker_buy_volume": (float(k[9]) if len(k) > 9 else 0.0),
         })
 
     closes  = [c["close"]  for c in parsed]
@@ -834,6 +839,13 @@ def _bootstrap_5m_from_db():
                     min(float(g["low"]) for g in group),
                     float(group[-1]["close"]),
                     sum(float(g["volume"]) for g in group),
+                    start + 299_999,   # [6] closeTime (approx) — keep Binance shape
+                    0.0,               # [7] quoteVolume (unused)
+                    0,                 # [8] numTrades (unused)
+                    # [9] takerBuyBaseVolume — summed from 1m rows when the durable
+                    # store carries it; 0.0 otherwise (CVD degrades for this coin
+                    # only on the synth-from-1m fallback path, not the REST 5m path).
+                    sum(float(g.get("taker_buy_volume", 0.0) or 0.0) for g in group),
                 ])
             if not synth:
                 continue
@@ -1649,6 +1661,10 @@ def _handle_ws_message(raw: str):
             closed = [
                 int(k["t"]),   float(k["o"]), float(k["h"]),
                 float(k["l"]), float(k["c"]), float(k["v"]),
+                int(k.get("T", 0) or 0),        # [6] closeTime  (keep Binance shape)
+                float(k.get("q", 0.0) or 0.0),  # [7] quoteVolume
+                int(k.get("n", 0) or 0),        # [8] numTrades
+                float(k.get("V", 0.0) or 0.0),  # [9] takerBuyBaseVolume → cvd_bar
             ]
             appended, gap, snapshot = _append_closed_candle(sym, interval, closed)
             if appended:
