@@ -619,7 +619,8 @@ def _note_maker_abandon(sym: str) -> None:
     n = _maker_abandon_counts.get(sym, 0) + 1
     _maker_abandon_counts[sym] = n
     if n >= limit:
-        _candidacy_cooldown[sym] = time.time() + _MAKER_ABANDON_COOLDOWN_SEC
+        _arm_candidacy_cooldown(sym, time.time() + _MAKER_ABANDON_COOLDOWN_SEC,
+                                "maker_abandon")
         _maker_abandon_counts[sym] = 0
         _log_skip_dedup(
             sym, "maker_abandon_cooldown",
@@ -1645,7 +1646,16 @@ def _log_shadow_dedup(symbol: str, reason: str, message: str) -> None:
 # a per-symbol candidacy cooldown so a just-failed coin is not re-evaluated for
 # 60s. [SKIP] activity lines are deduped per (symbol, reason) over 15 min.
 _candidacy_cooldown: Dict[str, float] = {}          # sym -> ts until re-eligible
+_candidacy_cooldown_reason: Dict[str, str] = {}     # sym -> WHY it was cooled down
 _CANDIDACY_COOLDOWN_SEC = 60.0
+
+
+def _arm_candidacy_cooldown(symbol: str, until_ts: float, reason: str) -> None:
+    """Arm the per-symbol candidacy cooldown AND record why, so the selection-time
+    skip reports the real cause (e.g. 'candidacy_cooldown: high_friction') instead
+    of masking every arming gate behind the bare 'candidacy_cooldown' reason."""
+    _candidacy_cooldown[symbol] = until_ts
+    _candidacy_cooldown_reason[symbol] = reason
 _skip_log_dedupe: Dict[Tuple[str, str], dict] = {}  # (sym, reason) -> {last_ts, suppressed}
 _SKIP_DEDUPE_WINDOW_SEC = 900.0                     # 15 minutes
 
@@ -1689,7 +1699,8 @@ def _note_candidacy_fail(symbol: str, fresh_score, reason: str = "") -> None:
     # O5.1 — a fresh re-check FAIL invalidates any held confirmation.
     _clear_buy_ready(symbol)
     # O5.2 — recheck-fail cooldown (config-driven, read at time of use).
-    _candidacy_cooldown[symbol] = time.time() + _cooldown_secs_for("recheck_fail")
+    _arm_candidacy_cooldown(symbol, time.time() + _cooldown_secs_for("recheck_fail"),
+                            reason or "recheck_fail")
 
 
 def _in_candidacy_cooldown(symbol: str) -> bool:
@@ -1699,6 +1710,7 @@ def _in_candidacy_cooldown(symbol: str) -> bool:
         return False
     if time.time() >= until:
         _candidacy_cooldown.pop(symbol, None)
+        _candidacy_cooldown_reason.pop(symbol, None)
         return False
     return True
 
@@ -9440,7 +9452,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # F6: skip coins in the post-fail candidacy cooldown (prevents ~7s churn
         # of a coin the fresh engine re-check just rejected).
         if _in_candidacy_cooldown(sym):
-            _record_rejection(sym, cached["score"], "candidacy_cooldown")
+            # Surface the ORIGINAL arming cause + seconds left, so a WolfScore-
+            # eligible coin in cooldown never shows the bare mask (zero silent
+            # drops). e.g. "candidacy_cooldown: high_friction (243s left)".
+            _cc_reason = _candidacy_cooldown_reason.get(sym, "?")
+            _cc_left = max(0, int(_candidacy_cooldown.get(sym, 0.0) - time.time()))
+            _record_rejection(sym, cached["score"], "candidacy_cooldown",
+                              f"{_cc_reason} ({_cc_left}s left)")
+            _trace_mark_block(sym, f"candidacy_cooldown: {_cc_reason} ({_cc_left}s left)")
             continue
         if not signal_engine_active and cached["score"] < min_sigs:
             _record_rejection(sym, cached["score"], "below_min_signals", f"needed {min_sigs}, got {cached['score']}")
@@ -9811,7 +9830,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # the skip is not re-spammed every heartbeat.
         _tmin = _tradeable_min(sym)
         if budget < _tmin:
-            _candidacy_cooldown[sym] = time.time() + _MAKER_ABANDON_COOLDOWN_SEC
+            _arm_candidacy_cooldown(sym, time.time() + _MAKER_ABANDON_COOLDOWN_SEC,
+                                    f"budget_below_min (${budget:.2f}<${_tmin:.2f})")
             if _budget_info["mult"] < 1.0:
                 _chain = (f"${_budget_info['base']:.2f} × {_budget_info['mult']:g} "
                           f"({_budget_info['mult_label']}) = ${budget:.2f}")
@@ -9915,7 +9935,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 # O5.2 — thin-liquidity cooldown (config-driven, read at time of
                 # use; replaces the flat 30-min _LIQUIDITY_COOLDOWN_SEC bench).
                 _thin_cd = _cooldown_secs_for("thin")
-                _candidacy_cooldown[sym] = time.time() + _thin_cd
+                _arm_candidacy_cooldown(sym, time.time() + _thin_cd, "thin_liquidity")
                 _record_rejection(
                     sym, score, "thin_liquidity",
                     f"24h quote vol ${_qv/1e6:.1f}M < ${_qv_floor/1e6:.0f}M floor")
@@ -9945,8 +9965,9 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 if _friction > _stop_budget:
                     # O5.2 — wide-spread / high-friction cooldown (config-driven,
                     # read at time of use; friction is spread-dominated).
-                    _candidacy_cooldown[sym] = (
-                        time.time() + _cooldown_secs_for("high_friction"))
+                    _arm_candidacy_cooldown(
+                        sym, time.time() + _cooldown_secs_for("high_friction"),
+                        "high_friction")
                     _record_rejection(
                         sym, score, "high_friction",
                         f"friction {_friction:.3f}% > {_fric_cap_pct:g}% of "
