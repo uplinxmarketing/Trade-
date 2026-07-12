@@ -1506,6 +1506,10 @@ def _ratchet_cfg() -> dict:
         "enabled":       _b("ratchet_enabled", True),
         "activate_r":    _f("ratchet_activate_r", 0.4),
         "activate_usdt": _f("ratchet_activate_usdt", 0.02),
+        # WolfScore-MR: arm the ratchet at a PEAK PRICE GAIN of this fraction (0.015
+        # = 1.5%), independent of R and ticket size. 0.0 = off (v3 behavior). The
+        # trailing/giveback math AFTER arming is unchanged.
+        "activate_price_pct": _f("ratchet_activate_price_pct", 0.0),
         "k_atr":         _f("ratchet_k_atr", 0.6),
         "giveback_pct":  _f("ratchet_giveback_pct", 50.0),
     }
@@ -1576,6 +1580,11 @@ def _evaluate_ratchet(pos: dict, sym: str, price: float, entry: float,
         if r_usdt and r_usdt > 0 and profit >= rc["activate_r"] * r_usdt:
             armed = True          # preferred R form (scales per coin)
         elif profit >= rc["activate_usdt"]:
+            armed = True
+        # MR (6-A): also arm at a peak PRICE gain of activate_price_pct — ticket-size
+        # independent, so it doesn't silently shift when the $/trade changes.
+        _act_pct = rc.get("activate_price_pct", 0.0)
+        if (not armed) and _act_pct and entry > 0 and price >= entry * (1.0 + float(_act_pct)):
             armed = True
         if not armed:
             return False
@@ -2367,8 +2376,54 @@ def _refresh_and_publish_scores() -> None:
         k = float(cfg.get("ev_floor_meanstd_k", 0.5) or 0.5)
         af = _wolf_adaptive_floor(pcts, abs_floor, mode, k)
         _publish_scan_scores(scores, tilt, af)
+        # WolfScore-MR shadow validation (5-A): score MR for these candidates and
+        # step the virtual book WITHOUT touching live buys. Independent of the live
+        # buy_formula so it validates MR even while v3 is live. Off via
+        # entries.mr_shadow_enabled=false.
+        try:
+            if bool(cfg.get("mr_shadow_enabled", True)):
+                _mr_shadow_tick(cand, cohort, tilt)
+        except Exception:
+            pass
     except Exception:
         pass
+
+
+def _mr_shadow_tick(cand, cohort, tilt) -> None:
+    """Compute WolfScore-MR for the candidate set and advance the mr_shadow virtual
+    book. Never affects live selection. Guarded."""
+    if ev_model is None:
+        return
+    try:
+        import mr_shadow as _mrs
+    except Exception:
+        return
+    scored: dict = {}; prices: dict = {}; atr_px: dict = {}; fee_f: dict = {}; spread_f: dict = {}
+    for s, c in cand:
+        try:
+            _sub = ev_model.compute_submetrics_mr(_wolf_inputs_mr(s, c), cohort or {})
+            _res = ev_model.wolfscore_mr(_sub, float(tilt or 0.0))
+            if _res:
+                scored[s] = _res
+        except Exception:
+            continue
+        _px = (c or {}).get("price")
+        if _px:
+            try:
+                prices[s] = float(_px)
+                _ap = (c or {}).get("atr_pct")
+                if _ap is not None:
+                    atr_px[s] = float(_ap) / 100.0 * float(_px)   # ATR% → price units
+            except (TypeError, ValueError):
+                pass
+        fee_f[s] = _fee_rate_for(s)
+        try:
+            _fs, _hs = _spread_pcts(s)
+            if _fs is not None:
+                spread_f[s] = float(_fs) / 100.0
+        except Exception:
+            pass
+    _mrs.mr_shadow_tick(scored, prices, atr_px, fee_f, spread_f)
 
 
 def _format_ev_scores(scores_map: dict, tilt: float, af) -> dict:

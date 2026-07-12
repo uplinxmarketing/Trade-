@@ -8097,6 +8097,19 @@ def api_fee_audit(limit: int = 50):
     }
 
 
+@app.get("/api/diagnostics/mr-shadow")
+def api_mr_shadow():
+    """WolfScore-MR shadow-validation report (Phase 5-A). Virtual MR trades scored
+    live and simulated through the real exit params — n, win%, avg win/loss %,
+    profit factor, disaster-stop count, $/day, and realized entry cost per trade.
+    Gate go-live on meets_bar (>=200 trades, win%>88, PF>1.5). Read-only."""
+    try:
+        import mr_shadow as _mrs
+        return _mrs.get_mr_shadow_report()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "available": False}
+
+
 @app.get("/api/universe/available")
 def api_universe_available():
     """Single source of truth for the coin PICKER + the watchlist-vs-Binance diff

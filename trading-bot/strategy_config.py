@@ -128,6 +128,8 @@ class EntriesConfig(BaseModel):
     # conservative on interim weights, by the operator's choice). UI-tunable. When
     # set, it is the WolfScore floor threshold (overrides min_win_probability_floor).
     buy_score_threshold:    float = Field(61.0, ge=0.0, le=100.0)
+    buy_formula:            str   = "v3"    # "v3" | "mr" — selects the buy score formula
+    mr_shadow_enabled:      bool  = True    # run WolfScore-MR shadow validation alongside live
     # S3-1 — default is now 'absolute': the buy floor is the static abs_floor (55,
     # the cliff the paper data revealed) regardless of the live distribution, so a
     # high scorer fires even in a strong field and sub-55 junk is cut in a weak one.
@@ -184,6 +186,7 @@ class ExitsConfig(BaseModel):
     # activation the fixed protective stop still holds (round-trip protection intact).
     ratchet_activate_r:        float = Field(0.8, ge=0.0, le=5.0)   # arm at ≥ this R of profit
     ratchet_activate_usdt:     float = Field(0.02, ge=0.0, le=100.0)  # OR ≥ this $ profit
+    ratchet_activate_price_pct: float = Field(0.0, ge=0.0, le=0.5)   # OR ≥ this peak PRICE gain (0.015=1.5%); 0=off
     ratchet_k_atr:             float = Field(1.0, ge=0.05, le=5.0)  # trail = peak − k×ATR (per-coin)
     ratchet_giveback_pct:      float = Field(50.0, ge=1.0, le=100.0)  # exit if profit gives back ≥ this % of peak
 
