@@ -9411,7 +9411,22 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # cached (last-candle) buy-ready verdict. This drives the two-state
         # cached-green vs engine-ready-fresh distinction and the DECISION-GAP
         # detector. cached_green mirrors the pre-check's ready test.
-        _cached_green = cached.get("score", 0) >= min_sigs
+        # Under sole-gate the REAL readiness gate is WolfScore >= floor, NOT the
+        # retired legacy 6-signal count. Keying _cached_green off the legacy score
+        # made a WolfScore-eligible coin (score>=65 but few legacy signals) invisible
+        # to the whole trace safety-net: it was dropped from _ready_syms_pass (so the
+        # end-of-pass backstop never stamped it), the stagger/backfill traces are
+        # gated behind `if _cached_green` (so it hit `continue` with NO reason), and
+        # the entry-report per_coin filter excluded it — the exact "score>=65, not
+        # bought, no blocker" silent drop. Derive readiness from WolfScore here.
+        if _wolfscore_sole_gate:
+            _ws_cg = _wolf_scores.get(sym) or {}
+            _ws_cg_pct = _ws_cg.get("pct")
+            _cached_green = (_ws_cg_pct is not None
+                             and float(_ws_cg_pct) >= _wolf_abs_floor
+                             and not _ws_cg.get("hard_gate"))
+        else:
+            _cached_green = cached.get("score", 0) >= min_sigs
         _trace_mark_evaluated(sym, _cached_green)
         # L1.2 — funnel stage 1: this symbol is buy-ready (cached-green) this
         # heartbeat. Counted alongside the Part J decision-trace hook.
@@ -9676,10 +9691,13 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             break
         if time.time() - _last_buy_ts < _eff_stagger:
             # Q1 — this slot fired too recently (entry stagger); the deferred
-            # ready candidate is waiting, not a silent gap.
+            # ready candidate is waiting, not a silent gap. Report seconds left so
+            # a ready coin ALWAYS carries a machine-readable reason (zero silent
+            # drops). _cached_green is now WolfScore-driven under sole-gate.
             if _cached_green:
+                _rem_stag = max(0.0, _eff_stagger - (time.time() - _last_buy_ts))
                 _trace_mark_block(
-                    sym, f"waiting: entry stagger ({_eff_stagger:.0f}s)")
+                    sym, f"waiting: buy stagger ({_rem_stag:.0f}s/{_eff_stagger:.0f}s remaining)")
             continue  # this slot too soon — try next coin in case it's been longer
 
         # ── Falling knife filter (§3.4a — volatility-scaled) ──────────────────
@@ -10078,12 +10096,19 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                             f"{_fresh_dec['reason']} (cache age={cache_age}s)", "warn")
                         _record_rejection(sym, _fresh_dec.get("score", score), "stale_signals",
                                           f"fresh_engine={_fresh_dec['reason']} age={cache_age}s")
+                        _trace_mark_block(sym, f"fresh re-check failed: {_fresh_dec['reason']}")
                         # F6: write fresh score back + candidacy cooldown so the
                         # pre-check stops re-selecting this coin every ~7s.
                         _note_candidacy_fail(sym, _fresh_dec.get("score"), _fresh_dec["reason"])
                         _release_buy_claim()
                         continue
-                else:
+                elif not _wolfscore_sole_gate:
+                    # LEGACY fresh re-check (only when sole-gate is OFF). Under
+                    # sole-gate WolfScore ≥ floor is THE gate and the scan already
+                    # scored this coin on ≤tier-fresh candles; re-blocking here on
+                    # the retired 6-signal count wrongly killed WolfScore-eligible
+                    # coins at execution time (the "score≥65, not bought" drop) and
+                    # contradicts the sole-gate model (see comment above).
                     _fresh_score = sum(_fresh_sigs.values())
                     if _fresh_score < min_sigs:
                         cache_age = round(time.time() - cached.get("ts", 0), 1)
@@ -10093,6 +10118,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                             f"(cache had {score}/6, age={cache_age}s)", "warn")
                         _record_rejection(sym, score, "stale_signals",
                                           f"fresh={_fresh_score} cache={score} age={cache_age}s")
+                        _trace_mark_block(sym, f"fresh re-check: score {_fresh_score} < {min_sigs}")
                         _note_candidacy_fail(sym, _fresh_score, "fresh_score_below_min")
                         _release_buy_claim()
                         continue
@@ -10102,9 +10128,13 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         f"[SKIP] {sym}: price moved {(_live_price - price)/price*100:.2f}% "
                         f"since cache (${price:.4f} → ${_live_price:.4f}) — skipping", "warn"
                     )
-                    # Q1 — price-drift skip is a state, not a silent gap.
+                    # Q1 — price-drift skip is a state, not a silent gap. Also
+                    # write the decision-trace reason so it surfaces in the
+                    # entry-report (blocked_at), not only /api/buy-rejections.
                     _record_rejection(sym, score, "price_moved",
                                       f"{(_live_price - price)/price*100:.2f}% since cache")
+                    _trace_mark_block(
+                        sym, f"price moved {(_live_price - price)/price*100:.2f}% since cache — re-eval next cycle")
                     _release_buy_claim()
                     continue
                 price = _live_price
@@ -10271,6 +10301,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             qty = max(0.0, _exec_qty - _base_commission)
 
         if qty <= 0:
+            # Post-fill zero quantity (fill returned nothing usable / all eaten by
+            # base-asset commission). Was a fully SILENT drop — record a reason.
+            _record_rejection(sym, score, "zero_fill_qty", "order returned qty<=0 after fees")
+            _trace_mark_block(sym, "blocked: zero fill quantity after fees")
             _release_buy_claim()
             continue
         # L1.2 — funnel stage: the entry is confirmed filled (qty > 0), for both
