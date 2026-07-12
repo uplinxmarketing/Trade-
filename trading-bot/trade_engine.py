@@ -9830,7 +9830,10 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # the skip is not re-spammed every heartbeat.
         _tmin = _tradeable_min(sym)
         if budget < _tmin:
-            _arm_candidacy_cooldown(sym, time.time() + _MAKER_ABANDON_COOLDOWN_SEC,
+            # Budget availability changes EVERY cycle (a slot frees, a position
+            # closes), so a shortfall is transient — a 20s re-check, NOT a 5-min
+            # lockout that stranded a 75+ coin long after funds were available.
+            _arm_candidacy_cooldown(sym, time.time() + 20.0,
                                     f"budget_below_min (${budget:.2f}<${_tmin:.2f})")
             if _budget_info["mult"] < 1.0:
                 _chain = (f"${_budget_info['base']:.2f} × {_budget_info['mult']:g} "
