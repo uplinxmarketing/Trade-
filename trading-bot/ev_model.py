@@ -714,6 +714,167 @@ def wolfscore(sub: Dict[str, float], tilt: float,
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# WolfScore-MR (mean-reversion) — dip-quality buy score. Scores "how likely is this
+# coin to bounce back above entry soon?" instead of v3's momentum (which structurally
+# buys tops). Backtested 90 coins × 10d on real 5m data + the real exit engine:
+# +$0.68/day, 92% win, PF 2.28, 0 disaster stops (v3: −$0.87/day, PF 0.42).
+# v3 above is left FULLY INTACT; the engine selects via entries.buy_formula. The
+# exit/sell engine is NOT touched by this.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+WOLFSCORE_MR_VERSION = "wolf-mr-v1"
+_MR_DIP_MIN_BASE = 0.7
+
+
+def _mr_clip(x, lo=-1.0, hi=1.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def compute_submetrics_mr(inp: Dict[str, Any], cohort: Optional[Dict[str, Any]] = None
+                          ) -> Dict[str, float]:
+    """MR 7 sub-metrics (O,E,K,Mk,Fr,Q,RS) from 5m klines (with taker volume) +
+    cohort median + btc 1h roc + sma200. Each value clipped to its range. O (dip)
+    and Q (quality) are REQUIRED — their gates are the thesis + the tail-risk
+    protection for a no-stop strategy; a missing feed leaves them 0 so the gate
+    fires safe. Never raises. Fr defaults to 1.0 (blocks) when ATR is unavailable."""
+    import math as _m
+    cohort = cohort or {}
+    out: Dict[str, float] = {"O": 0.0, "E": 0.0, "K": 0.0, "Mk": 0.0,
+                             "Fr": 1.0, "Q": 0.0, "RS": 0.0}
+    try:
+        closes = [float(c) for c in (inp.get("closes_5m") or []) if c is not None]
+        vols   = [float(v) for v in (inp.get("volumes_5m") or []) if v is not None]
+        takers = [float(t) for t in (inp.get("taker_5m") or []) if t is not None]
+        price  = float(inp.get("price") or (closes[-1] if closes else 0.0))
+
+        # O — dip depth (GATE): standardized distance below the 20-bar mean.
+        if len(closes) >= 20 and price > 0:
+            w = closes[-20:]
+            sma20 = sum(w) / 20.0
+            mean = sma20
+            sd20 = (sum((x - mean) ** 2 for x in w) / 20.0) ** 0.5
+            if sd20 > 0:
+                out["O"] = _mr_clip((sma20 - price) / (2.0 * sd20))
+
+        # E — exhaustion: 0.5·cvd_turn + 0.3·vol_fade + 0.6·lower_wick_frac.
+        cvd_turn = 0.0
+        if len(vols) >= 6 and len(takers) >= 6:
+            cvd = [2.0 * takers[i] - vols[i] for i in range(len(vols))]
+            if sum(cvd[-3:]) > sum(cvd[-6:-3]):
+                cvd_turn = 1.0
+            else:
+                cvd_turn = -1.0
+        vol_fade = 0.0
+        if len(vols) >= 20:
+            recent3 = sum(vols[-3:]) / 3.0
+            avg20 = sum(vols[-20:]) / 20.0
+            vol_fade = 1.0 if recent3 < avg20 else -0.5
+        lower_wick = 0.0
+        oh = inp.get("ohlc_last")   # (open, high, low, close) of the last candle
+        if oh and len(oh) >= 4:
+            o_, h_, l_, c_ = float(oh[0]), float(oh[1]), float(oh[2]), float(oh[3])
+            rng = h_ - l_
+            if rng > 0:
+                lower_wick = (min(c_, o_) - l_) / rng
+        out["E"] = _mr_clip(0.5 * cvd_turn + 0.3 * vol_fade + 0.6 * lower_wick)
+
+        # K — knife guard (GATE at <−0.5): is the 3-bar drop ACCELERATING?
+        roc3 = 0.0
+        if len(closes) >= 7 and closes[-4] and closes[-7]:
+            roc3 = closes[-1] / closes[-4] - 1.0
+            roc_p3 = closes[-4] / closes[-7] - 1.0
+            out["K"] = _mr_clip(-(roc3 - roc_p3) * 200.0)
+
+        # Mk — market health (GATE at <−0.6): btc 12×5m ≈ 1h roc.
+        btc = inp.get("btc_roc_1h")
+        if btc is not None:
+            out["Mk"] = _mr_clip(float(btc) * 150.0)
+
+        # Fr — friction (GATE at >0.5): (2·fee + spread) / atr, all FRACTIONS.
+        atr = inp.get("atr_frac")
+        if atr and float(atr) > 0:
+            fee = float(inp.get("fee_frac", 0.001))
+            spread = float(inp.get("spread_frac", 0.0) or 0.0)
+            out["Fr"] = min(1.0, (2.0 * fee + spread) / float(atr))
+
+        # Q — coin quality (GATE at <−0.5): price vs the 200-bar mean.
+        sma200 = inp.get("sma200")
+        if sma200 and float(sma200) > 0 and price > 0:
+            out["Q"] = _mr_clip((price / float(sma200) - 1.0) * 20.0)
+
+        # RS — relative strength: coin 3-bar roc vs the cohort median 3-bar roc.
+        med = cohort.get("median_roc_3bar")
+        if med is not None:
+            out["RS"] = _m.tanh(200.0 * (roc3 - float(med)))
+    except Exception:
+        pass
+    return out
+
+
+def wolfscore_mr(sub: Dict[str, float], tilt: float = 0.0) -> Dict[str, Any]:
+    """MR score: 5 hard gates → regime-tuned dip_min/weights → z = b0 + min(1,O)·
+    thesis → 100·sigmoid(z). O multiplies the thesis so no dip collapses the score
+    regardless of coin quality. Returns the same decomposition shape as v3."""
+    import math as _m
+    O  = float(sub.get("O", 0.0)); E = float(sub.get("E", 0.0))
+    K  = float(sub.get("K", 0.0)); Mk = float(sub.get("Mk", 0.0))
+    Fr = float(sub.get("Fr", 1.0)); Q = float(sub.get("Q", 0.0))
+    RS = float(sub.get("RS", 0.0))
+    t = float(tilt or 0.0)
+    regime = "up" if t > 0.15 else "down" if t < -0.15 else "side"
+
+    dip_min = _MR_DIP_MIN_BASE
+    wE, wK, wMk, wQ, wRS, wFr, b0 = 2.0, 1.5, 1.2, 0.8, 0.0, 3.0, -0.8
+    if regime == "down":            # deeper, safer dip; reward coins fighting trend
+        dip_min = _MR_DIP_MIN_BASE * 1.6
+        wK, wMk, wRS, b0 = 2.5, 2.0, 1.5, -1.4
+    elif regime == "up":            # shallower dips OK; exhaustion matters more
+        dip_min = _MR_DIP_MIN_BASE * 0.7
+        wE, b0 = 2.4, -0.5
+
+    def _mr_zero(gate: str) -> Dict[str, Any]:
+        return {"score": 0.0, "pct": 0.0, "hard_gate": gate, "z": None,
+                "regime": regime, "regime_tilt": round(t, 4),
+                "submetrics": {k: round(float(sub.get(k, 0.0)), 4)
+                               for k in ("O", "E", "K", "Mk", "Fr", "Q", "RS")},
+                "dip_min": round(dip_min, 3),
+                "version": WOLFSCORE_MR_VERSION, "trained": False}
+
+    # HARD GATES — no dip = no trade (O gates the whole thesis); knife / crash /
+    # cost / dying-coin each return 0 immediately.
+    if O < dip_min:  return _mr_zero("no_dip")
+    if K < -0.5:     return _mr_zero("falling_knife")
+    if Mk < -0.6:    return _mr_zero("market_crashing")
+    if Fr > 0.5:     return _mr_zero("high_friction")
+    if Q < -0.5:     return _mr_zero("dying_coin")
+
+    thesis = wE * E + wK * K + wMk * Mk + wQ * Q + wRS * RS - wFr * Fr
+    _og = min(1.0, O)
+    z = b0 + _og * thesis
+    p = 1.0 / (1.0 + _m.exp(-max(-30.0, min(30.0, z))))
+    contributions = {
+        "E":  round(_og * wE * E, 3),  "K":  round(_og * wK * K, 3),
+        "Mk": round(_og * wMk * Mk, 3), "Q":  round(_og * wQ * Q, 3),
+        "RS": round(_og * wRS * RS, 3), "Fr": round(-_og * wFr * Fr, 3),
+        "O":  round(O, 3),
+    }
+    top = sorted(contributions.items(), key=lambda kv: abs(kv[1]), reverse=True)[:6]
+    return {
+        "score": round(p * 100.0, 1), "pct": round(p * 100.0, 1),
+        "probability": round(p, 4), "z": round(z, 4), "hard_gate": None,
+        "regime": regime, "regime_tilt": round(t, 4), "dip_min": round(dip_min, 3),
+        "submetrics": {k: round(float(sub.get(k, 0.0)), 4)
+                       for k in ("O", "E", "K", "Mk", "Fr", "Q", "RS")},
+        "contributions": contributions,
+        "top_reasons": [{"feature": k, "points": v} for k, v in top],
+        "version": WOLFSCORE_MR_VERSION, "trained": False,
+    }
+
+
 def _wolf_derived_features(sub: Dict[str, float], tilt: float) -> List[float]:
     """The regime-gating score is LINEAR in the 9 weights once each weight's gate
     is folded into a derived feature. Order matches WOLF_WEIGHT_ORDER."""
