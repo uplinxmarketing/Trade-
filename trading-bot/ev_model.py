@@ -1217,7 +1217,7 @@ def compute_features_p5(a: Dict[str, Any]) -> Optional[Dict[str, float]]:
     try:
         med, btilt, bre_, bslope, codip = a["cx"]
         cl = a["c"]; hi = a["h"]; lo = a["l"]; vo = a["v"]; tb = a["tb"]; op = a["op"]
-        btc = a["btc"]
+        btc = a.get("btc") or cl   # only used as fallback when btc_last/3ago absent
         i = int(a["i"])
         fv = int(a.get("fv", 0) or 0)
         if i < fv + 320 or i < 320 or cl[i] == 0:
@@ -1277,7 +1277,15 @@ def compute_features_p5(a: Dict[str, Any]) -> Optional[Dict[str, float]]:
         f['bre'] = bre_ * 2 - 1
         f['bslope'] = _p5_clip(bslope * 4, -1, 1)
         _btc_sma576 = float(a.get("btc_sma576") or 0.0) or px
-        f['btcma'] = _p5_clip((btc[i] / _btc_sma576 - 1) * 10, -1, 1)
+        # BTC "current"/"3-bar-ago" close. In the sandbox all coins share one global
+        # bar index so btc[i] is valid; LIVE, per-coin arrays are NOT index-aligned
+        # with BTC's own array, so the caller passes btc_last/btc_3ago explicitly.
+        # Fall back to btc[i]/btc[i-3] (aligned-index path, e.g. the port test).
+        _btc_last = a.get("btc_last")
+        _btc_3ago = a.get("btc_3ago")
+        _btc_last = float(_btc_last) if _btc_last is not None else float(btc[i])
+        _btc_3ago = float(_btc_3ago) if _btc_3ago is not None else float(btc[i - 3])
+        f['btcma'] = _p5_clip((_btc_last / _btc_sma576 - 1) * 10, -1, 1)
         f['ret15'] = _p5_clip((px / cl[i - 3] - 1) * 100, -1, 1) if cl[i - 3] else 0.0
         f['ret1h'] = _p5_clip((px / cl[i - 12] - 1) * 60, -1, 1) if cl[i - 12] else 0.0
         l1 = min(lo[i - 12:i]) or 1e-9
@@ -1287,7 +1295,7 @@ def compute_features_p5(a: Dict[str, Any]) -> Optional[Dict[str, float]]:
         tr5 = _p5_mean(trs[-5:]); tr20 = _p5_mean(trs[-14:] + trs_o[-6:]) or 1e-9
         f['coil'] = _p5_clip(tr5 / tr20 - 1, -1, 1)
         f['codip'] = codip * 2 - 1
-        f['btc15'] = _p5_clip((btc[i] / btc[i - 3] - 1) * 150, -1, 1) if btc[i - 3] else 0.0
+        f['btc15'] = _p5_clip((_btc_last / _btc_3ago - 1) * 150, -1, 1) if _btc_3ago else 0.0
         hr = (int(a.get("tsms") or 0) // 3600000) % 24
         f['hsin'] = math.sin(2 * math.pi * hr / 24.0)
         f['hcos'] = math.cos(2 * math.pi * hr / 24.0)
