@@ -2168,8 +2168,13 @@ def _wolf_inputs_mr(sym: str, cached: dict) -> dict:
 # SQL scalar aggregates (database.kline_deep_aggs), NOT from a 14k-bar array — that
 # array cache (74 coins × 14600 × 7 lists) was ~250MB and blew RSS past the cap.
 _P5_MAX_BARS   = 900            # recent bars kept in RAM (FEAT needs <=864)
-_P5_ARR_TTL    = 600.0          # per-coin array/agg cache: one bounded DB read / 10 min
-_P5_CTX_TTL    = 120.0          # cohort/macro pass-context freshness
+# Recent-bar arrays refresh fast so scores follow each new 5m close (else the
+# whole universe's scores freeze for the cache window). The DEEP aggregates
+# (30d high / 50d SMA — expensive MAX/AVG scans) barely move, so they stay
+# cached far longer to keep the scan light (fixes the scan degradation).
+_P5_ARR_TTL    = 90.0           # per-coin recent-array cache (fresh scores)
+_P5_AGG_TTL    = 600.0          # per-coin deep-aggregate cache (hi30 / sma50d)
+_P5_CTX_TTL    = 60.0           # cohort/macro pass-context freshness
 _p5_arrays_cache: Dict[str, tuple] = {}
 _p5_aggs_cache: Dict[str, tuple] = {}
 _p5_arrays_lock = threading.Lock()
@@ -2258,7 +2263,7 @@ def _p5_get_aggs(sym: str) -> dict:
     now = time.time()
     with _p5_arrays_lock:
         ce = _p5_aggs_cache.get(sym)
-        if ce and (now - ce[0]) < _P5_ARR_TTL:
+        if ce and (now - ce[0]) < _P5_AGG_TTL:
             return ce[1]
     ag = {"hi30": None, "sma50d": None}
     try:

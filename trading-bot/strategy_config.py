@@ -489,6 +489,53 @@ SCHEMA: Dict[str, dict] = {
                                          "Legacy alias of the WolfScore gate — kept for back-compat; "
                                          "buy_score_threshold overrides it. Set both to the same value.",
                                          0.0, 100.0, 1.0, ""),
+    # ── WolfScore-P5 (buy_formula='p5') ──────────────────────────────────────
+    "entries.buy_formula": _meta("entries.buy_formula", "enum", "Entries",
+                                         "Buy formula",
+                                         "Which scoring engine gates buys: p5 = WolfScore-P5 (calibrated MLP, "
+                                         "no-stop exits) | mr = WolfScore-MR (mean-reversion) | v3 = legacy "
+                                         "momentum. Changing this hot-swaps the live engine; p5 is the current "
+                                         "production formula, mr/v3 are rollback.",
+                                         choices=["p5", "mr", "v3"]),
+    "entries.p5_trap_cap": _meta("entries.p5_trap_cap", "float", "Entries",
+                                         "P5 trap cap",
+                                         "Skip a P5 candidate if modeled P(trap — still underwater after 3 days) "
+                                         "exceeds this (0.12 = validated).", 0.0, 1.0, 0.01, ""),
+    "entries.p5_ev_min": _meta("entries.p5_ev_min", "float", "Entries",
+                                         "P5 min EV",
+                                         "Skip a P5 candidate whose modeled expected net return is below this "
+                                         "(fraction; -0.0005 = validated).", -0.05, 0.05, 0.0005, ""),
+    "entries.p5_universe_dhigh_min": _meta("entries.p5_universe_dhigh_min", "float", "Entries",
+                                         "P5 universe: min % of 30d high",
+                                         "Only trade coins priced at ≥ this fraction of their 30-day high "
+                                         "(0.70 = within 30% of the high — avoids falling-knife downtrends).",
+                                         0.0, 1.0, 0.05, ""),
+    "entries.p5_friction_max": _meta("entries.p5_friction_max", "float", "Entries",
+                                         "P5 friction max (RT/ATR)",
+                                         "Skip a coin if round-trip cost exceeds this fraction of its 5m ATR "
+                                         "(0.60 = fees must stay under 60% of one ATR of expected move).",
+                                         0.0, 1.0, 0.05, ""),
+    "entries.p5_macro_gate": _meta("entries.p5_macro_gate", "bool", "Entries",
+                                         "P5 macro-bear gate",
+                                         "When ON, block NEW entries while the market is in a macro-bear regime "
+                                         "(BTC below its 50d SMA + weak breadth). Never affects open positions/exits."),
+    "entries.p5_max_new_per_window": _meta("entries.p5_max_new_per_window", "int", "Entries",
+                                         "P5 max new / scan window",
+                                         "Pacing: at most this many new entries opened per scan window.",
+                                         1, 20, 1, ""),
+    "entries.p5_coin_cooldown_bars": _meta("entries.p5_coin_cooldown_bars", "int", "Entries",
+                                         "P5 re-entry cooldown (bars)",
+                                         "After any exit of a coin, block re-entry for this many 5m bars "
+                                         "(36 = 3 hours).", 0, 2000, 1, "×5m"),
+    "entries.p5_model_path": _meta("entries.p5_model_path", "string", "Entries",
+                                         "P5 model path",
+                                         "Path to wolf_p5_model.json ('' = alongside ev_model.py). Change only to "
+                                         "point at a retrained artifact.", read_only=True),
+    "exits.bail_after_days": _meta("exits.bail_after_days", "float", "Exits",
+                                         "P5 bail valve (days)",
+                                         "P5 no-stop optional valve: if a position is still underwater after this "
+                                         "many days, exit at market to free the slot. 0 = OFF (default).",
+                                         0.0, 60.0, 1.0, "d"),
     "entries.ev_floor_mode": _meta("entries.ev_floor_mode", "enum", "Entries",
                                          "WolfScore floor distribution rule",
                                          "absolute = the static floor only (55, the paper-data cliff) — a high "
