@@ -370,6 +370,7 @@ def init_db():
                 c         REAL,
                 v         REAL,
                 quote_v   REAL,
+                taker_v   REAL,
                 PRIMARY KEY (symbol, interval, open_time)
             );
 
@@ -472,12 +473,40 @@ def init_db():
             "ALTER TABLE trades ADD COLUMN exit_fee_usdt  REAL",
             "ALTER TABLE trades ADD COLUMN hold_time_sec  REAL",
             "ALTER TABLE trades ADD COLUMN origin         TEXT",
+            # WolfScore-P5: taker-buy base volume per kline (Binance array idx [9]).
+            # The durable store never persisted it; P5's cvd/cvd_div features need it
+            # for the last ~10 bars, and the 50d backfill fills it historically.
+            "ALTER TABLE klines ADD COLUMN taker_v REAL",
+            # P5 exit reason 'valve' (bail_after_days) — trades/positions gain it via
+            # the existing sell_reason/exit_label TEXT columns (no schema change).
         ]
         for sql in migrations:
             try:
                 c.execute(sql)
             except Exception:
                 pass  # column already exists — SQLite has no IF NOT EXISTS for ALTER
+
+        # ── WolfScore-P5 §10 — per-trade feature/label log (fuels off-box retrains) ──
+        try:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS p5_trade_log (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts          REAL,
+                    symbol      TEXT,
+                    score       REAL,
+                    p_trap      REAL,
+                    ev          REAL,
+                    gated       TEXT,
+                    features    TEXT,     -- JSON: the 41 features at entry
+                    exit_ts     REAL,
+                    net         REAL,
+                    bars        INTEGER,
+                    how         TEXT      -- tp | ratchet | breakeven | valve | still_open
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_p5_trade_log_ts ON p5_trade_log(ts)")
+        except Exception as e:
+            print(f"[Database] WARNING: p5_trade_log table not created: {e}")
 
         # ── Phase 5 §5.1 — config history (versioned strategy.json audit) ────
         try:
@@ -664,12 +693,17 @@ def _kline_to_tuple(row) -> Optional[tuple]:
             c = row.get("c", row.get("close"))
             v = row.get("v", row.get("volume"))
             quote_v = row.get("quote_v", row.get("quote_volume", row.get("q")))
+            # P5: taker-buy base volume. Accept the WS key "V", the plumbed
+            # "taker_buy_volume", the short "tb", or Binance long "taker_buy_base".
+            taker_v = row.get("taker_v", row.get("taker_buy_volume",
+                       row.get("tb", row.get("V", row.get("taker_buy_base")))))
         else:  # Binance kline array (list/tuple)
             open_time = row[0]
             o, h, l, c, v = row[1], row[2], row[3], row[4], row[5]
             quote_v = row[7] if len(row) > 7 else None
+            taker_v = row[9] if len(row) > 9 else None   # takerBuyBaseVolume
         return (int(open_time), _num(o), _num(h), _num(l), _num(c),
-                _num(v), _num(quote_v))
+                _num(v), _num(quote_v), _num(taker_v))
     except (TypeError, ValueError, IndexError, KeyError):
         return None
 
@@ -690,8 +724,8 @@ def save_klines(symbol: str, interval: str, rows: list) -> int:
         conn = _conn()
         conn.executemany("""
             INSERT OR REPLACE INTO klines
-                (symbol, interval, open_time, o, h, l, c, v, quote_v)
-            VALUES (?,?,?,?,?,?,?,?,?)
+                (symbol, interval, open_time, o, h, l, c, v, quote_v, taker_v)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
         """, tuples)
         conn.commit()
         conn.close()
@@ -714,7 +748,7 @@ def get_klines(symbol: str, interval: str,
     if end_ms is not None:
         where.append("open_time <= ?")
         params.append(int(end_ms))
-    sql = f"SELECT open_time, o, h, l, c, v, quote_v FROM klines WHERE {' AND '.join(where)}"
+    sql = f"SELECT open_time, o, h, l, c, v, quote_v, taker_v FROM klines WHERE {' AND '.join(where)}"
     with _lock.read():
         conn = _conn()
         if limit is not None:
