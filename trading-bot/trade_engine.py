@@ -4116,7 +4116,13 @@ def _verify_boot_protection() -> None:
     with a protective stop attached (stop_price OR hard_sl_price; be_moved may be
     False). A position mid-exit (dispatched underwater) is being flattened and is
     skipped. A held position with NEITHER stop is a live unprotected bag → log
-    CRITICAL and escalate via the H1 stuck path for manual action. Never raises."""
+    CRITICAL and escalate via the H1 stuck path for manual action. Never raises.
+
+    WolfScore-P5 no-stop mode: by design positions carry NO stop (hold-until-
+    recovery under the profit-side engine), so this check is a no-op — a missing
+    stop is the intended state, not an unprotected bag."""
+    if _no_stop_mode():
+        return
     try:
         with _positions_lock:
             snapshot = list(_positions)
@@ -10746,29 +10752,93 @@ def _fresh_bullish_score(sym: str, now: float) -> bool:
     return score >= 3 and (now - score_ts) <= 120
 
 
+def _no_stop_mode() -> bool:
+    """True when the live buy formula is P5 (WolfScore-P5 §5): the disaster stop
+    and the pre-profit ATR protective stop are REMOVED — positions are held until a
+    profit-side exit fires (take-profit / profit-ratchet / breakeven-scratch), or
+    the optional bail valve. Read directly from strategy.entries (string field).
+    buy_formula='mr' (rollback) restores the full legacy stop ladder."""
+    try:
+        return str((_load_strategy().get("entries") or {}).get("buy_formula", "v3")).lower() == "p5"
+    except Exception:
+        return False
+
+
+def _evaluate_exit_decision_p5(pos: dict, sym: str, price: float,
+                               now: float) -> Tuple[Optional[str], bool]:
+    """WolfScore-P5 exit engine — a VERBATIM port of sandbox p5.py sim_ns()/sim_valve()
+    (the exit the strategy was validated with). NO stop-loss and NO pre-profit ATR
+    stop: a position is held until a profit-side exit fires. R geometry is UNCHANGED
+    (TP=1.6R, breakeven arms at 1.2R, ratchet arms at 0.8R OR +1.5% peak) — only the
+    stop ORDER/exit is gone. Exit precedence mirrors sim_ns exactly:
+        take-profit → profit-ratchet → breakeven-scratch → (optional) valve.
+    The ratchet reuses _evaluate_ratchet (already identical to sim_ns's ratchet:
+    arm 0.8R/$0.02/+1.5%, trail peak−1×ATR, give-back 50%, min_profit floor)."""
+    cfg = _exit_cfg()
+    entry = float(pos.get("entry_price") or 0.0)
+    if entry <= 0 or price <= 0:
+        return None, False
+
+    # TP trigger = max(stored tp_price [entry×(1+1.6R)], real breakeven) — the BEP
+    # floor keeps the profit gate from ever vetoing the trigger (A1 parity).
+    real_target = compute_real_breakeven_price(pos)
+    tp_price = float(pos.get("tp_price") or 0.0)
+    tp_trigger = max(tp_price, real_target if real_target > 0 else 0.0)
+    crossed = tp_trigger > 0 and price >= tp_trigger
+
+    # 1) Take-profit — sim_ns: h>=tp → 'tp' (no trailing ABOVE tp in the validated
+    #    engine; the ratchet is the runner-capture layer below tp).
+    if crossed:
+        _stop_loss_confirmation.pop(sym, None)
+        return "take-profit", True
+
+    # 2) Profit-ratchet — arms at 0.8R / $0.02 / +1.5% peak, trails peak−k_atr×ATR,
+    #    give-back 50%, only exits in profit (min_profit_usdt floor). Reused verbatim.
+    if _evaluate_ratchet(pos, sym, price, entry, now, cfg):
+        return "profit-ratchet", crossed
+
+    # 3) Breakeven-scratch — sim_ns: once the trade has reached +1.2R (be arms), a
+    #    fade back to the breakeven price (entry + round-trip cost) exits flat. This
+    #    is a PROFIT-SIDE scratch (only arms after being up 1.2R), NOT a stop.
+    sl_dist = pos.get("sl_distance_pct")
+    be_r = cfg.get("breakeven_at_r")
+    if not pos.get("p5_be_armed"):
+        gain_pct = (price / entry - 1.0) * 100.0
+        if be_r is not None and sl_dist and gain_pct >= float(sl_dist) * float(be_r):
+            pos["p5_be_armed"] = True
+    if pos.get("p5_be_armed"):
+        be_price = real_target if real_target > 0 else entry * (1.0 + 2.0 * _fee_rate_for(sym))
+        if price <= be_price:
+            _stop_loss_confirmation.pop(sym, None)
+            return "breakeven", crossed
+
+    # 4) Optional bail valve (exits.bail_after_days, default 0 = OFF): a position
+    #    still underwater after N days is market-exited to free the slot (sim_valve).
+    try:
+        bail_days = float(cfg.get("bail_after_days") or 0.0)
+    except (TypeError, ValueError):
+        bail_days = 0.0
+    if bail_days > 0:
+        opened = pos.get("opened_at_ts", 0) or 0
+        if opened and (now - opened) >= bail_days * 86400.0 and price < entry:
+            return "valve", crossed
+
+    # else: HOLD (no stop) — hold-until-recovery under the profit-side engine.
+    return None, crossed
+
+
 def _evaluate_exit_decision(pos: dict, sym: str, price: float,
                             now: float) -> Tuple[Optional[str], bool]:
     """Decide whether `pos` should be sold at `price`. Returns
     (sell_reason_or_None, target_crossed).
 
-    Mutates shared decision state exactly like the old inline monitor code:
-    _stop_loss_confirmation counters, _pos_peaks (legacy smart-hold), and the
-    per-position BE-move/trail fields (be_moved, be_stop_price, peak_price,
-    tp_ratchet_floor).
+    WolfScore-P5 (buy_formula='p5'): the no-stop profit-side engine
+    (_evaluate_exit_decision_p5) — take-profit / ratchet / breakeven-scratch /
+    valve, NO stop-loss. Legacy stop ladder below is used only under rollback
+    (buy_formula='mr'/'v3')."""
+    if _no_stop_mode():
+        return _evaluate_exit_decision_p5(pos, sym, price, now)
 
-    Exit ladder (§2.1-2.3):
-      hard-stop-loss  price <= hard_sl_price — bypasses confirmation ticks,
-                      min-hold AND the profit gate (crash stop)
-      stop-loss       price <= stop_price — sl_confirm_ticks + min-hold apply
-      trail           post-BE-move trail/floor crossed — 1 tick, profit-side
-      take-profit     price >= TP trigger while trailing is disabled
-    TP trigger = max(pos['tp_price'], compute_real_breakeven_price(pos)) — the
-    BEP floor is recomputed at trigger time (fees can change) so the profit
-    gate (_profitable_sell_check) can never veto a trigger (A1 parity).
-
-    Legacy path (no exits block / positions without stored geometry): the
-    original global-mult logic verbatim — stop from _stop_loss_mult, target
-    from _user_tp_mult, optional smart-hold trailing with the score gate."""
     cfg = _exit_cfg()
     entry = pos["entry_price"]
     opened_ts = pos.get("opened_at_ts", 0)
