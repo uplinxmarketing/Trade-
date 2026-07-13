@@ -2157,11 +2157,194 @@ def _wolf_inputs_mr(sym: str, cached: dict) -> dict:
     return inp
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# WolfScore-P5 — input assembly + cohort/macro pass-context (buy_formula='p5')
+# ═══════════════════════════════════════════════════════════════════════════
+# P5 features need up to 50 DAYS of 5m history per coin (btc/breadth 50d SMA,
+# 30d high, 3d return). We read that from the durable kline store (now with taker
+# volume) and cache the per-coin arrays + the once-per-pass cohort/macro context.
+_P5_MAX_BARS   = 14600          # ~50.7 days of 5m (50d = 14400) + margin
+_P5_ARR_TTL    = 600.0          # per-coin durable-array cache: one bounded DB read / 10 min
+_P5_CTX_TTL    = 120.0          # cohort/macro pass-context freshness
+_p5_arrays_cache: Dict[str, tuple] = {}
+_p5_arrays_lock = threading.Lock()
+_p5_pass_ctx: Dict[str, Any] = {"ts": 0.0}
+_p5_ctx_lock = threading.Lock()
+# Per-coin last-exit wall-clock (P5 §4 pacing: coin_cooldown_bars re-entry lockout).
+_p5_last_exit_ts: Dict[str, float] = {}
+
+
+def _p5_pf(x, d: float = 0.0) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return d
+
+
+def _p5_mean(x) -> float:
+    x = list(x)
+    return sum(x) / len(x) if x else 0.0
+
+
+def _p5_model_path() -> Optional[str]:
+    try:
+        p = str((_load_strategy().get("entries") or {}).get("p5_model_path") or "").strip()
+        return p or None
+    except Exception:
+        return None
+
+
+def _p5_runtime_cfg() -> dict:
+    """strategy.entries p5_* live overrides merged over the model's config defaults.
+    buy_score_threshold is the SINGLE hard floor (no advisory path in p5)."""
+    try:
+        e = _load_strategy().get("entries") or {}
+    except Exception:
+        e = {}
+    def _f(k, d):
+        try:
+            return float(e.get(k, d))
+        except (TypeError, ValueError):
+            return d
+    return {
+        "buy_score_threshold":  _f("buy_score_threshold", 55.0),
+        "trap_cap":             _f("p5_trap_cap", 0.12),
+        "ev_min":               _f("p5_ev_min", -0.0005),
+        "universe_dhigh_min":   _f("p5_universe_dhigh_min", 0.70),
+        "friction_max":         _f("p5_friction_max", 0.60),
+        "p5_macro_gate":        bool(e.get("p5_macro_gate", True)),
+        "max_new_per_window":   int(_f("p5_max_new_per_window", 2)),
+        "coin_cooldown_bars":   int(_f("p5_coin_cooldown_bars", 36)),
+    }
+
+
+def _p5_get_arrays(sym: str) -> Optional[dict]:
+    """Per-coin 5m arrays {op,h,l,c,v,tb,ot} from the durable store, cached ~10 min.
+    None when <320 bars stored (warmup). tb (taker) is 0 for pre-migration bars —
+    only the last ~10 bars' taker is read by FEAT and those are freshly persisted."""
+    now = time.time()
+    with _p5_arrays_lock:
+        ce = _p5_arrays_cache.get(sym)
+        if ce and (now - ce[0]) < _P5_ARR_TTL:
+            return ce[1]
+    arr = None
+    try:
+        rows = database.get_klines(sym, "5m", limit=_P5_MAX_BARS) or []
+        if len(rows) >= 320:
+            arr = {
+                "op": [_p5_pf(r.get("o")) for r in rows],
+                "h":  [_p5_pf(r.get("h")) for r in rows],
+                "l":  [_p5_pf(r.get("l")) for r in rows],
+                "c":  [_p5_pf(r.get("c")) for r in rows],
+                "v":  [_p5_pf(r.get("v")) for r in rows],
+                "tb": [_p5_pf(r.get("taker_v")) for r in rows],
+                "ot": [int(r.get("open_time") or 0) for r in rows],
+            }
+    except Exception:
+        arr = None
+    with _p5_arrays_lock:
+        _p5_arrays_cache[sym] = (now, arr)
+    return arr
+
+
+def _p5_build_pass_ctx(syms) -> dict:
+    """Compute the once-per-scan cohort + macro context: cx=(med 3-bar roc, btc tilt,
+    breadth-above-240, breadth slope vs 288 bars ago, codip) + macro state
+    (BULL/MIX/BEAR from BTC vs 50d SMA + 50d breadth) + BTC scalars for btcma/btc15."""
+    now = time.time()
+    ctx: Dict[str, Any] = {"ts": now, "cx": (0.0, 0.0, 0.5, 0.0, 0.0), "macro": "MIX",
+                           "btc_last": None, "btc_3ago": None, "btc_sma576": None}
+    btilt = 0.0
+    b50 = 0.0
+    btc = _p5_get_arrays("BTCUSDT")
+    if btc and btc["c"]:
+        bc = btc["c"]; bi = len(bc) - 1
+        if bi >= 13 and bc[bi - 13]:
+            btilt = math.tanh(60.0 * (bc[bi] / bc[bi - 13] - 1.0))
+        ctx["btc_last"] = bc[bi]
+        ctx["btc_3ago"] = bc[bi - 3] if bi >= 3 else bc[bi]
+        ctx["btc_sma576"] = _p5_mean(bc[max(0, bi - 576):bi]) or bc[bi]
+        _btc_sma50d = _p5_mean(bc[max(0, bi - 14400):bi]) or bc[bi]
+        b50 = (bc[bi] / _btc_sma50d - 1.0) if _btc_sma50d else 0.0
+    rocs: List[float] = []
+    nd = nt = nb = a240 = a240p = a50 = 0
+    for s in syms:
+        a = _p5_get_arrays(s)
+        if not a or not a["c"]:
+            continue
+        c = a["c"]; i = len(c) - 1
+        if i < 300 or not c[i - 4]:
+            continue
+        nb += 1
+        r = c[i - 1] / c[i - 4] - 1.0
+        rocs.append(r); nt += 1
+        if r < -0.001:
+            nd += 1
+        if c[i] > _p5_mean(c[max(0, i - 240):i]):
+            a240 += 1
+        if c[i] > _p5_mean(c[max(0, i - 14400):i]):
+            a50 += 1
+        if i >= 288 + 240 and c[i - 288] > _p5_mean(c[i - 288 - 240:i - 288]):
+            a240p += 1
+    rocs.sort()
+    med = rocs[len(rocs) // 2] if rocs else 0.0
+    breadth = (a240 / nb) if nb else 0.5
+    breadth_prev = (a240p / nb) if nb else breadth
+    bslope = breadth - breadth_prev
+    codip = (nd / nt) if nt else 0.0
+    br50 = (a50 / nb) if nb else 0.5
+    if b50 < -0.02 and br50 < 0.35:
+        macro = "BEAR"
+    elif b50 > 0.01 and br50 > 0.55:
+        macro = "BULL"
+    else:
+        macro = "MIX"
+    ctx["cx"] = (med, btilt, breadth, bslope, codip)
+    ctx["macro"] = macro
+    ctx["b50"] = b50
+    ctx["br50"] = br50
+    with _p5_ctx_lock:
+        _p5_pass_ctx.clear(); _p5_pass_ctx.update(ctx)
+    return ctx
+
+
+def _p5_get_pass_ctx() -> dict:
+    """Fresh cohort/macro context; rebuilds from the active universe if stale."""
+    with _p5_ctx_lock:
+        c = dict(_p5_pass_ctx)
+    if c.get("ts") and (time.time() - float(c["ts"])) < _P5_CTX_TTL:
+        return c
+    try:
+        uni = sorted(_active_universe) if _active_universe else []
+    except Exception:
+        uni = []
+    return _p5_build_pass_ctx(uni) if uni else c
+
+
+def _wolf_inputs_p5(sym: str, ctx: Optional[dict] = None) -> Optional[dict]:
+    """Assemble the compute_features_p5 input dict for `sym` from the durable arrays
+    + the pass cohort/macro context. None when the coin lacks stored history."""
+    a = _p5_get_arrays(sym)
+    if not a or not a["c"]:
+        return None
+    ctx = ctx or _p5_get_pass_ctx()
+    i = len(a["c"]) - 1
+    hi30 = max(a["h"][max(0, i - 8639):i + 1]) if a["h"] else 0.0   # 30d (8640-bar) high
+    return {
+        "op": a["op"], "h": a["h"], "l": a["l"], "c": a["c"], "v": a["v"], "tb": a["tb"],
+        "i": i, "tsms": (a["ot"][i] if a["ot"] else 0), "fv": 0,
+        "hi30": hi30, "btc_sma576": ctx.get("btc_sma576"),
+        "btc_last": ctx.get("btc_last"), "btc_3ago": ctx.get("btc_3ago"),
+        "cx": ctx.get("cx", (0.0, 0.0, 0.5, 0.0, 0.0)),
+    }
+
+
 def _wolf_score_cached(sym: str, cached: dict, cohort: dict, tilt: float) -> Optional[dict]:
     """Buy-selection score for a signal-cache entry. Selects the formula from
-    entries.buy_formula: 'mr' → WolfScore-MR (compute_submetrics_mr → wolfscore_mr);
-    anything else → WolfScore v3 (default, unchanged). Returns the full decomposition
-    dict or None on failure / when ev_model is unavailable."""
+    entries.buy_formula: 'p5' → WolfScore-P5 (calibrated MLP; compute_features_p5 →
+    wolfscore_p5); 'mr' → WolfScore-MR; anything else → WolfScore v3 (default).
+    Returns the full decomposition dict or None on failure / when ev_model is
+    unavailable (p5: None also when the model artifact can't be loaded — fail-closed)."""
     if ev_model is None:
         return None
     try:
@@ -2178,6 +2361,18 @@ def _wolf_score_cached(sym: str, cached: dict, cohort: dict, tilt: float) -> Opt
         _formula = str((_load_strategy().get("entries") or {}).get("buy_formula", "v3")).lower()
     except Exception:
         _formula = "v3"
+    if _formula == "p5":
+        try:
+            if not ev_model.ensure_p5_loaded(_p5_model_path()):
+                return None   # fail-closed: no model → no score → sole-gate skips the buy
+            ctx = _p5_get_pass_ctx()
+            inp = _wolf_inputs_p5(sym, ctx)
+            feat = ev_model.compute_features_p5(inp) if inp else None
+            _pcfg = _p5_runtime_cfg()
+            macro_bear = bool(_pcfg.get("p5_macro_gate", True)) and (ctx.get("macro") == "BEAR")
+            return ev_model.wolfscore_p5(feat, _pcfg, macro_bear=macro_bear)
+        except Exception:
+            return None
     if _formula == "mr":
         try:
             _sub = ev_model.compute_submetrics_mr(_wolf_inputs_mr(sym, cached), cohort or {})
@@ -2365,6 +2560,20 @@ def _refresh_and_publish_scores() -> None:
         except Exception:
             tilt = 0.0
         cohort = _wolf_cohort_from(cand)
+        # WolfScore-P5: build the cohort/macro pass-context ONCE from this pass's
+        # candidates (breadth/med/codip/macro over the universe), so each per-coin
+        # _wolf_score_cached('p5') reads the fresh cached context instead of
+        # rebuilding it 89×. No-op for mr/v3.
+        _p5_live = False
+        try:
+            _p5_live = str((strategy.get("entries") or {}).get("buy_formula", "v3")).lower() == "p5"
+        except Exception:
+            _p5_live = False
+        if _p5_live:
+            try:
+                _p5_build_pass_ctx([s for s, _ in cand])
+            except Exception:
+                pass
         _now_pub = time.time()
         scores: Dict[str, dict] = {}
         for s, c in cand:
@@ -2380,18 +2589,21 @@ def _refresh_and_publish_scores() -> None:
         pcts = [float(v.get("pct")) for v in scores.values()
                 if v.get("hard_gate") is None and v.get("pct") is not None]
         cfg = _entries_cfg()
-        abs_floor = float(cfg.get("buy_score_threshold",
-                          cfg.get("min_win_probability_floor", 61.0)) or 61.0)
-        mode = str((strategy.get("entries") or {}).get("ev_floor_mode", "absolute") or "absolute")
-        k = float(cfg.get("ev_floor_meanstd_k", 0.5) or 0.5)
-        af = _wolf_adaptive_floor(pcts, abs_floor, mode, k)
+        if _p5_live:
+            # P5: the floor is the FIXED user threshold (hard, no distribution rule).
+            # No adaptive floor, and the MR shadow does not run.
+            af = None
+        else:
+            abs_floor = float(cfg.get("buy_score_threshold",
+                              cfg.get("min_win_probability_floor", 61.0)) or 61.0)
+            mode = str((strategy.get("entries") or {}).get("ev_floor_mode", "absolute") or "absolute")
+            k = float(cfg.get("ev_floor_meanstd_k", 0.5) or 0.5)
+            af = _wolf_adaptive_floor(pcts, abs_floor, mode, k)
         _publish_scan_scores(scores, tilt, af)
-        # WolfScore-MR shadow validation (5-A): score MR for these candidates and
-        # step the virtual book WITHOUT touching live buys. Independent of the live
-        # buy_formula so it validates MR even while v3 is live. Off via
-        # entries.mr_shadow_enabled=false.
+        # WolfScore-MR shadow validation: score MR for these candidates and step the
+        # virtual book WITHOUT touching live buys. Skipped entirely under P5.
         try:
-            if bool(cfg.get("mr_shadow_enabled", True)):
+            if (not _p5_live) and bool(cfg.get("mr_shadow_enabled", True)):
                 _mr_shadow_tick(cand, cohort, tilt)
         except Exception:
             pass
@@ -4116,7 +4328,13 @@ def _verify_boot_protection() -> None:
     with a protective stop attached (stop_price OR hard_sl_price; be_moved may be
     False). A position mid-exit (dispatched underwater) is being flattened and is
     skipped. A held position with NEITHER stop is a live unprotected bag → log
-    CRITICAL and escalate via the H1 stuck path for manual action. Never raises."""
+    CRITICAL and escalate via the H1 stuck path for manual action. Never raises.
+
+    WolfScore-P5 no-stop mode: by design positions carry NO stop (hold-until-
+    recovery under the profit-side engine), so this check is a no-op — a missing
+    stop is the intended state, not an unprotected bag."""
+    if _no_stop_mode():
+        return
     try:
         with _positions_lock:
             snapshot = list(_positions)
@@ -8475,6 +8693,9 @@ def _execute_sell(pos: dict, price: float, reason: str):
         # P2: clear the per-symbol profit-ratchet high-water mark for the same
         # reason — a re-opened position must arm the ratchet from scratch.
         _ratchet_state.pop(sym, None)
+        # P5 §4: stamp the exit time so the per-coin re-entry cooldown
+        # (coin_cooldown_bars) can lock this symbol out of immediate re-entry.
+        _p5_last_exit_ts[sym] = time.time()
 
 
 def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str, mode: str, now: str):
@@ -9688,7 +9909,50 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                                   "WolfScore unavailable (sole-gate → skip)")
                 _trace_mark_block(sym, "blocked: no WolfScore")
                 continue
-            if _ws_here is not None:
+            _p5_mode_local = False
+            try:
+                _p5_mode_local = str((_load_strategy().get("entries") or {}).get(
+                    "buy_formula", "v3")).lower() == "p5"
+            except Exception:
+                _p5_mode_local = False
+            if _ws_here is not None and _p5_mode_local:
+                # ── WolfScore-P5 tradable rule (§4) — HARD floor, NO advisory path ──
+                # tradable iff gated=='' AND pct>=buy_score_threshold AND
+                # p_trap<=trap_cap AND ev>=ev_min; plus per-coin re-entry cooldown.
+                # (Macro-bear surfaces as gated=='macro_bear' → blocks new entries.)
+                _pc5 = _p5_runtime_cfg()
+                _g5 = _ws_here.get("gated") or _ws_here.get("hard_gate")
+                if _g5:
+                    _record_rejection(sym, cached.get("score", 0), f"p5_{_g5}",
+                                      f"P5 gated: {_g5}")
+                    _trace_mark_block(sym, f"blocked: p5 {_g5}")
+                    continue
+                _pct5 = float(_ws_here.get("pct") or 0.0)
+                _pt5 = float(_ws_here.get("p_trap") if _ws_here.get("p_trap") is not None else 1.0)
+                _ev5 = float(_ws_here.get("ev") if _ws_here.get("ev") is not None else -1.0)
+                if _pct5 < float(_pc5["buy_score_threshold"]):
+                    _record_rejection(sym, cached.get("score", 0), "ev_prob_floor",
+                                      f"P5 score {_pct5:.0f} < floor {_pc5['buy_score_threshold']:.0f}")
+                    _trace_mark_block(sym, f"blocked: P5 {_pct5:.0f} < {_pc5['buy_score_threshold']:.0f}")
+                    continue
+                if _pt5 > float(_pc5["trap_cap"]):
+                    _record_rejection(sym, cached.get("score", 0), "p5_trap",
+                                      f"P5 trap {_pt5:.3f} > cap {_pc5['trap_cap']:.3f}")
+                    _trace_mark_block(sym, f"blocked: P5 trap {_pt5:.3f}")
+                    continue
+                if _ev5 < float(_pc5["ev_min"]):
+                    _record_rejection(sym, cached.get("score", 0), "p5_ev",
+                                      f"P5 EV {_ev5:.5f} < min {_pc5['ev_min']:.5f}")
+                    _trace_mark_block(sym, f"blocked: P5 EV {_ev5:.5f}")
+                    continue
+                _lex = _p5_last_exit_ts.get(sym, 0.0)
+                if _lex and (time.time() - _lex) < float(_pc5["coin_cooldown_bars"]) * 300.0:
+                    _record_rejection(sym, cached.get("score", 0), "p5_cooldown",
+                                      f"P5 re-entry cooldown ({_pc5['coin_cooldown_bars']} bars)")
+                    _trace_mark_block(sym, "waiting: P5 re-entry cooldown")
+                    continue
+                # passes P5 → fall through to the buy (MR/v3 gate logic is skipped)
+            elif _ws_here is not None:
                 # 1) Friction hard gate — always authoritative.
                 if _ws_here.get("hard_gate") == "friction":
                     _record_rejection(sym, cached.get("score", 0),
@@ -10746,29 +11010,94 @@ def _fresh_bullish_score(sym: str, now: float) -> bool:
     return score >= 3 and (now - score_ts) <= 120
 
 
+def _no_stop_mode() -> bool:
+    """True when the live buy formula is P5 (WolfScore-P5 §5): the disaster stop
+    and the pre-profit ATR protective stop are REMOVED — positions are held until a
+    profit-side exit fires (take-profit / profit-ratchet / breakeven-scratch), or
+    the optional bail valve. Read directly from strategy.entries (string field).
+    buy_formula='mr' (rollback) restores the full legacy stop ladder."""
+    try:
+        return str((_load_strategy().get("entries") or {}).get("buy_formula", "v3")).lower() == "p5"
+    except Exception:
+        return False
+
+
+def _evaluate_exit_decision_p5(pos: dict, sym: str, price: float,
+                               now: float) -> Tuple[Optional[str], bool]:
+    """WolfScore-P5 exit engine — a VERBATIM port of sandbox p5.py sim_ns()/sim_valve()
+    (the exit the strategy was validated with). NO stop-loss and NO pre-profit ATR
+    stop: a position is held until a profit-side exit fires. R geometry is UNCHANGED
+    (TP=1.6R, breakeven arms at 1.2R, ratchet arms at 0.8R OR +1.5% peak) — only the
+    stop ORDER/exit is gone. Exit precedence mirrors sim_ns exactly:
+        take-profit → profit-ratchet → breakeven-scratch → (optional) valve.
+    The ratchet reuses _evaluate_ratchet (already identical to sim_ns's ratchet:
+    arm 0.8R/$0.02/+1.5%, trail peak−1×ATR, give-back 50%, min_profit floor)."""
+    cfg = _exit_cfg()
+    entry = float(pos.get("entry_price") or 0.0)
+    if entry <= 0 or price <= 0:
+        return None, False
+
+    # TP trigger = max(stored tp_price [entry×(1+1.6R)], real breakeven) — the BEP
+    # floor keeps the profit gate from ever vetoing the trigger (A1 parity).
+    real_target = compute_real_breakeven_price(pos)
+    tp_price = float(pos.get("tp_price") or 0.0)
+    tp_trigger = max(tp_price, real_target if real_target > 0 else 0.0)
+    crossed = tp_trigger > 0 and price >= tp_trigger
+
+    # 1) Take-profit — sim_ns: h>=tp → 'tp' (no trailing ABOVE tp in the validated
+    #    engine; the ratchet is the runner-capture layer below tp).
+    if crossed:
+        _stop_loss_confirmation.pop(sym, None)
+        return "take-profit", True
+
+    # 2) Profit-ratchet — arms at 0.8R / $0.02 / +1.5% peak, trails peak−k_atr×ATR,
+    #    give-back 50%, only exits in profit (min_profit_usdt floor). Reused verbatim.
+    if _evaluate_ratchet(pos, sym, price, entry, now, cfg):
+        return "profit-ratchet", crossed
+
+    # 3) Breakeven-scratch — sim_ns: once the trade has reached +1.2R (be arms), a
+    #    fade back to the breakeven price (entry + round-trip cost) exits flat. This
+    #    is a PROFIT-SIDE scratch (only arms after being up 1.2R), NOT a stop.
+    sl_dist = pos.get("sl_distance_pct")
+    be_r = cfg.get("breakeven_at_r")
+    if not pos.get("p5_be_armed"):
+        gain_pct = (price / entry - 1.0) * 100.0
+        if be_r is not None and sl_dist and gain_pct >= float(sl_dist) * float(be_r):
+            pos["p5_be_armed"] = True
+    if pos.get("p5_be_armed"):
+        be_price = real_target if real_target > 0 else entry * (1.0 + 2.0 * _fee_rate_for(sym))
+        if price <= be_price:
+            _stop_loss_confirmation.pop(sym, None)
+            return "breakeven", crossed
+
+    # 4) Optional bail valve (exits.bail_after_days, default 0 = OFF): a position
+    #    still underwater after N days is market-exited to free the slot (sim_valve).
+    #    Read directly from strategy.exits (the _exit_cfg whitelist would drop it).
+    try:
+        bail_days = float((_load_strategy().get("exits") or {}).get("bail_after_days", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        bail_days = 0.0
+    if bail_days > 0:
+        opened = pos.get("opened_at_ts", 0) or 0
+        if opened and (now - opened) >= bail_days * 86400.0 and price < entry:
+            return "valve", crossed
+
+    # else: HOLD (no stop) — hold-until-recovery under the profit-side engine.
+    return None, crossed
+
+
 def _evaluate_exit_decision(pos: dict, sym: str, price: float,
                             now: float) -> Tuple[Optional[str], bool]:
     """Decide whether `pos` should be sold at `price`. Returns
     (sell_reason_or_None, target_crossed).
 
-    Mutates shared decision state exactly like the old inline monitor code:
-    _stop_loss_confirmation counters, _pos_peaks (legacy smart-hold), and the
-    per-position BE-move/trail fields (be_moved, be_stop_price, peak_price,
-    tp_ratchet_floor).
+    WolfScore-P5 (buy_formula='p5'): the no-stop profit-side engine
+    (_evaluate_exit_decision_p5) — take-profit / ratchet / breakeven-scratch /
+    valve, NO stop-loss. Legacy stop ladder below is used only under rollback
+    (buy_formula='mr'/'v3')."""
+    if _no_stop_mode():
+        return _evaluate_exit_decision_p5(pos, sym, price, now)
 
-    Exit ladder (§2.1-2.3):
-      hard-stop-loss  price <= hard_sl_price — bypasses confirmation ticks,
-                      min-hold AND the profit gate (crash stop)
-      stop-loss       price <= stop_price — sl_confirm_ticks + min-hold apply
-      trail           post-BE-move trail/floor crossed — 1 tick, profit-side
-      take-profit     price >= TP trigger while trailing is disabled
-    TP trigger = max(pos['tp_price'], compute_real_breakeven_price(pos)) — the
-    BEP floor is recomputed at trigger time (fees can change) so the profit
-    gate (_profitable_sell_check) can never veto a trigger (A1 parity).
-
-    Legacy path (no exits block / positions without stored geometry): the
-    original global-mult logic verbatim — stop from _stop_loss_mult, target
-    from _user_tp_mult, optional smart-hold trailing with the score gate."""
     cfg = _exit_cfg()
     entry = pos["entry_price"]
     opened_ts = pos.get("opened_at_ts", 0)
@@ -11684,6 +12013,28 @@ def _place_managed_exit(pos: dict) -> None:
     qty = _floor_qty(float(pos.get("quantity") or 0), sym)
     if not sym or tp <= 0 or qty <= 0:
         return
+    # ── WolfScore-P5 §5 — NO stop leg. Place a plain maker LIMIT sell at TP only.
+    # Every non-TP exit (ratchet / breakeven / valve) is an engine-managed MARKET
+    # sell, and the existing cancel-first sell path cancels this resting TP before
+    # it fires (replaces the OCO rescue logic). No OCO, no STOP_LOSS_LIMIT leg —
+    # so no exchange stop can ever trigger under the no-stop strategy.
+    if _no_stop_mode():
+        try:
+            resp = exit_orders.place_maker_tp(sym, qty, _floor_price_tick(tp, sym))
+            if isinstance(resp, dict) and resp.get("rejected"):
+                database.log_activity(
+                    f"[ManagedExit] {sym}: P5 maker TP rejected ({resp.get('code')}: "
+                    f"{resp.get('msg')}) — price already through target, local exit imminent",
+                    "info")
+            else:
+                database.log_activity(
+                    f"[ManagedExit] {sym}: P5 maker TP resting @ "
+                    f"{_floor_price_tick(tp, sym):.8f} qty={qty} (no stop leg)", "info")
+        except Exception as _pe:
+            log_diag_issue("managed_exit", "warn",
+                           f"{sym}: P5 maker-TP placement failed — local monitoring only",
+                           detail=f"{type(_pe).__name__}: {_pe}")
+        return
     cfg = _exit_cfg()
     try:
         if cfg.get("oco_enabled"):
@@ -11725,6 +12076,76 @@ def _place_managed_exit(pos: dict) -> None:
         log_diag_issue("managed_exit", "warn",
                        f"{sym}: exit-order placement failed — local monitoring only",
                        detail=f"{type(_pe).__name__}: {_pe}")
+
+
+def _p5_migrate_open_positions() -> dict:
+    """WolfScore-P5 flip: bring EVERY currently-open position under the no-stop
+    engine. For each: cancel its resting OCO/stop legs (so no exchange stop can
+    fire — these positions are now hold-until-recovery) and place a plain maker TP
+    limit at the existing tp_price. FAIL-SAFE: any position whose cancel/replace
+    fails is left to the local engine (which exits at market via cancel-first-sell)
+    — never naked, never double-ordered. LIVE only; paper = no-op. Idempotent."""
+    out = {"migrated": 0, "cancelled": 0, "tp_placed": 0, "errors": 0, "skipped": 0}
+    try:
+        if get_mode() != "live" or connection.is_using_paper_fallback():
+            out["skipped"] = 1
+            return out
+    except Exception:
+        return out
+    try:
+        with _positions_lock:
+            snap = list(_positions)
+    except Exception:
+        return out
+    for pos in snap:
+        sym = pos.get("symbol")
+        if not sym:
+            continue
+        try:
+            orders = []
+            try:
+                orders = binance_direct.get_open_orders(sym) or []
+            except Exception:
+                orders = []
+            seen_lists = set()
+            for o in orders:
+                try:
+                    olid = o.get("orderListId", -1)
+                    if olid is not None and int(olid) > 0:
+                        if int(olid) in seen_lists:
+                            continue
+                        seen_lists.add(int(olid))
+                        binance_direct.cancel_order_list(sym, int(olid))   # OCO
+                    else:
+                        binance_direct.cancel_order(sym, int(o.get("orderId")))
+                    out["cancelled"] += 1
+                except Exception:
+                    out["errors"] += 1
+            try:
+                if exit_orders is not None:
+                    exit_orders.forget(sym)
+            except Exception:
+                pass
+            # Drop stored stop geometry — the no-stop engine ignores it anyway, this
+            # just keeps /api/positions and boot-protection honest.
+            pos["hard_sl_price"] = None
+            pos["stop_price"] = None
+            try:
+                _place_managed_exit(pos)   # no-stop mode → plain maker TP, no stop leg
+                out["tp_placed"] += 1
+            except Exception:
+                out["errors"] += 1
+            out["migrated"] += 1
+        except Exception:
+            out["errors"] += 1
+    try:
+        database.log_activity(
+            f"[P5-migrate] open positions → no-stop: migrated={out['migrated']} "
+            f"cancelled={out['cancelled']} tp_placed={out['tp_placed']} "
+            f"errors={out['errors']}", "warn")
+    except Exception:
+        pass
+    return out
 
 
 def _finalize_managed_exit(pos: dict, sym: str, exit_price: float, reason: str,

@@ -128,8 +128,19 @@ class EntriesConfig(BaseModel):
     # conservative on interim weights, by the operator's choice). UI-tunable. When
     # set, it is the WolfScore floor threshold (overrides min_win_probability_floor).
     buy_score_threshold:    float = Field(61.0, ge=0.0, le=100.0)
-    buy_formula:            str   = "v3"    # "v3" | "mr" — selects the buy score formula
+    buy_formula:            str   = "v3"    # "v3" | "mr" | "p5" — selects the buy score formula
     mr_shadow_enabled:      bool  = True    # run WolfScore-MR shadow validation alongside live
+    # ── WolfScore-P5 (buy_formula='p5') — calibrated-probability MLP ─────────────
+    # buy_score_threshold is the P5 floor too (single hard floor; 55 = validated).
+    # The model artifact ships pre-trained; these gate the tradable set (§4/§6).
+    p5_model_path:          str   = ""       # abs/rel path to wolf_p5_model.json ('' = alongside ev_model.py)
+    p5_trap_cap:            float = Field(0.12, ge=0.0, le=1.0)     # skip if P(trap) > this
+    p5_ev_min:              float = Field(-0.0005, ge=-1.0, le=1.0) # skip if EV < this
+    p5_universe_dhigh_min:  float = Field(0.70, ge=0.0, le=1.0)     # skip if price < this × 30d high
+    p5_friction_max:        float = Field(0.60, ge=0.0, le=1.0)     # skip if round-trip/ATR > this
+    p5_macro_gate:          bool  = True     # block NEW entries in macro-BEAR (never touches exits)
+    p5_max_new_per_window:  int   = Field(2, ge=1, le=20)           # pacing: max new entries / scan window
+    p5_coin_cooldown_bars:  int   = Field(36, ge=0, le=2000)        # per-coin re-entry lockout (×5m)
     # S3-1 — default is now 'absolute': the buy floor is the static abs_floor (55,
     # the cliff the paper data revealed) regardless of the live distribution, so a
     # high scorer fires even in a strong field and sub-55 junk is cut in a weak one.
@@ -189,6 +200,11 @@ class ExitsConfig(BaseModel):
     ratchet_activate_price_pct: float = Field(0.0, ge=0.0, le=0.5)   # OR ≥ this peak PRICE gain (0.015=1.5%); 0=off
     ratchet_k_atr:             float = Field(1.0, ge=0.05, le=5.0)  # trail = peak − k×ATR (per-coin)
     ratchet_giveback_pct:      float = Field(50.0, ge=1.0, le=100.0)  # exit if profit gives back ≥ this % of peak
+    # ── WolfScore-P5 (§5) optional bail valve — default OFF. When >0: a position
+    # still underwater after N days is market-exited (frees the slot). Only active
+    # under buy_formula='p5' (the no-stop engine). hard_sl_pct / sl_confirm_ticks /
+    # oco_* remain in the schema for rollback but are IGNORED under p5 (no-stop mode).
+    bail_after_days:           float = Field(0.0, ge=0.0, le=60.0)
 
     @model_validator(mode="after")
     def _check_sl_bounds(self):

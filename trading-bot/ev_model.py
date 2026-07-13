@@ -815,10 +815,22 @@ def compute_submetrics_mr(inp: Dict[str, Any], cohort: Optional[Dict[str, Any]] 
     return out
 
 
+_MR_CALL_COUNT = 0   # §11-5: must stay 0 under P5 (MR must execute nowhere)
+
+
+def get_mr_call_count() -> int:
+    """Number of times wolfscore_mr has run since boot. Under buy_formula='p5' this
+    MUST remain 0 — the operator's proof that the retired MR engine fires nowhere."""
+    return _MR_CALL_COUNT
+
+
 def wolfscore_mr(sub: Dict[str, float], tilt: float = 0.0) -> Dict[str, Any]:
     """MR score: 5 hard gates → regime-tuned dip_min/weights → z = b0 + min(1,O)·
     thesis → 100·sigmoid(z). O multiplies the thesis so no dip collapses the score
-    regardless of coin quality. Returns the same decomposition shape as v3."""
+    regardless of coin quality. Returns the same decomposition shape as v3.
+    DEPRECATED under P5 (rollback-only); _MR_CALL_COUNT tracks stray calls."""
+    global _MR_CALL_COUNT
+    _MR_CALL_COUNT += 1
     import math as _m
     O  = float(sub.get("O", 0.0)); E = float(sub.get("E", 0.0))
     K  = float(sub.get("K", 0.0)); Mk = float(sub.get("Mk", 0.0))
@@ -1069,3 +1081,343 @@ def model_status(min_clean: Optional[int] = None) -> Dict[str, Any]:
         "note": m.get("note", ""),
         "weights": active_weights(),
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WolfScore-P5 — calibrated-probability MLP buy score (wolf-p5-v1)
+# ═══════════════════════════════════════════════════════════════════════════
+# A pre-trained 63→24→1 MLP (two heads: P(win24), P(trap)) with Platt calibration,
+# validated on 365d × 90 coins of real 5m Binance data (walk-forward + adversarial
+# suite). This module ships the INFERENCE side only — training happens off-box on
+# the sandbox PC (p5.py / p8.py) and produces wolf_p5_model.json, which is loaded
+# here once at startup. Pure python (no numpy) to keep the live bot dependency-light.
+#
+# FEAT()/expand() below are a VERBATIM port of sandbox p5.py (the exact functions
+# the model was trained on) — feature names, order, coefficients, and the 63-dim
+# expansion (10 squares + 12 pairs) must match the artifact or every score is
+# meaningless. compute_features_p5() is FEAT() re-parameterised to read per-coin
+# arrays (assembled by trade_engine._wolf_inputs_p5) instead of the sandbox's
+# global numpy arrays; the arithmetic is identical.
+import os as _os_p5
+
+P5_VERSION = "wolf-p5-v1"
+
+# FN3 from p5.py — the 41 features, IN ORDER (model input dims 0..40).
+P5_FN = ['dip', 'rsi5', 'rsi15', 'rsi1h', 'rsi4h', 'pos_rng', 'bb', 'tr15', 'tr1', 'tr4',
+         'sl15', 'sl1', 'sl4', 'align', 'stack', 'volsurge', 'cvd', 'cvd_div', 'atrpn', 'atr_exp',
+         'btc', 'rs', 'wick', 'redrun', 'vwapd', 'fr', 'ret24', 'ret3d', 'dhigh', 'bre', 'bslope', 'btcma',
+         'ret15', 'ret1h', 'low1h', 'hl2', 'coil', 'codip', 'btc15', 'hsin', 'hcos']
+P5_IX = {k: j for j, k in enumerate(P5_FN)}
+# KEY (squares) and PAIRS from p5.py — the 10 + 12 = 22 interaction dims → 63 total.
+P5_KEY = ['tr4', 'tr1', 'dip', 'align', 'stack', 'rsi5', 'cvd_div', 'bre', 'ret3d', 'dhigh']
+P5_PAIRS = [('tr4', 'dip'), ('tr1', 'rsi5'), ('stack', 'dip'), ('align', 'volsurge'), ('btc', 'dip'),
+            ('atrpn', 'fr'), ('bre', 'dip'), ('btcma', 'dip'), ('bre', 'atrpn'), ('ret3d', 'dip'),
+            ('codip', 'dip'), ('low1h', 'volsurge')]
+
+# Fees the model trained on (p5.py: FEE=0.001, SPREAD=0.0005, RT=2*FEE+SPREAD). The
+# `fr` friction feature uses this exact round-trip constant — do NOT swap in the live
+# per-coin fee here or the feature drifts from what the model saw.
+_P5_FEE = 0.001
+_P5_SPREAD = 0.0005
+_P5_RT = 2 * _P5_FEE + _P5_SPREAD
+
+_p5_model: Optional[Dict[str, Any]] = None
+_p5_load_error: Optional[str] = None
+
+
+def _p5_clip(x, a, b):
+    return a if x < a else (b if x > b else x)
+
+
+def _p5_mean(x):
+    x = list(x)
+    return sum(x) / len(x) if x else 0.0
+
+
+def load_p5_model(path: Optional[str] = None) -> Dict[str, Any]:
+    """Load + validate wolf_p5_model.json once. Validates version and that the
+    feature list/order matches P5_FN exactly (a mismatch would silently corrupt
+    every score). Raises on any structural problem — the caller decides whether a
+    missing/invalid model disables the p5 formula."""
+    global _p5_model, _p5_load_error
+    if path is None:
+        path = _os_p5.path.join(_os_p5.path.dirname(_os_p5.path.abspath(__file__)),
+                                "wolf_p5_model.json")
+    with open(path, "r") as f:
+        m = json.load(f)
+    if m.get("version") != P5_VERSION:
+        raise ValueError(f"p5 model version {m.get('version')!r} != {P5_VERSION!r}")
+    if list(m.get("features") or []) != P5_FN:
+        raise ValueError("p5 model feature names/order do not match P5_FN")
+    if list(m.get("squares") or []) != P5_KEY:
+        raise ValueError("p5 model squares do not match P5_KEY")
+    if [list(p) for p in (m.get("pairs") or [])] != [list(p) for p in P5_PAIRS]:
+        raise ValueError("p5 model pairs do not match P5_PAIRS")
+    for head in ("head_win24", "head_trap"):
+        h = m.get(head) or {}
+        W1 = h.get("W1") or []
+        if len(W1) != 63 or (W1 and len(W1[0]) != len(h.get("b1") or [])):
+            raise ValueError(f"p5 model {head} W1 shape invalid")
+    _p5_model = m
+    _p5_load_error = None
+    return m
+
+
+def ensure_p5_loaded(path: Optional[str] = None) -> bool:
+    """Idempotent load. Returns True when a valid model is in memory, else records
+    the error (p5 scoring then returns None → the buy path fails closed)."""
+    global _p5_load_error
+    if _p5_model is not None:
+        return True
+    try:
+        load_p5_model(path)
+        return True
+    except Exception as e:
+        _p5_load_error = f"{type(e).__name__}: {e}"
+        return False
+
+
+def p5_model_status() -> Dict[str, Any]:
+    if _p5_model is None:
+        return {"loaded": False, "version": None, "error": _p5_load_error}
+    return {"loaded": True, "version": _p5_model.get("version"),
+            "trained": _p5_model.get("trained"), "config": _p5_model.get("config", {}),
+            "n_features": len(_p5_model.get("features", []))}
+
+
+def p5_config() -> Dict[str, Any]:
+    """The model's own config block (thresholds, gates, pacing) — the defaults the
+    artifact was validated with. strategy.entries.p5_* override these live."""
+    return (_p5_model or {}).get("config", {}) or {}
+
+
+# ── FEAT helpers (verbatim from p5.py) ─────────────────────────────────────────
+def _p5_rsi(cl, i, n=14):
+    up = dn = 0.0
+    for j in range(i - n, i):
+        d = cl[j] - cl[j - 1]
+        if d > 0:
+            up += d
+        else:
+            dn -= d
+    if up + dn == 0:
+        return 0.0
+    return (up / (up + dn)) * 2 - 1
+
+
+def _p5_htf(cl, i, mult, n):
+    out = []
+    j = i
+    for _ in range(n):
+        if j - mult < 0:
+            break
+        out.append(cl[j - 1])
+        j -= mult
+    return out[::-1]
+
+
+def compute_features_p5(a: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    """VERBATIM port of p5.py FEAT(), reading per-coin arrays from `a` instead of
+    the sandbox globals. `a` carries:
+      op,h,l,c,v,tb : per-coin OHLCV + taker-buy-volume lists (index space shared
+                      with `btc`); i : index of the last CLOSED bar to score.
+      btc : BTC close list; tsms : open-time ms of bar i; hi30 : 30d high at i;
+      btc_sma576 : BTC 576-bar (2d) SMA at i; fv : first-valid index (warmup base);
+      cx : (med, btilt, bre, bslope, codip) cohort/macro context for bar i.
+    Returns the 41-feature dict (+ '_atrp' and '_dhigh_ratio' helpers) or None when
+    the coin is inside its 320-bar warmup / lacks HTF depth. Never raises."""
+    try:
+        med, btilt, bre_, bslope, codip = a["cx"]
+        cl = a["c"]; hi = a["h"]; lo = a["l"]; vo = a["v"]; tb = a["tb"]; op = a["op"]
+        btc = a.get("btc") or cl   # only used as fallback when btc_last/3ago absent
+        i = int(a["i"])
+        fv = int(a.get("fv", 0) or 0)
+        if i < fv + 320 or i < 320 or cl[i] == 0:
+            return None
+        px = cl[i]
+        m20 = _p5_mean(cl[i - 20:i])
+        sd20 = (_p5_mean([(x - m20) ** 2 for x in cl[i - 20:i]])) ** 0.5 or 1e-9
+        h15 = _p5_htf(cl, i, 3, 30); h1 = _p5_htf(cl, i, 12, 26); h4 = _p5_htf(cl, i, 48, 13)
+        if len(h15) < 25 or len(h1) < 21 or len(h4) < 9:
+            return None
+        ma15 = _p5_mean(h15[-20:]); ma1 = _p5_mean(h1[-20:]); ma4 = _p5_mean(h4[-8:])
+        trs = [max(hi[j] - lo[j], abs(hi[j] - cl[j - 1]), abs(lo[j] - cl[j - 1])) for j in range(i - 14, i)]
+        atr = _p5_mean(trs); atrp = atr / px if px else 0
+        trs_o = [max(hi[j] - lo[j], abs(hi[j] - cl[j - 1]), abs(lo[j] - cl[j - 1])) for j in range(i - 40, i - 14)]
+        atr_o = _p5_mean(trs_o) or 1e-9
+        vs = _p5_mean(vo[i - 20:i]) or 1e-9; v5 = _p5_mean(vo[i - 5:i])
+        cvd5 = sum(2 * tb[j] - vo[j] for j in range(i - 5, i)); tv5 = sum(vo[i - 5:i]) or 1e-9
+        cvdp_ = sum(2 * tb[j] - vo[j] for j in range(i - 10, i - 5)); tvp = sum(vo[i - 10:i - 5]) or 1e-9
+        ret5 = px / (cl[i - 5] or px) - 1
+        cvdn = cvd5 / tv5; cvdp = cvdp_ / tvp
+        hh = max(hi[i - 48:i]); ll = min(lo[i - 48:i]); rng = (hh - ll) or 1e-9
+        vwv = sum(vo[i - 20:i]) or 1e-9
+        vwap = sum(cl[j] * vo[j] for j in range(i - 20, i)) / vwv
+        red = 0
+        for j in range(i - 1, i - 7, -1):
+            if cl[j] < op[j]:
+                red += 1
+            else:
+                break
+        r1 = (hi[i - 1] - lo[i - 1]) or 1e-9
+        f: Dict[str, float] = {}
+        f['dip'] = _p5_clip((m20 - px) / (2 * sd20), -1, 1); f['rsi5'] = _p5_rsi(cl, i, 14)
+        f['rsi15'] = _p5_rsi(h15, len(h15), 14) if len(h15) > 15 else 0
+        f['rsi1h'] = _p5_rsi(h1, len(h1), 14) if len(h1) > 15 else 0
+        f['rsi4h'] = _p5_rsi(h4, len(h4), 8) if len(h4) > 9 else 0
+        f['pos_rng'] = _p5_clip((px - ll) / rng * 2 - 1, -1, 1); f['bb'] = _p5_clip((px - m20) / (2 * sd20), -1, 1)
+        f['tr15'] = _p5_clip((px / ma15 - 1) * 40, -1, 1); f['tr1'] = _p5_clip((px / ma1 - 1) * 25, -1, 1)
+        f['tr4'] = _p5_clip((px / ma4 - 1) * 15, -1, 1)
+        f['sl15'] = _p5_clip((h15[-1] / h15[-5] - 1) * 80, -1, 1) if h15[-5] else 0
+        f['sl1'] = _p5_clip((h1[-1] / h1[-6] - 1) * 60, -1, 1) if h1[-6] else 0
+        f['sl4'] = _p5_clip((h4[-1] / h4[-4] - 1) * 20, -1, 1) if h4[-4] else 0
+        f['align'] = _p5_clip((f['tr15'] + f['tr1'] + f['tr4']) / 3, -1, 1)
+        f['stack'] = _p5_clip((1 if f['tr1'] > 0 else -1) * 0.4 + (1 if f['tr4'] > 0 else -1) * 0.4 + (1 if f['sl4'] > 0 else -1) * 0.2, -1, 1)
+        f['volsurge'] = _p5_clip(v5 / vs - 1, -1, 2) / 2; f['cvd'] = _p5_clip(cvdn, -1, 1)
+        f['cvd_div'] = _p5_clip((cvdn - cvdp) * 2 - ret5 * 80, -1, 1)
+        f['atrpn'] = _p5_clip(atrp * 150, 0, 1); f['atr_exp'] = _p5_clip(atr / atr_o - 1, -1, 1)
+        f['btc'] = btilt
+        f['rs'] = math.tanh(200 * ((cl[i - 1] / cl[i - 4] - 1) - med)) if cl[i - 4] else 0
+        f['wick'] = _p5_clip(((min(cl[i - 1], op[i - 1]) - lo[i - 1]) / r1) * 2 - 1, -1, 1)
+        f['redrun'] = _p5_clip(red / 3.0 - 1, -1, 1)
+        f['vwapd'] = _p5_clip((px - vwap) / vwap * 100, -1, 1)
+        f['fr'] = _p5_clip(_P5_RT / max(atrp, 1e-6), 0, 1); f['_atrp'] = atrp
+        f['ret24'] = _p5_clip((px / cl[i - 288] - 1) * 8, -1, 1) if i >= 288 and cl[i - 288] else 0.0
+        f['ret3d'] = _p5_clip((px / cl[i - 864] - 1) * 5, -1, 1) if i >= 864 and cl[i - 864] else 0.0
+        _hi30 = float(a.get("hi30") or 0.0) or px
+        f['dhigh'] = _p5_clip((px / _hi30 - 1) * 4, -1, 0)
+        f['bre'] = bre_ * 2 - 1
+        f['bslope'] = _p5_clip(bslope * 4, -1, 1)
+        _btc_sma576 = float(a.get("btc_sma576") or 0.0) or px
+        # BTC "current"/"3-bar-ago" close. In the sandbox all coins share one global
+        # bar index so btc[i] is valid; LIVE, per-coin arrays are NOT index-aligned
+        # with BTC's own array, so the caller passes btc_last/btc_3ago explicitly.
+        # Fall back to btc[i]/btc[i-3] (aligned-index path, e.g. the port test).
+        _btc_last = a.get("btc_last")
+        _btc_3ago = a.get("btc_3ago")
+        _btc_last = float(_btc_last) if _btc_last is not None else float(btc[i])
+        _btc_3ago = float(_btc_3ago) if _btc_3ago is not None else float(btc[i - 3])
+        f['btcma'] = _p5_clip((_btc_last / _btc_sma576 - 1) * 10, -1, 1)
+        f['ret15'] = _p5_clip((px / cl[i - 3] - 1) * 100, -1, 1) if cl[i - 3] else 0.0
+        f['ret1h'] = _p5_clip((px / cl[i - 12] - 1) * 60, -1, 1) if cl[i - 12] else 0.0
+        l1 = min(lo[i - 12:i]) or 1e-9
+        f['low1h'] = _p5_clip((px / l1 - 1) * 50, 0, 1)
+        hl = sum(1 for j in range(i - 5, i) if lo[j] > lo[j - 1])
+        f['hl2'] = hl / 5.0 * 2 - 1
+        tr5 = _p5_mean(trs[-5:]); tr20 = _p5_mean(trs[-14:] + trs_o[-6:]) or 1e-9
+        f['coil'] = _p5_clip(tr5 / tr20 - 1, -1, 1)
+        f['codip'] = codip * 2 - 1
+        f['btc15'] = _p5_clip((_btc_last / _btc_3ago - 1) * 150, -1, 1) if _btc_3ago else 0.0
+        hr = (int(a.get("tsms") or 0) // 3600000) % 24
+        f['hsin'] = math.sin(2 * math.pi * hr / 24.0)
+        f['hcos'] = math.cos(2 * math.pi * hr / 24.0)
+        f['_dhigh_ratio'] = (px / _hi30) if _hi30 else 1.0
+        return f
+    except Exception:
+        return None
+
+
+def _p5_expand(x: List[float]) -> List[float]:
+    """p5.py expand(): 41 base features → 63 (append 10 squares of KEY, then 12
+    products of PAIRS). Order is load-bearing (matches the trained W1 rows)."""
+    e = list(x)
+    for k in P5_KEY:
+        e.append(x[P5_IX[k]] * x[P5_IX[k]])
+    for aa, bb in P5_PAIRS:
+        e.append(x[P5_IX[aa]] * x[P5_IX[bb]])
+    return e
+
+
+def _p5_sigmoid(z: float) -> float:
+    if z < -30.0:
+        z = -30.0
+    elif z > 30.0:
+        z = 30.0
+    return 1.0 / (1.0 + math.exp(-z))
+
+
+def _p5_head_prob(head: Dict[str, Any], e: List[float]) -> float:
+    """Forward pass of one MLP head + Platt: relu(e·W1+b1)·W2+b2 → sigmoid → Platt.
+    Mirrors p5.py mlp_prob() + platt_apply() exactly, in pure python."""
+    W1 = head["W1"]; b1 = head["b1"]; W2 = head["W2"]; b2 = head["b2"]
+    a_pl, b_pl = head["platt"]
+    hid = len(b1)
+    z = b2
+    for j in range(hid):
+        s = b1[j]
+        for k in range(63):
+            s += e[k] * W1[k][j]
+        if s > 0.0:                      # relu
+            z += s * W2[j]
+    p_raw = _p5_sigmoid(z)
+    p_raw = min(1.0 - 1e-6, max(1e-6, p_raw))
+    logit = math.log(p_raw / (1.0 - p_raw))
+    return _p5_sigmoid(a_pl * logit + b_pl)
+
+
+def p5_infer(feat_vec: List[float]) -> Tuple[float, float, float]:
+    """(p_win24, p_trap, ev) from a 41-feature vector. EV per p5.py: pW·win_mean +
+    pT·trap_mean + max(0,1-pW-pT)·mid_mean, using the artifact's class_means."""
+    e = _p5_expand(feat_vec)
+    pw = _p5_head_prob(_p5_model["head_win24"], e)
+    pt = _p5_head_prob(_p5_model["head_trap"], e)
+    cm = _p5_model.get("class_means", {}) or {}
+    pm = max(0.0, 1.0 - pw - pt)
+    ev = pw * float(cm.get("win", 0.0)) + pt * float(cm.get("trap", 0.0)) + pm * float(cm.get("mid", 0.0))
+    return pw, pt, ev
+
+
+def wolfscore_p5(feat: Optional[Dict[str, float]], cfg: Optional[Dict[str, Any]] = None,
+                 macro_bear: bool = False) -> Dict[str, Any]:
+    """P5 publish payload for one coin (EvScorePanel-compatible). ALWAYS returns a
+    real pct for any coin that produced features (no zeroing — unlike MR); `gated`
+    is metadata that blocks BUYING, not the score display:
+        gated ∈ {'warmup','universe','friction','macro_bear',''}
+    Precedence: warmup > universe > friction > macro_bear. cfg overrides the model's
+    universe_dhigh_min / friction_max. Never raises."""
+    _mc = p5_config()
+    _cfg = cfg or {}
+    dhigh_min = float(_cfg.get("universe_dhigh_min", _mc.get("universe_dhigh_min", 0.70)))
+    fr_max = float(_cfg.get("friction_max", _mc.get("friction_max", 0.60)))
+    if feat is None:
+        return {"pct": None, "score": None, "p_trap": None, "ev": None,
+                "gated": "warmup", "hard_gate": "warmup", "version": P5_VERSION,
+                "trained": True, "submetrics": {}}
+    if _p5_model is None:
+        return {"pct": None, "score": None, "gated": "warmup", "hard_gate": "warmup",
+                "version": P5_VERSION, "trained": False, "submetrics": {},
+                "note": "p5 model not loaded"}
+    try:
+        vec = [float(feat.get(k, 0.0)) for k in P5_FN]
+        pw, pt, ev = p5_infer(vec)
+        pct = 100.0 * pw
+        gated = ""
+        dr = feat.get("_dhigh_ratio")
+        if dr is not None and float(dr) < dhigh_min:
+            gated = "universe"
+        elif float(feat.get("fr", 0.0)) > fr_max:
+            gated = "friction"
+        elif macro_bear:
+            gated = "macro_bear"
+        return {
+            "pct": round(pct, 1), "score": round(pct, 1),
+            "p_trap": round(pt, 4), "ev": round(ev, 6),
+            "probability": round(pw, 4),
+            "gated": gated, "hard_gate": (gated or None),
+            "version": P5_VERSION, "trained": True,
+            "submetrics": {
+                "score": round(pct, 1), "p_trap": round(pt, 4), "ev": round(ev, 6),
+                "dip": round(float(feat.get("dip", 0.0)), 4),
+                "align": round(float(feat.get("align", 0.0)), 4),
+                "bre": round(float(feat.get("bre", 0.0)), 4),
+                "fr": round(float(feat.get("fr", 0.0)), 4),
+                "dhigh": round(float(feat.get("dhigh", 0.0)), 4),
+                "cvd_div": round(float(feat.get("cvd_div", 0.0)), 4),
+                "rs": round(float(feat.get("rs", 0.0)), 4),
+            },
+            "_atrp": feat.get("_atrp"),
+        }
+    except Exception as e:
+        return {"pct": None, "score": None, "gated": "warmup", "hard_gate": "warmup",
+                "version": P5_VERSION, "trained": True, "submetrics": {},
+                "note": f"p5 infer error: {type(e).__name__}: {e}"}
