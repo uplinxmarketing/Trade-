@@ -5889,17 +5889,58 @@ def api_diagnostics_bundle(
     section("GATE BLOCKERS (current signals snapshot)")
     def _gates():
         out.write("  NOTE: gate blockers are a live snapshot (not scoped to RANGE)\n")
+        # P5: summarize from the scan's ALREADY-PUBLISHED scores (fast dict read).
+        # The legacy api_signals_summary path recomputed 17 signals × 74 coins AND
+        # re-scored each coin through P5 (~13s) — pointless under wolfscore_sole_gate.
+        _bf = "v3"
+        try:
+            _bf = str((_load_strategy().get("entries") or {}).get("buy_formula", "v3")).lower()
+        except Exception:
+            pass
+        if _bf == "p5":
+            b = _ev_live_scores_bundle()
+            scores = b.get("scores", {}) or {}
+            _e = _load_strategy().get("entries") or {}
+            thr = float(_e.get("buy_score_threshold", 55) or 55)
+            cap = float(_e.get("p5_trap_cap", 0.12) or 0.12)
+            evmin = float(_e.get("p5_ev_min", -0.0005))
+            reasons: dict = {}
+            allowed = 0
+            for sym, d in scores.items():
+                d = d or {}
+                g = d.get("hard_gate")
+                pct = d.get("pct")
+                sm = d.get("submetrics") or {}
+                pt = sm.get("p_trap")
+                ev = sm.get("ev")
+                if g:
+                    r = str(g)
+                elif pct is None or float(pct) < thr:
+                    r = f"score {float(pct or 0):.0f} < {thr:.0f}"
+                elif pt is not None and float(pt) > cap:
+                    r = f"p_trap {float(pt):.2f} > {cap:.2f}"
+                elif ev is not None and float(ev) < evmin:
+                    r = f"ev {float(ev):.4f} < {evmin:.4f}"
+                else:
+                    allowed += 1
+                    continue
+                reasons[r] = reasons.get(r, 0) + 1
+            out.write(f"  tracked={len(scores)} buy_ready={allowed}\n")
+            for r, n in sorted(reasons.items(), key=lambda x: -x[1])[:12]:
+                out.write(f"  {n:>3}x {r}\n")
+            return
+        # legacy (mr/v3): the original per-coin signal + gate summary
         res = api_signals_summary(limit=100)
-        reasons: dict = {}
+        reasons2: dict = {}
         allowed = 0
         for sig in res.get("signals", []):
             if sig.get("buy_allowed"):
                 allowed += 1
             else:
                 r = sig.get("buy_reason", "unknown")[:70]
-                reasons[r] = reasons.get(r, 0) + 1
+                reasons2[r] = reasons2.get(r, 0) + 1
         out.write(f"  tracked={res.get('total_tracked')} buy_ready={allowed}\n")
-        for r, n in sorted(reasons.items(), key=lambda x: -x[1])[:12]:
+        for r, n in sorted(reasons2.items(), key=lambda x: -x[1])[:12]:
             out.write(f"  {n:>3}x {r}\n")
     safe(_gates, "gates")
 
