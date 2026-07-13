@@ -5669,15 +5669,24 @@ def api_diagnostics_bundle(
             return f"N/A (n={d})"
         return f"{(100.0 * (numer or 0) / d):.1f}{suffix}"
 
+    _sec_times: dict = {}
+
     def section(title):
         out.write(f"\n===== {title} =====\n")
 
     def safe(fn, label=""):
+        _t0 = time.time()
         try:
             return fn()
         except Exception as e:
             out.write(f"  [{label or 'section'} unavailable: {type(e).__name__}: {e}]\n")
             return None
+        finally:
+            _dt = time.time() - _t0
+            _sec_times[label or "section"] = round(_dt, 2)
+            # Inline flag for any section that dominates the bundle latency.
+            if _dt >= 3.0:
+                out.write(f"  [⏱ slow section: {_dt:.1f}s]\n")
 
     out.write(f"WOLFBOT DIAGNOSTIC BUNDLE — {now_iso}\n")
     out.write(f"RANGE: {_range_label}\n")
@@ -6208,6 +6217,13 @@ def api_diagnostics_bundle(
     safe(_cfg, "config")
 
     out.write("\n===== END OF BUNDLE =====\n")
+    # Per-section timings (slowest first) so a slow bundle self-diagnoses.
+    try:
+        section("SECTION TIMINGS (s)")
+        for _lbl, _dt in sorted(_sec_times.items(), key=lambda kv: -kv[1]):
+            out.write(f"  {_lbl:22} {_dt}\n")
+    except Exception:
+        pass
     _text_b = out.getvalue()
     _BUNDLE_CACHE[_cache_key] = {"text": _text_b, "ts": time.time()}
     # Never let a browser/proxy hand back a stale bundle — every copy must be a
