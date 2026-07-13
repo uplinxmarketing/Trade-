@@ -1379,12 +1379,18 @@ def wolfscore_p5(feat: Optional[Dict[str, float]], cfg: Optional[Dict[str, Any]]
     _cfg = cfg or {}
     dhigh_min = float(_cfg.get("universe_dhigh_min", _mc.get("universe_dhigh_min", 0.70)))
     fr_max = float(_cfg.get("friction_max", _mc.get("friction_max", 0.60)))
+    # NOTE: pct is ALWAYS numeric (never None) — the rest of the engine (tiered
+    # scorer, aggregation, /api feeds) does float(pct) arithmetic and MR's gated
+    # coins returned 0.0, not None. A None here threw 'float argument must be a
+    # real number, not NoneType' on every scan → crash loop. Warmup/error → 0.0
+    # (still gated + below threshold + trap/ev fail → never buyable).
     if feat is None:
-        return {"pct": None, "score": None, "p_trap": None, "ev": None,
+        return {"pct": 0.0, "score": 0.0, "p_trap": 1.0, "ev": -1.0,
                 "gated": "warmup", "hard_gate": "warmup", "version": P5_VERSION,
                 "trained": True, "submetrics": {}}
     if _p5_model is None:
-        return {"pct": None, "score": None, "gated": "warmup", "hard_gate": "warmup",
+        return {"pct": 0.0, "score": 0.0, "p_trap": 1.0, "ev": -1.0,
+                "gated": "warmup", "hard_gate": "warmup",
                 "version": P5_VERSION, "trained": False, "submetrics": {},
                 "note": "p5 model not loaded"}
     try:
@@ -1418,6 +1424,7 @@ def wolfscore_p5(feat: Optional[Dict[str, float]], cfg: Optional[Dict[str, Any]]
             "_atrp": feat.get("_atrp"),
         }
     except Exception as e:
-        return {"pct": None, "score": None, "gated": "warmup", "hard_gate": "warmup",
+        return {"pct": 0.0, "score": 0.0, "p_trap": 1.0, "ev": -1.0,
+                "gated": "warmup", "hard_gate": "warmup",
                 "version": P5_VERSION, "trained": True, "submetrics": {},
                 "note": f"p5 infer error: {type(e).__name__}: {e}"}
