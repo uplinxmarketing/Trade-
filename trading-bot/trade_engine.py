@@ -11072,8 +11072,9 @@ def _evaluate_exit_decision_p5(pos: dict, sym: str, price: float,
 
     # 4) Optional bail valve (exits.bail_after_days, default 0 = OFF): a position
     #    still underwater after N days is market-exited to free the slot (sim_valve).
+    #    Read directly from strategy.exits (the _exit_cfg whitelist would drop it).
     try:
-        bail_days = float(cfg.get("bail_after_days") or 0.0)
+        bail_days = float((_load_strategy().get("exits") or {}).get("bail_after_days", 0.0) or 0.0)
     except (TypeError, ValueError):
         bail_days = 0.0
     if bail_days > 0:
@@ -12012,6 +12013,28 @@ def _place_managed_exit(pos: dict) -> None:
     qty = _floor_qty(float(pos.get("quantity") or 0), sym)
     if not sym or tp <= 0 or qty <= 0:
         return
+    # ── WolfScore-P5 §5 — NO stop leg. Place a plain maker LIMIT sell at TP only.
+    # Every non-TP exit (ratchet / breakeven / valve) is an engine-managed MARKET
+    # sell, and the existing cancel-first sell path cancels this resting TP before
+    # it fires (replaces the OCO rescue logic). No OCO, no STOP_LOSS_LIMIT leg —
+    # so no exchange stop can ever trigger under the no-stop strategy.
+    if _no_stop_mode():
+        try:
+            resp = exit_orders.place_maker_tp(sym, qty, _floor_price_tick(tp, sym))
+            if isinstance(resp, dict) and resp.get("rejected"):
+                database.log_activity(
+                    f"[ManagedExit] {sym}: P5 maker TP rejected ({resp.get('code')}: "
+                    f"{resp.get('msg')}) — price already through target, local exit imminent",
+                    "info")
+            else:
+                database.log_activity(
+                    f"[ManagedExit] {sym}: P5 maker TP resting @ "
+                    f"{_floor_price_tick(tp, sym):.8f} qty={qty} (no stop leg)", "info")
+        except Exception as _pe:
+            log_diag_issue("managed_exit", "warn",
+                           f"{sym}: P5 maker-TP placement failed — local monitoring only",
+                           detail=f"{type(_pe).__name__}: {_pe}")
+        return
     cfg = _exit_cfg()
     try:
         if cfg.get("oco_enabled"):
@@ -12053,6 +12076,76 @@ def _place_managed_exit(pos: dict) -> None:
         log_diag_issue("managed_exit", "warn",
                        f"{sym}: exit-order placement failed — local monitoring only",
                        detail=f"{type(_pe).__name__}: {_pe}")
+
+
+def _p5_migrate_open_positions() -> dict:
+    """WolfScore-P5 flip: bring EVERY currently-open position under the no-stop
+    engine. For each: cancel its resting OCO/stop legs (so no exchange stop can
+    fire — these positions are now hold-until-recovery) and place a plain maker TP
+    limit at the existing tp_price. FAIL-SAFE: any position whose cancel/replace
+    fails is left to the local engine (which exits at market via cancel-first-sell)
+    — never naked, never double-ordered. LIVE only; paper = no-op. Idempotent."""
+    out = {"migrated": 0, "cancelled": 0, "tp_placed": 0, "errors": 0, "skipped": 0}
+    try:
+        if get_mode() != "live" or connection.is_using_paper_fallback():
+            out["skipped"] = 1
+            return out
+    except Exception:
+        return out
+    try:
+        with _positions_lock:
+            snap = list(_positions)
+    except Exception:
+        return out
+    for pos in snap:
+        sym = pos.get("symbol")
+        if not sym:
+            continue
+        try:
+            orders = []
+            try:
+                orders = binance_direct.get_open_orders(sym) or []
+            except Exception:
+                orders = []
+            seen_lists = set()
+            for o in orders:
+                try:
+                    olid = o.get("orderListId", -1)
+                    if olid is not None and int(olid) > 0:
+                        if int(olid) in seen_lists:
+                            continue
+                        seen_lists.add(int(olid))
+                        binance_direct.cancel_order_list(sym, int(olid))   # OCO
+                    else:
+                        binance_direct.cancel_order(sym, int(o.get("orderId")))
+                    out["cancelled"] += 1
+                except Exception:
+                    out["errors"] += 1
+            try:
+                if exit_orders is not None:
+                    exit_orders.forget(sym)
+            except Exception:
+                pass
+            # Drop stored stop geometry — the no-stop engine ignores it anyway, this
+            # just keeps /api/positions and boot-protection honest.
+            pos["hard_sl_price"] = None
+            pos["stop_price"] = None
+            try:
+                _place_managed_exit(pos)   # no-stop mode → plain maker TP, no stop leg
+                out["tp_placed"] += 1
+            except Exception:
+                out["errors"] += 1
+            out["migrated"] += 1
+        except Exception:
+            out["errors"] += 1
+    try:
+        database.log_activity(
+            f"[P5-migrate] open positions → no-stop: migrated={out['migrated']} "
+            f"cancelled={out['cancelled']} tp_placed={out['tp_placed']} "
+            f"errors={out['errors']}", "warn")
+    except Exception:
+        pass
+    return out
 
 
 def _finalize_managed_exit(pos: dict, sym: str, exit_price: float, reason: str,

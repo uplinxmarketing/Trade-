@@ -815,10 +815,22 @@ def compute_submetrics_mr(inp: Dict[str, Any], cohort: Optional[Dict[str, Any]] 
     return out
 
 
+_MR_CALL_COUNT = 0   # §11-5: must stay 0 under P5 (MR must execute nowhere)
+
+
+def get_mr_call_count() -> int:
+    """Number of times wolfscore_mr has run since boot. Under buy_formula='p5' this
+    MUST remain 0 — the operator's proof that the retired MR engine fires nowhere."""
+    return _MR_CALL_COUNT
+
+
 def wolfscore_mr(sub: Dict[str, float], tilt: float = 0.0) -> Dict[str, Any]:
     """MR score: 5 hard gates → regime-tuned dip_min/weights → z = b0 + min(1,O)·
     thesis → 100·sigmoid(z). O multiplies the thesis so no dip collapses the score
-    regardless of coin quality. Returns the same decomposition shape as v3."""
+    regardless of coin quality. Returns the same decomposition shape as v3.
+    DEPRECATED under P5 (rollback-only); _MR_CALL_COUNT tracks stray calls."""
+    global _MR_CALL_COUNT
+    _MR_CALL_COUNT += 1
     import math as _m
     O  = float(sub.get("O", 0.0)); E = float(sub.get("E", 0.0))
     K  = float(sub.get("K", 0.0)); Mk = float(sub.get("Mk", 0.0))

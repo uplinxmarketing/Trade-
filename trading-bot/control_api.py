@@ -904,6 +904,101 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("mr_golive", exc)
 
+            # ── WolfScore-P5 GO-LIVE (owner-approved; supersedes MR) ──────────────
+            # Flip the LIVE buy formula to P5 (calibrated-probability MLP, validated
+            # 365d × 90 coins). One-time + guarded (p5_golive_rev). Sets the tradable
+            # gates (threshold 55 HARD, trap_cap 0.12, ev_min -0.0005, universe 0.70,
+            # friction 0.60, macro gate on, pacing 2/window + 36-bar cooldown), raises
+            # kline_retention to 55d so the 50d P5 history persists, and drops the MR
+            # shadow + the min_win_probability_floor alias (P5 uses ONE hard floor).
+            # Then: migrate open positions to the no-stop engine (cancel OCO/stop legs,
+            # place a maker TP limit), load the model, and kick the 50d backfill in the
+            # background. MR/v3 stay in the code for instant rollback (buy_formula='mr').
+            try:
+                import trade_engine
+                import ev_model
+                _p5R = 1
+                _raw_p5 = _load_strategy()
+                if int(_raw_p5.get("p5_golive_rev", 0) or 0) < _p5R:
+                    _ent_p5 = dict(_raw_p5.get("entries") or {})
+                    _ext_p5 = dict(_raw_p5.get("exits") or {})
+                    _siz_p5 = dict(_raw_p5.get("sizing") or {})
+                    _dat_p5 = dict(_raw_p5.get("data") or {})
+                    _ent_p5["buy_formula"] = "p5"
+                    _ent_p5["buy_score_threshold"] = 55.0
+                    _ent_p5["wolfscore_sole_gate"] = True
+                    _ent_p5["p5_trap_cap"] = 0.12
+                    _ent_p5["p5_ev_min"] = -0.0005
+                    _ent_p5["p5_universe_dhigh_min"] = 0.70
+                    _ent_p5["p5_friction_max"] = 0.60
+                    _ent_p5["p5_macro_gate"] = True
+                    _ent_p5["p5_max_new_per_window"] = 2
+                    _ent_p5["p5_coin_cooldown_bars"] = 36
+                    _ent_p5["p5_model_path"] = _ent_p5.get("p5_model_path") or ""
+                    # P5 uses a single hard floor; drop the MR alias + shadow flag.
+                    _ent_p5.pop("min_win_probability_floor", None)
+                    _ent_p5.pop("mr_shadow_enabled", None)
+                    _ext_p5["bail_after_days"] = 0.0        # valve OFF (owner default)
+                    _dat_p5["kline_retention_days"] = 55.0  # keep the 50d P5 history
+                    _siz_p5["max_positions"] = 8
+                    _write_strategy_patch({"p5_golive_rev": _p5R,
+                                           "entries": _ent_p5, "exits": _ext_p5,
+                                           "sizing": _siz_p5, "data": _dat_p5,
+                                           "max_positions": 8})
+                    database.log_activity(
+                        "WolfScore-P5 GO-LIVE: buy_formula=p5, threshold=55 (hard), "
+                        "trap_cap=0.12, ev_min=-0.0005, macro-gate ON, no-stop exit "
+                        "engine, retention 55d — MR retired from the live path "
+                        "(rollback: buy_formula=mr)", "warn")
+                    steps.append("P5 go-live (buy_formula=p5, threshold=55, no-stop)")
+
+                    # Load the model early (fail-closed if the artifact is missing).
+                    try:
+                        _p5path = (_ent_p5.get("p5_model_path") or "").strip() or None
+                        if ev_model is not None and hasattr(ev_model, "ensure_p5_loaded"):
+                            if ev_model.ensure_p5_loaded(_p5path):
+                                steps.append(f"P5 model loaded ({ev_model.p5_model_status().get('version')})")
+                            else:
+                                database.log_activity(
+                                    f"P5 model FAILED to load: "
+                                    f"{ev_model.p5_model_status().get('error')} — buys fail-closed "
+                                    f"until the artifact is present", "critical")
+                    except Exception as _me:
+                        _step_failed("p5_model_load", _me)
+
+                    # Migrate open positions to the no-stop engine (buy_formula is now
+                    # p5, so _place_managed_exit places a maker TP with no stop leg).
+                    try:
+                        _mig = trade_engine._p5_migrate_open_positions()
+                        steps.append(f"P5 open-position migration: {_mig}")
+                    except Exception as _pe:
+                        _step_failed("p5_open_pos_migrate", _pe)
+
+                    # Kick the 50d backfill in the BACKGROUND (non-blocking; warmup
+                    # clears progressively). Guarded — a fetch failure never blocks boot.
+                    try:
+                        _p5_syms = [c["symbol"] for c in (_raw_p5.get("approved_coins") or [])
+                                    if isinstance(c, dict) and c.get("approved") and c.get("symbol")]
+
+                        def _p5_bf():
+                            try:
+                                import p5_backfill as _pbf
+                                _pbf.run_backfill(
+                                    _p5_syms, log=lambda m: database.log_activity(m, "info"))
+                            except Exception as _be:
+                                try:
+                                    database.log_activity(
+                                        f"[p5-backfill] thread error: {_be}", "warn")
+                                except Exception:
+                                    pass
+                        threading.Thread(target=_p5_bf, name="p5-backfill",
+                                         daemon=True).start()
+                        steps.append(f"P5 50d backfill started ({len(_p5_syms)} coins, background)")
+                    except Exception as _bfe:
+                        _step_failed("p5_backfill_kick", _bfe)
+            except Exception as exc:
+                _step_failed("p5_golive", exc)
+
             # 4c-e. Hard-stop paper-shadow if it is disabled. It is start()ed early
             #   in boot (above), BEFORE the s3 migration flips
             #   data.paper_shadow_enabled=false, so the thread is alive and merely
