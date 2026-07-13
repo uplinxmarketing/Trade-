@@ -65,7 +65,7 @@ export function EvExpectancyCard({ baseUrl = '' }: { baseUrl?: string }) {
   return (
     <div className="space-y-1.5">
       <p className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">
-        Expectancy — live vs paper-shadow
+        Expectancy — live
       </p>
       {loading && !data ? (
         <p className="text-[9px] text-muted-foreground py-1">Loading expectancy…</p>
@@ -75,8 +75,7 @@ export function EvExpectancyCard({ baseUrl = '' }: { baseUrl?: string }) {
         </p>
       ) : (
         <div className="flex gap-2">
-          <Leg title="Live" sub="slot-limited" leg={data?.live} />
-          <Leg title="Paper-shadow" sub="unconstrained" leg={data?.paper_shadow} />
+          <Leg title="Live" sub="realized, net of fees" leg={data?.live} />
         </div>
       )}
     </div>

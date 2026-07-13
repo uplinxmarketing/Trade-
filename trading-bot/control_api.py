@@ -9468,9 +9468,47 @@ def api_ev_model():
 
 def _ev_model_impl():
     try:
+        import ev_model as _ev
+        _p5_live = False
+        try:
+            _p5_live = str((_load_strategy().get("entries") or {}).get(
+                "buy_formula", "v3")).lower() == "p5"
+        except Exception:
+            _p5_live = False
+
+        if _p5_live:
+            # LIVE model under P5 is the calibrated MLP (trained OFF-box on the
+            # sandbox). No in-app training, no paper. Headline moves with the live
+            # score distribution so the panel is never static.
+            _pst = {}
+            _psfn = getattr(_ev, "p5_model_status", None)
+            if callable(_psfn):
+                _pst = _psfn() or {}
+            _scores = _ev_live_scores_bundle().get("scores", {}) or {}
+            _pcts = [float((d or {}).get("pct") or 0.0) for d in _scores.values()]
+            _thr = 55.0
+            try:
+                _thr = float((_load_strategy().get("entries") or {}).get("buy_score_threshold", 55) or 55)
+            except Exception:
+                pass
+            _clear = sum(1 for p in _pcts if p >= _thr)
+            _top = max(_pcts) if _pcts else 0.0
+            status = {
+                "version": _pst.get("version") or "wolf-p5-v1",
+                "trained": True,          # ships pre-trained (validated 365d × 90 coins)
+                "n_trades": len(_scores),
+                "floor_active": True,
+                "min_clean": 0,
+                "loaded": bool(_pst.get("loaded", True)),
+                "note": (f"WolfScore-P5 — calibrated MLP, trained off-box · "
+                         f"scored {len(_scores)} · clearing {_thr:.0f}: {_clear} · top {_top:.0f}%"),
+            }
+            return {"status": status, "versions": [status["version"]],
+                    "counts": {}, "p5": True}
+
+        # legacy (mr/v3): the old in-app EV logistic model status (paper stripped)
         status, versions = {}, []
         try:
-            import ev_model as _ev
             _st = getattr(_ev, "model_status", None)
             if callable(_st):
                 status = _st()
@@ -9483,9 +9521,11 @@ def _ev_model_impl():
         try:
             fn = getattr(database, "count_training_samples", None)
             if callable(fn):
-                counts = fn()
+                counts = fn() or {}
         except Exception:
             counts = {}
+        if isinstance(counts, dict):
+            counts.pop("paper_shadow", None)   # paper retired
         return {"status": status, "versions": versions, "counts": counts}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
@@ -9655,17 +9695,9 @@ def api_ev_expectancy():
 
 
 def _ev_expectancy_impl():
+    # LIVE-ONLY: paper-shadow is retired under P5. Return just the live leg.
     try:
-        live = _ev_live_expectancy()
-        paper = {}
-        try:
-            import paper_shadow as _ps
-            fn = getattr(_ps, "get_paper_stats", None)
-            if callable(fn):
-                paper = fn()
-        except Exception:
-            paper = {}
-        return {"live": live, "paper_shadow": paper}
+        return {"live": _ev_live_expectancy()}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 

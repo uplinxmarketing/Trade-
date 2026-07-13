@@ -187,11 +187,10 @@ export function EvModelPanel({ baseUrl = '' }: { baseUrl?: string }) {
         </p>
       ) : (
         <>
-          {/* Counts */}
-          <div className="grid grid-cols-4 gap-1">
+          {/* Counts (live-only; paper-shadow retired under P5) */}
+          <div className="grid grid-cols-3 gap-1">
             {([
               ['Live', counts.live],
-              ['Paper', counts.paper_shadow],
               ['Total', counts.total],
               ['Wins', counts.wins],
             ] as Array<[string, number | undefined]>).map(([label, v]) => (
