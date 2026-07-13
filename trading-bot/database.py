@@ -761,6 +761,29 @@ def get_klines(symbol: str, interval: str,
     return [dict(r) for r in rows]
 
 
+def kline_deep_aggs(symbol: str, interval: str = "5m") -> dict:
+    """WolfScore-P5 deep-history scalars computed IN SQLite (O(1) Python memory):
+    hi30 = 30d (8640-bar) high, sma50d = 50d (14400-bar) close mean. Lets P5 hold
+    only ~900 recent bars per coin in RAM instead of 14k+ (the memory blowout).
+    Uses the (symbol, interval, open_time) PK, so each is an indexed range scan."""
+    hi30 = sma50d = None
+    try:
+        with _lock.read():
+            conn = _conn()
+            r = conn.execute(
+                "SELECT MAX(h) FROM (SELECT h FROM klines WHERE symbol=? AND interval=? "
+                "ORDER BY open_time DESC LIMIT 8640)", (symbol, interval)).fetchone()
+            hi30 = r[0] if r and r[0] is not None else None
+            r = conn.execute(
+                "SELECT AVG(c) FROM (SELECT c FROM klines WHERE symbol=? AND interval=? "
+                "ORDER BY open_time DESC LIMIT 14400)", (symbol, interval)).fetchone()
+            sma50d = r[0] if r and r[0] is not None else None
+            conn.close()
+    except Exception:
+        pass
+    return {"hi30": hi30, "sma50d": sma50d}
+
+
 _CANDLE_RETENTION_DAYS_DEFAULT = 5.0
 
 

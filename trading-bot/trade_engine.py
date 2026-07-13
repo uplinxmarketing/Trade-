@@ -2163,10 +2163,15 @@ def _wolf_inputs_mr(sym: str, cached: dict) -> dict:
 # P5 features need up to 50 DAYS of 5m history per coin (btc/breadth 50d SMA,
 # 30d high, 3d return). We read that from the durable kline store (now with taker
 # volume) and cache the per-coin arrays + the once-per-pass cohort/macro context.
-_P5_MAX_BARS   = 14600          # ~50.7 days of 5m (50d = 14400) + margin
-_P5_ARR_TTL    = 600.0          # per-coin durable-array cache: one bounded DB read / 10 min
+# MEMORY: hold only ~900 recent bars per coin in RAM (covers every FEAT lookback —
+# deepest is ret3d at i-864). The two deep values (30d high, 50d SMA) come from
+# SQL scalar aggregates (database.kline_deep_aggs), NOT from a 14k-bar array — that
+# array cache (74 coins × 14600 × 7 lists) was ~250MB and blew RSS past the cap.
+_P5_MAX_BARS   = 900            # recent bars kept in RAM (FEAT needs <=864)
+_P5_ARR_TTL    = 600.0          # per-coin array/agg cache: one bounded DB read / 10 min
 _P5_CTX_TTL    = 120.0          # cohort/macro pass-context freshness
 _p5_arrays_cache: Dict[str, tuple] = {}
+_p5_aggs_cache: Dict[str, tuple] = {}
 _p5_arrays_lock = threading.Lock()
 _p5_pass_ctx: Dict[str, Any] = {"ts": 0.0}
 _p5_ctx_lock = threading.Lock()
@@ -2247,6 +2252,26 @@ def _p5_get_arrays(sym: str) -> Optional[dict]:
     return arr
 
 
+def _p5_get_aggs(sym: str) -> dict:
+    """Deep-history scalars {hi30, sma50d} via SQL aggregates, cached ~10 min.
+    Keeps P5's per-coin RAM at ~900 bars instead of 14k+."""
+    now = time.time()
+    with _p5_arrays_lock:
+        ce = _p5_aggs_cache.get(sym)
+        if ce and (now - ce[0]) < _P5_ARR_TTL:
+            return ce[1]
+    ag = {"hi30": None, "sma50d": None}
+    try:
+        _a = database.kline_deep_aggs(sym, "5m")
+        if isinstance(_a, dict):
+            ag = _a
+    except Exception:
+        pass
+    with _p5_arrays_lock:
+        _p5_aggs_cache[sym] = (now, ag)
+    return ag
+
+
 def _p5_build_pass_ctx(syms) -> dict:
     """Compute the once-per-scan cohort + macro context: cx=(med 3-bar roc, btc tilt,
     breadth-above-240, breadth slope vs 288 bars ago, codip) + macro state
@@ -2264,7 +2289,8 @@ def _p5_build_pass_ctx(syms) -> dict:
         ctx["btc_last"] = bc[bi]
         ctx["btc_3ago"] = bc[bi - 3] if bi >= 3 else bc[bi]
         ctx["btc_sma576"] = _p5_mean(bc[max(0, bi - 576):bi]) or bc[bi]
-        _btc_sma50d = _p5_mean(bc[max(0, bi - 14400):bi]) or bc[bi]
+        # 50d SMA from the SQL aggregate (array only holds ~900 bars now).
+        _btc_sma50d = _p5_get_aggs("BTCUSDT").get("sma50d") or _p5_mean(bc) or bc[bi]
         b50 = (bc[bi] / _btc_sma50d - 1.0) if _btc_sma50d else 0.0
     rocs: List[float] = []
     nd = nt = nb = a240 = a240p = a50 = 0
@@ -2280,9 +2306,10 @@ def _p5_build_pass_ctx(syms) -> dict:
         rocs.append(r); nt += 1
         if r < -0.001:
             nd += 1
-        if c[i] > _p5_mean(c[max(0, i - 240):i]):
+        if c[i] > _p5_mean(c[max(0, i - 240):i]):     # 240 bars fit in the ~900 array
             a240 += 1
-        if c[i] > _p5_mean(c[max(0, i - 14400):i]):
+        _sma50 = _p5_get_aggs(s).get("sma50d")         # 50d SMA via SQL aggregate
+        if _sma50 and c[i] > _sma50:
             a50 += 1
         if i >= 288 + 240 and c[i - 288] > _p5_mean(c[i - 288 - 240:i - 288]):
             a240p += 1
@@ -2329,7 +2356,9 @@ def _wolf_inputs_p5(sym: str, ctx: Optional[dict] = None) -> Optional[dict]:
         return None
     ctx = ctx or _p5_get_pass_ctx()
     i = len(a["c"]) - 1
-    hi30 = max(a["h"][max(0, i - 8639):i + 1]) if a["h"] else 0.0   # 30d (8640-bar) high
+    # 30d high from the SQL aggregate (the array now holds only ~900 bars); fall
+    # back to the in-RAM max if the aggregate is unavailable.
+    hi30 = _p5_get_aggs(sym).get("hi30") or (max(a["h"]) if a["h"] else 0.0)
     return {
         "op": a["op"], "h": a["h"], "l": a["l"], "c": a["c"], "v": a["v"], "tb": a["tb"],
         "i": i, "tsms": (a["ot"][i] if a["ot"] else 0), "fv": 0,
