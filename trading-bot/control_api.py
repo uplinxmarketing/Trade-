@@ -4021,6 +4021,68 @@ def api_signals_summary(limit: int = 30):
         strategy = _load_strategy()
         _SNAPSHOT_SKIP = {"E1_spread_too_wide"}
 
+        # ── P5 FAST PATH ─────────────────────────────────────────────────────
+        # Under wolfscore_sole_gate the legacy signal engine is RETIRED, so
+        # recomputing 17 signal compute_fns × 74 coins + a per-coin re-score here
+        # (~13s, every 3s from the Market Signals poll) is pure waste that starves
+        # the scan. Serve the scan's already-published P5 scores instead: buy
+        # eligibility straight from the P5 gates, and the six core signal booleans
+        # read from the cache (already computed on the 5m close — no recompute).
+        _bf5 = str((strategy.get("entries") or {}).get("buy_formula", "v3")).lower()
+        if _bf5 == "p5":
+            pub: dict = {}
+            try:
+                import trade_engine as _te_p5
+                _gl = _te_p5.get_live_ev_scores(allow_compute=False)
+                _inner = _gl.get("scores") if isinstance(_gl, dict) else None
+                pub = (_inner if isinstance(_inner, dict) else _gl) or {}
+            except Exception:
+                pub = {}
+            _e5 = strategy.get("entries") or {}
+            _thr5 = float(_e5.get("buy_score_threshold", 55) or 55)
+            _cap5 = float(_e5.get("p5_trap_cap", 0.12) or 0.12)
+            _evm5 = float(_e5.get("p5_ev_min", -0.0005))
+            slist = []
+            for sym, entry in snap.items():
+                try:
+                    d = pub.get(sym) or {}
+                    sm = d.get("submetrics") or {}
+                    g = d.get("hard_gate")
+                    pct = d.get("pct")
+                    pt = sm.get("p_trap")
+                    ev = sm.get("ev")
+                    if g:
+                        allowed, reason = False, str(g)
+                    elif pct is None or float(pct) < _thr5:
+                        allowed, reason = False, f"score {float(pct or 0):.0f} < {_thr5:.0f}"
+                    elif pt is not None and float(pt) > _cap5:
+                        allowed, reason = False, f"p_trap {float(pt):.2f} > {_cap5:.2f}"
+                    elif ev is not None and float(ev) < _evm5:
+                        allowed, reason = False, f"ev {float(ev):.4f} < {_evm5:.4f}"
+                    else:
+                        allowed, reason = True, "ready"
+                    sig = entry.get("signals", {}) or {}
+                    slist.append({
+                        "symbol": sym,
+                        "score": pct if pct is not None else entry.get("score", 0),
+                        "price": entry.get("price"),
+                        "signal_results": {k: {"fired": bool(sig.get(k, False)), "raw_value": None}
+                                           for k in ("trend", "rsi", "macd", "volume", "obv", "atr")},
+                        "buy_allowed": allowed,
+                        "buy_reason": reason,
+                        "gate_blockers": ([str(g)] if g else ([] if allowed else [reason])),
+                        "signal_engine_allowed": allowed,
+                        "promo_pair_available": False,
+                        "ts": entry.get("ts", 0),
+                        "p5": {"pct": pct, "p_trap": pt, "ev": ev, "gated": d.get("gated", "")},
+                    })
+                except Exception:
+                    continue
+            slist.sort(key=lambda x: (0 if x["buy_allowed"] else 1, -(x["score"] or 0)))
+            result = {"signals": slist, "total_tracked": len(slist), "ts": now}
+            _signals_summary_cache = {"ts": now, "data": result}
+            return {"signals": slist[:limit], "total_tracked": len(slist), "ts": now, "cached": False}
+
         # J1 — decision-trace overlay. Pulled ONCE here inside the cached
         # builder so it refreshes with the 3s summary cache. Guarded: an older
         # trade_engine without get_decision_trace() leaves the map empty and the
