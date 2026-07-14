@@ -1999,6 +1999,20 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                   label = 'pW<'; labelColor = 'bg-yellow-500/20 text-yellow-400';
                 } else if (reason.startsWith('veto_')) {
                   label = 'VETO'; labelColor = 'bg-orange-500/20 text-orange-400';
+                } else if (/thin[_ ]?liquid|\bthin\b/i.test(reason)) {
+                  // Candidacy gate: 24h quote volume below the liquidity floor.
+                  label = 'THIN'; labelColor = 'bg-sky-500/20 text-sky-400';
+                } else if (/coarse[_ ]?tick|\btick\b/i.test(reason)) {
+                  // Candidacy gate: one price tick too large a % of price (coarse grid).
+                  label = 'TICK'; labelColor = 'bg-sky-500/20 text-sky-400';
+                } else if (/high[_ ]?friction|friction/i.test(reason)) {
+                  label = 'FRIC'; labelColor = 'bg-amber-500/20 text-amber-400';
+                } else if (/pacing/i.test(reason)) {
+                  label = 'PACE'; labelColor = 'bg-amber-500/20 text-amber-400';
+                } else if (/cooldown/i.test(reason)) {
+                  label = 'COOL'; labelColor = 'bg-amber-500/20 text-amber-400';
+                } else if (/slippage/i.test(reason)) {
+                  label = 'SLIP'; labelColor = 'bg-orange-500/20 text-orange-400';
                 } else if ((sig.gate_blockers?.length ?? 0) > 0 ||
                            ['friction', 'universe', 'macro_bear', 'warmup', 'model_missing',
                             'cluster_guard', 'r_pacing', 'r_cooldown', 'hour_window'].includes(reason)) {
