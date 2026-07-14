@@ -2373,12 +2373,242 @@ def _wolf_inputs_p5(sym: str, ctx: Optional[dict] = None) -> Optional[dict]:
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# WolfScore-R — dual-head ensemble engine (scoring_engine='wolf-r-volume'|'wolf-r')
+# ═══════════════════════════════════════════════════════════════════════════
+# Reuses the P5 memory-safe 900-bar array cache (R's deepest window is 288 bars,
+# warmup 620 — well within 900; NO deep aggregates needed for scoring). Cross-
+# sectional med/breadth + BTC + macro computed once per scan.
+_r_pass_ctx: Dict[str, Any] = {"ts": 0.0}
+_r_recent_buys: List[float] = []          # executed-buy wall-clocks (30-min pacing)
+_r_recent_lock = threading.Lock()
+
+
+def _r_note_buy() -> None:
+    """Record an executed buy for the R 30-min pacing window."""
+    try:
+        with _r_recent_lock:
+            _r_recent_buys.append(time.time())
+            if len(_r_recent_buys) > 500:
+                del _r_recent_buys[:-500]
+    except Exception:
+        pass
+
+
+def _r_buys_in_window(sec: float = 1800.0) -> int:
+    now = time.time()
+    with _r_recent_lock:
+        _r_recent_buys[:] = [t for t in _r_recent_buys if now - t < sec]
+        return len(_r_recent_buys)
+
+
+def _r_cluster_guard_active() -> bool:
+    """WolfScore-R cluster guard: True when >= 3 OPEN positions are older than 288
+    bars (1 day) AND currently underwater — new buys pause until one recovers or
+    closes. Judged on the live price; never raises."""
+    try:
+        now = time.time()
+        with _positions_lock:
+            snap = list(_positions)
+        try:
+            import data_collector as _dc
+            _prices = getattr(_dc, "prices", {}) or {}
+        except Exception:
+            _prices = {}
+        stale_uw = 0
+        for p in snap:
+            opened = p.get("opened_at_ts", 0) or 0
+            if not opened or (now - opened) / 300.0 <= 288.0:
+                continue
+            entry = float(p.get("entry_price") or 0.0)
+            sym = p.get("symbol")
+            px = float(_prices.get(sym) or 0.0)
+            if entry > 0 and px > 0 and px < entry:
+                stale_uw += 1
+        return stale_uw >= 3
+    except Exception:
+        return False
+
+
+def _active_engine() -> str:
+    """Effective scoring engine. entries.scoring_engine ('wolf-r-volume'|'wolf-r'|
+    'wolf-p5') takes precedence; else falls back to entries.buy_formula (p5/mr/v3).
+    This is the single rollback switch — flipping it never touches open positions."""
+    try:
+        e = _load_strategy().get("entries") or {}
+        se = str(e.get("scoring_engine", "") or "").lower()
+        if se in ("wolf-r-volume", "wolf-r"):
+            return se
+        if se == "wolf-p5":
+            return "p5"
+        return str(e.get("buy_formula", "v3")).lower()
+    except Exception:
+        return "v3"
+
+
+def _r_is_active() -> bool:
+    return _active_engine() in ("wolf-r-volume", "wolf-r")
+
+
+def _r_model_path() -> Optional[str]:
+    try:
+        p = str((_load_strategy().get("entries") or {}).get("r_model_path") or "").strip()
+        return p or None
+    except Exception:
+        return None
+
+
+def _r_runtime_cfg() -> dict:
+    """R gate/pacing config. pw_min is wired to the existing score slider
+    (buy_score_threshold); pz_max is the new freeze-veto ceiling. Volume preset =
+    (50, 6.0); balanced = (55, 4.0). Universe/friction/macro gates kept from P5."""
+    try:
+        e = _load_strategy().get("entries") or {}
+    except Exception:
+        e = {}
+    eng = _active_engine()
+    if eng == "wolf-r-volume":
+        pw_def, pz_def, maxnew_def, cool_def = 50.0, 6.0, 4, 12
+    else:
+        pw_def, pz_def, maxnew_def, cool_def = 55.0, 2.4, 2, 36
+    preset = str(e.get("preset", "") or "").lower()
+    if preset == "volume":
+        pw_def, pz_def = 50.0, 6.0
+    elif preset == "balanced":
+        pw_def, pz_def = 55.0, 4.0
+
+    def _f(k, d):
+        try:
+            return float(e.get(k, d))
+        except (TypeError, ValueError):
+            return d
+
+    def _i(k, d):
+        try:
+            return int(float(e.get(k, d)))
+        except (TypeError, ValueError):
+            return d
+    return {
+        "engine": eng,
+        "pw_min": _f("buy_score_threshold", pw_def),   # the existing UI score slider
+        "pz_max": _f("pz_max", pz_def),
+        "friction_max": _f("p5_friction_max", 0.60),
+        "universe_dhigh_min": _f("p5_universe_dhigh_min", 0.70),
+        "macro_gate": bool(e.get("p5_macro_gate", True)),
+        "max_new_per_30min": _i("r_max_new_per_30min", maxnew_def),
+        "coin_cooldown_bars": _i("r_coin_cooldown_bars", cool_def),
+        "cluster_guard": bool(e.get("cluster_guard", eng == "wolf-r-volume")),
+        "hour_window": bool(e.get("hour_window", False)),
+    }
+
+
+def _r_median(xs) -> float:
+    if not xs:
+        return 0.0
+    s = sorted(xs); m = len(s)
+    return s[m // 2] if m % 2 else (s[m // 2 - 1] + s[m // 2]) / 2.0
+
+
+def _r_build_pass_ctx(syms) -> dict:
+    """Once-per-scan cross-sectional context: median r1h/r24h + breadth (share with
+    r1h>0) over WARMUP-PASSED coins (≥620 bars, matching training), BTC 15m/1h roc,
+    and the macro state (reused from the P5 50d aggregate)."""
+    now = time.time()
+    r1hs: List[float] = []
+    r24s: List[float] = []
+    nb = npos = 0
+    for s in syms:
+        a = _p5_get_arrays(s)
+        if not a or len(a["c"]) < 620:
+            continue
+        c = a["c"]; i = len(c) - 1
+        if i < 288 or not c[i - 12] or not c[i - 288]:
+            continue
+        r1h = c[i] / c[i - 12] - 1.0
+        r24 = c[i] / c[i - 288] - 1.0
+        r1hs.append(r1h); r24s.append(r24); nb += 1
+        if r1h > 0:
+            npos += 1
+    med1h = _r_median(r1hs); med24 = _r_median(r24s)
+    breadth1h = (npos / nb) if nb else 0.5
+    btc15 = btc1h = 0.0
+    btc = _p5_get_arrays("BTCUSDT")
+    if btc and len(btc["c"]) > 13:
+        bc = btc["c"]; bi = len(bc) - 1
+        if bc[bi - 3]:
+            btc15 = bc[bi] / bc[bi - 3] - 1.0
+        if bc[bi - 12]:
+            btc1h = bc[bi] / bc[bi - 12] - 1.0
+    macro = "MIX"
+    try:
+        _bs = _p5_get_aggs("BTCUSDT").get("sma50d")
+        if btc and btc["c"] and _bs:
+            b50 = btc["c"][-1] / _bs - 1.0
+            a50 = nb2 = 0
+            for s in syms:
+                _sm = _p5_get_aggs(s).get("sma50d")
+                _a = _p5_get_arrays(s)
+                if _sm and _a and _a["c"]:
+                    nb2 += 1
+                    if _a["c"][-1] > _sm:
+                        a50 += 1
+            br50 = (a50 / nb2) if nb2 else 0.5
+            if b50 < -0.02 and br50 < 0.35:
+                macro = "BEAR"
+            elif b50 > 0.01 and br50 > 0.55:
+                macro = "BULL"
+    except Exception:
+        pass
+    ctx = {"ts": now, "med1h": med1h, "med24": med24, "breadth1h": breadth1h,
+           "btc15": btc15, "btc1h": btc1h, "macro": macro}
+    with _p5_ctx_lock:
+        _r_pass_ctx.clear(); _r_pass_ctx.update(ctx)
+    return ctx
+
+
+def _r_get_pass_ctx() -> dict:
+    with _p5_ctx_lock:
+        c = dict(_r_pass_ctx)
+    if c.get("ts") and (time.time() - float(c["ts"])) < _P5_CTX_TTL:
+        return c
+    try:
+        uni = sorted(_active_universe) if _active_universe else []
+    except Exception:
+        uni = []
+    return _r_build_pass_ctx(uni) if uni else c
+
+
+def _wolf_inputs_r(sym: str, ctx: Optional[dict] = None) -> Optional[dict]:
+    """Assemble WolfScore-R inputs: the ~900-bar OHLCV+taker array (as (N,6) rows)
+    + this-scan cross-sectional scalars + hour + dhigh_ratio (30d-high, for the
+    kept universe gate). None when < 620 bars (warmup)."""
+    a = _p5_get_arrays(sym)
+    if not a or len(a["c"]) < 620:
+        return None
+    ctx = ctx or _r_get_pass_ctx()
+    op = a["op"]; h = a["h"]; l = a["l"]; c = a["c"]; v = a["v"]; tb = a["tb"]; ot = a["ot"]
+    i = len(c) - 1
+    hr = ((int(ot[i]) if ot else 0) // 3600000) % 24
+    hs = math.sin(2 * math.pi * hr / 24.0)
+    hc = math.cos(2 * math.pi * hr / 24.0)
+    hi30 = _p5_get_aggs(sym).get("hi30") or (max(h) if h else 0.0)
+    dhigh_ratio = (c[i] / hi30) if hi30 else 1.0
+    return {
+        "arr": list(zip(op, h, l, c, v, tb)),   # (N,6) → numpy in ev_model
+        "med1h": ctx.get("med1h", 0.0), "med24": ctx.get("med24", 0.0),
+        "breadth1h": ctx.get("breadth1h", 0.5),
+        "btc15": ctx.get("btc15", 0.0), "btc1h": ctx.get("btc1h", 0.0),
+        "hs": hs, "hc": hc, "dhigh_ratio": dhigh_ratio,
+        "macro_bear": (ctx.get("macro") == "BEAR"),
+    }
+
+
 def _wolf_score_cached(sym: str, cached: dict, cohort: dict, tilt: float) -> Optional[dict]:
-    """Buy-selection score for a signal-cache entry. Selects the formula from
-    entries.buy_formula: 'p5' → WolfScore-P5 (calibrated MLP; compute_features_p5 →
-    wolfscore_p5); 'mr' → WolfScore-MR; anything else → WolfScore v3 (default).
+    """Buy-selection score for a signal-cache entry. Selects the engine from
+    entries.scoring_engine / buy_formula: 'wolf-r-volume'|'wolf-r' → WolfScore-R
+    (dual-head ensemble); 'p5' → WolfScore-P5; 'mr' → WolfScore-MR; else v3.
     Returns the full decomposition dict or None on failure / when ev_model is
-    unavailable (p5: None also when the model artifact can't be loaded — fail-closed)."""
+    unavailable (R/p5: fail-closed when the model artifact can't be loaded)."""
     if ev_model is None:
         return None
     try:
@@ -2392,9 +2622,24 @@ def _wolf_score_cached(sym: str, cached: dict, cohort: dict, tilt: float) -> Opt
     # ev_floor_mode at _ENTRIES_DEFAULTS). Through _entries_cfg this returned "v3"
     # forever even with buy_formula=mr on disk, keeping the live engine on v3.
     try:
-        _formula = str((_load_strategy().get("entries") or {}).get("buy_formula", "v3")).lower()
+        _formula = _active_engine()
     except Exception:
         _formula = "v3"
+    if _formula in ("wolf-r-volume", "wolf-r"):
+        try:
+            ev_model.ensure_r_loaded(_r_model_path())
+            _cfgr = _r_runtime_cfg()
+            _inp = _wolf_inputs_r(sym)
+            if not _inp:
+                return ev_model.wolfscore_r(None, cfg=_cfgr)   # warmup (numeric, gated)
+            _x, _atr = ev_model.compute_features_r(
+                _inp["arr"], _inp["med1h"], _inp["med24"], _inp["breadth1h"],
+                _inp["btc15"], _inp["btc1h"], _inp["hs"], _inp["hc"])
+            _mb = bool(_cfgr.get("macro_gate", True)) and _inp.get("macro_bear", False)
+            return ev_model.wolfscore_r(_x, atr_last=_atr, cfg=_cfgr,
+                                        dhigh_ratio=_inp.get("dhigh_ratio"), macro_bear=_mb)
+        except Exception:
+            return None
     if _formula == "p5":
         try:
             if not ev_model.ensure_p5_loaded(_p5_model_path()):
@@ -2598,14 +2843,21 @@ def _refresh_and_publish_scores() -> None:
         # candidates (breadth/med/codip/macro over the universe), so each per-coin
         # _wolf_score_cached('p5') reads the fresh cached context instead of
         # rebuilding it 89×. No-op for mr/v3.
-        _p5_live = False
+        _eng_live = "v3"
         try:
-            _p5_live = str((strategy.get("entries") or {}).get("buy_formula", "v3")).lower() == "p5"
+            _eng_live = _active_engine()
         except Exception:
-            _p5_live = False
+            _eng_live = "v3"
+        _p5_live = _eng_live == "p5"
+        _r_live = _eng_live in ("wolf-r-volume", "wolf-r")
         if _p5_live:
             try:
                 _p5_build_pass_ctx([s for s, _ in cand])
+            except Exception:
+                pass
+        elif _r_live:
+            try:
+                _r_build_pass_ctx([s for s, _ in cand])
             except Exception:
                 pass
         _now_pub = time.time()
@@ -2623,8 +2875,8 @@ def _refresh_and_publish_scores() -> None:
         pcts = [float(v.get("pct")) for v in scores.values()
                 if v.get("hard_gate") is None and v.get("pct") is not None]
         cfg = _entries_cfg()
-        if _p5_live:
-            # P5: the floor is the FIXED user threshold (hard, no distribution rule).
+        if _p5_live or _r_live:
+            # P5/R: the gate is a FIXED threshold (hard, no distribution rule).
             # No adaptive floor, and the MR shadow does not run.
             af = None
         else:
@@ -2637,7 +2889,7 @@ def _refresh_and_publish_scores() -> None:
         # WolfScore-MR shadow validation: score MR for these candidates and step the
         # virtual book WITHOUT touching live buys. Skipped entirely under P5.
         try:
-            if (not _p5_live) and bool(cfg.get("mr_shadow_enabled", True)):
+            if (not _p5_live) and (not _r_live) and bool(cfg.get("mr_shadow_enabled", True)):
                 _mr_shadow_tick(cand, cohort, tilt)
         except Exception:
             pass
@@ -8736,6 +8988,39 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     """Inner sell logic — called only when the _selling guard is held."""
     from datetime import timezone as _tz
 
+    # ── WolfScore-R VOLUME no-loss assertion (§2/§3) ─────────────────────────────
+    # In wolf-r-volume mode NO code path may submit a sell with negative expected
+    # PnL. The profit engine (TP/ratchet/breakeven) only ever exits >= breakeven, so
+    # a negative-PnL automated sell here is a BUG — log CRITICAL and BLOCK it.
+    # Operator-initiated exits (manual/force/delist/successor) and the wolf-r base
+    # 'valve3' are the only allowed negative paths and bypass this guard.
+    try:
+        _R_ALLOWED_NEG = ("manual", "force", "force-sell", "forced", "delist",
+                          "delisted", "successor", "reconcile", "valve3")
+        if _active_engine() == "wolf-r-volume" and str(reason) not in _R_ALLOWED_NEG:
+            _e_entry = float(pos.get("entry_price") or pos.get("avg_entry_price") or 0.0)
+            _e_qty = float(qty or 0.0)
+            if _e_entry > 0 and _e_qty > 0 and float(price) > 0:
+                _e_fee = _fee_rate_for(sym)
+                _e_net = (float(price) - _e_entry) * _e_qty - (float(price) * _e_qty + _e_entry * _e_qty) * _e_fee
+                if _e_net < 0:
+                    database.log_activity(
+                        f"CRITICAL: wolf-r-volume no-loss assertion BLOCKED a '{reason}' sell of "
+                        f"{sym} — expected net {_e_net:.5f} USDT < 0 (price {price} < entry {_e_entry}). "
+                        f"No loss exits exist in this mode; this is a bug — order not submitted.",
+                        "critical")
+                    try:
+                        log_diag_issue("no_loss_assert", "critical",
+                                       f"{sym}: blocked negative-PnL '{reason}' sell (net {_e_net:.5f})")
+                    except Exception:
+                        pass
+                    with _selling_lock:
+                        _selling.discard(sym)
+                        _selling_ts.pop(sym, None)
+                    return
+    except Exception:
+        pass
+
     # Phase 1 §1.3: the price passed into _execute_sell is the trigger price —
     # capture it BEFORE any fresh-quote reassignment; slippage_bps baseline.
     _trigger_price = price
@@ -9943,13 +10228,50 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                                   "WolfScore unavailable (sole-gate → skip)")
                 _trace_mark_block(sym, "blocked: no WolfScore")
                 continue
-            _p5_mode_local = False
+            _eng_local = "v3"
             try:
-                _p5_mode_local = str((_load_strategy().get("entries") or {}).get(
-                    "buy_formula", "v3")).lower() == "p5"
+                _eng_local = _active_engine()
             except Exception:
-                _p5_mode_local = False
-            if _ws_here is not None and _p5_mode_local:
+                _eng_local = "v3"
+            _p5_mode_local = (_eng_local == "p5")
+            _r_mode_local = (_eng_local in ("wolf-r-volume", "wolf-r"))
+            if _ws_here is not None and _r_mode_local:
+                # ── WolfScore-R tradable rule ──────────────────────────────────
+                # wolfscore_r already applied the full gate chain (universe /
+                # friction / macro_bear / pz_veto / below_thr / warmup /
+                # model_missing) → gated=='' means eligible. Then: cluster guard,
+                # per-coin cooldown, 30-min pacing, optional hour window. Ranking
+                # by pW is the loop's existing score-descending order.
+                _rc = _r_runtime_cfg()
+                _gr = _ws_here.get("gated") or _ws_here.get("hard_gate")
+                if _gr:
+                    _record_rejection(sym, cached.get("score", 0), f"r_{_gr}", f"R gated: {_gr}")
+                    _trace_mark_block(sym, f"blocked: R {_gr}")
+                    continue
+                if _rc.get("cluster_guard") and _r_cluster_guard_active():
+                    _record_rejection(sym, cached.get("score", 0), "r_cluster_guard",
+                                      "cluster guard: >=3 stale underwater positions")
+                    _trace_mark_block(sym, "paused: R cluster guard")
+                    continue
+                _lexr = _p5_last_exit_ts.get(sym, 0.0)
+                if _lexr and (time.time() - _lexr) < float(_rc["coin_cooldown_bars"]) * 300.0:
+                    _record_rejection(sym, cached.get("score", 0), "r_cooldown",
+                                      f"R re-entry cooldown ({_rc['coin_cooldown_bars']} bars)")
+                    _trace_mark_block(sym, "waiting: R re-entry cooldown")
+                    continue
+                _rwin = _r_buys_in_window(1800.0)
+                if _rwin >= int(_rc["max_new_per_30min"]):
+                    _record_rejection(sym, cached.get("score", 0), "r_pacing",
+                                      f"R pacing: {_rwin}/{_rc['max_new_per_30min']} in 30min")
+                    _trace_mark_block(sym, "waiting: R 30-min pacing")
+                    continue
+                if _rc.get("hour_window") and not (12 <= time.gmtime().tm_hour < 17):
+                    _record_rejection(sym, cached.get("score", 0), "r_hour_window",
+                                      "outside 12:00-17:00 UTC hour window")
+                    _trace_mark_block(sym, "waiting: R hour window")
+                    continue
+                # passes R → fall through to the buy (MR/v3 + P5 gate logic skipped)
+            elif _ws_here is not None and _p5_mode_local:
                 # ── WolfScore-P5 tradable rule (§4) — HARD floor, NO advisory path ──
                 # tradable iff gated=='' AND pct>=buy_score_threshold AND
                 # p_trap<=trap_cap AND ev>=ev_min; plus per-coin re-entry cooldown.
@@ -10894,6 +11216,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # Update stagger tracking
         _last_buy_ts = time.time()
         _buys_this_scan += 1
+        _r_note_buy()          # WolfScore-R 30-min pacing window (no-op off R mode)
         _record_corr_entry()   # §4.5 — executed buy enters the 5-min window
         pos_id = database.save_position(pos_record)
         pos_record["id"] = pos_id
@@ -11045,13 +11368,13 @@ def _fresh_bullish_score(sym: str, now: float) -> bool:
 
 
 def _no_stop_mode() -> bool:
-    """True when the live buy formula is P5 (WolfScore-P5 §5): the disaster stop
-    and the pre-profit ATR protective stop are REMOVED — positions are held until a
-    profit-side exit fires (take-profit / profit-ratchet / breakeven-scratch), or
-    the optional bail valve. Read directly from strategy.entries (string field).
-    buy_formula='mr' (rollback) restores the full legacy stop ladder."""
+    """True for the no-loss-side engines (P5 and WolfScore-R): the disaster stop and
+    the pre-profit ATR protective stop are REMOVED — positions are held until a
+    profit-side exit fires (take-profit / profit-ratchet / breakeven-scratch). The
+    ONLY negative-PnL exits are the optional P5 bail valve or the wolf-r valve3
+    (never wolf-r-volume). mr/v3 (rollback) restore the full legacy stop ladder."""
     try:
-        return str((_load_strategy().get("entries") or {}).get("buy_formula", "v3")).lower() == "p5"
+        return _active_engine() in ("p5", "wolf-r-volume", "wolf-r")
     except Exception:
         return False
 
@@ -11115,6 +11438,19 @@ def _evaluate_exit_decision_p5(pos: dict, sym: str, price: float,
         opened = pos.get("opened_at_ts", 0) or 0
         if opened and (now - opened) >= bail_days * 86400.0 and price < entry:
             return "valve", crossed
+
+    # 5) WolfScore-R base valve3 (scoring_engine='wolf-r' ONLY — NOT wolf-r-volume):
+    #    from age >= 864 bars (3d), exit at the first CLOSE below avg entry, then a
+    #    288-bar coin cooldown. This is the ONLY negative-PnL path in wolf-r mode.
+    #    wolf-r-volume has NO valve (held to recovery), so this never fires there.
+    try:
+        if _active_engine() == "wolf-r":
+            opened = pos.get("opened_at_ts", 0) or 0
+            if opened and ((now - opened) / 300.0) >= 864.0 and price < entry:
+                _p5_last_exit_ts[sym] = now   # 288-bar cooldown seed (re-entry lockout)
+                return "valve3", crossed
+    except Exception:
+        pass
 
     # else: HOLD (no stop) — hold-until-recovery under the profit-side engine.
     return None, crossed
