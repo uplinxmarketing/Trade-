@@ -9389,6 +9389,24 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
                 f"— relabeled 'below-breakeven' (no cooldown)", "warn"
             )
 
+    # Item-1 instrumentation — TP execution telemetry (LOG-ONLY, no logic change).
+    # This is the MARKET (taker) sell path; maker LIMIT_MAKER fills finalize in
+    # _finalize_managed_exit (which already logs 'maker-tp'). On a taker TP/ratchet
+    # capture, record the chosen mode + fill-vs-target so real slippage is measured
+    # against the 5bp assumption. reason may already be relabeled on a net-negative
+    # fill, so also cover the relabels for a complete picture.
+    try:
+        if str(reason) in ("take-profit", "profit-ratchet", "slippage-loss", "below-breakeven"):
+            _tp_tgt = float(pos.get("tp_price") or 0.0) or float(price or 0.0)
+            _tp_slip_bp = (((float(price) - float(fill_price)) / float(price)) * 10000.0) \
+                if (float(price or 0) > 0 and fill_price) else 0.0
+            database.log_activity(
+                f"TP_EXEC {sym} mode=taker/market reason={reason} "
+                f"target={_tp_tgt:.8f} fill={float(fill_price or 0):.8f} "
+                f"slip_bp={_tp_slip_bp:.1f} net={net_profit:.5f}", "info")
+    except Exception:
+        pass
+
     buy_ts  = pos.get("timestamp", now)
     sell_ts = now
     try:
