@@ -915,8 +915,7 @@ async def lifespan(app: FastAPI):
             # place a maker TP limit), load the model, and kick the 50d backfill in the
             # background. MR/v3 stay in the code for instant rollback (buy_formula='mr').
             try:
-                import trade_engine
-                import ev_model
+                import ev_model   # trade_engine comes from the lifespan closure
                 _p5R = 1
                 _raw_p5 = _load_strategy()
                 if int(_raw_p5.get("p5_golive_rev", 0) or 0) < _p5R:
@@ -1008,8 +1007,7 @@ async def lifespan(app: FastAPI):
             # retention stays 55d (covers the 620-bar warmup — the P5 50d backfill
             # already filled it). P5 stays dormant one flag away (rollback).
             try:
-                import trade_engine
-                import ev_model
+                import ev_model   # trade_engine comes from the lifespan closure
                 _rgR = 1
                 _raw_r = _load_strategy()
                 if int(_raw_r.get("r_golive_rev", 0) or 0) < _rgR:
