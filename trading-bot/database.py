@@ -751,13 +751,19 @@ def get_klines(symbol: str, interval: str,
     sql = f"SELECT open_time, o, h, l, c, v, quote_v, taker_v FROM klines WHERE {' AND '.join(where)}"
     with _lock.read():
         conn = _conn()
-        if limit is not None:
-            rows = conn.execute(sql + " ORDER BY open_time DESC LIMIT ?",
-                                params + [int(limit)]).fetchall()
-            rows = list(reversed(rows))
-        else:
-            rows = conn.execute(sql + " ORDER BY open_time ASC", params).fetchall()
-        conn.close()
+        try:
+            if limit is not None:
+                rows = conn.execute(sql + " ORDER BY open_time DESC LIMIT ?",
+                                    params + [int(limit)]).fetchall()
+                rows = list(reversed(rows))
+            else:
+                rows = conn.execute(sql + " ORDER BY open_time ASC", params).fetchall()
+        finally:
+            # Guarantee close even when execute() raises (WAL busy_timeout →
+            # OperationalError under contention). Without this the connection —
+            # and its cursor/page cache — leaks on every contended read, a
+            # steady contention-paced RSS climb.
+            conn.close()
     return [dict(r) for r in rows]
 
 
