@@ -148,6 +148,7 @@ class EntriesConfig(BaseModel):
     # balanced=55/4.0).
     scoring_engine:         str   = ""       # ''|'wolf-r-volume'|'wolf-r'|'wolf-p5'
     pz_max:                 float = Field(6.0, ge=0.0, le=100.0)    # freeze-veto ceiling (max ensemble member)
+    pz_veto_enabled:        bool  = True     # enforce the pZ ceiling; False = veto off (pZ still reported)
     preset:                 str   = ""       # ''|'volume'|'balanced' (sets pw_min/pz_max)
     cluster_guard:          bool  = True     # pause new buys while >=3 open >288 bars & underwater
     hour_window:            bool  = False    # only enter 12:00-17:00 UTC
@@ -563,6 +564,11 @@ SCHEMA: Dict[str, dict] = {
                                          "WolfScore-R: reject a coin if its worst-member freeze probability pZ "
                                          "exceeds this (volume 6.0, balanced 4.0, base 2.4). Lower = fewer, "
                                          "safer trades.", 0.0, 100.0, 0.5, ""),
+    "entries.pz_veto_enabled": _meta("entries.pz_veto_enabled", "bool", "Entries",
+                                         "R freeze-veto enabled",
+                                         "WolfScore-R: enforce the pZ ceiling (pz_max). OFF disables the freeze "
+                                         "veto entirely WITHOUT moving pz_max — pZ is still computed and reported. "
+                                         "Use to confirm pz is the binding constraint, not to run unguarded long-term."),
     "entries.preset": _meta("entries.preset", "enum", "Entries",
                                          "R preset",
                                          "Sets pw_min + pz_max together: volume=(50,6.0) higher volume | "
