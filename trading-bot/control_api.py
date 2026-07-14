@@ -9925,6 +9925,31 @@ def _r_scorecard_impl():
                 "usd_per_day": round(usd_per_day - base["usd_per_day"], 3),
             },
         }
+        # Item-2 requirement — live-universe divergence from the 92-coin backtest
+        # set + the tick-excluded symbols with their tick%. The exclusion is
+        # justified (backtests can't see tick quantization), but every baseline
+        # comparison must carry this note.
+        _uni = {"backtest_set": 92, "live_count": None, "tick_pct_max": 0.0,
+                "tick_excluded": []}
+        try:
+            from exchange_info import get_symbol_filters as _gsf_u
+            _appr = _approved_symbols()
+            _uni["live_count"] = len(_appr)
+            _tick_cap_u = float((_load_strategy().get("entries") or {}).get("tick_pct_max", 0.0) or 0.0)
+            _uni["tick_pct_max"] = _tick_cap_u
+            if _tick_cap_u > 0:
+                for _s in _appr:
+                    try:
+                        _ts = float((_gsf_u(_s) or {}).get("tick_size", 0.0) or 0.0)
+                        _px = float(prices.get(_s) or 0.0)
+                        if _ts > 0 and _px > 0 and (_ts / _px * 100.0) > _tick_cap_u:
+                            _uni["tick_excluded"].append(
+                                {"symbol": _s, "tick_pct": round(_ts / _px * 100.0, 4)})
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        summary["universe"] = _uni
         slots = 8
         try:
             slots = int((_load_strategy().get("sizing") or {}).get("max_positions", 8) or 8)

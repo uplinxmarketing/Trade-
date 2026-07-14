@@ -549,30 +549,46 @@ _LIQUIDITY_COOLDOWN_SEC = 1800.0     # 30 min
 
 
 def _quote_volume_24h_usd(symbol: str):
-    """24h quote volume in USDT for `symbol`, summed from the durable 1m kline
-    store (quote_v column) over the last 24h; falls back to Σ close×base_volume
-    when quote_v is absent (WS-persisted klines store base volume only). Cached
-    5 min. Returns None when no kline data exists at all (caller fails open —
-    a missing liquidity stat must never block a real candidate). No REST weight."""
+    """24h quote volume in USDT for `symbol`. PRIMARY source is the exchange's own
+    rolling 24h quoteVolume from the @miniTicker WS stream
+    (data_collector.market_stats[sym]['quote_vol_24h']) — authoritative, live, and
+    zero REST. FALLBACK (only if that's missing/stale) is the durable 1m kline-store
+    sum, which UNDERCOUNTS coins whose local store is younger than 24h (a recently
+    auto-added coin like JUV then looks falsely thin). Cached 5 min. None when no
+    source has data (caller fails open — a missing liquidity stat must never block a
+    real candidate). Buy-side gate only."""
     now = time.time()
     ce = _qv24h_cache.get(symbol)
     if ce and (now - ce[1]) < _QV24H_CACHE_TTL:
         return ce[0]
     qv = None
+    # Primary: exchange 24h quoteVolume harvested from the miniTicker WS rollup.
     try:
-        start_ms = int((now - 86400.0) * 1000)
-        rows = database.get_klines(symbol, config.CANDLE_TIMEFRAME, start_ms=start_ms)
-        vals = [float(r["quote_v"]) for r in (rows or [])
-                if r.get("quote_v") is not None]
-        if vals:
-            qv = sum(vals)
-        elif rows:
-            approx = [float(r["c"]) * float(r["v"]) for r in rows
-                      if r.get("c") is not None and r.get("v") is not None]
-            if approx:
-                qv = sum(approx)
+        import data_collector as _dc_ms
+        _st = (getattr(_dc_ms, "market_stats", {}) or {}).get(symbol)
+        if isinstance(_st, dict):
+            _q = _st.get("quote_vol_24h")
+            _q_ts = float(_st.get("ts") or 0.0)
+            if _q is not None and (now - _q_ts) < 900.0:   # fresh within 15 min
+                qv = float(_q)
     except Exception:
         qv = None
+    # Fallback: sum quote_v over the last 24h from the durable 1m kline store.
+    if qv is None:
+        try:
+            start_ms = int((now - 86400.0) * 1000)
+            rows = database.get_klines(symbol, config.CANDLE_TIMEFRAME, start_ms=start_ms)
+            vals = [float(r["quote_v"]) for r in (rows or [])
+                    if r.get("quote_v") is not None]
+            if vals:
+                qv = sum(vals)
+            elif rows:
+                approx = [float(r["c"]) * float(r["v"]) for r in rows
+                          if r.get("c") is not None and r.get("v") is not None]
+                if approx:
+                    qv = sum(approx)
+        except Exception:
+            qv = None
     _qv24h_cache[symbol] = (qv, now)
     return qv
 
@@ -11325,6 +11341,24 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     database.log_activity(
                         f"PZ_CF {sym} pz={_pzf:.2f} pz_max={_r_runtime_cfg().get('pz_max')} "
                         f"would_block@6.0={_pzf > 6.0} would_block@8.0={_pzf > 8.0}", "info")
+                # Item 3 — friction counterfactual: whether the historical friction
+                # gate (0.60) WOULD have blocked this entry (friction is still
+                # reported even though the gate is off for volume). grep FRICTION_CF.
+                _fr_cf = (_pub_sc.get("submetrics") or {}).get("friction")
+                if _fr_cf is not None:
+                    _frf = float(_fr_cf)
+                    database.log_activity(
+                        f"FRICTION_CF {sym} friction={_frf:.3f} "
+                        f"would_block@0.60={_frf > 0.60}", "info")
+                # Item 4 — tick counterfactual: tick% vs the filter (0.10). grep TICK_CF.
+                _entry_px_cf = float(pos_record.get("entry_price") or 0.0)
+                _tk_cf = _tick_pct(sym, _entry_px_cf)
+                if _tk_cf is not None:
+                    _tkp = _tk_cf * 100.0
+                    database.log_activity(
+                        f"TICK_CF {sym} tick_pct={_tkp:.3f} "
+                        f"tick_pct_max={_entries_cfg().get('tick_pct_max', 0.0)} "
+                        f"would_block@0.10={_tkp > 0.10}", "info")
         except Exception:
             pass
         _record_corr_entry()   # §4.5 — executed buy enters the 5-min window
