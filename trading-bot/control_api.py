@@ -4096,13 +4096,21 @@ def api_signals_summary(limit: int = 30):
             # already applied the full gate chain → gated=='' means eligible). No
             # per-coin recompute.
             pubr: dict = {}
+            _trace_r: dict = {}
             try:
                 import trade_engine as _te_r
                 _glr = _te_r.get_live_ev_scores(allow_compute=False)
                 _innr = _glr.get("scores") if isinstance(_glr, dict) else None
                 pubr = (_innr if isinstance(_innr, dict) else _glr) or {}
+                # Truth-in-labeling: the published score only knows the SCORING
+                # gates (pz/friction/universe/below_thr). Runtime CANDIDACY gates
+                # (thin-liquidity / coarse-tick / cooldown / high-friction / pacing)
+                # live in the buy-loop decision trace. Merge a FRESH block reason so
+                # a score-eligible-but-gated coin shows its true reason, not "ready".
+                _trace_r = _te_r.get_decision_trace() or {}
             except Exception:
                 pubr = {}
+                _trace_r = {}
             slistr = []
             for sym, entry in snap.items():
                 try:
@@ -4111,6 +4119,13 @@ def api_signals_summary(limit: int = 30):
                     pct = d.get("pct")
                     allowed = (not g)
                     reason = "ready" if allowed else str(g)
+                    # Overlay a fresh candidacy block (buy-path) when the score is clean.
+                    _t = _trace_r.get(sym) or {}
+                    _blk = _t.get("last_block_reason")
+                    _blk_ts = float(_t.get("last_block_ts") or 0.0)
+                    if allowed and _blk and (now - _blk_ts) < 90.0:
+                        allowed = False
+                        reason = str(_blk)
                     sig = entry.get("signals", {}) or {}
                     slistr.append({
                         "symbol": sym,
@@ -4119,7 +4134,8 @@ def api_signals_summary(limit: int = 30):
                         "signal_results": {k: {"fired": bool(sig.get(k, False)), "raw_value": None}
                                            for k in ("trend", "rsi", "macd", "volume", "obv", "atr")},
                         "buy_allowed": allowed, "buy_reason": reason,
-                        "gate_blockers": ([str(g)] if g else []),
+                        "gate_blockers": ([str(g)] if g else []) + (
+                            [str(_blk)] if (not g and _blk and (now - _blk_ts) < 90.0) else []),
                         "signal_engine_allowed": allowed, "promo_pair_available": False,
                         "ts": entry.get("ts", 0),
                         "r": {"pW": d.get("pw"), "pZ": d.get("pz"), "gated": d.get("gated", "")},
@@ -6110,6 +6126,18 @@ def api_diagnostics_bundle(
     # -- Signal telemetry -----------------------------------------------------
     section("SIGNAL TELEMETRY (24h fire rates)")
     def _tel():
+        # X1 relabel — under wolfscore_sole_gate the legacy signal engine is
+        # RETIRED (the R/P5 scorer is the sole gate), so these fire rates —
+        # X1_atr_untradeable included — are LEGACY TELEMETRY that gate NOTHING.
+        # Called out so a high fire rate stops reading like a blocker.
+        try:
+            _eng_tel = _load_strategy().get("entries") or {}
+            if bool(_eng_tel.get("wolfscore_sole_gate", True)):
+                out.write("  NOTE: LEGACY TELEMETRY — the signal engine is retired under "
+                          "wolfscore_sole_gate; these fire rates (incl. X1_atr_untradeable) "
+                          "gate NOTHING. The live gate is the R/P5 scorer.\n")
+        except Exception:
+            pass
         if _cache_key != "24h":
             out.write("  NOTE: telemetry fire rates are a fixed rolling 24h window "
                       f"(not scoped to RANGE {_cache_key})\n")
