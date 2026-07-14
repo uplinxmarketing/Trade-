@@ -14,6 +14,7 @@ import WalletPanelV2 from '@/components/dashboard/WalletPanelV2';
 import ReportDashboard from '@/components/dashboard/ReportDashboard';
 import OrderBookPanel from '@/components/dashboard/OrderBookPanel';
 import { FunnelPanel } from '@/components/dashboard/FunnelPanel';
+import { RScorecardPanel } from '@/components/dashboard/RScorecardPanel';
 import { EvScorePanel } from '@/components/dashboard/EvScorePanel';
 import { useBinanceWebSocket } from '@/hooks/useBinanceWebSocket';
 import { supabase } from '@/integrations/supabase/client';
@@ -243,6 +244,9 @@ const Index = () => {
 
             {/* Entry Funnel — L1.2: today's ready→recheck→budget→posted→filled */}
             <FunnelPanel baseUrl={API_BASE} />
+
+            {/* WolfScore-R scorecard — volume-doc §4: daily rollup + 7d vs baseline */}
+            <RScorecardPanel baseUrl={API_BASE} />
 
             {/* EV win-probability scores — S5: per-coin scores, ranking, expectancy, model */}
             <EvScorePanel baseUrl={API_BASE} />

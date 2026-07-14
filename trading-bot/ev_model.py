@@ -1428,3 +1428,268 @@ def wolfscore_p5(feat: Optional[Dict[str, float]], cfg: Optional[Dict[str, Any]]
                 "gated": "warmup", "hard_gate": "warmup",
                 "version": P5_VERSION, "trained": True, "submetrics": {},
                 "note": f"p5 infer error: {type(e).__name__}: {e}"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WolfScore-R — dual-head volume/quality ensemble (wolf-r-v1)
+# ═══════════════════════════════════════════════════════════════════════════
+# A 3-member ensemble; each member has two heads: head_win4h (P the sell engine
+# closes this buy in profit within 4h) and head_freeze3d (P still underwater 3d
+# later). pW = MEAN of the 3 win4h heads; pZ = MAX of the 3 freeze3d heads
+# (worst-case veto). 26 features, feature windows reach 288 bars (warmup 620) —
+# no deep aggregates. Ported VERBATIM from sandbox rlib.py (feats_coin v2=False,
+# mlp_prob, platt_apply); numpy float32 so the live pipeline matches the sandbox
+# reference to < 1e-6 (the equivalence gate). numpy is REQUIRED for this engine —
+# if it (or the artifact) is missing, every coin gates 'model_missing' (fail loud).
+try:
+    import numpy as _rnp
+    from numpy.lib.stride_tricks import sliding_window_view as _r_swv
+    _R_NUMPY = True
+except Exception:
+    _rnp = None
+    _R_NUMPY = False
+
+R_VERSION = "wolf-r-v1"
+R_WARMUP_BARS = 620
+R_FEATURES = ['r5', 'r15', 'r1h', 'r4h', 'r24h', 'accel15', 'pullbk', 'lowsl1h', 'volr',
+              'vburst', 'tb5', 'tb1h', 'tbshift', 'dollv', 'atrp', 'coil', 'rngexp', 'dhigh24',
+              'pos24', 'rs1h', 'rs24h', 'breadth', 'btc15', 'btc1h', 'hsin', 'hcos']
+_R_RT = 0.0020   # rlib RT_DEF — only used for the (kept) friction gate, not scoring
+
+_r_model = None
+_r_load_error = None
+
+
+# ── rlib helpers (VERBATIM) ────────────────────────────────────────────────────
+def _r_sh(x, k):
+    o = _rnp.full(len(x), _rnp.nan, _rnp.float32); o[k:] = x[:-k]; return o
+
+
+def _r_rmean(x, w):
+    cs = _rnp.cumsum(_rnp.insert(x.astype(_rnp.float64), 0, 0.0))
+    o = _rnp.full(len(x), _rnp.nan, _rnp.float32); o[w - 1:] = ((cs[w:] - cs[:-w]) / w).astype(_rnp.float32); return o
+
+
+def _r_rsum(x, w):
+    cs = _rnp.cumsum(_rnp.insert(x.astype(_rnp.float64), 0, 0.0))
+    o = _rnp.full(len(x), _rnp.nan, _rnp.float32); o[w - 1:] = (cs[w:] - cs[:-w]).astype(_rnp.float32); return o
+
+
+def _r_rmax(x, w):
+    o = _rnp.full(len(x), _rnp.nan, _rnp.float32); o[w - 1:] = _r_swv(_rnp.ascontiguousarray(x), w).max(axis=1); return o
+
+
+def _r_rmin(x, w):
+    o = _rnp.full(len(x), _rnp.nan, _rnp.float32); o[w - 1:] = _r_swv(_rnp.ascontiguousarray(x), w).min(axis=1); return o
+
+
+def load_r_model(path=None):
+    """Load + validate wolf_r_model.json. Strict: version, 26-feature order, 3
+    members × 2 heads with the exact shapes. Raises on any mismatch."""
+    global _r_model, _r_load_error
+    if not _R_NUMPY:
+        raise RuntimeError("numpy unavailable — WolfScore-R requires numpy")
+    if path is None:
+        path = _os_p5.path.join(_os_p5.path.dirname(_os_p5.path.abspath(__file__)),
+                                "wolf_r_model.json")
+    with open(path, "r") as f:
+        m = json.load(f)
+    if m.get("version") != R_VERSION:
+        raise ValueError(f"r model version {m.get('version')!r} != {R_VERSION!r}")
+    if list(m.get("features") or []) != R_FEATURES:
+        raise ValueError("r model feature names/order do not match R_FEATURES")
+    mem = m.get("members") or []
+    if len(mem) != 3:
+        raise ValueError(f"r model expects 3 members, got {len(mem)}")
+    hid = int(m.get("hidden", 16))
+    for mi, member in enumerate(mem):
+        for hk in ("head_win4h", "head_freeze3d"):
+            h = member.get(hk) or {}
+            for key, shp in (("mu", (26,)), ("sd", (26,)), ("W1", (26, hid)),
+                             ("b1", (hid,)), ("W2", (hid,)), ("platt", (2,))):
+                a = _rnp.asarray(h.get(key), dtype=_rnp.float32)
+                if tuple(a.shape) != shp:
+                    raise ValueError(f"r model member {mi} {hk}.{key} shape {a.shape} != {shp}")
+        # pre-cast the arrays once for fast inference
+        for hk in ("head_win4h", "head_freeze3d"):
+            h = member[hk]
+            h["_mu"] = _rnp.asarray(h["mu"], _rnp.float32)
+            h["_sd"] = _rnp.asarray(h["sd"], _rnp.float32)
+            h["_W1"] = _rnp.asarray(h["W1"], _rnp.float32)
+            h["_b1"] = _rnp.asarray(h["b1"], _rnp.float32)
+            h["_W2"] = _rnp.asarray(h["W2"], _rnp.float32)
+            h["_b2"] = float(h["b2"])
+            h["_platt"] = (float(h["platt"][0]), float(h["platt"][1]))
+    _r_model = m
+    _r_load_error = None
+    return m
+
+
+def ensure_r_loaded(path=None):
+    global _r_load_error
+    if _r_model is not None:
+        return True
+    if not _R_NUMPY:
+        _r_load_error = "numpy unavailable"
+        return False
+    try:
+        load_r_model(path)
+        return True
+    except Exception as e:
+        _r_load_error = f"{type(e).__name__}: {e}"
+        return False
+
+
+def r_model_status():
+    if _r_model is None:
+        return {"loaded": False, "version": None, "error": _r_load_error, "numpy": _R_NUMPY}
+    return {"loaded": True, "version": _r_model.get("version"), "numpy": _R_NUMPY,
+            "hidden": _r_model.get("hidden"), "warmup_bars": _r_model.get("warmup_bars"),
+            "members": len(_r_model.get("members", [])),
+            "gate": _r_model.get("gate"), "pacing": _r_model.get("pacing")}
+
+
+def compute_features_r(a, med1h, med24, breadth1h, btc15, btc1h, hs_last, hc_last):
+    """VERBATIM port of rlib.feats_coin (v2=False, 26 features) → the LAST-bar
+    26-vector for `a` (numpy (N,6) float32 [o,h,l,c,v,tb]). Cross-sectional
+    (rs1h/rs24h/breadth) + BTC + hour come in as this-scan scalars (only the last
+    row is read). Returns (x[26] cleaned, atr_last) or (None, None) if < warmup."""
+    if not _R_NUMPY:
+        return None, None
+    try:
+        a = _rnp.asarray(a, dtype=_rnp.float32)
+        N = a.shape[0]
+        if N < R_WARMUP_BARS:
+            return None, None
+        hi = a[:, 1]; lo = a[:, 2]; cl = a[:, 3]; vo = a[:, 4]; tb = a[:, 5]
+        pc = _r_sh(cl, 1)
+        tr = _rnp.maximum(hi - lo, _rnp.maximum(_rnp.abs(hi - pc), _rnp.abs(lo - pc)))
+        tr = _rnp.where(_rnp.isfinite(tr), tr, hi - lo)
+        atr = _r_rmean(tr, 14)
+        v288 = _r_rmean(vo, 288)
+        tbsh = _rnp.where(vo > 0, tb / _rnp.maximum(vo, 1e-12), _rnp.nan)
+        tb1h = _r_rsum(tb, 12) / _rnp.maximum(_r_rsum(vo, 12), 1e-12)
+        tbsh288 = _r_rmean(_rnp.nan_to_num(tbsh, nan=0.5), 288)
+        mx12 = _r_rmax(hi, 12); mn12 = _r_rmin(lo, 12)
+        mx288 = _r_rmax(hi, 288); mn288 = _r_rmin(lo, 288)
+        lo6 = _r_rmin(lo, 6)
+        F = _rnp.empty((N, 26), _rnp.float32)
+        F[:, 0] = cl / _r_sh(cl, 1) - 1
+        F[:, 1] = cl / _r_sh(cl, 3) - 1
+        F[:, 2] = cl / _r_sh(cl, 12) - 1
+        F[:, 3] = cl / _r_sh(cl, 48) - 1
+        F[:, 4] = cl / _r_sh(cl, 288) - 1
+        F[:, 5] = F[:, 1] - (_r_sh(cl, 3) / _r_sh(cl, 6) - 1)
+        F[:, 6] = (cl - mx12) / _rnp.maximum(mx12 - mn12, 1e-9)
+        F[:, 7] = (lo6 - _r_sh(lo6, 6)) / _rnp.maximum(atr, 1e-9)
+        F[:, 8] = vo / _rnp.maximum(v288, 1e-9)
+        F[:, 9] = _r_rsum(vo, 3) / _rnp.maximum(3 * v288, 1e-9)
+        F[:, 10] = tbsh
+        F[:, 11] = tb1h
+        F[:, 12] = tb1h - tbsh288
+        F[:, 13] = _rnp.log10(_rnp.maximum(v288 * cl, 1e-9))
+        F[:, 14] = atr / _rnp.maximum(cl, 1e-9)
+        F[:, 15] = atr / _rnp.maximum(_r_sh(atr, 288), 1e-9)
+        F[:, 16] = (hi - lo) / _rnp.maximum(atr, 1e-9)
+        F[:, 17] = cl / _rnp.maximum(mx288, 1e-9) - 1
+        F[:, 18] = (cl - mn288) / _rnp.maximum(mx288 - mn288, 1e-9)
+        F[:, 19] = F[:, 2] - _rnp.float32(med1h)
+        F[:, 20] = F[:, 4] - _rnp.float32(med24)
+        F[:, 21] = _rnp.float32(breadth1h)
+        F[:, 22] = _rnp.float32(btc15)
+        F[:, 23] = _rnp.float32(btc1h)
+        F[:, 24] = _rnp.float32(hs_last)
+        F[:, 25] = _rnp.float32(hc_last)
+        x = F[-1]
+        x = _rnp.nan_to_num(_rnp.clip(x, -1e6, 1e6), nan=0.0)
+        _atr_last = float(atr[-1]) if _rnp.isfinite(atr[-1]) else 0.0
+        return x, _atr_last
+    except Exception:
+        return None, None
+
+
+def _r_mlp_prob(head, x2d):
+    """rlib.mlp_prob VERBATIM (single-sample). x2d: (1,26) float32."""
+    Xn = _rnp.clip((x2d - head["_mu"]) / head["_sd"], -6, 6)
+    h1 = _rnp.tanh(Xn @ head["_W1"] + head["_b1"])
+    z = _rnp.clip(h1 @ head["_W2"] + head["_b2"], -30, 30)
+    return 1.0 / (1.0 + _rnp.exp(-z))
+
+
+def _r_platt_apply(ab, p):
+    """rlib.platt_apply VERBATIM."""
+    pc = _rnp.clip(_rnp.asarray(p, dtype=_rnp.float64), 1e-6, 1 - 1e-6)
+    zz = _rnp.log(pc / (1 - pc))
+    return 1.0 / (1.0 + _rnp.exp(-(ab[0] * zz + ab[1])))
+
+
+def r_infer(feat_vec):
+    """(pW, pZ) from a 26-feature vector. pW = mean of the 3 win4h heads (×100);
+    pZ = MAX of the 3 freeze3d heads (×100). Matches rlib exactly."""
+    x2d = _rnp.asarray(feat_vec, dtype=_rnp.float32).reshape(1, 26)
+    wins = []
+    frzs = []
+    for member in _r_model["members"]:
+        hw = member["head_win4h"]; hf = member["head_freeze3d"]
+        pw = _r_platt_apply(hw["_platt"], _r_mlp_prob(hw, x2d))
+        pz = _r_platt_apply(hf["_platt"], _r_mlp_prob(hf, x2d))
+        wins.append(float(pw.reshape(-1)[0]))
+        frzs.append(float(pz.reshape(-1)[0]))
+    pW = 100.0 * (sum(wins) / len(wins))
+    pZ = 100.0 * max(frzs)
+    return pW, pZ
+
+
+def wolfscore_r(feat_vec, atr_last=None, cfg=None, dhigh_ratio=None, macro_bear=False):
+    """WolfScore-R publish payload for one coin. `pct`/`score` = pW (0-100, the UI
+    score). Also carries pZ and a gate reason. Gates (kept from P5 + the R gate,
+    precedence): warmup > model_missing > universe > friction > macro_bear >
+    pz_veto > below_thr > '' (eligible). pct is ALWAYS numeric (never None)."""
+    _cfg = cfg or {}
+    pw_min = float(_cfg.get("pw_min", 55.0))
+    pz_max = float(_cfg.get("pz_max", 2.4))
+    fr_max = float(_cfg.get("friction_max", 0.60))
+    dhigh_min = float(_cfg.get("universe_dhigh_min", 0.70))
+    if feat_vec is None:
+        return {"pct": 0.0, "score": 0.0, "pw": 0.0, "pz": 100.0, "ev": None,
+                "gated": "warmup", "hard_gate": "warmup", "version": R_VERSION,
+                "trained": True, "submetrics": {}}
+    if _r_model is None or not _R_NUMPY:
+        return {"pct": 0.0, "score": 0.0, "pw": 0.0, "pz": 100.0,
+                "gated": "model_missing", "hard_gate": "model_missing",
+                "version": R_VERSION, "trained": False, "submetrics": {},
+                "note": _r_load_error or "r model not loaded"}
+    try:
+        pW, pZ = r_infer(feat_vec)
+        atrp = float(feat_vec[14]) if feat_vec is not None else 0.0   # F14 = atr/close
+        fr = (_R_RT / max(atrp, 1e-6)) if atrp else 1.0
+        gated = ""
+        if dhigh_ratio is not None and float(dhigh_ratio) < dhigh_min:
+            gated = "universe"
+        elif fr > fr_max:
+            gated = "friction"
+        elif macro_bear:
+            gated = "macro_bear"
+        elif pZ > pz_max:
+            gated = "pz_veto"
+        elif pW < pw_min:
+            gated = "below_thr"
+        return {
+            "pct": round(pW, 1), "score": round(pW, 1),
+            "pw": round(pW, 2), "pz": round(pZ, 2),
+            "gated": gated, "hard_gate": (gated or None),
+            "version": R_VERSION, "trained": True,
+            "submetrics": {
+                "pW": round(pW, 2), "pZ": round(pZ, 2),
+                "atrp": round(atrp, 5), "friction": round(fr, 3),
+                "r1h": round(float(feat_vec[2]), 5), "r24h": round(float(feat_vec[4]), 5),
+                "dhigh24": round(float(feat_vec[17]), 5), "rs1h": round(float(feat_vec[19]), 5),
+                "vburst": round(float(feat_vec[9]), 4), "breadth": round(float(feat_vec[21]), 4),
+            },
+            "_atr_last": atr_last,
+        }
+    except Exception as e:
+        return {"pct": 0.0, "score": 0.0, "pw": 0.0, "pz": 100.0,
+                "gated": "model_missing", "hard_gate": "model_missing",
+                "version": R_VERSION, "trained": True, "submetrics": {},
+                "note": f"r infer error: {type(e).__name__}: {e}"}
