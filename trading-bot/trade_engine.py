@@ -577,6 +577,22 @@ def _quote_volume_24h_usd(symbol: str):
     return qv
 
 
+def _tick_pct(symbol: str, price: float) -> Optional[float]:
+    """One price tick as a FRACTION of price (tickSize / price), or None when
+    unknown. Large → coarse price quantization: fine profit targets are
+    unreachable through the grid (e.g. PEPE's 0.353% tick vs a ~1% TP), so the
+    coin oscillates ±1 tick and, with no stop, becomes a stuck bag. Live-only
+    knowledge (the sandbox klines can't see tick quantization)."""
+    try:
+        if not price or float(price) <= 0:
+            return None
+        from exchange_info import get_symbol_filters as _gsf_tp
+        ts = float((_gsf_tp(symbol) or {}).get("tick_size", 0.0) or 0.0)
+        return (ts / float(price)) if ts > 0 else None
+    except Exception:
+        return None
+
+
 def _planned_sl_distance_pct(symbol: str, price: float, no_db: bool = False):
     """The 1R stop distance (%) the exit geometry WOULD assign to an entry at
     `price` right now — same clamp/legacy rules as _apply_entry_exit_geometry
@@ -10733,6 +10749,27 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         _lot_waste_flags.pop(sym, None)
 
         # ── L2.2 — liquidity floor (cheap check first) ────────────────────────
+        # ── Item-4 — tick-granularity universe filter (buy-side only) ─────────
+        # Reject coins whose ONE price tick exceeds tick_pct_max of price. On
+        # low-priced coins the tick can be a large fraction (PEPE ≈ 0.353%): the
+        # price grid is too coarse for the strategy's fine profit targets ($0.01
+        # inside a 0.35% tick), so they oscillate ±1 tick, never reach TP, and —
+        # with no stop in volume mode — become stuck bags. Config knob, default 0
+        # (off). Not a rejection-cooldown; a stable structural exclusion. Live-only
+        # (the sandbox klines cannot see tick quantization).
+        _tick_cap = float(_entries_cfg().get("tick_pct_max", 0.0) or 0.0)
+        if _tick_cap > 0:
+            _tpct = _tick_pct(sym, price)
+            if _tpct is not None and (_tpct * 100.0) > _tick_cap:
+                _record_rejection(sym, score, "coarse_tick",
+                                  f"tick {_tpct*100:.3f}% > {_tick_cap:.2f}% of price")
+                _log_skip_dedup(
+                    sym, "coarse_tick",
+                    f"[SKIP] {sym}: price tick {_tpct*100:.3f}% of price > "
+                    f"{_tick_cap:.2f}% max — grid too coarse for fine TP; excluded.",
+                    "warn")
+                continue
+
         # Skip symbols whose 24h quote volume (USDT) is below the configured
         # floor: thin books slip badly on both entry and exit. 24h quote volume
         # is derived from the durable kline store (no REST weight). Unavailable

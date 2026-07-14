@@ -10702,6 +10702,38 @@ def api_klines_coverage(symbols: str = "approved"):
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+@app.get("/api/diagnostics/tick-granularity")
+def api_tick_granularity(symbols: str = "approved", threshold_pct: float = 0.10):
+    """Item 4 — per-symbol price-tick size as a % of price. Flags coins where ONE
+    tick exceeds threshold_pct (too coarse for fine profit targets; entries with
+    tick_pct_max > 0 exclude them). ?symbols=approved (default) or a CSV list."""
+    try:
+        from exchange_info import get_symbol_filters as _gsf
+        import data_collector as _dc
+        _prices = getattr(_dc, "prices", {}) or {}
+        if str(symbols).strip().lower() == "approved":
+            syms = _approved_symbols()
+        else:
+            syms = [s.strip().upper() for s in str(symbols).split(",") if s.strip()]
+        rows = []
+        for s in syms:
+            try:
+                ts = float((_gsf(s) or {}).get("tick_size", 0.0) or 0.0)
+                px = float(_prices.get(s) or 0.0)
+                tp = (ts / px * 100.0) if (ts > 0 and px > 0) else None
+                rows.append({"symbol": s, "tick_size": ts, "price": px,
+                             "tick_pct": round(tp, 4) if tp is not None else None,
+                             "too_coarse": bool(tp is not None and tp > threshold_pct)})
+            except Exception as _e:
+                rows.append({"symbol": s, "error": str(_e)})
+        rows.sort(key=lambda r: (r.get("tick_pct") is None, -(r.get("tick_pct") or 0.0)))
+        flagged = [r["symbol"] for r in rows if r.get("too_coarse")]
+        return {"threshold_pct": threshold_pct, "count": len(rows),
+                "flagged_count": len(flagged), "flagged": flagged, "symbols": rows}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 # ── Phase 5 §5.1 + Phase 6 §6 — v2 strategy config API ───────────────────────
 #
 # Payload shapes (frontend contract):

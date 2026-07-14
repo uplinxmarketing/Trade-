@@ -78,12 +78,21 @@ def _fetch_exchange_info():
         step_size = 0.0
         min_qty = 0.0
         min_notional = 0.0
+        tick_size = 0.0
         for f in sym_info.get("filters", []):
             ft = f.get("filterType")
             if ft == "LOT_SIZE":
                 try:
                     step_size = float(f.get("stepSize", 0))
                     min_qty = float(f.get("minQty", 0))
+                except (ValueError, TypeError):
+                    pass
+            elif ft == "PRICE_FILTER":
+                # tickSize — the minimum price increment. On low-priced coins this
+                # can be a large fraction of price (coarse quantization), making
+                # fine profit targets unreachable through the price grid.
+                try:
+                    tick_size = float(f.get("tickSize", 0))
                 except (ValueError, TypeError):
                     pass
             elif ft in ("MIN_NOTIONAL", "NOTIONAL"):
@@ -94,7 +103,8 @@ def _fetch_exchange_info():
                 except (ValueError, TypeError):
                     pass
         if step_size > 0:
-            filters[symbol] = {"step_size": step_size, "min_qty": min_qty, "min_notional": min_notional}
+            filters[symbol] = {"step_size": step_size, "min_qty": min_qty,
+                               "min_notional": min_notional, "tick_size": tick_size}
     return filters, statuses, usdt_spot
 
 
