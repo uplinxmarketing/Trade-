@@ -141,6 +141,19 @@ class EntriesConfig(BaseModel):
     p5_macro_gate:          bool  = True     # block NEW entries in macro-BEAR (never touches exits)
     p5_max_new_per_window:  int   = Field(2, ge=1, le=20)           # pacing: max new entries / scan window
     p5_coin_cooldown_bars:  int   = Field(36, ge=0, le=2000)        # per-coin re-entry lockout (×5m)
+    # ── WolfScore-R (scoring_engine='wolf-r-volume'|'wolf-r') — dual-head ensemble ─
+    # scoring_engine overrides buy_formula when set to a wolf-r*/wolf-p5 value;
+    # '' = use buy_formula (p5/mr/v3). pw_min is the existing buy_score_threshold
+    # slider; pz_max is the freeze-veto ceiling. preset sets both (volume=50/6.0,
+    # balanced=55/4.0).
+    scoring_engine:         str   = ""       # ''|'wolf-r-volume'|'wolf-r'|'wolf-p5'
+    pz_max:                 float = Field(6.0, ge=0.0, le=100.0)    # freeze-veto ceiling (max ensemble member)
+    preset:                 str   = ""       # ''|'volume'|'balanced' (sets pw_min/pz_max)
+    cluster_guard:          bool  = True     # pause new buys while >=3 open >288 bars & underwater
+    hour_window:            bool  = False    # only enter 12:00-17:00 UTC
+    r_max_new_per_30min:    int   = Field(4, ge=1, le=50)           # R pacing: new entries / 30 min
+    r_coin_cooldown_bars:   int   = Field(12, ge=0, le=2000)        # R per-coin re-entry lockout (×5m)
+    r_model_path:           str   = ""       # abs/rel path to wolf_r_model.json ('' = alongside ev_model.py)
     # S3-1 — default is now 'absolute': the buy floor is the static abs_floor (55,
     # the cliff the paper data revealed) regardless of the live distribution, so a
     # high scorer fires even in a strong field and sub-55 junk is cut in a weak one.
@@ -536,6 +549,44 @@ SCHEMA: Dict[str, dict] = {
                                          "P5 no-stop optional valve: if a position is still underwater after this "
                                          "many days, exit at market to free the slot. 0 = OFF (default).",
                                          0.0, 60.0, 1.0, "d"),
+    # ── WolfScore-R (scoring_engine) ─────────────────────────────────────────
+    "entries.scoring_engine": _meta("entries.scoring_engine", "enum", "Entries",
+                                         "Scoring engine",
+                                         "The live scoring engine. wolf-r-volume = WolfScore-R volume gate "
+                                         "(pW>=50 & pZ<=6, no loss exits, cluster guard) | wolf-r = R base "
+                                         "(55/2.4 + valve3) | wolf-p5 = P5. Overrides Buy formula when set; "
+                                         "'' falls back to Buy formula (p5/mr/v3). Rollback = switch this.",
+                                         choices=["wolf-r-volume", "wolf-r", "wolf-p5", ""]),
+    "entries.pz_max": _meta("entries.pz_max", "float", "Entries",
+                                         "R freeze-veto ceiling (pZ ≤)",
+                                         "WolfScore-R: reject a coin if its worst-member freeze probability pZ "
+                                         "exceeds this (volume 6.0, balanced 4.0, base 2.4). Lower = fewer, "
+                                         "safer trades.", 0.0, 100.0, 0.5, ""),
+    "entries.preset": _meta("entries.preset", "enum", "Entries",
+                                         "R preset",
+                                         "Sets pw_min + pz_max together: volume=(50,6.0) higher volume | "
+                                         "balanced=(55,4.0) safer. '' = use the individual sliders.",
+                                         choices=["volume", "balanced", ""]),
+    "entries.cluster_guard": _meta("entries.cluster_guard", "bool", "Entries",
+                                         "R cluster guard",
+                                         "Pause NEW buys while >=3 open positions are older than 288 bars (1 day) "
+                                         "AND underwater (avoids piling into a frozen cluster). Never affects exits."),
+    "entries.hour_window": _meta("entries.hour_window", "bool", "Entries",
+                                         "R hour window (12-17 UTC)",
+                                         "Optional: only open new entries between 12:00-17:00 UTC "
+                                         "(loss-reducing, volume-reducing). Off = all hours."),
+    "entries.r_max_new_per_30min": _meta("entries.r_max_new_per_30min", "int", "Entries",
+                                         "R max new / 30 min",
+                                         "WolfScore-R pacing: at most this many new entries per rolling 30-min "
+                                         "window (volume 4).", 1, 50, 1, ""),
+    "entries.r_coin_cooldown_bars": _meta("entries.r_coin_cooldown_bars", "int", "Entries",
+                                         "R re-entry cooldown (bars)",
+                                         "WolfScore-R: after any exit of a coin, block re-entry for this many 5m "
+                                         "bars (volume 12 = 1h).", 0, 2000, 1, "×5m"),
+    "entries.r_model_path": _meta("entries.r_model_path", "string", "Entries",
+                                         "R model path",
+                                         "Path to wolf_r_model.json ('' = alongside ev_model.py). Change only to "
+                                         "point at a retrained artifact.", read_only=True),
     "entries.ev_floor_mode": _meta("entries.ev_floor_mode", "enum", "Entries",
                                          "WolfScore floor distribution rule",
                                          "absolute = the static floor only (55, the paper-data cliff) — a high "

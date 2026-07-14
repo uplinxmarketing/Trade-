@@ -999,6 +999,65 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 _step_failed("p5_golive", exc)
 
+            # ── WolfScore-R VOLUME GO-LIVE (owner-ordered; supersedes P5) ────────
+            # One-time + guarded (r_golive_rev). Flips scoring_engine to
+            # wolf-r-volume with the volume gate (pw_min=50 via the score slider,
+            # pz_max=6.0), preset='volume', cluster_guard ON, R pacing (4/30min,
+            # 12-bar cooldown), max_positions=8, $11 tickets. No loss exits (the
+            # loss-side ATR stop is removed via _no_stop_mode; no valve in volume).
+            # retention stays 55d (covers the 620-bar warmup — the P5 50d backfill
+            # already filled it). P5 stays dormant one flag away (rollback).
+            try:
+                import trade_engine
+                import ev_model
+                _rgR = 1
+                _raw_r = _load_strategy()
+                if int(_raw_r.get("r_golive_rev", 0) or 0) < _rgR:
+                    _ent_r = dict(_raw_r.get("entries") or {})
+                    _ext_r = dict(_raw_r.get("exits") or {})
+                    _siz_r = dict(_raw_r.get("sizing") or {})
+                    _dat_r = dict(_raw_r.get("data") or {})
+                    _ent_r["scoring_engine"] = "wolf-r-volume"
+                    _ent_r["preset"] = "volume"
+                    _ent_r["buy_score_threshold"] = 50.0   # pw_min (the score slider)
+                    _ent_r["pz_max"] = 6.0
+                    _ent_r["cluster_guard"] = True
+                    _ent_r["hour_window"] = False
+                    _ent_r["r_max_new_per_30min"] = 4
+                    _ent_r["r_coin_cooldown_bars"] = 12
+                    _ent_r["r_model_path"] = _ent_r.get("r_model_path") or ""
+                    _ext_r["bail_after_days"] = 0.0        # no valve in volume mode
+                    _dat_r["kline_retention_days"] = max(
+                        55.0, float(_dat_r.get("kline_retention_days", 0) or 0))
+                    _siz_r["max_positions"] = 8
+                    _siz_r["min_position_usdt"] = 11.0
+                    _write_strategy_patch({"r_golive_rev": _rgR,
+                                           "entries": _ent_r, "exits": _ext_r,
+                                           "sizing": _siz_r, "data": _dat_r,
+                                           "max_positions": 8})
+                    database.log_activity(
+                        "WolfScore-R VOLUME GO-LIVE: scoring_engine=wolf-r-volume, "
+                        "gate pW>=50 & pZ<=6.0, cluster guard ON, pacing 4/30min + "
+                        "12-bar cooldown, NO loss exits — P5 dormant (rollback: "
+                        "scoring_engine=wolf-p5)", "warn")
+                    steps.append("R volume go-live (scoring_engine=wolf-r-volume, 50/6.0)")
+
+                    # Load the R model early (fail loud → everything gates model_missing).
+                    try:
+                        _rpath = (_ent_r.get("r_model_path") or "").strip() or None
+                        if hasattr(ev_model, "ensure_r_loaded"):
+                            if ev_model.ensure_r_loaded(_rpath):
+                                steps.append(f"R model loaded ({ev_model.r_model_status().get('version')})")
+                            else:
+                                database.log_activity(
+                                    f"R model FAILED to load: {ev_model.r_model_status().get('error')} "
+                                    f"— buys gate 'model_missing' until fixed (numpy + artifact required)",
+                                    "critical")
+                    except Exception as _rme:
+                        _step_failed("r_model_load", _rme)
+            except Exception as exc:
+                _step_failed("r_golive", exc)
+
             # 4c-e. Hard-stop paper-shadow if it is disabled. It is start()ed early
             #   in boot (above), BEFORE the s3 migration flips
             #   data.paper_shadow_enabled=false, so the thread is alive and merely
@@ -4028,7 +4087,51 @@ def api_signals_summary(limit: int = 30):
         # the scan. Serve the scan's already-published P5 scores instead: buy
         # eligibility straight from the P5 gates, and the six core signal booleans
         # read from the cache (already computed on the 5m close — no recompute).
-        _bf5 = str((strategy.get("entries") or {}).get("buy_formula", "v3")).lower()
+        _bf5 = "v3"
+        try:
+            import trade_engine as _te_eng
+            _bf5 = _te_eng._active_engine()
+        except Exception:
+            _bf5 = str((strategy.get("entries") or {}).get("buy_formula", "v3")).lower()
+        if _bf5 in ("wolf-r-volume", "wolf-r"):
+            # WolfScore-R fast path: serve the scan's published pW/pZ (wolfscore_r
+            # already applied the full gate chain → gated=='' means eligible). No
+            # per-coin recompute.
+            pubr: dict = {}
+            try:
+                import trade_engine as _te_r
+                _glr = _te_r.get_live_ev_scores(allow_compute=False)
+                _innr = _glr.get("scores") if isinstance(_glr, dict) else None
+                pubr = (_innr if isinstance(_innr, dict) else _glr) or {}
+            except Exception:
+                pubr = {}
+            slistr = []
+            for sym, entry in snap.items():
+                try:
+                    d = pubr.get(sym) or {}
+                    g = d.get("hard_gate")
+                    pct = d.get("pct")
+                    allowed = (not g)
+                    reason = "ready" if allowed else str(g)
+                    sig = entry.get("signals", {}) or {}
+                    slistr.append({
+                        "symbol": sym,
+                        "score": pct if pct is not None else entry.get("score", 0),
+                        "price": entry.get("price"),
+                        "signal_results": {k: {"fired": bool(sig.get(k, False)), "raw_value": None}
+                                           for k in ("trend", "rsi", "macd", "volume", "obv", "atr")},
+                        "buy_allowed": allowed, "buy_reason": reason,
+                        "gate_blockers": ([str(g)] if g else []),
+                        "signal_engine_allowed": allowed, "promo_pair_available": False,
+                        "ts": entry.get("ts", 0),
+                        "r": {"pW": d.get("pw"), "pZ": d.get("pz"), "gated": d.get("gated", "")},
+                    })
+                except Exception:
+                    continue
+            slistr.sort(key=lambda x: (0 if x["buy_allowed"] else 1, -(x["score"] or 0)))
+            result = {"signals": slistr, "total_tracked": len(slistr), "ts": now}
+            _signals_summary_cache = {"ts": now, "data": result}
+            return {"signals": slistr[:limit], "total_tracked": len(slistr), "ts": now, "cached": False}
         if _bf5 == "p5":
             pub: dict = {}
             try:
@@ -9469,13 +9572,43 @@ def api_ev_model():
 def _ev_model_impl():
     try:
         import ev_model as _ev
-        _p5_live = False
+        import trade_engine as _te_m
+        _eng_m = "v3"
         try:
-            _p5_live = str((_load_strategy().get("entries") or {}).get(
-                "buy_formula", "v3")).lower() == "p5"
+            _eng_m = _te_m._active_engine()
         except Exception:
-            _p5_live = False
+            _eng_m = "v3"
 
+        if _eng_m in ("wolf-r-volume", "wolf-r"):
+            # LIVE model under R is the dual-head ensemble (trained off-box). Headline
+            # moves with the live pW distribution.
+            _rst = {}
+            try:
+                _rst = _ev.r_model_status() or {}
+            except Exception:
+                _rst = {}
+            _scores = _ev_live_scores_bundle().get("scores", {}) or {}
+            _pws = [float((d or {}).get("pct") or 0.0) for d in _scores.values()]
+            _rc = {}
+            try:
+                _rc = _te_m._r_runtime_cfg()
+            except Exception:
+                _rc = {}
+            _thr = float(_rc.get("pw_min", 50.0)); _pzmax = float(_rc.get("pz_max", 6.0))
+            _clear = sum(1 for p in _pws if p >= _thr)
+            _top = max(_pws) if _pws else 0.0
+            status = {
+                "version": _rst.get("version") or "wolf-r-v1",
+                "trained": bool(_rst.get("loaded", False)),
+                "n_trades": len(_scores), "floor_active": True, "min_clean": 0,
+                "loaded": bool(_rst.get("loaded", False)),
+                "note": (f"WolfScore-R ({_eng_m}) — dual-head ensemble, trained off-box · "
+                         f"gate pW>={_thr:.0f} & pZ<={_pzmax:.1f} · scored {len(_scores)} · "
+                         f"clearing pW: {_clear} · top {_top:.0f}%"),
+            }
+            return {"status": status, "versions": [status["version"]], "counts": {}, "engine": _eng_m}
+
+        _p5_live = (_eng_m == "p5")
         if _p5_live:
             # LIVE model under P5 is the calibrated MLP (trained OFF-box on the
             # sandbox). No in-app training, no paper. Headline moves with the live
@@ -9700,6 +9833,112 @@ def _ev_expectancy_impl():
         return {"live": _ev_live_expectancy()}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+# ── WolfScore-R live scorecard (§4 — the weekly refine instrument) ────────────
+# Section-1 baselines (r11.py, both years, this exact artifact) by preset. The
+# scorecard prints live vs baseline with a divergence column so "test live and
+# keep refining" is a concrete comparison, not a vibe.
+_R_BASELINES = {
+    "volume":   {"tr_per_day": 4.1, "win_pct": 82.0, "usd_per_day": -0.18},
+    "balanced": {"tr_per_day": 2.5, "win_pct": 84.5, "usd_per_day": -0.07},
+}
+
+
+@app.get("/api/diagnostics/r-scorecard")
+def api_r_scorecard():
+    """WolfScore-R scorecard: daily rollup + 7-day summary vs the section-1 baseline
+    (divergence column) + open-position / freeze snapshot. TTL-cached 30s."""
+    return _ttl_cached("r_scorecard", 30.0, _r_scorecard_impl)
+
+
+def _r_scorecard_impl():
+    try:
+        import trade_engine as _te
+        preset = "volume"
+        try:
+            e = _load_strategy().get("entries") or {}
+            preset = str(e.get("preset", "") or "").lower() or (
+                "balanced" if float(e.get("buy_score_threshold", 50) or 50) >= 55 else "volume")
+        except Exception:
+            preset = "volume"
+        daily = database.scorecard_daily(days=8, mode="live") or []
+
+        # open-position / freeze snapshot (live prices)
+        now = time.time()
+        try:
+            with _te._positions_lock:
+                snap = list(_te._positions)
+        except Exception:
+            snap = []
+        try:
+            import data_collector as _dc
+            prices = getattr(_dc, "prices", {}) or {}
+        except Exception:
+            prices = {}
+        open_n = open_24 = open_72 = 0
+        deployed = 0.0
+        worst_dd = 0.0
+        freezes = []
+        for p in snap:
+            open_n += 1
+            deployed += float(p.get("budget_usdt") or p.get("quantity", 0) * p.get("entry_price", 0) or 0.0)
+            opened = p.get("opened_at_ts", 0) or 0
+            age_bars = (now - opened) / 300.0 if opened else 0.0
+            if age_bars > 288:
+                open_24 += 1
+            if age_bars > 864:
+                open_72 += 1
+            entry = float(p.get("entry_price") or 0.0)
+            sym = p.get("symbol")
+            px = float(prices.get(sym) or 0.0)
+            if entry > 0 and px > 0:
+                dd = (px / entry - 1.0) * 100.0
+                if dd < worst_dd:
+                    worst_dd = dd
+                if age_bars > 864 and px < entry:   # underwater > 3d = a freeze
+                    freezes.append({"coin": sym, "age_bars": int(age_bars),
+                                    "drawdown_pct": round(dd, 2)})
+
+        # 7-day summary
+        last7 = daily[:7]
+        d_days = max(1, len(last7))
+        tr7 = sum(r["trades"] for r in last7)
+        w7 = sum(r["wins"] for r in last7)
+        net7 = sum(r["net_usd"] for r in last7)
+        tr_per_day = tr7 / d_days
+        win_pct = (100.0 * w7 / tr7) if tr7 else 0.0
+        usd_per_day = net7 / d_days
+        base = _R_BASELINES.get(preset, _R_BASELINES["volume"])
+        summary = {
+            "preset": preset, "days": d_days,
+            "tr_per_day": round(tr_per_day, 2), "win_pct": round(win_pct, 1),
+            "usd_per_day": round(usd_per_day, 3), "net_7d": round(net7, 3), "trades_7d": tr7,
+            "baseline": base,
+            "divergence": {
+                "tr_per_day": round(tr_per_day - base["tr_per_day"], 2),
+                "win_pct": round(win_pct - base["win_pct"], 1),
+                "usd_per_day": round(usd_per_day - base["usd_per_day"], 3),
+            },
+        }
+        slots = 8
+        try:
+            slots = int((_load_strategy().get("sizing") or {}).get("max_positions", 8) or 8)
+        except Exception:
+            pass
+        return {
+            "engine": _te._active_engine(),
+            "daily": daily,
+            "summary": summary,
+            "open": {
+                "open_positions": open_n, "open_gt_24h": open_24, "open_gt_72h": open_72,
+                "deployed_usd": round(deployed, 2), "worst_drawdown_pct": round(worst_dd, 2),
+                "trades_per_slot": round((tr7 / d_days) / max(1, slots), 3),
+                "freezes": freezes,
+            },
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "daily": [], "summary": {}, "open": {}}
 
 
 # ── Shadow-Lab summary (data scraper w/ virtual budget) ──────────────────────

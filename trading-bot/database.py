@@ -761,6 +761,42 @@ def get_klines(symbol: str, interval: str,
     return [dict(r) for r in rows]
 
 
+def scorecard_daily(days: int = 8, mode: str = "live") -> list:
+    """WolfScore-R scorecard: per-UTC-day rollup of CLOSED trades over the last
+    `days` — date, trades, wins, breakevens, net_usd, fees_usd, valve_exits.
+    Newest day first. Guarded → [] on any error."""
+    out = []
+    try:
+        with _lock.read():
+            conn = _conn()
+            rows = conn.execute(
+                """
+                SELECT substr(timestamp_sell,1,10) AS d,
+                       COUNT(*)                                  AS trades,
+                       SUM(CASE WHEN net_profit > 0.0009 THEN 1 ELSE 0 END) AS wins,
+                       SUM(CASE WHEN net_profit BETWEEN -0.0009 AND 0.0009 THEN 1 ELSE 0 END) AS breakevens,
+                       COALESCE(SUM(net_profit), 0.0)            AS net_usd,
+                       COALESCE(SUM(COALESCE(buy_fee,0)+COALESCE(sell_fee,0)), 0.0) AS fees_usd,
+                       SUM(CASE WHEN sell_reason LIKE 'valve%' THEN 1 ELSE 0 END) AS valve_exits
+                FROM trades
+                WHERE mode = ? AND timestamp_sell IS NOT NULL
+                GROUP BY d ORDER BY d DESC LIMIT ?
+                """, (mode, int(days))).fetchall()
+            conn.close()
+        for r in rows:
+            d = dict(r)
+            out.append({
+                "date": d.get("d"), "trades": int(d.get("trades") or 0),
+                "wins": int(d.get("wins") or 0), "breakevens": int(d.get("breakevens") or 0),
+                "net_usd": round(float(d.get("net_usd") or 0.0), 4),
+                "fees_usd": round(float(d.get("fees_usd") or 0.0), 4),
+                "valve_exits": int(d.get("valve_exits") or 0),
+            })
+    except Exception:
+        return []
+    return out
+
+
 def kline_deep_aggs(symbol: str, interval: str = "5m") -> dict:
     """WolfScore-P5 deep-history scalars computed IN SQLite (O(1) Python memory):
     hi30 = 30d (8640-bar) high, sma50d = 50d (14400-bar) close mean. Lets P5 hold
