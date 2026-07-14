@@ -187,21 +187,33 @@ function placeholderBadge(lifecycle: CoinLifecycle, successor?: string, backfill
 function WolfScoreCell({ pct, score, unavailable }: {
   pct: number | null; score?: EvScore; unavailable: boolean;
 }) {
+  // WolfScore-R carries pZ (freeze-veto) — surface it so a high-score coin that is
+  // HELD is self-explaining (e.g. score 66 but "pz_veto"). gated reason wins over pZ.
+  const gate = score?.hard_gate;
+  const sm = (score?.submetrics ?? {}) as Record<string, number>;
+  const pz = sm.pZ ?? (score as unknown as { pz?: number })?.pz;
   if (pct != null) {
     return (
       <span
-        className="text-[10px] font-mono font-bold text-center tabular-nums"
-        style={{ color: scoreColor(pct) }}
-        title={`WolfScore ${pct.toFixed(0)}/100`}
+        className="flex flex-col items-center leading-tight"
+        title={gate
+          ? `WolfScore ${pct.toFixed(0)}/100 — GATED (${gate}): excluded from buys regardless of score.`
+          : `WolfScore ${pct.toFixed(0)}/100${pz != null ? ` · freeze-risk pZ ${Number(pz).toFixed(1)}` : ''}${pz != null ? ' (eligible)' : ''}`}
       >
-        {Math.round(pct)}
+        <span className="text-[10px] font-mono font-bold tabular-nums" style={{ color: scoreColor(pct) }}>
+          {Math.round(pct)}
+        </span>
+        {gate ? (
+          <span className="text-[7px] font-semibold text-loss/90 truncate max-w-[4.5rem]">{gate}</span>
+        ) : pz != null ? (
+          <span className="text-[7px] text-gain/80 tabular-nums">pZ {Number(pz).toFixed(1)}</span>
+        ) : null}
       </span>
     );
   }
   if (unavailable) {
     return <span className="text-[9px] text-muted-foreground/50 text-center" title="WolfScore endpoint unavailable">—</span>;
   }
-  const gate = score?.hard_gate;
   const text = gate ? `gated: ${gate}` : 'warming';
   return (
     <span
@@ -1979,12 +1991,20 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                   // Signals fired but an execution gate blocks the entry — the
                   // tooltip (reason) names the exact blocker(s).
                   label = 'GATE'; labelColor = 'bg-amber-500/20 text-amber-400';
+                } else if (reason === 'pz_veto') {
+                  // WolfScore-R freeze-veto: pW may be high but pZ > pz_max.
+                  label = 'pZ✗'; labelColor = 'bg-orange-500/20 text-orange-400';
+                } else if (reason === 'below_thr' || reason.startsWith('mandatory_') || reason.startsWith('score_')) {
+                  // Below the score gate (R: pW < pw_min; legacy: WolfScore floor).
+                  label = 'pW<'; labelColor = 'bg-yellow-500/20 text-yellow-400';
                 } else if (reason.startsWith('veto_')) {
                   label = 'VETO'; labelColor = 'bg-orange-500/20 text-orange-400';
-                } else if (reason.startsWith('mandatory_') || reason.startsWith('score_')) {
-                  // WolfScore below the buy gate (the old MAND/WAIT signal-engine
-                  // states collapse to one: not yet at the WolfScore threshold).
-                  label = 'BELOW'; labelColor = 'bg-yellow-500/20 text-yellow-400';
+                } else if ((sig.gate_blockers?.length ?? 0) > 0 ||
+                           ['friction', 'universe', 'macro_bear', 'warmup', 'model_missing',
+                            'cluster_guard', 'r_pacing', 'r_cooldown', 'hour_window'].includes(reason)) {
+                  // Any other execution gate — show the exact reason so a scored coin
+                  // that is HELD is never unexplained (the whole point under R).
+                  label = (reason || 'GATE').slice(0, 12); labelColor = 'bg-amber-500/20 text-amber-400';
                 } else {
                   label = 'HOLD'; labelColor = 'bg-muted/30 text-muted-foreground';
                 }
