@@ -153,6 +153,7 @@ class EntriesConfig(BaseModel):
     hour_window:            bool  = False    # only enter 12:00-17:00 UTC
     r_max_new_per_30min:    int   = Field(4, ge=1, le=50)           # R pacing: new entries / 30 min
     r_coin_cooldown_bars:   int   = Field(12, ge=0, le=2000)        # R per-coin re-entry lockout (×5m)
+    r_friction_gate: Optional[bool] = None   # R friction HARD gate; None=auto (off for volume, on otherwise), still reported
     r_model_path:           str   = ""       # abs/rel path to wolf_r_model.json ('' = alongside ev_model.py)
     # S3-1 — default is now 'absolute': the buy floor is the static abs_floor (55,
     # the cliff the paper data revealed) regardless of the live distribution, so a
@@ -583,6 +584,14 @@ SCHEMA: Dict[str, dict] = {
                                          "R re-entry cooldown (bars)",
                                          "WolfScore-R: after any exit of a coin, block re-entry for this many 5m "
                                          "bars (volume 12 = 1h).", 0, 2000, 1, "×5m"),
+    "entries.r_friction_gate": _meta("entries.r_friction_gate", "bool", "Entries",
+                                         "R friction hard-gate",
+                                         "WolfScore-R: hard-block coins whose round-trip fee exceeds friction_max × "
+                                         "per-bar ATR. OFF by default in volume mode — the sandbox baseline never "
+                                         "hard-gates on friction (the fee is already priced into the model), so a "
+                                         "live gate double-counts it and over-blocks low-volatility coins. Friction "
+                                         "is still reported either way. Leave off unless you want fewer, "
+                                         "higher-volatility entries."),
     "entries.r_model_path": _meta("entries.r_model_path", "string", "Entries",
                                          "R model path",
                                          "Path to wolf_r_model.json ('' = alongside ev_model.py). Change only to "

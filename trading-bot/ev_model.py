@@ -1649,6 +1649,13 @@ def wolfscore_r(feat_vec, atr_last=None, cfg=None, dhigh_ratio=None, macro_bear=
     pw_min = float(_cfg.get("pw_min", 55.0))
     pz_max = float(_cfg.get("pz_max", 2.4))
     fr_max = float(_cfg.get("friction_max", 0.60))
+    # friction_gate: when False, friction is still COMPUTED and reported in
+    # submetrics but is NOT a hard gate. The sandbox (rlib.py) that produced the
+    # volume baseline never hard-gates on friction — it subtracts the round-trip
+    # cost from returns and lets the (net-of-cost-trained) pW/pZ model decide, so
+    # a live friction gate double-counts the fee. Default True preserves the
+    # legacy P5/v3 behavior; wolf-r-volume passes False.
+    friction_gate = bool(_cfg.get("friction_gate", True))
     dhigh_min = float(_cfg.get("universe_dhigh_min", 0.70))
     if feat_vec is None:
         return {"pct": 0.0, "score": 0.0, "pw": 0.0, "pz": 100.0, "ev": None,
@@ -1666,7 +1673,7 @@ def wolfscore_r(feat_vec, atr_last=None, cfg=None, dhigh_ratio=None, macro_bear=
         gated = ""
         if dhigh_ratio is not None and float(dhigh_ratio) < dhigh_min:
             gated = "universe"
-        elif fr > fr_max:
+        elif friction_gate and fr > fr_max:
             gated = "friction"
         elif macro_bear:
             gated = "macro_bear"
