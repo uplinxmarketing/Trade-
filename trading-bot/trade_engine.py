@@ -10734,6 +10734,18 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # slippage history → 0 (never block a symbol's first trade); missing
         # spread or stop distance → fail-open. Config read at time of use.
         _fric_cap_pct = float(_entries_cfg().get("max_friction_of_stop", 0.0))
+        # This gate is STOP-relative. In volume mode there is no loss-side stop, so
+        # the budget collapses to a tiny ATR-based number and trips on any spread
+        # for low-vol coins — the same double-counting the R scoring friction gate
+        # had. Disable it for whichever R engine has friction gating off (default
+        # wolf-r-volume), matching entries.r_friction_gate. p5/v3/mr unchanged.
+        try:
+            _eng_fric = _active_engine()
+        except Exception:
+            _eng_fric = "v3"
+        if _eng_fric in ("wolf-r-volume", "wolf-r") and \
+                not _r_runtime_cfg().get("friction_gate", True):
+            _fric_cap_pct = 0.0
         if _fric_cap_pct > 0:
             _full_sp, _half_sp = _spread_pcts(sym)
             _stop_pct = _planned_sl_distance_pct(sym, price)
