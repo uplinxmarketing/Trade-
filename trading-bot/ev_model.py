@@ -1656,6 +1656,11 @@ def wolfscore_r(feat_vec, atr_last=None, cfg=None, dhigh_ratio=None, macro_bear=
     # a live friction gate double-counts the fee. Default True preserves the
     # legacy P5/v3 behavior; wolf-r-volume passes False.
     friction_gate = bool(_cfg.get("friction_gate", True))
+    # pz_veto_enabled: kill-switch for the freeze veto WITHOUT moving pz_max. When
+    # False the pZ ceiling is not enforced (pZ still computed & reported) — used to
+    # confirm pz is the binding constraint and not masking a second blocker. pz_max
+    # is the separate threshold lever. Default True preserves shipped behavior.
+    pz_veto_enabled = bool(_cfg.get("pz_veto_enabled", True))
     dhigh_min = float(_cfg.get("universe_dhigh_min", 0.70))
     if feat_vec is None:
         return {"pct": 0.0, "score": 0.0, "pw": 0.0, "pz": 100.0, "ev": None,
@@ -1677,7 +1682,7 @@ def wolfscore_r(feat_vec, atr_last=None, cfg=None, dhigh_ratio=None, macro_bear=
             gated = "friction"
         elif macro_bear:
             gated = "macro_bear"
-        elif pZ > pz_max:
+        elif pz_veto_enabled and pZ > pz_max:
             gated = "pz_veto"
         elif pW < pw_min:
             gated = "below_thr"

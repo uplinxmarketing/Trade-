@@ -2430,13 +2430,31 @@ def _r_cluster_guard_active() -> bool:
         return False
 
 
+_warned_dead_buy_formula = False
+
+
 def _active_engine() -> str:
     """Effective scoring engine. entries.scoring_engine ('wolf-r-volume'|'wolf-r'|
     'wolf-p5') takes precedence; else falls back to entries.buy_formula (p5/mr/v3).
     This is the single rollback switch — flipping it never touches open positions."""
+    global _warned_dead_buy_formula
     try:
         e = _load_strategy().get("entries") or {}
         se = str(e.get("scoring_engine", "") or "").lower()
+        # Step 8 — deprecation warning (once): a set scoring_engine OVERRIDES
+        # buy_formula, so a lingering non-trivial buy_formula is DEAD config. Warn
+        # so it stops reading like a live setting. Behavior is unchanged.
+        if not _warned_dead_buy_formula and se in ("wolf-r-volume", "wolf-r", "wolf-p5"):
+            _bf = str(e.get("buy_formula", "") or "").lower()
+            if _bf and _bf != "v3":
+                _warned_dead_buy_formula = True
+                try:
+                    database.log_activity(
+                        f"DEPRECATION: entries.buy_formula={_bf!r} is DEAD config under "
+                        f"scoring_engine={se!r} (which takes precedence) — it is ignored. "
+                        f"Remove buy_formula to avoid confusion.", "warn")
+                except Exception:
+                    pass
         if se in ("wolf-r-volume", "wolf-r"):
             return se
         if se == "wolf-p5":
@@ -2492,6 +2510,7 @@ def _r_runtime_cfg() -> dict:
         "engine": eng,
         "pw_min": _f("buy_score_threshold", pw_def),   # the existing UI score slider
         "pz_max": _f("pz_max", pz_def),
+        "pz_veto_enabled": bool(e.get("pz_veto_enabled", True)),
         "friction_max": _f("p5_friction_max", 0.60),
         # Volume mode: the sandbox baseline has no friction HARD gate (fee is
         # baked into the net-of-cost model), so default it OFF for wolf-r-volume
@@ -11236,6 +11255,23 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         _last_buy_ts = time.time()
         _buys_this_scan += 1
         _r_note_buy()          # WolfScore-R 30-min pacing window (no-op off R mode)
+        # Step 6 — pz counterfactual tag. On every executed R buy, record the
+        # freeze score and whether the tighter historical ceilings (6.0 shipped,
+        # 8.0 first bump) WOULD have blocked it, so raised-pz_max entries can be
+        # win-rate/expectancy-compared against baseline after ~40-50 trades
+        # (grep 'PZ_CF' in the activity log). Guarded; never blocks the buy.
+        try:
+            if _r_is_active():
+                with _scan_scores_pub_lock:
+                    _pub_sc = (_scan_scores_pub.get("scores") or {}).get(sym) or {}
+                _pz_cf = _pub_sc.get("pz")
+                if _pz_cf is not None:
+                    _pzf = float(_pz_cf)
+                    database.log_activity(
+                        f"PZ_CF {sym} pz={_pzf:.2f} pz_max={_r_runtime_cfg().get('pz_max')} "
+                        f"would_block@6.0={_pzf > 6.0} would_block@8.0={_pzf > 8.0}", "info")
+        except Exception:
+            pass
         _record_corr_entry()   # §4.5 — executed buy enters the 5-min window
         pos_id = database.save_position(pos_record)
         pos_record["id"] = pos_id
