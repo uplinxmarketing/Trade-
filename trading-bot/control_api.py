@@ -6282,23 +6282,30 @@ def api_diagnostics_bundle(
     safe(_diag, "diag")
 
     # -- EV model (S5) --------------------------------------------------------
-    section("EV MODEL")
+    section("SCORING MODEL")
     def _ev_bundle():
         import ev_model as _ev
-        st = _ev.model_status()
-        out.write(f"  version={st.get('version')} trained={st.get('trained')} "
-                  f"n_trades={st.get('n_trades')} "
-                  f"floor_active={st.get('floor_active')} "
-                  f"min_clean={st.get('min_clean')}\n")
+        import trade_engine as _te_m
+        _eng = "v3"
         try:
-            counts = database.count_training_samples() or {}
-            out.write(f"  samples: total={counts.get('total')} "
-                      f"live={counts.get('live')} "
-                      f"paper_shadow={counts.get('paper_shadow')} "
-                      f"wins={counts.get('wins')}\n")
+            _eng = _te_m._active_engine()
         except Exception:
-            out.write("  samples: [unavailable]\n")
-        # WolfScore-v3 live feed: regime, adaptive floor, top-5 scores.
+            _eng = "v3"
+        # Report the ACTIVE engine's model (R / P5 / legacy). Paper retired.
+        if _eng in ("wolf-r-volume", "wolf-r"):
+            _rs = _ev.r_model_status() if hasattr(_ev, "r_model_status") else {}
+            out.write(f"  engine={_eng} model={_rs.get('version')} loaded={_rs.get('loaded')} "
+                      f"numpy={_rs.get('numpy')} members={_rs.get('members')} "
+                      f"warmup_bars={_rs.get('warmup_bars')}\n")
+        elif _eng == "p5":
+            _ps5 = _ev.p5_model_status() if hasattr(_ev, "p5_model_status") else {}
+            out.write(f"  engine=p5 model={_ps5.get('version')} loaded={_ps5.get('loaded')}\n")
+        else:
+            st = _ev.model_status()
+            out.write(f"  engine={_eng} version={st.get('version')} trained={st.get('trained')} "
+                      f"n_trades={st.get('n_trades')} floor_active={st.get('floor_active')} "
+                      f"min_clean={st.get('min_clean')}\n")
+        # Live feed: regime, floor, top-5 scores.
         bundle = _ev_live_scores_bundle()
         scores = bundle.get("scores", {}) or {}
         rg = bundle.get("regime", {}) or {}
@@ -6325,27 +6332,26 @@ def api_diagnostics_bundle(
                 for s, d in ranked) + "\n")
         else:
             out.write("  top scores: none\n")
-        # Live vs paper expectancy.
+        # Live expectancy (paper-shadow retired — live-only reporting).
         lv = _ev_live_expectancy()
         out.write(f"  live expectancy={lv.get('expectancy')} "
                   f"win_rate={lv.get('win_rate')}% n={lv.get('n')}\n")
-        try:
-            import paper_shadow as _ps
-            pfn = getattr(_ps, "get_paper_stats", None)
-            ps = pfn() if callable(pfn) else {}
-            if isinstance(ps, dict) and ps:
-                out.write(f"  paper_shadow expectancy={ps.get('expectancy')} "
-                          f"win_rate={ps.get('win_rate')} n={ps.get('n_total', ps.get('n'))} "
-                          f"open={ps.get('open_positions')}\n")
-            else:
-                out.write("  paper_shadow: [unavailable]\n")
-        except Exception:
-            out.write("  paper_shadow: [unavailable]\n")
     safe(_ev_bundle, "ev_model")
 
     # -- Shadow-Lab (paper-shadow data scraper w/ virtual budget) ----------------
     section("SHADOW-LAB")
     def _shadow_bundle():
+        # Paper-shadow is retired under the live-only R / P5 engines. Skip the
+        # virtual-budget scraper entirely and note it, rather than printing stale
+        # or empty paper stats.
+        try:
+            import trade_engine as _te_m
+            _eng = _te_m._active_engine()
+        except Exception:
+            _eng = "v3"
+        if _eng in ("wolf-r-volume", "wolf-r", "p5"):
+            out.write(f"  paper-shadow retired (engine={_eng}, live-only)\n")
+            return
         st = _shadow_get_stats()
         sm = _shadow_get_summary(_range_hours())
         if not st and not sm:
