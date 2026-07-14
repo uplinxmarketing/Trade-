@@ -2493,6 +2493,13 @@ def _r_runtime_cfg() -> dict:
         "pw_min": _f("buy_score_threshold", pw_def),   # the existing UI score slider
         "pz_max": _f("pz_max", pz_def),
         "friction_max": _f("p5_friction_max", 0.60),
+        # Volume mode: the sandbox baseline has no friction HARD gate (fee is
+        # baked into the net-of-cost model), so default it OFF for wolf-r-volume
+        # and ON otherwise. entries.r_friction_gate overrides: None/absent=auto,
+        # True/False force it. Reversible from the UI without a redeploy.
+        "friction_gate": ((eng != "wolf-r-volume")
+                          if e.get("r_friction_gate") is None
+                          else bool(e.get("r_friction_gate"))),
         "universe_dhigh_min": _f("p5_universe_dhigh_min", 0.70),
         "macro_gate": bool(e.get("p5_macro_gate", True)),
         "max_new_per_30min": _i("r_max_new_per_30min", maxnew_def),
