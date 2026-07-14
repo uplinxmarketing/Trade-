@@ -1338,6 +1338,55 @@ def _seed_known_universe(coins: list) -> None:
         _known_universe.update(c for c in coins if c)
 
 
+def _deep_history_engine_active() -> bool:
+    """True when the active scoring engine consumes DEEP durable history (P5 or
+    any WolfScore-R variant). Those models gate every coin 'warmup' until the
+    durable 5m store holds ~620+ bars, which the shallow WS buffer backfill
+    (~60 bars) never reaches. Defensive read — any error → False (no-op)."""
+    try:
+        with open(config.STRATEGY_FILE) as f:
+            s = json.load(f)
+        ent = s.get("entries") if isinstance(s.get("entries"), dict) else {}
+        eng = str(ent.get("scoring_engine", "") or "").lower()
+        if eng in ("wolf-r-volume", "wolf-r", "wolf-p5"):
+            return True
+        return str(ent.get("buy_formula", "") or "").lower() == "p5"
+    except Exception:
+        return False
+
+
+# R/P5 need ~620 5m bars in the durable store to score a coin; go a bit past the
+# warmup so freshly-added coins clear it with headroom on the first pass.
+_DEEP_BACKFILL_MIN_BARS = 620
+
+
+def _deep_backfill_new_symbols(syms: list, reason: str) -> None:
+    """BLOCKING deep 5m backfill (~days of history from Binance's public mirror)
+    for newly-added universe coins whose durable 5m store is short. Runs the same
+    p5_backfill path the boot go-live uses, so a coin auto-added AFTER boot warms
+    in minutes instead of crawling up from live bars for ~2 days. Guarded and
+    idempotent (save_klines is INSERT OR REPLACE); a failure skips that coin.
+    Call via asyncio.to_thread so the WS event loop never blocks."""
+    try:
+        import p5_backfill as _pbf
+    except Exception as e:
+        print(f"[DataCollector] deep backfill unavailable: {e}")
+        return
+    for s in syms:
+        try:
+            cov = database.kline_coverage(s, "5m") or {}
+            if int(cov.get("count", 0) or 0) >= _DEEP_BACKFILL_MIN_BARS:
+                continue  # already deep enough
+            n = _pbf.backfill_symbol(s)
+            try:
+                database.log_activity(
+                    f"[deep-backfill] {reason}: {s} +{n} bars (5m durable)", "info")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[DataCollector] deep backfill FAILED {s}: {type(e).__name__}: {e}")
+
+
 async def _backfill_watchlist_additions(active: list, reason: str = "watchlist-add") -> None:
     """I1 — after the universe set is (re)built, detect symbols that were NEVER
     in the resolved universe before (diff against _known_universe) and run a
@@ -1362,6 +1411,15 @@ async def _backfill_watchlist_additions(active: list, reason: str = "watchlist-a
     ready = [c for c in targets if backfill_ready(c)]
     print(f"[DataCollector] watchlist-add backfill: {len(ready)}/{len(targets)} "
           f"new symbols → ready in {dur:.1f}s")
+    # DEEP durable backfill for R/P5 — the shallow buffer fill above only reaches
+    # ~60 5m bars, but the R/P5 models need ~620 in the durable store or they gate
+    # the coin 'warmup' for ~2 days. Fetch the history now (public mirror, off the
+    # weight-limited API), in a thread so the WS loop never blocks.
+    if _deep_history_engine_active():
+        try:
+            await asyncio.to_thread(_deep_backfill_new_symbols, list(new_syms), reason)
+        except Exception as e:
+            print(f"[DataCollector] deep watchlist backfill error: {e}")
 
 
 def _spawn_watchlist_add_backfill(active: list, reason: str = "watchlist-add"):
