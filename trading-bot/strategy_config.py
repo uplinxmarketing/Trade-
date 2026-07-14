@@ -85,6 +85,7 @@ class EntriesConfig(BaseModel):
     # L2 Tier 1 — liquidity floor: skip symbols whose 24h quote volume (USDT) is
     # below this. Thin coins are where spread vetoes and slippage cluster.
     min_quote_volume_24h_usd: float = Field(20_000_000.0, ge=0.0, le=10_000_000_000.0)
+    tick_pct_max:           float = Field(0.0, ge=0.0, le=5.0)   # buy-side: reject coins whose 1 tick > this % of price (0=off)
     # O5.3 — a candidate must hold buy-ready across live ticks for this many
     # seconds, then fire immediately (confirm-then-fire). 0 = pure live/tick;
     # up to a full 300s candle = max discipline. Filters intra-candle flickers
@@ -453,6 +454,12 @@ SCHEMA: Dict[str, dict] = {
                                          "Liquidity floor: skip symbols whose 24h quote volume (USDT) is "
                                          "below this.",
                                          0.0, 10_000_000_000.0, 1_000_000.0, "USDT"),
+    "entries.tick_pct_max": _meta("entries.tick_pct_max", "float", "Entries",
+                                         "Max tick size (% of price)",
+                                         "Buy-side universe filter: exclude coins whose ONE price tick exceeds "
+                                         "this % of price. Coarse-tick coins (e.g. PEPE ≈0.35%) can't reach fine "
+                                         "profit targets through the price grid and become stuck bags. 0 = off; "
+                                         "0.10 recommended.", 0.0, 5.0, 0.01, "%"),
     "entries.confirm_seconds": _meta("entries.confirm_seconds", "float", "Entries",
                                          "Confirm seconds",
                                          "A buy-ready candidate must hold across live ticks for this many "
