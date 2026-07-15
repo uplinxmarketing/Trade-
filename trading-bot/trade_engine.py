@@ -1645,10 +1645,21 @@ def _evaluate_ratchet(pos: dict, sym: str, price: float, entry: float,
     if not (trail_hit or giveback_hit):
         return False
 
-    # ── Profit floor — the ratchet only ever exits IN PROFIT ─────────────────
-    # If a pullback would drop the exit below the floor, HOLD; the protective
-    # stop (P1, now unblocked) is the backstop.
-    if profit < _min_profit_usdt():
+    # ── Profit floor (SLIPPAGE-AWARE) — the ratchet only ever exits IN PROFIT,
+    # and `profit` here is measured at the current/trigger price while the actual
+    # exit is a TAKER market sell that fills a half-spread LOWER. So require the
+    # trigger profit to clear min_profit PLUS the expected half-spread slippage —
+    # otherwise a $0.01 lock slips to ~$0 net on the fill. HOLD if it can't clear.
+    _min_p = _min_profit_usdt()
+    _slip_buf = 0.0
+    try:
+        _fsp_rt, _hsp_rt = _spread_pcts(sym)
+        _hbps_rt = _hsp_rt if _hsp_rt is not None else 0.05   # default 5bps half-spread
+        if price > 0 and qty > 0:
+            _slip_buf = (float(_hbps_rt) / 100.0) * price * qty
+    except Exception:
+        _slip_buf = 0.0
+    if profit < (_min_p + _slip_buf):
         return False
     return True
 
