@@ -789,6 +789,24 @@ def scorecard_daily(days: int = 8, mode: str = "live") -> list:
                 GROUP BY d ORDER BY d DESC LIMIT ?
                 """, (mode, int(days))).fetchall()
             conn.close()
+        # Per-day CLUSTER_ENTRY count (burst telemetry) — best-effort; a schema
+        # mismatch just yields 0 so the scorecard never breaks on it.
+        cluster_by_day: dict = {}
+        try:
+            with _lock.read():
+                conn2 = _conn()
+                try:
+                    crows = conn2.execute(
+                        "SELECT substr(timestamp,1,10) AS d, COUNT(*) AS n "
+                        "FROM activity_log WHERE message LIKE 'CLUSTER_ENTRY%' "
+                        "GROUP BY d").fetchall()
+                finally:
+                    conn2.close()
+            for cr in crows:
+                cd = dict(cr)
+                cluster_by_day[cd.get("d")] = int(cd.get("n") or 0)
+        except Exception:
+            cluster_by_day = {}
         for r in rows:
             d = dict(r)
             out.append({
@@ -797,6 +815,7 @@ def scorecard_daily(days: int = 8, mode: str = "live") -> list:
                 "net_usd": round(float(d.get("net_usd") or 0.0), 4),
                 "fees_usd": round(float(d.get("fees_usd") or 0.0), 4),
                 "valve_exits": int(d.get("valve_exits") or 0),
+                "cluster_events": int(cluster_by_day.get(d.get("d"), 0)),
             })
     except Exception:
         return []

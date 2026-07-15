@@ -2434,6 +2434,49 @@ def _r_buys_in_window(sec: float = 1800.0) -> int:
         return len(_r_recent_buys)
 
 
+# ── Burst telemetry ───────────────────────────────────────────────────────────
+# Pacing was the anti-burst brake; with it removed, make its absence VISIBLE:
+# whenever 3+ entries execute within any rolling 10-min span, log a cluster-entry
+# event (symbols + each pw/pz + BTC 15m move) and count it for the scorecard.
+_r_entry_events: List[tuple] = []         # (ts, sym, pw, pz)
+_r_entry_events_lock = threading.Lock()
+_r_cluster_active = False                 # True while an active 3+/10min cluster stands
+
+
+def _r_note_entry_for_burst(sym: str, pw, pz) -> None:
+    """Record an executed entry and log a CLUSTER_ENTRY event the moment a rolling
+    10-min window holds 3+ entries (logged once per cluster, at formation)."""
+    global _r_cluster_active
+    now = time.time()
+    try:
+        with _r_entry_events_lock:
+            _r_entry_events.append((now, sym, pw, pz))
+            cutoff = now - 600.0
+            while _r_entry_events and _r_entry_events[0][0] < cutoff:
+                _r_entry_events.pop(0)
+            recent = list(_r_entry_events)
+        if len(recent) >= 3:
+            if not _r_cluster_active:
+                _r_cluster_active = True
+                try:
+                    _btc15 = float(_r_get_pass_ctx().get("btc15") or 0.0) * 100.0
+                except Exception:
+                    _btc15 = 0.0
+                _syms = " ".join(
+                    f"{s}(pw={float(p or 0):.0f}/pz={float(z or 0):.1f})"
+                    for (_t, s, p, z) in recent)
+                try:
+                    database.log_activity(
+                        f"CLUSTER_ENTRY {len(recent)} entries in 10m: {_syms} "
+                        f"| btc15={_btc15:+.2f}%", "warn")
+                except Exception:
+                    pass
+        else:
+            _r_cluster_active = False
+    except Exception:
+        pass
+
+
 def _r_cluster_guard_active() -> bool:
     """WolfScore-R cluster guard: True when >= 3 OPEN positions are older than 288
     bars (1 day) AND currently underwater — new buys pause until one recovers or
@@ -2463,6 +2506,7 @@ def _r_cluster_guard_active() -> bool:
 
 
 _warned_dead_buy_formula = False
+_warned_r_rank_flip = False       # one-shot log when the ASC-pZ ranking flip is applied
 
 
 def _active_engine() -> str:
@@ -10187,14 +10231,44 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     _live_up_mode = str(_entries_cfg_s2.get("live_up_regime_mode", "allow") or "allow")
     _live_up_min_pct = float(_entries_cfg_s2.get("live_up_regime_min_pct", 70.0) or 70.0)
     if _ev_ranking_on and _wolf_scores:
-        # Eligible candidates first, DESCENDING WolfScore pct, ties by DESCENDING
-        # raw signal score; symbols without a WolfScore fall to the tail (-1 pct).
-        def _wolf_rank_key(_it):
-            _s, _c = _it
-            _e = _wolf_scores.get(_s)
-            _p = float(_e.get("pct", -1.0)) if _e else -1.0
-            return (_p, float(_c.get("score", 0) or 0))
-        _items = sorted(_items, key=_wolf_rank_key, reverse=True)
+        _eng_rank = "v3"
+        try:
+            _eng_rank = _active_engine()
+        except Exception:
+            _eng_rank = "v3"
+        if _eng_rank in ("wolf-r-volume", "wolf-r"):
+            # RANKING FLIP (operator): buy SAFEST-FIRST — ASCENDING pZ (freeze
+            # risk), tiebreak by pW DESC. Coins without a pZ sort to the tail. Was
+            # pW-desc; flipped so a same-scan cluster fills the lowest-freeze-risk
+            # names first.
+            global _warned_r_rank_flip
+            if not _warned_r_rank_flip:
+                _warned_r_rank_flip = True
+                try:
+                    database.log_activity(
+                        "RANKING FLIP active (wolf-r): same-scan eligibles now buy in "
+                        "ASCENDING pZ order (safest first), tiebreak pW DESC "
+                        "(previously pW-desc).", "warn")
+                except Exception:
+                    pass
+
+            def _r_rank_key(_it):
+                _s, _c = _it
+                _e = _wolf_scores.get(_s) or {}
+                _pz = _e.get("pz")
+                _pzv = float(_pz) if _pz is not None else 1e9
+                _pw = float(_e.get("pct", -1.0)) if _e else -1.0
+                return (_pzv, -_pw)   # pZ ASC, then pW DESC
+            _items = sorted(_items, key=_r_rank_key)
+        else:
+            # Eligible candidates first, DESCENDING WolfScore pct, ties by DESC raw
+            # signal score; symbols without a WolfScore fall to the tail (-1 pct).
+            def _wolf_rank_key(_it):
+                _s, _c = _it
+                _e = _wolf_scores.get(_s)
+                _p = float(_e.get("pct", -1.0)) if _e else -1.0
+                return (_p, float(_c.get("score", 0) or 0))
+            _items = sorted(_items, key=_wolf_rank_key, reverse=True)
 
     def _mark_rest_no_slot(_from_idx: int, _k: int, _n: int) -> None:
         # Capacity hit mid-loop → every still-unprocessed ready candidate gets an
@@ -10381,12 +10455,18 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                                       f"R re-entry cooldown ({_rc['coin_cooldown_bars']} bars)")
                     _trace_mark_block(sym, "waiting: R re-entry cooldown")
                     continue
-                _rwin = _r_buys_in_window(1800.0)
-                if _rwin >= int(_rc["max_new_per_30min"]):
-                    _record_rejection(sym, cached.get("score", 0), "r_pacing",
-                                      f"R pacing: {_rwin}/{_rc['max_new_per_30min']} in 30min")
-                    _trace_mark_block(sym, "waiting: R 30-min pacing")
-                    continue
+                # PACING: r_max_new_per_30min <= 0 DISABLES the 30-min cap (buy NOW,
+                # same scan). A positive value caps new entries per rolling 30 min.
+                # (Guard the >0 case explicitly — a bare `_rwin >= 0` would block
+                # EVERY buy when the cap is 0.)
+                _maxnew = int(_rc["max_new_per_30min"])
+                if _maxnew > 0:
+                    _rwin = _r_buys_in_window(1800.0)
+                    if _rwin >= _maxnew:
+                        _record_rejection(sym, cached.get("score", 0), "r_pacing",
+                                          f"R pacing: {_rwin}/{_maxnew} in 30min")
+                        _trace_mark_block(sym, "waiting: R 30-min pacing")
+                        continue
                 if _rc.get("hour_window") and not (12 <= time.gmtime().tm_hour < 17):
                     _record_rejection(sym, cached.get("score", 0), "r_hour_window",
                                       "outside 12:00-17:00 UTC hour window")
@@ -11413,6 +11493,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                         f"PZ_CF {sym} pz={_pzf:.2f} pz_max={_r_runtime_cfg().get('pz_max')} "
                         f"would_block@4.0={_pzf > 4.0} would_block@6.0={_pzf > 6.0} "
                         f"would_block@8.0={_pzf > 8.0}", "info")
+                # Burst telemetry — record this entry; logs CLUSTER_ENTRY on 3+/10min.
+                _r_note_entry_for_burst(sym, _pub_sc.get("pw"), _pub_sc.get("pz"))
                 # Item 3 — friction counterfactual: whether the historical friction
                 # gate (0.60) WOULD have blocked this entry (friction is still
                 # reported even though the gate is off for volume). grep FRICTION_CF.
