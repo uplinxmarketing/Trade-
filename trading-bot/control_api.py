@@ -9978,6 +9978,24 @@ def _r_scorecard_impl():
         except Exception:
             pass
         summary["universe"] = _uni
+        # Operator pz-flip log with its pre-registered baseline. The scorecard
+        # carries this so every win-rate/expectancy read is judged against the
+        # baseline set when the current pz_max was chosen.
+        try:
+            _pzm = float((_load_strategy().get("entries") or {}).get("pz_max", 6.0) or 6.0)
+        except Exception:
+            _pzm = 6.0
+        _PZ_BASELINES = {
+            6.0:  {"tr_per_day": "2-3", "usd_per_day": "-0.03 to -0.11", "note": "measured pz6 row"},
+            8.0:  {"tr_per_day": "3-4", "usd_per_day": "-0.10 to -0.19",
+                   "note": "operator flip; interpolated between measured pz6 and pz10"},
+            10.0: {"tr_per_day": "4-6", "usd_per_day": "-0.18 to -0.30", "note": "measured pz10 row"},
+        }
+        summary["pz_flip"] = {
+            "pz_max": _pzm,
+            "baseline": _PZ_BASELINES.get(_pzm, {"note": "no pre-registered baseline for this pz_max"}),
+            "review": "pre-registered: 7 days or 50 trades, no gate changes inside the window",
+        }
         slots = 8
         try:
             slots = int((_load_strategy().get("sizing") or {}).get("max_positions", 8) or 8)
@@ -10838,6 +10856,68 @@ def api_open_orders():
                      if stop_legs else
                      "OK: no exchange stop legs — managed exits are TP-only, "
                      "consistent with the no-loss spec."),
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/diagnostics/movers-vs-model")
+def api_movers_vs_model(top: int = 10):
+    """One-shot 'movers vs model': top coins by 4h and 24h gain, each with the R
+    model's pw/pz/gate + candle age. Purpose: confirm elevated pZ sits ON the
+    pumped/extended movers (the model pricing chase-risk, as designed) and not on
+    STALE data. Flags any top mover whose candle age > 120s as a freshness bug."""
+    try:
+        import trade_engine as _te
+        import data_collector as _dc
+        now = time.time()
+        prices  = getattr(_dc, "prices", {}) or {}
+        mstats  = getattr(_dc, "market_stats", {}) or {}
+        last_ts = getattr(_dc, "last_price_ts", {}) or {}
+        scores = {}
+        try:
+            _gl = _te.get_live_ev_scores(allow_compute=False)
+            scores = (_gl.get("scores") if isinstance(_gl, dict) else _gl) or {}
+        except Exception:
+            scores = {}
+        rows = []
+        for sym in sorted(set(list(prices.keys()) + list(scores.keys()))):
+            if sym == "__meta__":
+                continue
+            px = float(prices.get(sym) or 0.0)
+            st = mstats.get(sym) or {}
+            o24 = float(st.get("open_24h") or 0.0)
+            g24 = ((px - o24) / o24 * 100.0) if (o24 > 0 and px > 0) else None
+            g4 = None
+            try:
+                a = _te._p5_get_arrays(sym)
+                if a and a.get("c") and len(a["c"]) >= 49 and a["c"][-49]:
+                    g4 = (a["c"][-1] / a["c"][-49] - 1.0) * 100.0   # 48 x 5m = 4h
+            except Exception:
+                pass
+            _lt = float(last_ts.get(sym) or 0.0)
+            cage = round(now - _lt, 1) if _lt else None
+            sc = scores.get(sym) or {}
+            rows.append({
+                "symbol": sym,
+                "gain_4h_pct":  round(g4, 2) if g4 is not None else None,
+                "gain_24h_pct": round(g24, 2) if g24 is not None else None,
+                "pw": sc.get("pw"), "pz": sc.get("pz"),
+                "gated": sc.get("gated") or "",
+                "candle_age_sec": cage,
+                "stale": bool(cage is not None and cage > 120),
+            })
+        by4  = sorted([r for r in rows if r["gain_4h_pct"]  is not None],
+                      key=lambda r: -r["gain_4h_pct"])[:top]
+        by24 = sorted([r for r in rows if r["gain_24h_pct"] is not None],
+                      key=lambda r: -r["gain_24h_pct"])[:top]
+        stale = sorted({r["symbol"] for r in (by4 + by24) if r["stale"]})
+        return {
+            "ts": now, "top_by_4h": by4, "top_by_24h": by24,
+            "stale_movers": stale,
+            "freshness": ("FRESHNESS BUG: top mover(s) with candle age > 120s → "
+                          + ", ".join(stale)) if stale
+                         else "OK: all top movers fresh (candle age <= 120s)",
         }
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
