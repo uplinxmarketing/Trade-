@@ -4998,7 +4998,12 @@ def _data_cfg() -> dict:
 
 # ── Account helpers ────────────────────────────────────────────────────
 
+_last_usdt_balance: Optional[float] = None   # last SUCCESSFUL live USDT free read
+_usdt_balance_fail_log_ts: float = 0.0        # dedupe the transient-timeout log
+
+
 def _get_usdt_balance() -> float:
+    global _last_usdt_balance, _usdt_balance_fail_log_ts
     try:
         if get_mode() != "live":
             # Paper mode: read directly from PaperClient's in-memory balance dict
@@ -5012,10 +5017,22 @@ def _get_usdt_balance() -> float:
         acc = _acct()
         for b in acc["balances"]:
             if b["asset"] == "USDT":
-                return float(b["free"])
+                _bal = float(b["free"])
+                _last_usdt_balance = _bal
+                return _bal
+        return 0.0   # account fetched OK but no USDT asset → genuinely ~0
     except Exception as e:
-        database.log_activity(f"get_usdt_balance error: {e}", "warn")
-    return 0.0
+        # Transient REST/TLS timeout to Binance. Do NOT return 0.0 (that reads as
+        # an empty wallet → mis-size/block); fall back to the last known balance
+        # and log at most once/60s so it stops spamming the diagnostics popup.
+        _now = time.time()
+        if _now - _usdt_balance_fail_log_ts >= 60.0:
+            _usdt_balance_fail_log_ts = _now
+            database.log_activity(
+                f"get_usdt_balance transient error ({type(e).__name__}) — using "
+                f"cached ${(_last_usdt_balance if _last_usdt_balance is not None else 0.0):.2f}",
+                "info")
+        return _last_usdt_balance if _last_usdt_balance is not None else 0.0
 
 
 # ── F9: initial_balance semantics ─────────────────────────────────────────────
