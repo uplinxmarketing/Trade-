@@ -22,6 +22,7 @@ import { StrategySettingsPanel } from './StrategySettingsPanel';
 import { EntryGatePanel } from './EntryGatePanel';
 import { ConfigHistoryPanel } from './ConfigHistoryPanel';
 import UniverseNoticesBanner from './UniverseNoticesBanner';
+import PnlStatsStrip from './PnlStatsStrip';
 import { MemoryRestartBanner } from './DataHealthPanel';
 import { useUniverseHealth } from '@/hooks/useUniverseHealth';
 import { resolveCoinStatus, type CoinLifecycle } from '@/lib/coin-status';
@@ -444,6 +445,7 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
   const [agentStatus, setAgentStatus]       = useState('');
   const [scanning, setScanning]   = useState(false);
   const [showAllTrades, setShowAllTrades] = useState(false);
+  const [tradeTab, setTradeTab] = useState<'buys' | 'sells'>('sells');
   const [showAllPositions, setShowAllPositions] = useState(false);
   const [showPositionsSection, setShowPositionsSection] = useState(true);
   const [showTradesSection, setShowTradesSection] = useState(true);
@@ -1353,6 +1355,9 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
         </div>
       ) : (
         <div className="p-4 space-y-3">
+          {/* P&L stats strip + range selector (Today · 7D · All) */}
+          <PnlStatsStrip />
+
           {/* Running control */}
           <div className="flex gap-2">
             {isRunning ? (
@@ -1490,10 +1495,18 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
               <>
                 <div className="space-y-2">
                   <AnimatePresence initial={false}>
-                  {(showAllPositions
-                    ? [...positions].sort((a, b) => (b.dist_to_exit_pct ?? -999) - (a.dist_to_exit_pct ?? -999))
-                    : [...positions].sort((a, b) => (b.dist_to_exit_pct ?? -999) - (a.dist_to_exit_pct ?? -999)).slice(0, 5)
-                  ).map(pos => {
+                  {(() => {
+                    // Composite rank: ready-to-sell > profitable, then closer to
+                    // exit target (higher dist_to_exit_pct), then more profit.
+                    // Sorted DESC so the "hottest" positions float to the top;
+                    // the layout transition on each card animates the reorder.
+                    const rank = (p: typeof positions[number]) =>
+                      (p.ready_to_sell ? 3 : p.profitable ? 2 : 0) * 1e6
+                      + (p.dist_to_exit_pct ?? -999) * 1000
+                      + (p.net_profit_now ?? 0);
+                    const ranked = [...positions].sort((a, b) => rank(b) - rank(a));
+                    return (showAllPositions ? ranked : ranked.slice(0, 5));
+                  })().map(pos => {
                     const entry = pos.avg_entry_price > 0 ? pos.avg_entry_price : 0;
                     // Priority: fresh_prices (injected per-poll outside cache) > local WS > cached server price
                     const cur   = freshPrices[pos.symbol]
@@ -1653,15 +1666,32 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
           <div className="px-4 pb-3">
             {trades.length === 0 ? (
               <p className="text-[10px] text-muted-foreground py-2">No trades yet</p>
-            ) : (
+            ) : (() => {
+              const buys  = trades.filter(t => t.side === 'BUY');
+              const sells = trades.filter(t => t.side === 'SELL');
+              const filtered = tradeTab === 'buys' ? buys : sells;
+              return (
               <>
+                {/* Buys / Sells tab switcher */}
+                <div className="flex gap-1 mb-2">
+                  {([['sells', 'Sells', sells.length], ['buys', 'Buys', buys.length]] as const).map(([id, label, count]) => (
+                    <button key={id} onClick={() => setTradeTab(id)}
+                      className={`text-[8px] px-1.5 py-0.5 border rounded ${tradeTab === id ? 'border-accent text-accent' : 'border-border text-muted-foreground hover:border-accent/50'}`}>
+                      {label} ({count})
+                    </button>
+                  ))}
+                </div>
                 <div className="space-y-1">
-                  {(showAllTrades ? trades : trades.slice(0, 10)).map((t, i) => (
+                  {(showAllTrades ? filtered : filtered.slice(0, 10)).map((t, i) => (
                     <div key={t.id || i} className="flex items-center justify-between py-1 border-b border-border/50 last:border-0">
                       <div className="flex items-center gap-2">
                         {t.side === 'BUY'
-                          ? <TrendingUp className="w-3 h-3 text-gain" />
-                          : <TrendingDown className="w-3 h-3 text-loss" />}
+                          ? <TrendingUp className="w-3 h-3 text-muted-foreground" />
+                          : t.pnl != null
+                            ? (t.pnl >= 0
+                                ? <TrendingUp className="w-3 h-3 text-gain" />
+                                : <TrendingDown className="w-3 h-3 text-loss" />)
+                            : <TrendingDown className="w-3 h-3 text-muted-foreground" />}
                         <div>
                           <p className="text-[11px] font-bold">{t.symbol.replace('USDT','')}</p>
                           <p className="text-[9px] text-muted-foreground">{formatTime(t.created_at)}</p>
@@ -1685,14 +1715,15 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                     </div>
                   ))}
                 </div>
-                {trades.length > 10 && (
+                {filtered.length > 10 && (
                   <button onClick={() => setShowAllTrades(!showAllTrades)}
                     className="mt-2 text-[10px] text-accent hover:underline">
-                    {showAllTrades ? 'Show less' : `Show all ${trades.length} trades`}
+                    {showAllTrades ? 'Show less' : `Show all ${filtered.length} ${tradeTab}`}
                   </button>
                 )}
               </>
-            )}
+              );
+            })()}
           </div>
         )}
       </div>
