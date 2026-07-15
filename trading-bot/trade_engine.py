@@ -10764,6 +10764,31 @@ def _check_buys_from_cache(prices: Dict[str, float]):
         # Within tolerance — proceed and clear any stale oversized-ticket flag.
         _lot_waste_flags.pop(sym, None)
 
+        # ── Item-2 — pre-trade spread/slippage veto (buy-side) ────────────────
+        # Protect the 5bp slippage assumption: skip when half-spread + the 5bp
+        # assumption exceeds the per-symbol slippage ceiling (risk.max_avg_slippage
+        # _bps). This is the ENTRY-side complement to the existing post-trade
+        # rolling slippage veto. Fail-open when the book is unavailable (never
+        # block a real candidate on a missing quote). Config read at time of use.
+        try:
+            _slip_ceiling = float(_risk_cfg().get("max_avg_slippage_bps", 15.0) or 15.0)
+        except Exception:
+            _slip_ceiling = 15.0
+        if _slip_ceiling > 0:
+            _fsp_v, _hsp_v = _spread_pcts(sym)
+            if _hsp_v is not None:
+                _half_bps = _hsp_v * 100.0
+                if (_half_bps + 5.0) > _slip_ceiling:
+                    _record_rejection(sym, score, "spread_slippage_veto",
+                                      f"half-spread {_half_bps:.1f}bp + 5bp > "
+                                      f"{_slip_ceiling:.0f}bp ceiling")
+                    _log_skip_dedup(
+                        sym, "spread_slippage_veto",
+                        f"[SKIP] {sym}: half-spread {_half_bps:.1f}bp + 5bp assumption "
+                        f"> {_slip_ceiling:.0f}bp slippage ceiling — skipping (protects "
+                        f"the 5bp fill assumption).", "warn")
+                    continue
+
         # ── L2.2 — liquidity floor (cheap check first) ────────────────────────
         # ── Item-4 — tick-granularity universe filter (buy-side only) ─────────
         # Reject coins whose ONE price tick exceeds tick_pct_max of price. On

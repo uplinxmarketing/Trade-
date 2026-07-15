@@ -10787,6 +10787,62 @@ def api_tick_granularity(symbols: str = "approved", threshold_pct: float = 0.10)
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+@app.get("/api/diagnostics/open-orders")
+def api_open_orders():
+    """Item 5 (READ-ONLY) — list the ACTUAL exchange open orders for every held
+    symbol. Flags any STOP leg (type contains STOP, or a SELL carrying a stopPrice)
+    — under the no-loss volume spec there should be NONE (managed exits are
+    LIMIT_MAKER TP only). This endpoint does NOT cancel or modify anything."""
+    try:
+        import trade_engine as _te
+        try:
+            _mode = _te.get_mode()
+        except Exception:
+            _mode = "unknown"
+        if _mode != "live":
+            return {"mode": _mode, "note": "paper mode — no exchange-side orders",
+                    "held": [], "symbols": [], "stop_legs_found": 0, "stop_legs": []}
+        with _te._positions_lock:
+            held = sorted({p.get("symbol") for p in _te._positions if p.get("symbol")})
+        import binance_direct as _bd
+        out, stop_legs = [], []
+        for sym in held:
+            try:
+                orders = _bd.get_open_orders(sym) or []
+            except Exception as e:
+                out.append({"symbol": sym, "error": str(e)})
+                continue
+            rows = []
+            for o in orders:
+                _typ = str(o.get("type", "") or "")
+                _side = str(o.get("side", "") or "")
+                _stop = o.get("stopPrice")
+                try:
+                    _is_stop = ("STOP" in _typ.upper()) or (
+                        _side == "SELL" and _stop is not None and float(_stop) > 0)
+                except Exception:
+                    _is_stop = "STOP" in _typ.upper()
+                row = {"orderId": o.get("orderId"), "type": _typ, "side": _side,
+                       "price": o.get("price"), "stopPrice": _stop,
+                       "qty": o.get("origQty"), "is_stop_leg": bool(_is_stop)}
+                rows.append(row)
+                if _is_stop:
+                    stop_legs.append({"symbol": sym, **row})
+            out.append({"symbol": sym, "n_orders": len(rows), "orders": rows})
+        return {
+            "mode": "live", "held": held, "symbols": out,
+            "stop_legs_found": len(stop_legs), "stop_legs": stop_legs,
+            "note": ("WARNING: exchange STOP legs exist — an automated loss path "
+                     "that contradicts the no-loss volume spec. Cancel/replace to "
+                     "TP-only requires explicit per-symbol operator confirmation."
+                     if stop_legs else
+                     "OK: no exchange stop legs — managed exits are TP-only, "
+                     "consistent with the no-loss spec."),
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 # ── Phase 5 §5.1 + Phase 6 §6 — v2 strategy config API ───────────────────────
 #
 # Payload shapes (frontend contract):
