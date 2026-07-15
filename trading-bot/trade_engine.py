@@ -11411,7 +11411,8 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                     _pzf = float(_pz_cf)
                     database.log_activity(
                         f"PZ_CF {sym} pz={_pzf:.2f} pz_max={_r_runtime_cfg().get('pz_max')} "
-                        f"would_block@6.0={_pzf > 6.0} would_block@8.0={_pzf > 8.0}", "info")
+                        f"would_block@4.0={_pzf > 4.0} would_block@6.0={_pzf > 6.0} "
+                        f"would_block@8.0={_pzf > 8.0}", "info")
                 # Item 3 — friction counterfactual: whether the historical friction
                 # gate (0.60) WOULD have blocked this entry (friction is still
                 # reported even though the gate is off for volume). grep FRICTION_CF.
