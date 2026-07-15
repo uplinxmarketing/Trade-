@@ -9211,13 +9211,59 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
         # -1013: market closed/delisted — blacklist and force-close
         # -2010: insufficient balance — could be ghost OR a quantity/lot-size
         #        mismatch on a real position. Verify with a balance check first.
-        is_possible_ghost = "-2010" in err_str or "insufficient balance" in err_str.lower()
-        is_closed = "-1013" in err_str or "Market is closed" in err_str
+        _es_low = err_str.lower()
+        is_possible_ghost = "-2010" in err_str or "insufficient balance" in _es_low
+        # A GENUINE halt/delisting returns a "Market is closed" message (or -1121
+        # invalid symbol). -1013 ALONE is a generic exchange FILTER failure
+        # (LOT_SIZE / MIN_NOTIONAL / PRICE_FILTER) — NOT a delisting — and must NOT
+        # trigger a force-close at a loss (that mislabels lot-size errors on a
+        # recovered/dust position as 'market closed/delisted').
+        is_market_closed = ("market is closed" in _es_low) or ("-1121" in err_str)
+        is_filter_fail = ("-1013" in err_str) and not is_market_closed
+        is_closed = is_market_closed
         if is_closed:
             _bad_symbols.add(sym)
 
         should_force_close = is_closed
         force_close_label = ""
+
+        if is_filter_fail:
+            # -1013 = exchange FILTER failure, NOT a delisting. Re-fetch filters,
+            # round the sell qty to the lot step, and let the next tick retry; if
+            # the notional is genuinely below the exchange minimum it is dust —
+            # park it. NEVER force-close a live coin at a loss on a -1013.
+            try:
+                from exchange_info import get_symbol_filters as _gsf1013
+                _flt13 = _gsf1013(sym) or {}
+                _step13 = float(_flt13.get("step_size", 0.0) or 0.0)
+                _minnot13 = float(_flt13.get("min_notional", 0.0) or 0.0)
+                _act13 = _get_actual_balance(sym)
+                _q13 = _act13 if (_act13 and _act13 > 0) else float(pos.get("quantity", 0) or 0)
+                if _step13 > 0 and _q13 > 0:
+                    _q13 = math.floor(_q13 / _step13) * _step13
+                _notional13 = _q13 * (price or 0.0)
+                if _minnot13 > 0 and 0 < _notional13 < _minnot13:
+                    database.log_activity(
+                        f"{sym}: sell -1013 filter — notional ${_notional13:.2f} < minNotional "
+                        f"${_minnot13:.2f}; parking as dust (NOT delisted, NOT force-closed).",
+                        "warn")
+                    _bad_symbols.discard(sym)
+                    _sell_last_failed_ts[sym] = time.time() + 300.0
+                    return
+                if _q13 > 0:
+                    with _positions_lock:
+                        pos["quantity"] = _q13
+                database.log_activity(
+                    f"{sym}: sell rejected -1013 (lot-size/min-notional filter, NOT a "
+                    f"delisting) — corrected qty to {_q13:.8f}, retry next tick.", "warn")
+                _sell_last_failed_ts[sym] = time.time() + 5.0
+                return
+            except Exception as _fe13:
+                database.log_activity(
+                    f"{sym}: sell -1013 handling error ({type(_fe13).__name__}: {_fe13}) "
+                    f"— backing off 60s, NOT force-closing.", "warn")
+                _sell_last_failed_ts[sym] = time.time() + 60.0
+                return
 
         if is_possible_ghost and not is_closed:
             is_ghost, ghost_reason = _is_truly_ghost_position(sym, float(pos.get("quantity", 0)))
