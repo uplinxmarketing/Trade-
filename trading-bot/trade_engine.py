@@ -12715,6 +12715,19 @@ def _place_managed_exit(pos: dict) -> None:
     # it fires (replaces the OCO rescue logic). No OCO, no STOP_LOSS_LIMIT leg —
     # so no exchange stop can ever trigger under the no-stop strategy.
     if _no_stop_mode():
+        # Honor exits.maker_tp under the no-stop engines: when FALSE, do NOT rest a
+        # maker LIMIT_MAKER TP. The local monitor already market-sells on TP cross
+        # (and on ratchet/breakeven), so a resting order is redundant AND forces a
+        # cancel-first round-trip on every exit — which added ~3s of pickup_to_gate
+        # latency on a slow signed-REST link and eroded profit-locks. Taker-exit
+        # mode ⇒ no resting order ⇒ exits fire immediately. When TRUE, rest it as
+        # before (passive maker-fee TP capture).
+        try:
+            _mk_tp = bool(_exit_cfg().get("maker_tp", True))
+        except Exception:
+            _mk_tp = True
+        if not _mk_tp:
+            return
         try:
             resp = exit_orders.place_maker_tp(sym, qty, _floor_price_tick(tp, sym))
             if isinstance(resp, dict) and resp.get("rejected"):
