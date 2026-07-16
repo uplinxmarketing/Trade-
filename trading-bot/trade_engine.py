@@ -2531,7 +2531,7 @@ def _active_engine() -> str:
         # Step 8 — deprecation warning (once): a set scoring_engine OVERRIDES
         # buy_formula, so a lingering non-trivial buy_formula is DEAD config. Warn
         # so it stops reading like a live setting. Behavior is unchanged.
-        if not _warned_dead_buy_formula and se in ("wolf-r-volume", "wolf-r", "wolf-p5"):
+        if not _warned_dead_buy_formula and se in ("wolf-r-volume", "wolf-r", "wolf-r-scalp", "wolf-p5"):
             _bf = str(e.get("buy_formula", "") or "").lower()
             if _bf and _bf != "v3":
                 _warned_dead_buy_formula = True
@@ -2542,7 +2542,7 @@ def _active_engine() -> str:
                         f"Remove buy_formula to avoid confusion.", "warn")
                 except Exception:
                     pass
-        if se in ("wolf-r-volume", "wolf-r"):
+        if se in ("wolf-r-volume", "wolf-r", "wolf-r-scalp"):
             return se
         if se == "wolf-p5":
             return "p5"
@@ -2552,13 +2552,22 @@ def _active_engine() -> str:
 
 
 def _r_is_active() -> bool:
-    return _active_engine() in ("wolf-r-volume", "wolf-r")
+    return _active_engine() in ("wolf-r-volume", "wolf-r", "wolf-r-scalp")
 
 
 def _r_model_path() -> Optional[str]:
     try:
         p = str((_load_strategy().get("entries") or {}).get("r_model_path") or "").strip()
-        return p or None
+        if p:
+            return p
+        # SCALP resolves to its own artifact (wolf_r_scalp_model.json); R/volume
+        # fall through to ev_model's default (wolf_r_model.json).
+        if _active_engine() == "wolf-r-scalp":
+            try:
+                return ev_model._r_scalp_default_path()
+            except Exception:
+                return None
+        return None
     except Exception:
         return None
 
@@ -2574,13 +2583,21 @@ def _r_runtime_cfg() -> dict:
     eng = _active_engine()
     if eng == "wolf-r-volume":
         pw_def, pz_def, maxnew_def, cool_def = 50.0, 6.0, 4, 12
+    elif eng == "wolf-r-scalp":
+        # 15-minute win head (pF15). Gate: pf15_min=60, pz_max=5.0; pacing off
+        # (guard stays on); per-coin cooldown 6 bars (30 min).
+        pw_def, pz_def, maxnew_def, cool_def = 60.0, 5.0, 0, 6
     else:
         pw_def, pz_def, maxnew_def, cool_def = 55.0, 2.4, 2, 36
     preset = str(e.get("preset", "") or "").lower()
-    if preset == "volume":
-        pw_def, pz_def = 50.0, 6.0
-    elif preset == "balanced":
-        pw_def, pz_def = 55.0, 4.0
+    # preset only re-tunes the two probability thresholds for the non-scalp R
+    # engines; SCALP's gate (60/5.0) is fixed by the model spec and not
+    # preset-overridden.
+    if eng != "wolf-r-scalp":
+        if preset == "volume":
+            pw_def, pz_def = 50.0, 6.0
+        elif preset == "balanced":
+            pw_def, pz_def = 55.0, 4.0
 
     def _f(k, d):
         try:
@@ -2593,24 +2610,36 @@ def _r_runtime_cfg() -> dict:
             return int(float(e.get(k, d)))
         except (TypeError, ValueError):
             return d
+    # SCALP's win threshold is a fixed model-spec gate (pf15_min=60), decoupled
+    # from buy_score_threshold (that slider was tuned for the 4h win head).
+    # Override with entries.pf15_min if an operator ever needs to. R/volume keep
+    # wiring pw_min to the existing UI score slider.
+    if eng == "wolf-r-scalp":
+        _pw_min = _f("pf15_min", pw_def)
+        # scalp keeps its own pz ceiling (scalp_pz_max, default 5.0) so flipping
+        # back to volume restores the operator's standing shared pz_max untouched.
+        _pz_max = _f("scalp_pz_max", pz_def)
+    else:
+        _pw_min = _f("buy_score_threshold", pw_def)
+        _pz_max = _f("pz_max", pz_def)
     return {
         "engine": eng,
-        "pw_min": _f("buy_score_threshold", pw_def),   # the existing UI score slider
-        "pz_max": _f("pz_max", pz_def),
+        "pw_min": _pw_min,   # R/volume: UI score slider; scalp: fixed pf15_min gate
+        "pz_max": _pz_max,
         "pz_veto_enabled": bool(e.get("pz_veto_enabled", True)),
         "friction_max": _f("p5_friction_max", 0.60),
         # Volume mode: the sandbox baseline has no friction HARD gate (fee is
         # baked into the net-of-cost model), so default it OFF for wolf-r-volume
         # and ON otherwise. entries.r_friction_gate overrides: None/absent=auto,
         # True/False force it. Reversible from the UI without a redeploy.
-        "friction_gate": ((eng != "wolf-r-volume")
+        "friction_gate": ((eng not in ("wolf-r-volume", "wolf-r-scalp"))
                           if e.get("r_friction_gate") is None
                           else bool(e.get("r_friction_gate"))),
         "universe_dhigh_min": _f("p5_universe_dhigh_min", 0.70),
         "macro_gate": bool(e.get("p5_macro_gate", True)),
         "max_new_per_30min": _i("r_max_new_per_30min", maxnew_def),
         "coin_cooldown_bars": _i("r_coin_cooldown_bars", cool_def),
-        "cluster_guard": bool(e.get("cluster_guard", eng == "wolf-r-volume")),
+        "cluster_guard": bool(e.get("cluster_guard", eng in ("wolf-r-volume", "wolf-r-scalp"))),
         "hour_window": bool(e.get("hour_window", False)),
     }
 
@@ -2738,7 +2767,7 @@ def _wolf_score_cached(sym: str, cached: dict, cohort: dict, tilt: float) -> Opt
         _formula = _active_engine()
     except Exception:
         _formula = "v3"
-    if _formula in ("wolf-r-volume", "wolf-r"):
+    if _formula in ("wolf-r-volume", "wolf-r", "wolf-r-scalp"):
         try:
             ev_model.ensure_r_loaded(_r_model_path())
             _cfgr = _r_runtime_cfg()
@@ -2962,7 +2991,7 @@ def _refresh_and_publish_scores() -> None:
         except Exception:
             _eng_live = "v3"
         _p5_live = _eng_live == "p5"
-        _r_live = _eng_live in ("wolf-r-volume", "wolf-r")
+        _r_live = _eng_live in ("wolf-r-volume", "wolf-r", "wolf-r-scalp")
         if _p5_live:
             try:
                 _p5_build_pass_ctx([s for s, _ in cand])
@@ -9133,7 +9162,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
     try:
         _R_ALLOWED_NEG = ("manual", "force", "force-sell", "forced", "delist",
                           "delisted", "successor", "reconcile", "valve3")
-        if _active_engine() == "wolf-r-volume" and str(reason) not in _R_ALLOWED_NEG:
+        if _active_engine() in ("wolf-r-volume", "wolf-r-scalp") and str(reason) not in _R_ALLOWED_NEG:
             _e_entry = float(pos.get("entry_price") or pos.get("avg_entry_price") or 0.0)
             _e_qty = float(qty or 0.0)
             if _e_entry > 0 and _e_qty > 0 and float(price) > 0:
@@ -9141,7 +9170,7 @@ def _do_execute_sell(pos: dict, sym: str, qty: float, price: float, reason: str,
                 _e_net = (float(price) - _e_entry) * _e_qty - (float(price) * _e_qty + _e_entry * _e_qty) * _e_fee
                 if _e_net < 0:
                     database.log_activity(
-                        f"CRITICAL: wolf-r-volume no-loss assertion BLOCKED a '{reason}' sell of "
+                        f"CRITICAL: {_active_engine()} no-loss assertion BLOCKED a '{reason}' sell of "
                         f"{sym} — expected net {_e_net:.5f} USDT < 0 (price {price} < entry {_e_entry}). "
                         f"No loss exits exist in this mode; this is a bug — order not submitted.",
                         "critical")
@@ -10270,7 +10299,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _eng_rank = _active_engine()
         except Exception:
             _eng_rank = "v3"
-        if _eng_rank in ("wolf-r-volume", "wolf-r"):
+        if _eng_rank in ("wolf-r-volume", "wolf-r", "wolf-r-scalp"):
             # RANKING FLIP (operator): buy SAFEST-FIRST — ASCENDING pZ (freeze
             # risk), tiebreak by pW DESC. Coins without a pZ sort to the tail. Was
             # pW-desc; flipped so a same-scan cluster fills the lowest-freeze-risk
@@ -10464,7 +10493,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             except Exception:
                 _eng_local = "v3"
             _p5_mode_local = (_eng_local == "p5")
-            _r_mode_local = (_eng_local in ("wolf-r-volume", "wolf-r"))
+            _r_mode_local = (_eng_local in ("wolf-r-volume", "wolf-r", "wolf-r-scalp"))
             if _ws_here is not None and _r_mode_local:
                 # ── WolfScore-R tradable rule ──────────────────────────────────
                 # wolfscore_r already applied the full gate chain (universe /
@@ -11018,7 +11047,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _eng_fric = _active_engine()
         except Exception:
             _eng_fric = "v3"
-        if _eng_fric in ("wolf-r-volume", "wolf-r") and \
+        if _eng_fric in ("wolf-r-volume", "wolf-r", "wolf-r-scalp") and \
                 not _r_runtime_cfg().get("friction_gate", True):
             _fric_cap_pct = 0.0
         if _fric_cap_pct > 0:
@@ -11706,7 +11735,7 @@ def _no_stop_mode() -> bool:
     ONLY negative-PnL exits are the optional P5 bail valve or the wolf-r valve3
     (never wolf-r-volume). mr/v3 (rollback) restore the full legacy stop ladder."""
     try:
-        return _active_engine() in ("p5", "wolf-r-volume", "wolf-r")
+        return _active_engine() in ("p5", "wolf-r-volume", "wolf-r", "wolf-r-scalp")
     except Exception:
         return False
 

@@ -147,10 +147,19 @@ class EntriesConfig(BaseModel):
     # '' = use buy_formula (p5/mr/v3). pw_min is the existing buy_score_threshold
     # slider; pz_max is the freeze-veto ceiling. preset sets both (volume=50/6.0,
     # balanced=55/4.0).
-    scoring_engine:         str   = ""       # ''|'wolf-r-volume'|'wolf-r'|'wolf-p5'
+    scoring_engine:         str   = ""       # ''|'wolf-r-volume'|'wolf-r'|'wolf-r-scalp'|'wolf-p5'
     pz_max:                 float = Field(6.0, ge=0.0, le=100.0)    # freeze-veto ceiling (max ensemble member)
     pz_veto_enabled:        bool  = True     # enforce the pZ ceiling; False = veto off (pZ still reported)
-    preset:                 str   = ""       # ''|'volume'|'balanced' (sets pw_min/pz_max)
+    preset:                 str   = ""       # ''|'volume'|'balanced' (sets pw_min/pz_max; ignored for scalp)
+    # ── WolfScore-R-SCALP (scoring_engine='wolf-r-scalp') — 15-min win head ───────
+    # Same 26 features / 3-member ensemble as R, but the win head is head_win15m
+    # (pF15 = % chance the sell engine banks the buy within 15 min). Gate is fixed
+    # by the model spec: pf15_min=60, scalp_pz_max=5.0 (decoupled from the shared
+    # pz_max so a rollback to volume restores it untouched). Pacing off, guard on,
+    # per-coin cooldown 6 bars (30 min via r_coin_cooldown_bars). Loads
+    # wolf_r_scalp_model.json alongside ev_model.py unless r_model_path overrides.
+    pf15_min:               float = Field(60.0, ge=0.0, le=100.0)   # scalp win gate (pF15)
+    scalp_pz_max:           float = Field(5.0, ge=0.0, le=100.0)    # scalp freeze-veto ceiling
     cluster_guard:          bool  = True     # pause new buys while >=3 open >288 bars & underwater
     hour_window:            bool  = False    # only enter 12:00-17:00 UTC
     r_max_new_per_30min:    int   = Field(4, ge=1, le=50)           # R pacing: new entries / 30 min
@@ -563,14 +572,26 @@ SCHEMA: Dict[str, dict] = {
                                          "Scoring engine",
                                          "The live scoring engine. wolf-r-volume = WolfScore-R volume gate "
                                          "(pW>=50 & pZ<=6, no loss exits, cluster guard) | wolf-r = R base "
-                                         "(55/2.4 + valve3) | wolf-p5 = P5. Overrides Buy formula when set; "
-                                         "'' falls back to Buy formula (p5/mr/v3). Rollback = switch this.",
-                                         choices=["wolf-r-volume", "wolf-r", "wolf-p5", ""]),
+                                         "(55/2.4 + valve3) | wolf-r-scalp = R 15-min win head (pF15>=60 & "
+                                         "pZ<=5, no loss exits, cluster guard) | wolf-p5 = P5. Overrides Buy "
+                                         "formula when set; '' falls back to Buy formula (p5/mr/v3). Rollback = "
+                                         "switch this.",
+                                         choices=["wolf-r-volume", "wolf-r", "wolf-r-scalp", "wolf-p5", ""]),
     "entries.pz_max": _meta("entries.pz_max", "float", "Entries",
                                          "R freeze-veto ceiling (pZ ≤)",
                                          "WolfScore-R: reject a coin if its worst-member freeze probability pZ "
                                          "exceeds this (volume 6.0, balanced 4.0, base 2.4). Lower = fewer, "
                                          "safer trades.", 0.0, 100.0, 0.5, ""),
+    "entries.pf15_min": _meta("entries.pf15_min", "float", "Entries",
+                                         "Scalp win gate (pF15 ≥)",
+                                         "WolfScore-R-SCALP: minimum % chance the sell engine banks the buy "
+                                         "within 15 min (pF15). Spec gate = 60. Only applies when "
+                                         "scoring_engine='wolf-r-scalp'.", 0.0, 100.0, 1.0, ""),
+    "entries.scalp_pz_max": _meta("entries.scalp_pz_max", "float", "Entries",
+                                         "Scalp freeze-veto ceiling (pZ ≤)",
+                                         "WolfScore-R-SCALP: reject a coin if worst-member freeze probability pZ "
+                                         "exceeds this. Spec gate = 5.0. Decoupled from pz_max so a rollback to "
+                                         "volume restores the shared ceiling untouched.", 0.0, 100.0, 0.5, ""),
     "entries.pz_veto_enabled": _meta("entries.pz_veto_enabled", "bool", "Entries",
                                          "R freeze-veto enabled",
                                          "WolfScore-R: enforce the pZ ceiling (pz_max). OFF disables the freeze "

@@ -1956,14 +1956,19 @@ const AITradingAgent = ({ selectedCoins, prices, binanceConnected, onConnectBina
                 <button
                   onClick={() => setWolfSort(s => (s === 'desc' ? 'asc' : 'desc'))}
                   className="flex items-center justify-center gap-0.5 text-[8px] text-muted-foreground font-semibold hover:text-foreground transition-colors"
-                  title="WolfScore — live 0-100 win-probability. Click to sort."
+                  title={`WolfScore — live 0-100 ${(signalsData as any)?.score_label || 'win-probability'}. Click to sort.`}
                 >
-                  WOLF{wolfSort === 'desc' ? ' ▼' : ' ▲'}
+                  {(signalsData as any)?.engine === 'wolf-r-scalp' ? 'PF15' : 'WOLF'}{wolfSort === 'desc' ? ' ▼' : ' ▲'}
                 </button>
                 <span className="text-[8px] text-muted-foreground font-semibold">COIN</span>
                 <span className="text-[8px] text-muted-foreground text-center">BUY</span>
                 <span className="text-[8px] text-muted-foreground text-right">PRICE</span>
               </div>
+              {(signalsData as any)?.engine === 'wolf-r-scalp' && (
+                <p className="text-[7px] text-muted-foreground/80 leading-tight pt-0.5 pb-1 break-words">
+                  <span className="font-semibold">PF15</span> = % profit within 15m (chance the sell engine banks this buy inside 15 minutes)
+                </p>
+              )}
               {/* J1 — cached-vs-fresh legend. Explains the two-state badge so the
                   #1 source of operator confusion (green cache, no buy) is labelled. */}
               {anyTrace && (

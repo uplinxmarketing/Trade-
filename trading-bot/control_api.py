@@ -4091,7 +4091,7 @@ def api_signals_summary(limit: int = 30):
             _bf5 = _te_eng._active_engine()
         except Exception:
             _bf5 = str((strategy.get("entries") or {}).get("buy_formula", "v3")).lower()
-        if _bf5 in ("wolf-r-volume", "wolf-r"):
+        if _bf5 in ("wolf-r-volume", "wolf-r", "wolf-r-scalp"):
             # WolfScore-R fast path: serve the scan's published pW/pZ (wolfscore_r
             # already applied the full gate chain → gated=='' means eligible). No
             # per-coin recompute.
@@ -4143,9 +4143,15 @@ def api_signals_summary(limit: int = 30):
                 except Exception:
                     continue
             slistr.sort(key=lambda x: (0 if x["buy_allowed"] else 1, -(x["score"] or 0)))
-            result = {"signals": slistr, "total_tracked": len(slistr), "ts": now}
+            # SCALP's score is pF15 (% profit within 15m) rather than the 4h win
+            # probability — surface a label so the UI names the column correctly.
+            _score_label = ("% profit within 15m" if _bf5 == "wolf-r-scalp"
+                            else "win-probability")
+            result = {"signals": slistr, "total_tracked": len(slistr), "ts": now,
+                      "engine": _bf5, "score_label": _score_label}
             _signals_summary_cache = {"ts": now, "data": result}
-            return {"signals": slistr[:limit], "total_tracked": len(slistr), "ts": now, "cached": False}
+            return {"signals": slistr[:limit], "total_tracked": len(slistr), "ts": now,
+                    "cached": False, "engine": _bf5, "score_label": _score_label}
         if _bf5 == "p5":
             pub: dict = {}
             try:
@@ -6320,7 +6326,7 @@ def api_diagnostics_bundle(
         except Exception:
             _eng = "v3"
         # Report the ACTIVE engine's model (R / P5 / legacy). Paper retired.
-        if _eng in ("wolf-r-volume", "wolf-r"):
+        if _eng in ("wolf-r-volume", "wolf-r", "wolf-r-scalp"):
             _rs = _ev.r_model_status() if hasattr(_ev, "r_model_status") else {}
             out.write(f"  engine={_eng} model={_rs.get('version')} loaded={_rs.get('loaded')} "
                       f"numpy={_rs.get('numpy')} members={_rs.get('members')} "
@@ -6377,7 +6383,7 @@ def api_diagnostics_bundle(
             _eng = _te_m._active_engine()
         except Exception:
             _eng = "v3"
-        if _eng in ("wolf-r-volume", "wolf-r", "p5"):
+        if _eng in ("wolf-r-volume", "wolf-r", "wolf-r-scalp", "p5"):
             out.write(f"  paper-shadow retired (engine={_eng}, live-only)\n")
             return
         st = _shadow_get_stats()
@@ -9611,7 +9617,7 @@ def _ev_model_impl():
         except Exception:
             _eng_m = "v3"
 
-        if _eng_m in ("wolf-r-volume", "wolf-r"):
+        if _eng_m in ("wolf-r-volume", "wolf-r", "wolf-r-scalp"):
             # LIVE model under R is the dual-head ensemble (trained off-box). Headline
             # moves with the live pW distribution.
             _rst = {}

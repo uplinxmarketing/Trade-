@@ -1450,6 +1450,12 @@ except Exception:
     _R_NUMPY = False
 
 R_VERSION = "wolf-r-v1"
+R_SCALP_VERSION = "wolf-r-scalp-v1"
+R_VERSIONS = (R_VERSION, R_SCALP_VERSION)
+# Win head name: 'head_win4h' for R (4h) / 'head_win15m' for R-SCALP (15m). The
+# freeze head is 'head_freeze3d' in both. Detected at load; used by r_infer.
+_R_WIN_HEADS = ("head_win4h", "head_win15m")
+_r_loaded_path = None   # path of the currently-loaded artifact (reload on change)
 R_WARMUP_BARS = 620
 R_FEATURES = ['r5', 'r15', 'r1h', 'r4h', 'r24h', 'accel15', 'pullbk', 'lowsl1h', 'volr',
               'vburst', 'tb5', 'tb1h', 'tbshift', 'dollv', 'atrp', 'coil', 'rngexp', 'dhigh24',
@@ -1483,27 +1489,42 @@ def _r_rmin(x, w):
     o = _rnp.full(len(x), _rnp.nan, _rnp.float32); o[w - 1:] = _r_swv(_rnp.ascontiguousarray(x), w).min(axis=1); return o
 
 
+def _r_default_path():
+    return _os_p5.path.join(_os_p5.path.dirname(_os_p5.path.abspath(__file__)),
+                            "wolf_r_model.json")
+
+
+def _r_scalp_default_path():
+    return _os_p5.path.join(_os_p5.path.dirname(_os_p5.path.abspath(__file__)),
+                            "wolf_r_scalp_model.json")
+
+
 def load_r_model(path=None):
-    """Load + validate wolf_r_model.json. Strict: version, 26-feature order, 3
-    members × 2 heads with the exact shapes. Raises on any mismatch."""
-    global _r_model, _r_load_error
+    """Load + validate wolf_r_model.json OR wolf_r_scalp_model.json. Strict:
+    version (wolf-r-v1 | wolf-r-scalp-v1), 26-feature order, 3 members × 2 heads —
+    head_freeze3d plus a win head (head_win4h for R, head_win15m for SCALP) — with
+    the exact shapes. Raises on any mismatch."""
+    global _r_model, _r_load_error, _r_loaded_path
     if not _R_NUMPY:
         raise RuntimeError("numpy unavailable — WolfScore-R requires numpy")
     if path is None:
-        path = _os_p5.path.join(_os_p5.path.dirname(_os_p5.path.abspath(__file__)),
-                                "wolf_r_model.json")
+        path = _r_default_path()
     with open(path, "r") as f:
         m = json.load(f)
-    if m.get("version") != R_VERSION:
-        raise ValueError(f"r model version {m.get('version')!r} != {R_VERSION!r}")
+    if m.get("version") not in R_VERSIONS:
+        raise ValueError(f"r model version {m.get('version')!r} not in {R_VERSIONS!r}")
     if list(m.get("features") or []) != R_FEATURES:
         raise ValueError("r model feature names/order do not match R_FEATURES")
     mem = m.get("members") or []
     if len(mem) != 3:
         raise ValueError(f"r model expects 3 members, got {len(mem)}")
+    # Detect the win head (R: head_win4h; SCALP: head_win15m). freeze is common.
+    _win_hk = next((k for k in _R_WIN_HEADS if k in (mem[0] or {})), None)
+    if _win_hk is None:
+        raise ValueError(f"r model member has no win head (expected one of {_R_WIN_HEADS})")
     hid = int(m.get("hidden", 16))
     for mi, member in enumerate(mem):
-        for hk in ("head_win4h", "head_freeze3d"):
+        for hk in (_win_hk, "head_freeze3d"):
             h = member.get(hk) or {}
             for key, shp in (("mu", (26,)), ("sd", (26,)), ("W1", (26, hid)),
                              ("b1", (hid,)), ("W2", (hid,)), ("platt", (2,))):
@@ -1511,7 +1532,7 @@ def load_r_model(path=None):
                 if tuple(a.shape) != shp:
                     raise ValueError(f"r model member {mi} {hk}.{key} shape {a.shape} != {shp}")
         # pre-cast the arrays once for fast inference
-        for hk in ("head_win4h", "head_freeze3d"):
+        for hk in (_win_hk, "head_freeze3d"):
             h = member[hk]
             h["_mu"] = _rnp.asarray(h["mu"], _rnp.float32)
             h["_sd"] = _rnp.asarray(h["sd"], _rnp.float32)
@@ -1520,20 +1541,25 @@ def load_r_model(path=None):
             h["_W2"] = _rnp.asarray(h["W2"], _rnp.float32)
             h["_b2"] = float(h["b2"])
             h["_platt"] = (float(h["platt"][0]), float(h["platt"][1]))
+    m["_win_head_key"] = _win_hk
     _r_model = m
     _r_load_error = None
+    _r_loaded_path = path
     return m
 
 
 def ensure_r_loaded(path=None):
     global _r_load_error
-    if _r_model is not None:
+    _resolved = path or _r_default_path()
+    # Reload when the requested artifact differs from the one in memory (mode
+    # switch R <-> R-SCALP without a fresh process).
+    if _r_model is not None and _r_loaded_path == _resolved:
         return True
     if not _R_NUMPY:
         _r_load_error = "numpy unavailable"
         return False
     try:
-        load_r_model(path)
+        load_r_model(_resolved)
         return True
     except Exception as e:
         _r_load_error = f"{type(e).__name__}: {e}"
@@ -1624,13 +1650,15 @@ def _r_platt_apply(ab, p):
 
 
 def r_infer(feat_vec):
-    """(pW, pZ) from a 26-feature vector. pW = mean of the 3 win4h heads (×100);
-    pZ = MAX of the 3 freeze3d heads (×100). Matches rlib exactly."""
+    """(pW, pZ) from a 26-feature vector. pW/pF = mean of the 3 WIN heads (×100)
+    — head_win4h for R, head_win15m for R-SCALP; pZ = MAX of the 3 freeze3d heads
+    (×100). Matches rlib exactly."""
     x2d = _rnp.asarray(feat_vec, dtype=_rnp.float32).reshape(1, 26)
+    _win_hk = _r_model.get("_win_head_key", "head_win4h")
     wins = []
     frzs = []
     for member in _r_model["members"]:
-        hw = member["head_win4h"]; hf = member["head_freeze3d"]
+        hw = member[_win_hk]; hf = member["head_freeze3d"]
         pw = _r_platt_apply(hw["_platt"], _r_mlp_prob(hw, x2d))
         pz = _r_platt_apply(hf["_platt"], _r_mlp_prob(hf, x2d))
         wins.append(float(pw.reshape(-1)[0]))
