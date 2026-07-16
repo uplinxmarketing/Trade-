@@ -3490,7 +3490,7 @@ def _binance_request(url: str, timeout: float = 3.0, source: str = "unknown",
         try:
             _record_rest_error(
                 f"[{source}] HTTP {he.code}: {he.reason}",
-                url=url, response_body=body_text,
+                url=url, response_body=body_text, critical=critical,
             )
         except TypeError:
             try:
@@ -3503,7 +3503,8 @@ def _binance_request(url: str, timeout: float = 3.0, source: str = "unknown",
         tb = _tb_b.format_exc()[-400:]
         _backoff_record_failure(source)
         try:
-            _record_rest_error(f"[{source}] {type(e).__name__}: {e}", url=url, response_body=tb)
+            _record_rest_error(f"[{source}] {type(e).__name__}: {e}", url=url,
+                               response_body=tb, critical=critical)
         except TypeError:
             try:
                 _record_rest_error(f"[{source}] {type(e).__name__}: {e} | {url[:200]}")
@@ -3694,7 +3695,8 @@ _last_binance_err_log_ts: Dict[str, float] = {}
 _BINANCE_ERR_LOG_THROTTLE_SEC = 30.0
 
 
-def _record_rest_error(err_msg: str, url: str = "", response_body: str = "") -> None:
+def _record_rest_error(err_msg: str, url: str = "", response_body: str = "",
+                       critical: bool = True) -> None:
     try:
         with _binance_health_lock:
             _binance_health["rest_error_count"] += 1
@@ -3710,8 +3712,12 @@ def _record_rest_error(err_msg: str, url: str = "", response_body: str = "") -> 
                 detail_parts.append(f"url={url[:300]}")
             if response_body:
                 detail_parts.append(f"response={response_body[:300]}")
+            # NON-critical REST calls (btc_klines / batch_prices / held_watchdog)
+            # have graceful fallbacks (cached regime, WS prices), so a transient
+            # mirror timeout is not an ERROR — log it at WARN so it stops inflating
+            # the error count / cluttering the diagnostics popup.
             log_diag_issue(
-                "binance", "error",
+                "binance", ("error" if critical else "warn"),
                 f"REST: {str(err_msg)[:150]} (×{_binance_health['rest_error_count']} since start)",
                 detail=" | ".join(detail_parts) if detail_parts else "",
             )
