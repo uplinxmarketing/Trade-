@@ -36,3 +36,7 @@ trading-bot/data/
 .persistence_probe
 .write_probe
 .cfg_probe
+
+# Python bytecode
+__pycache__/
+*.py[cod]
