@@ -160,6 +160,7 @@ class EntriesConfig(BaseModel):
     # wolf_r_scalp_model.json alongside ev_model.py unless r_model_path overrides.
     pf15_min:               float = Field(60.0, ge=0.0, le=100.0)   # scalp win gate (pF15)
     scalp_pz_max:           float = Field(5.0, ge=0.0, le=100.0)    # scalp freeze-veto ceiling
+    scalp_shadow_enabled:   bool  = True     # read-only scalp throughput profiler (no live effect)
     cluster_guard:          bool  = True     # pause new buys while >=3 open >288 bars & underwater
     hour_window:            bool  = False    # only enter 12:00-17:00 UTC
     r_max_new_per_30min:    int   = Field(4, ge=1, le=50)           # R pacing: new entries / 30 min

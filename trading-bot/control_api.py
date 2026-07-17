@@ -6372,6 +6372,29 @@ def api_diagnostics_bundle(
                   f"win_rate={lv.get('win_rate')}% n={lv.get('n')}\n")
     safe(_ev_bundle, "ev_model")
 
+    # -- R-SCALP throughput shadow (read-only gate profiler) ----------------------
+    section("SCALP-THROUGHPUT")
+    def _scalp_tp_bundle():
+        import trade_engine as _te_m
+        rep = _te_m._scalp_shadow_throughput()
+        sm = rep.get("shadow_model", {}) or {}
+        if not sm.get("loaded"):
+            out.write(f"  scalp shadow not loaded (error={sm.get('error')})\n")
+            return
+        out.write(f"  enabled={rep.get('enabled')} window_h={rep.get('window_hours')} "
+                  f"elapsed_h={rep.get('elapsed_hours')} scored={rep.get('n_coins_scored')} "
+                  f"pz_max={rep.get('pz_max')}\n")
+        out.write(f"  ticket=${rep.get('ticket_usdt')} fee_rt=${rep.get('fee_roundtrip_usdt')} "
+                  f"({rep.get('fee_roundtrip_pct')}%) min_profit=${rep.get('min_profit_usdt')}\n")
+        snap = rep.get("snapshot", {}) or {}
+        out.write(f"  dist: pf15 p50={snap.get('pf15_p50')} p90={snap.get('pf15_p90')} "
+                  f"max={snap.get('pf15_max')} | pz p10={snap.get('pz_p10')} p50={snap.get('pz_p50')}\n")
+        for r in rep.get("ladder", []):
+            out.write(f"  pf15>={r['pf15_min']:.0f}: trades/day={r['trades_per_day']} "
+                      f"clearing_now={r['coins_clearing_now']} mean_pf15={r['mean_pf15_clearing']} "
+                      f"breakeven_winner=${r['breakeven_winner_usdt']}\n")
+    safe(_scalp_tp_bundle, "scalp_throughput")
+
     # -- Shadow-Lab (paper-shadow data scraper w/ virtual budget) ----------------
     section("SHADOW-LAB")
     def _shadow_bundle():
@@ -8496,6 +8519,22 @@ def api_mr_shadow():
     try:
         import mr_shadow as _mrs
         return _mrs.get_mr_shadow_report()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "available": False}
+
+
+@app.get("/api/diagnostics/scalp-throughput")
+def api_scalp_throughput():
+    """READ-ONLY WolfScore-R-SCALP throughput profiler. Runs the scalp model in
+    shadow on the features the live engine already computes (no live effect) and
+    reports, for a ladder of candidate pF15 gates (60/55/50/45/40) at the scalp
+    pZ ceiling: rolling trades/day, coins clearing now, mean pF15 of clearing
+    coins (the model's own win-prob), and a first-order net-of-fee EV. Use this
+    to pick the LOWEST gate that stays net-positive before touching live buys.
+    Requires the live engine to be an R-family engine so features are computed."""
+    try:
+        import trade_engine as _te
+        return _te._scalp_shadow_throughput()
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}", "available": False}
 

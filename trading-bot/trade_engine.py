@@ -2516,6 +2516,183 @@ def _r_cluster_guard_active() -> bool:
         return False
 
 
+# ── R-SCALP throughput shadow (read-only measurement) ────────────────────────
+# Answers "how many trades/day would each candidate pF15 gate open?" WITHOUT
+# changing live buying. On every score of a coin under any R-family engine we
+# already hold the 26-feature vector; we run the SEPARATE scalp shadow model on
+# it (ev_model.scalp_shadow_infer → never touches the live model) and record a
+# "gate-open" event whenever the coin crosses into eligibility at each ladder
+# threshold, subject to the same per-coin cooldown a real trade would honour.
+# The 24h rolling event counts give an empirical trades/day estimate per gate.
+_SCALP_LADDER = (60.0, 55.0, 50.0, 45.0, 40.0)   # pF15 thresholds to profile
+_scalp_shadow_events: "dict" = {t: [] for t in _SCALP_LADDER}  # thr -> [ts,...] (24h)
+_scalp_shadow_elig_ts: "dict" = {}                # (sym,thr) -> last eligible ts
+_scalp_shadow_latest: "dict" = {}                 # sym -> (ts, pf15, pz)
+_scalp_shadow_lock = threading.Lock()
+_scalp_shadow_started_ts = 0.0
+
+
+def _scalp_shadow_enabled() -> bool:
+    """Default ON — it's read-only. entries.scalp_shadow_enabled=false disables."""
+    try:
+        e = _load_strategy().get("entries") or {}
+        v = e.get("scalp_shadow_enabled", True)
+        return bool(v)
+    except Exception:
+        return True
+
+
+def _scalp_shadow_observe(sym: str, feat_vec) -> None:
+    """Run the scalp shadow model on an already-computed 26-feature vector and
+    record gate-open transitions per ladder threshold. Never raises; never
+    affects live scoring."""
+    global _scalp_shadow_started_ts
+    if not _scalp_shadow_enabled():
+        return
+    try:
+        if not ev_model.ensure_scalp_shadow_loaded():
+            return
+        res = ev_model.scalp_shadow_infer(feat_vec)
+        if not res:
+            return
+        pf15, pz = float(res[0]), float(res[1])
+        now = time.time()
+        # Same freeze veto and per-coin cooldown a real scalp trade would honour,
+        # so a "gate-open event" approximates a distinct tradable opportunity.
+        try:
+            _cfg = _load_strategy().get("entries") or {}
+            _pzmax = float(_cfg.get("scalp_pz_max", 5.0))
+            _cool_bars = float(_cfg.get("r_coin_cooldown_bars", 6))
+        except Exception:
+            _pzmax, _cool_bars = 5.0, 6.0
+        _cool_s = max(0.0, _cool_bars * 300.0)
+        cutoff = now - 86400.0
+        with _scalp_shadow_lock:
+            if _scalp_shadow_started_ts == 0.0:
+                _scalp_shadow_started_ts = now
+            _scalp_shadow_latest[sym] = (now, pf15, pz)
+            frozen = pz > _pzmax
+            for thr in _SCALP_LADDER:
+                eligible = (pf15 >= thr) and (not frozen)
+                key = (sym, thr)
+                last = _scalp_shadow_elig_ts.get(key, 0.0)
+                if eligible:
+                    # New gate-open only if it wasn't already inside the cooldown
+                    # window of a prior open (mirrors real re-entry lockout).
+                    if (now - last) >= _cool_s:
+                        dq = _scalp_shadow_events[thr]
+                        dq.append(now)
+                        while dq and dq[0] < cutoff:
+                            dq.pop(0)
+                    _scalp_shadow_elig_ts[key] = now
+    except Exception:
+        pass
+
+
+def _scalp_shadow_throughput() -> dict:
+    """Aggregate the rolling shadow accumulator into a per-gate trades/day table
+    plus a distribution snapshot and a first-order net-of-fee EV estimate."""
+    now = time.time()
+    try:
+        e = _load_strategy().get("entries") or {}
+        x = _load_strategy().get("exits") or {}
+    except Exception:
+        e, x = {}, {}
+    _pzmax = 5.0
+    try:
+        _pzmax = float(e.get("scalp_pz_max", 5.0))
+    except Exception:
+        pass
+    # Ticket + fee model for the EV proxy. Winner banks ~min_profit_usdt; a
+    # non-win in 15m is HELD (no realized loss in the no-loss engine) → ~0. So
+    # EV/trade ≈ pWin·min_profit − round-trip fee on the ticket. Optimistic on
+    # the freeze/lock cost; stated as such.
+    try:
+        _min_profit = float(x.get("min_profit_usdt", 0.01) or 0.01)
+    except Exception:
+        _min_profit = 0.01
+    _ticket = 11.0
+    try:
+        _b = _load_strategy().get("budget") or {}
+        _tf = float(_b.get("budget_fixed_usdt", 0) or 0)
+        if _tf > 0:
+            _ticket = _tf
+    except Exception:
+        pass
+    try:
+        _fee_rt = 2.0 * float(_fee_rate_for("BTCUSDT"))
+    except Exception:
+        _fee_rt = 2.0 * 0.001
+    _fee_usdt = _fee_rt * _ticket
+    with _scalp_shadow_lock:
+        started = _scalp_shadow_started_ts or now
+        latest = dict(_scalp_shadow_latest)
+        events = {t: list(v) for t, v in _scalp_shadow_events.items()}
+    elapsed_h = max(1e-6, (now - started) / 3600.0)
+    win_h = min(24.0, elapsed_h)
+    cutoff = now - win_h * 3600.0
+    # snapshot distribution (latest per-coin pF15/pZ this scan-ish)
+    pfs = sorted(v[1] for v in latest.values())
+    pzs = sorted(v[2] for v in latest.values())
+
+    def _pct(arr, q):
+        if not arr:
+            return None
+        i = min(len(arr) - 1, max(0, int(round(q * (len(arr) - 1)))))
+        return round(arr[i], 2)
+    ladder = []
+    for thr in _SCALP_LADDER:
+        evs = [t for t in events.get(thr, []) if t >= cutoff]
+        n = len(evs)
+        tpd = n * (24.0 / win_h)
+        clearing = [v[1] for v in latest.values()
+                    if v[1] >= thr and v[2] <= _pzmax]
+        mean_pf = round(sum(clearing) / len(clearing), 2) if clearing else None
+        pwin = (mean_pf / 100.0) if mean_pf is not None else None
+        ev_trade = round(pwin * _min_profit - _fee_usdt, 5) if pwin is not None else None
+        ev_day = round(ev_trade * tpd, 4) if ev_trade is not None else None
+        # Unambiguous, assumption-free hurdle: given this gate's win prob, the
+        # average WINNER must net at least this many USDT to cover the round-trip
+        # fee (breakeven_winner = fee / pWin). Compare to what the sell engine
+        # actually banks per win — if realized winners fall below it, this gate
+        # loses money no matter how many trades/day it produces.
+        be_winner = round(_fee_usdt / pwin, 5) if (pwin and pwin > 0) else None
+        ladder.append({
+            "pf15_min": thr,
+            "events_window": n,
+            "trades_per_day": round(tpd, 1),
+            "coins_clearing_now": len(clearing),
+            "mean_pf15_clearing": mean_pf,
+            "breakeven_winner_usdt": be_winner,
+            "ev_per_trade_usdt": ev_trade,
+            "ev_per_day_usdt": ev_day,
+            "net_positive": (ev_trade is not None and ev_trade > 0),
+        })
+    return {
+        "enabled": _scalp_shadow_enabled(),
+        "shadow_model": ev_model.scalp_shadow_status() if hasattr(ev_model, "scalp_shadow_status") else {},
+        "window_hours": round(win_h, 2),
+        "elapsed_hours": round(elapsed_h, 2),
+        "pz_max": _pzmax,
+        "ticket_usdt": _ticket,
+        "fee_roundtrip_pct": round(_fee_rt * 100.0, 4),
+        "fee_roundtrip_usdt": round(_fee_usdt, 5),
+        "min_profit_usdt": _min_profit,
+        "ev_model_note": ("EV/trade ≈ pWin·min_profit − round-trip fee. Winner banks "
+                          "min_profit; a non-win is HELD (no realized loss) so counted 0 "
+                          "— OPTIMISTIC (ignores capital-lock/freeze cost). Use trades/day "
+                          "and mean_pf15 as the primary signals."),
+        "n_coins_scored": len(latest),
+        "snapshot": {
+            "pf15_p50": _pct(pfs, 0.50), "pf15_p90": _pct(pfs, 0.90),
+            "pf15_max": round(pfs[-1], 2) if pfs else None,
+            "pz_p50": _pct(pzs, 0.50), "pz_p10": _pct(pzs, 0.10),
+        },
+        "ladder": ladder,
+        "ts": now,
+    }
+
+
 _warned_dead_buy_formula = False
 _warned_r_rank_flip = False       # one-shot log when the ASC-pZ ranking flip is applied
 
@@ -2777,6 +2954,11 @@ def _wolf_score_cached(sym: str, cached: dict, cohort: dict, tilt: float) -> Opt
             _x, _atr = ev_model.compute_features_r(
                 _inp["arr"], _inp["med1h"], _inp["med24"], _inp["breadth1h"],
                 _inp["btc15"], _inp["btc1h"], _inp["hs"], _inp["hc"])
+            # Read-only scalp-throughput shadow: reuse the just-computed features
+            # (no extra feature work) to measure how many trades each candidate
+            # pF15 gate would open. Never affects the live score below.
+            if _x is not None:
+                _scalp_shadow_observe(sym, _x)
             _mb = bool(_cfgr.get("macro_gate", True)) and _inp.get("macro_bear", False)
             return ev_model.wolfscore_r(_x, atr_last=_atr, cfg=_cfgr,
                                         dhigh_ratio=_inp.get("dhigh_ratio"), macro_bear=_mb)

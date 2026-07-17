@@ -1649,15 +1649,15 @@ def _r_platt_apply(ab, p):
     return 1.0 / (1.0 + _rnp.exp(-(ab[0] * zz + ab[1])))
 
 
-def r_infer(feat_vec):
-    """(pW, pZ) from a 26-feature vector. pW/pF = mean of the 3 WIN heads (×100)
+def _r_infer_model(model, feat_vec):
+    """(pW, pZ) for an EXPLICIT model dict. pW/pF = mean of the 3 WIN heads (×100)
     — head_win4h for R, head_win15m for R-SCALP; pZ = MAX of the 3 freeze3d heads
     (×100). Matches rlib exactly."""
     x2d = _rnp.asarray(feat_vec, dtype=_rnp.float32).reshape(1, 26)
-    _win_hk = _r_model.get("_win_head_key", "head_win4h")
+    _win_hk = model.get("_win_head_key", "head_win4h")
     wins = []
     frzs = []
-    for member in _r_model["members"]:
+    for member in model["members"]:
         hw = member[_win_hk]; hf = member["head_freeze3d"]
         pw = _r_platt_apply(hw["_platt"], _r_mlp_prob(hw, x2d))
         pz = _r_platt_apply(hf["_platt"], _r_mlp_prob(hf, x2d))
@@ -1666,6 +1666,91 @@ def r_infer(feat_vec):
     pW = 100.0 * (sum(wins) / len(wins))
     pZ = 100.0 * max(frzs)
     return pW, pZ
+
+
+def r_infer(feat_vec):
+    """(pW, pZ) from a 26-feature vector using the LIVE model (_r_model)."""
+    return _r_infer_model(_r_model, feat_vec)
+
+
+# ── R-SCALP shadow handle ────────────────────────────────────────────────────
+# A SEPARATE scalp model handle used only for read-only throughput measurement,
+# so shadow inference NEVER evicts the live _r_model (which ensure_r_loaded
+# swaps in place). Loads wolf_r_scalp_model.json once; independent of the active
+# engine. Used by trade_engine's scalp-throughput shadow when the live engine is
+# any R-family engine (features are already computed) — measures how many trades
+# each candidate pF15 gate would open WITHOUT changing live buying.
+_scalp_shadow_model = None
+_scalp_shadow_error = None
+
+
+def ensure_scalp_shadow_loaded():
+    """Load the scalp artifact into the dedicated shadow handle (idempotent).
+    Does NOT touch _r_model. Returns True when the shadow model is ready."""
+    global _scalp_shadow_model, _scalp_shadow_error
+    if _scalp_shadow_model is not None:
+        return True
+    if not _R_NUMPY:
+        _scalp_shadow_error = "numpy unavailable"
+        return False
+    try:
+        path = _r_scalp_default_path()
+        with open(path, "r") as f:
+            m = json.load(f)
+        # Reuse the same strict validation + array pre-cast as load_r_model, but
+        # store into the shadow global instead of _r_model.
+        if m.get("version") not in R_VERSIONS:
+            raise ValueError(f"scalp shadow version {m.get('version')!r} not in {R_VERSIONS!r}")
+        if list(m.get("features") or []) != R_FEATURES:
+            raise ValueError("scalp shadow feature names/order do not match R_FEATURES")
+        mem = m.get("members") or []
+        if len(mem) != 3:
+            raise ValueError(f"scalp shadow expects 3 members, got {len(mem)}")
+        _win_hk = next((k for k in _R_WIN_HEADS if k in (mem[0] or {})), None)
+        if _win_hk is None:
+            raise ValueError(f"scalp shadow member has no win head (expected {_R_WIN_HEADS})")
+        hid = int(m.get("hidden", 16))
+        for mi, member in enumerate(mem):
+            for hk in (_win_hk, "head_freeze3d"):
+                h = member.get(hk) or {}
+                for key, shp in (("mu", (26,)), ("sd", (26,)), ("W1", (26, hid)),
+                                 ("b1", (hid,)), ("W2", (hid,)), ("platt", (2,))):
+                    a = _rnp.asarray(h.get(key), dtype=_rnp.float32)
+                    if tuple(a.shape) != shp:
+                        raise ValueError(f"scalp shadow member {mi} {hk}.{key} shape {a.shape} != {shp}")
+            for hk in (_win_hk, "head_freeze3d"):
+                h = member[hk]
+                h["_mu"] = _rnp.asarray(h["mu"], _rnp.float32)
+                h["_sd"] = _rnp.asarray(h["sd"], _rnp.float32)
+                h["_W1"] = _rnp.asarray(h["W1"], _rnp.float32)
+                h["_b1"] = _rnp.asarray(h["b1"], _rnp.float32)
+                h["_W2"] = _rnp.asarray(h["W2"], _rnp.float32)
+                h["_b2"] = float(h["b2"])
+                h["_platt"] = (float(h["platt"][0]), float(h["platt"][1]))
+        m["_win_head_key"] = _win_hk
+        _scalp_shadow_model = m
+        _scalp_shadow_error = None
+        return True
+    except Exception as e:
+        _scalp_shadow_error = f"{type(e).__name__}: {e}"
+        return False
+
+
+def scalp_shadow_infer(feat_vec):
+    """(pF15, pZ) from the shadow scalp model, or None if unavailable."""
+    if _scalp_shadow_model is None:
+        return None
+    try:
+        return _r_infer_model(_scalp_shadow_model, feat_vec)
+    except Exception:
+        return None
+
+
+def scalp_shadow_status():
+    return {"loaded": _scalp_shadow_model is not None,
+            "version": (_scalp_shadow_model or {}).get("version"),
+            "win_head": (_scalp_shadow_model or {}).get("_win_head_key"),
+            "error": _scalp_shadow_error, "numpy": _R_NUMPY}
 
 
 def wolfscore_r(feat_vec, atr_last=None, cfg=None, dhigh_ratio=None, macro_bear=False):
