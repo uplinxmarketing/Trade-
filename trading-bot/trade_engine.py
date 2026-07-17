@@ -5609,19 +5609,21 @@ def _record_rejection(symbol: str, score, reason: str, detail: str = ""):
     # (global "(all)" rejections are ignored — they aren't per-symbol blocks).
     _trace_mark_block(symbol, reason)
 
-def _mark_ready_no_slot(strategy: dict, k: int, n: int) -> None:
+def _mark_ready_no_slot(strategy: dict, k: int, n: int, note: str = "") -> None:
     """Q1 — when the buy check returns early at capacity (before the per-symbol
     loop), every currently buy-ready candidate would otherwise be left with NO
     attempt and NO block reason → a silent DECISION-GAP. Stamp each ready coin
     with an explicit machine-readable 'waiting: no free slot (k/n)' block so the
-    capacity throttle always shows a state. Never raises on the hot path."""
+    capacity throttle always shows a state. `note` appends the cause (e.g. the
+    neutral-regime slot cut) so the reason is self-explanatory. Never raises."""
     try:
         min_sigs = int(strategy.get("min_signals", config.MIN_SIGNALS_TO_BUY))
         approved = {c["symbol"] for c in strategy.get("approved_coins", [])
                     if c.get("approved")}
         with _signal_cache_lock:
             snap = dict(_signal_cache)
-        reason = f"waiting: no free slot ({k}/{n})"
+        reason = (f"waiting: no free slot ({k}/{n}) — {note}" if note
+                  else f"waiting: no free slot ({k}/{n})")
         for s, v in snap.items():
             if s in approved and v.get("score", 0) >= min_sigs:
                 _trace_mark_block(s, reason)
@@ -10150,6 +10152,7 @@ def _check_buys_from_cache(prices: Dict[str, float]):
     # "off" disables scaling. The decision is logged once per transition.
     _eff_stagger  = _BUY_STAGGER_SEC
     _eff_max_buys = _MAX_BUYS_PER_SCAN
+    _slot_cut_note = ""
     try:
         _regime_now = get_btc_regime()
         if _regime_now == "neutral":
@@ -10163,7 +10166,14 @@ def _check_buys_from_cache(prices: Dict[str, float]):
                 _nmult = _neutral_size_mult()
                 _slot_cap = max(1, min(math.ceil(max_pos * _nmult),
                                        max(1, max_pos // 2)))
+                _pre_cut = max_pos
                 max_pos = min(max_pos, _slot_cap)
+                if max_pos < _pre_cut:
+                    # Make the invisible neutral halving explicit in the capacity
+                    # block reason (operators were mystified by "no free slot
+                    # (4/3)" while settings showed 8 slots).
+                    _slot_cut_note = (f"neutral regime halved {_pre_cut}→{max_pos} "
+                                      f"(neutral_scaling_mode=slots)")
                 _eff_stagger  = _BUY_STAGGER_SEC * 2.0
                 _eff_max_buys = max(1, _MAX_BUYS_PER_SCAN // 2)
             _log_neutral_scaling_transition(_regime_now, _neutral_mode,
@@ -10186,14 +10196,15 @@ def _check_buys_from_cache(prices: Dict[str, float]):
             _degr_tag = (f" (degraded from {_slots_info['max_positions']}: "
                          f"allocation {_slots_info['effective_allocation']:.2f})"
                          if _slots_info["degraded"] else "")
+            _cut_tag = f" [{_slot_cut_note}]" if _slot_cut_note else ""
             database.log_activity(
-                f"At max positions ({n_open}/{max_pos}){_degr_tag} — bot active, "
+                f"At max positions ({n_open}/{max_pos}){_degr_tag}{_cut_tag} — bot active, "
                 f"waiting for an exit before opening new trades",
                 "info",
             )
         # Q1 — mark every buy-ready candidate 'no free slot' so this early return
         # never leaves a ready coin with no attempt AND no block reason.
-        _mark_ready_no_slot(strategy, n_open, max_pos)
+        _mark_ready_no_slot(strategy, n_open, max_pos, _slot_cut_note)
         return  # already at capacity — buys resume automatically after a sell
 
     # Enforce configurable min_signals threshold (overrides config.MIN_SIGNALS_TO_BUY)

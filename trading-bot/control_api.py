@@ -7293,6 +7293,11 @@ _ENTRIES_VALIDATION = {
 # dropped on POST so a GET→edit→POST round-trip never errors.
 _REGIME_VALIDATION = {
     "neutral_size_mult": ("float", 0.0, 1.0),
+    # M1.2 — the neutral-regime risk-reduction mode. Was READ by the engine
+    # (strategy.regime.neutral_scaling_mode, default "auto") but MISSING from this
+    # whitelist, so the UI/API could never set it — the operator had to hand-edit
+    # strategy.json. "off" disables the neutral slot/size cut entirely.
+    "neutral_scaling_mode": ("enum", ("auto", "size", "slots", "off"), None),
 }
 _REGIME_READONLY_KEYS = {"refresh_sec"}
 
@@ -7322,6 +7327,14 @@ def _validate_typed_block(block: dict, spec: dict, block_name: str,
                 validated[key] = val
             else:
                 errors[key] = "must be a boolean"
+            continue
+        if typ == "enum":
+            allowed = lo or ()
+            sval = str(val).strip().lower()
+            if sval in allowed:
+                validated[key] = sval
+            else:
+                errors[key] = f"must be one of {sorted(allowed)}"
             continue
         if isinstance(val, bool) or not isinstance(val, (int, float)):
             errors[key] = "must be a number"
